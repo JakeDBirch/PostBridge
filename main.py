@@ -2597,8 +2597,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             container.config(bg=color)
             row.config(bg=color)
             for w in row.winfo_children():
-                try:    w.config(bg=color)
-                except: pass
+                if hasattr(w, "set_bg"):
+                    w.set_bg(color)
+                else:
+                    try:    w.config(bg=color)
+                    except: pass
 
         for base in self._aaf_sources:
             # ── Per-source StringVars (survive rebuilds) ──────────────────────

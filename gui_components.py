@@ -193,9 +193,10 @@ class _FlatDropdown(tk.Frame):
 
     def __init__(self, parent, textvariable=None, values=(), state="readonly",
                  font=None, width=20, justify="left", **kw):
-        super().__init__(parent, bg=SURF2, bd=0,
+        self._base_bg = kw.pop("bg", SURF2)
+        super().__init__(parent, bg=self._base_bg, bd=0,
                          highlightthickness=1, highlightbackground=BORDER,
-                         cursor="hand2")
+                         cursor="hand2", **kw)
         self._var        = textvariable if textvariable is not None else tk.StringVar()
         self._values     = list(values)
         self._state      = state
@@ -205,12 +206,12 @@ class _FlatDropdown(tk.Frame):
         self._outside_id = None
 
         self._lbl = tk.Label(self, textvariable=self._var,
-                             font=self._font, bg=SURF2, fg=TEXT,
+                             font=self._font, bg=self._base_bg, fg=TEXT,
                              padx=8, pady=5, anchor="w", width=width)
         self._lbl.pack(side="left", fill="x", expand=True)
 
         self._arr = tk.Label(self, text=self._ARROW,
-                             font=self._font, bg=SURF2, fg=SUB,
+                             font=self._font, bg=self._base_bg, fg=SUB,
                              padx=6, pady=5)
         self._arr.pack(side="right")
 
@@ -220,10 +221,17 @@ class _FlatDropdown(tk.Frame):
                 w.bind("<Enter>",    lambda e: self._tint(True))
                 w.bind("<Leave>",    lambda e: self._tint(False))
 
+    def set_bg(self, color):
+        """Update the base background color (used by row color coding)."""
+        self._base_bg = color
+        self.config(bg=color)
+        self._lbl.config(bg=color)
+        self._arr.config(bg=color)
+
     def _tint(self, on):
         if self._popup:
             return
-        c = SURF3 if on else SURF2
+        c = SURF3 if on else self._base_bg
         b = ACCENT if on else BORDER
         self.config(bg=c, highlightbackground=b)
         self._lbl.config(bg=c)
