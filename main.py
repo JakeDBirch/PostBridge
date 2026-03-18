@@ -364,55 +364,101 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             n = len(paths_list)
             count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
 
+        def _add_file_row(p):
+            """Add a single media file and create its display row."""
+            p = str(p).strip().strip("{}")
+            if not p or not os.path.isfile(p): return
+            if os.path.basename(p).startswith("._"): return
+            if not is_media(p): return
+            if p in paths_list: return
+            paths_list.append(p)
+            is_v = is_video(p)
+            row = tk.Frame(file_list, bg=SURF2,
+                           highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text="VIDEO" if is_v else "AUDIO",
+                     font=("Courier New", 9, "bold"),
+                     bg="#2a3d2a" if is_v else "#1e2a3a",
+                     fg=SUCCESS if is_v else "#7a9fff",
+                     padx=5, pady=2).pack(side="left")
+            tk.Label(row, text=basename(p), font=FB, bg=SURF2, fg=TEXT,
+                     padx=6, anchor="w").pack(side="left", fill="x", expand=True)
+            rm = tk.Label(row, text=" × ", font=FB, bg=SURF2, fg=SUB,
+                          cursor="hand2", padx=4)
+            rm.pack(side="right")
+            def _rm(e, p=p, r=row):
+                if p in paths_list: paths_list.remove(p)
+                r.destroy()
+                _update_count()
+            rm.bind("<Button-1>", _rm)
+            _update_count()
+
+        def _add_folder_row(folder, folder_paths):
+            """Bulk-add all media files from a folder as a single display row."""
+            added = [p for p in folder_paths if p not in paths_list]
+            if not added: return
+            for p in added:
+                paths_list.append(p)
+            row = tk.Frame(file_list, bg=SURF2,
+                           highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text="FOLDER",
+                     font=("Courier New", 9, "bold"),
+                     bg="#2a2a3d", fg="#aaaaff",
+                     padx=5, pady=2).pack(side="left")
+            tk.Label(row,
+                     text="{}  ({} files)".format(os.path.basename(folder), len(added)),
+                     font=FB, bg=SURF2, fg=TEXT,
+                     padx=6, anchor="w").pack(side="left", fill="x", expand=True)
+            rm = tk.Label(row, text=" × ", font=FB, bg=SURF2, fg=SUB,
+                          cursor="hand2", padx=4)
+            rm.pack(side="right")
+            def _rm(e, ps=added, r=row):
+                for p in ps:
+                    if p in paths_list: paths_list.remove(p)
+                r.destroy()
+                _update_count()
+            rm.bind("<Button-1>", _rm)
+            _update_count()
+
         def _add_media(raw):
+            """Handle DnD drops — supports both individual files and folders."""
             paths = parse_dnd(raw) if isinstance(raw, str) else raw
             for p in paths:
                 p = str(p).strip().strip("{}")
-                if not p or not os.path.isfile(p): continue
-                if os.path.basename(p).startswith("._"): continue
-                if not is_media(p): continue
-                if p in paths_list: continue
-                paths_list.append(p)
-                is_v = is_video(p)
-                row = tk.Frame(file_list, bg=SURF2,
-                               highlightbackground=BORDER, highlightthickness=1)
-                row.pack(fill="x", pady=1)
-                tk.Label(row, text="VIDEO" if is_v else "AUDIO",
-                         font=("Courier New", 9, "bold"),
-                         bg="#2a3d2a" if is_v else "#1e2a3a",
-                         fg=SUCCESS if is_v else "#7a9fff",
-                         padx=5, pady=2).pack(side="left")
-                tk.Label(row, text=basename(p), font=FB, bg=SURF2, fg=TEXT,
-                         padx=6, anchor="w").pack(side="left", fill="x", expand=True)
-                rm = tk.Label(row, text=" × ", font=FB, bg=SURF2, fg=SUB,
-                              cursor="hand2", padx=4)
-                rm.pack(side="right")
-                def _rm(e, p=p, r=row):
-                    if p in paths_list: paths_list.remove(p)
-                    r.destroy()
-                    _update_count()
-                rm.bind("<Button-1>", _rm)
-            _update_count()
+                if not p: continue
+                if os.path.isdir(p):
+                    fps = []
+                    for root, _, files in os.walk(p):
+                        for fn in sorted(files):
+                            fp = os.path.join(root, fn)
+                            if is_media(fp): fps.append(fp)
+                    if fps: _add_folder_row(p, fps)
+                else:
+                    _add_file_row(p)
 
         btn_row = tk.Frame(panel, bg=SURF)
         btn_row.pack(anchor="w", padx=12, pady=(4, 10))
 
         def _browse_f():
-            ext_glob = " ".join("*" + e for e in sorted(MEDIA_EXTS))
+            exts = sorted(MEDIA_EXTS)
+            ext_glob = (" ".join("*" + e for e in exts) + " " +
+                        " ".join("*" + e.upper() for e in exts))
             ps = filedialog.askopenfilenames(
                 title="Select audio/video files",
                 filetypes=[("Media", ext_glob), ("All files", "*.*")])
-            if ps: _add_media(list(ps))
+            if ps:
+                for p in list(ps): _add_file_row(p)
 
         def _browse_d():
             folder = filedialog.askdirectory(title="Select media folder")
             if not folder: return
-            ps = []
+            fps = []
             for root, _, files in os.walk(folder):
                 for fn in sorted(files):
                     fp = os.path.join(root, fn)
-                    if is_media(fp): ps.append(fp)
-            _add_media(ps)
+                    if is_media(fp): fps.append(fp)
+            if fps: _add_folder_row(folder, fps)
 
         self._btn(btn_row, "+ BROWSE FILES",  _browse_f, small=True).pack(side="left", padx=(0, 8))
         self._btn(btn_row, "+ BROWSE FOLDER", _browse_d, small=True).pack(side="left")
@@ -2308,7 +2354,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._clear()
         self._section("STEP 2 — ASSIGN VIDEO MEDIA")
 
-        total_clips = sum(len(t["clips"]) for t in self._aaf_data["tracks"])
+        total_clips  = sum(len(t["clips"]) for t in self._aaf_data["tracks"])
+        has_prefetch = bool(getattr(self, "_prefetch_aaf_media", []))
         tk.Label(self.body,
                  text="{} clips from {} tracks  \u00b7  {} unique sources.  "
                       "Add video files below, then assign each source clip to its video.".format(
@@ -2316,7 +2363,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                           len(self._aaf_sources)),
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
-        sf = self._scroll_frame(self.body, height=500)
+        # ── Progress bar and nav pinned to bottom so they're always visible ────
+        self._aaf_prog_frame = tk.Frame(self.body, bg=BG)
+        self._aaf_prog_frame.pack(side="bottom", fill="x", pady=(6, 0))
+        self._aaf_prog_lbl = tk.Label(self._aaf_prog_frame, text="", font=FB,
+                                      bg=BG, fg=SUB, anchor="w")
+        self._aaf_prog_lbl.pack(fill="x", pady=(0, 3))
+        self._aaf_prog_bar = _FlatProgressBar(self._aaf_prog_frame, height=4)
+        self._aaf_prog_bar.pack(fill="x")
+        self._aaf_prog_frame.pack_forget()   # hidden until build starts
+
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8,0))
+        self._btn(nav, "\u2190 BACK",    self._aaf_step1).pack(side="left")
+        self._btn(nav, "SAVE SETUP",     self._aaf_save_setup).pack(side="left", padx=(8,0))
+        self._btn(nav, "LOAD SETUP",     self._aaf_load_setup).pack(side="left", padx=(4,0))
+        self._aaf_build_btn = self._btn(nav, "BUILD XML  \u2192", self._aaf_build,
+                                        color=ACCENT)
+        self._aaf_build_btn.pack(side="right")
+
+        # ── Scrollable content area fills remaining space ─────────────────────
+        sf = self._scroll_frame(self.body)
 
         # ── Video file pool (collapsible) ──────────────────────────────────────
         pool_frame = tk.Frame(sf, bg=SURF,
@@ -2324,13 +2391,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         pool_frame.pack(fill="x", pady=(0,8), padx=2)
 
         v_body = tk.Frame(pool_frame, bg=SURF)   # collapsible content
-        v_open = [True]
+        v_open = [not has_prefetch]
 
         ph = tk.Frame(pool_frame, bg=SURF, cursor="hand2")
         ph.pack(fill="x", padx=12, pady=(10,4))
 
-        v_arrow = tk.Label(ph, text="\u25bc", font=FB, bg=SURF, fg=ACCENT,
-                           cursor="hand2")
+        v_arrow = tk.Label(ph, text="\u25bc" if not has_prefetch else "\u25b6",
+                           font=FB, bg=SURF, fg=ACCENT, cursor="hand2")
         v_arrow.pack(side="left", padx=(0, 6))
         tk.Label(ph, text="VIDEO FILES", font=FL, bg=SURF, fg=ACCENT,
                  cursor="hand2").pack(side="left")
@@ -2350,8 +2417,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for w in (ph, v_arrow):
             w.bind("<Button-1>", lambda e: _toggle_vpool())
 
-        # Body contents
-        v_body.pack(fill="x")
+        # Body contents — only expand on initial render if no files were pre-loaded
+        if not has_prefetch:
+            v_body.pack(fill="x")
         self._aaf_video_paths = []
         self._aaf_file_list   = tk.Frame(v_body, bg=SURF)
         self._aaf_file_list.pack(fill="x", padx=12)
@@ -2377,13 +2445,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         apool_frame.pack(fill="x", pady=(0, 8), padx=2)
 
         a_body = tk.Frame(apool_frame, bg=SURF)   # collapsible content
-        a_open = [True]
+        a_open = [not has_prefetch]
 
         aph = tk.Frame(apool_frame, bg=SURF, cursor="hand2")
         aph.pack(fill="x", padx=12, pady=(10, 4))
 
-        a_arrow = tk.Label(aph, text="\u25bc", font=FB, bg=SURF, fg=ACCENT,
-                           cursor="hand2")
+        a_arrow = tk.Label(aph, text="\u25bc" if not has_prefetch else "\u25b6",
+                           font=FB, bg=SURF, fg=ACCENT, cursor="hand2")
         a_arrow.pack(side="left", padx=(0, 6))
         tk.Label(aph, text="REFERENCE AUDIO FILES", font=FL, bg=SURF, fg=ACCENT,
                  cursor="hand2").pack(side="left")
@@ -2406,8 +2474,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for w in (aph, a_arrow):
             w.bind("<Button-1>", lambda e: _toggle_apool())
 
-        # Body contents
-        a_body.pack(fill="x")
+        # Body contents — only expand on initial render if no files were pre-loaded
+        if not has_prefetch:
+            a_body.pack(fill="x")
         self._aaf_audio_paths     = []
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
@@ -2496,14 +2565,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(row_fps, text="  (29.97 DF for standard broadcast; override if needed)",
                  font=FB, bg=SURF, fg=SUB).pack(side="left")
 
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "\u2190 BACK",    self._aaf_step1).pack(side="left")
-        self._btn(nav, "SAVE SETUP",     self._aaf_save_setup).pack(side="left", padx=(8,0))
-        self._btn(nav, "LOAD SETUP",     self._aaf_load_setup).pack(side="left", padx=(4,0))
-        self._aaf_build_btn = self._btn(nav, "BUILD XML  \u2192", self._aaf_build,
-                                        color=ACCENT)
-        self._aaf_build_btn.pack(side="right")
-
         # Pre-load any video/audio files dropped at Step 1
         prefetch = getattr(self, "_prefetch_aaf_media", [])
         if prefetch:
@@ -2512,15 +2573,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if vp: self._aaf_add_video_batch(vp)
             if ap: self._aaf_add_audio_batch(ap)
 
-        # Build progress (hidden until BUILD XML is clicked)
-        self._aaf_prog_frame = tk.Frame(self.body, bg=BG)
-        self._aaf_prog_frame.pack(fill="x", pady=(6, 0))
-        self._aaf_prog_lbl = tk.Label(self._aaf_prog_frame, text="", font=FB,
-                                      bg=BG, fg=SUB, anchor="w")
-        self._aaf_prog_lbl.pack(fill="x", pady=(0, 3))
-        self._aaf_prog_bar = _FlatProgressBar(self._aaf_prog_frame, height=4)
-        self._aaf_prog_bar.pack(fill="x")
-        self._aaf_prog_frame.pack_forget()   # hidden until build starts
+    # Palette of subtle background tints — one per assigned video file.
+    # Unassigned rows use a warm amber tint so they stand out immediately.
+    _ASSIGN_PALETTE  = ["#162b16", "#16162b", "#2b1616",
+                        "#2b2516", "#162b2b", "#261626"]
+    _UNASSIGNED_ROW  = "#2a1a08"
 
     def _rebuild_aaf_source_rows(self):
         """Rebuild per-source video assignment dropdowns based on current video pool."""
@@ -2528,7 +2585,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             w.destroy()
         self._aaf_sync_btns = {}   # stale widget refs — repopulated below
 
-        options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        options   = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        vid_fns   = [basename(p) for p in self._aaf_video_paths]
+        vid_color = {fn: self._ASSIGN_PALETTE[i % len(self._ASSIGN_PALETTE)]
+                     for i, fn in enumerate(vid_fns)}
+
+        def _row_bg(sv_val):
+            return vid_color.get(sv_val, self._UNASSIGNED_ROW)
+
+        def _apply_color(container, row, color):
+            container.config(bg=color)
+            row.config(bg=color)
+            for w in row.winfo_children():
+                try:    w.config(bg=color)
+                except: pass
 
         for base in self._aaf_sources:
             # ── Per-source StringVars (survive rebuilds) ──────────────────────
@@ -2548,14 +2618,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 sv.set("— no video —")
 
             # ── Row ───────────────────────────────────────────────────────────
-            container = tk.Frame(self._aaf_assign_frame, bg=SURF)
+            bg = _row_bg(sv.get())
+            container = tk.Frame(self._aaf_assign_frame, bg=bg)
             container.pack(fill="x", pady=2)
 
-            row = tk.Frame(container, bg=SURF)
+            row = tk.Frame(container, bg=bg)
             row.pack(fill="x")
 
             # ✕ remove (far right)
-            rm_lbl = tk.Label(row, text=" \u2715 ", font=FB, bg=SURF, fg=SUB,
+            rm_lbl = tk.Label(row, text=" \u2715 ", font=FB, bg=bg, fg=SUB,
                               cursor="hand2", width=3)
             rm_lbl.pack(side="right")
             rm_lbl.bind("<Button-1>",
@@ -2575,13 +2646,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             # PT track label
             tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
-            tk.Label(row, text=tracks_str, font=FB, bg=SURF, fg=SUB,
+            tk.Label(row, text=tracks_str, font=FB, bg=bg, fg=SUB,
                      width=16, anchor="w").pack(side="right", padx=(4, 0))
 
             # Source name (expands)
-            name_lbl = tk.Label(row, text=base, font=FB, bg=SURF, fg=TEXT, anchor="w")
+            name_lbl = tk.Label(row, text=base, font=FB, bg=bg, fg=TEXT, anchor="w")
             name_lbl.pack(side="left", fill="x", expand=True)
             self._tooltip(name_lbl, base)
+
+            # ── Live color update when dropdown changes ────────────────────────
+            def _on_change(*args, c=container, r=row, s=sv):
+                _apply_color(c, r, _row_bg(s.get()))
+            sv.trace_add("write", _on_change)
 
         self._aaf_auto_match()
 
@@ -2842,7 +2918,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             text="{} file{}".format(n, "s" if n != 1 else ""))
 
     def _aaf_browse_audio_files(self):
-        ext_glob = " ".join("*" + e for e in sorted(MEDIA_EXTS))
+        exts = sorted(MEDIA_EXTS)
+        ext_glob = (" ".join("*" + e for e in exts) + " " +
+                    " ".join("*" + e.upper() for e in exts))
         paths = filedialog.askopenfilenames(
             title="Select reference audio / video files",
             filetypes=[("Audio / video", ext_glob), ("All files", "*.*")])
@@ -2948,7 +3026,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_browse_files(self):
         from utils import VIDEO_EXTS
-        ext_glob = " ".join("*" + e for e in sorted(VIDEO_EXTS))
+        exts = sorted(VIDEO_EXTS)
+        ext_glob = (" ".join("*" + e for e in exts) + " " +
+                    " ".join("*" + e.upper() for e in exts))
         paths = filedialog.askopenfilenames(
             title="Select video files",
             filetypes=[("Video files", ext_glob), ("All files", "*.*")])
