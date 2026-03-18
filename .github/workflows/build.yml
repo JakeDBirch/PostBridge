@@ -1,0 +1,126 @@
+name: Build PostBridge
+
+# Runs automatically on every push to main.
+# Can also be triggered manually: GitHub → Actions tab → Build PostBridge → Run workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # manual trigger button in the Actions tab
+
+jobs:
+
+  # ── Windows ──────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Download ffmpeg (Windows x64)
+        shell: pwsh
+        run: |
+          $base = "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          New-Item -ItemType Directory -Force ffmpeg-bin | Out-Null
+          Invoke-WebRequest "$base/ffmpeg-win-x64.exe"  -OutFile "ffmpeg-bin\ffmpeg.exe"
+          Invoke-WebRequest "$base/ffprobe-win-x64.exe" -OutFile "ffmpeg-bin\ffprobe.exe"
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip output folder
+        shell: pwsh
+        run: Compress-Archive -Path dist\PostBridge -DestinationPath PostBridge-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-windows
+          path: PostBridge-windows.zip
+          retention-days: 30
+
+  # ── macOS  Apple Silicon (M1 / M2 / M3) ─────────────────────────────────────
+  build-macos-arm:
+    runs-on: macos-14        # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Download ffmpeg (macOS ARM64)
+        run: |
+          mkdir -p ffmpeg-bin
+          base="https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          curl -fL -o ffmpeg-bin/ffmpeg-osx-arm64  "$base/ffmpeg-osx-arm64"
+          curl -fL -o ffmpeg-bin/ffprobe-osx-arm64 "$base/ffprobe-osx-arm64"
+          chmod +x ffmpeg-bin/ffmpeg-osx-arm64 ffmpeg-bin/ffprobe-osx-arm64
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip .app (preserving macOS metadata)
+        run: ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-mac-arm64
+          path: PostBridge-mac-arm64.zip
+          retention-days: 30
+
+  # ── macOS  Intel ──────────────────────────────────────────────────────────────
+  build-macos-intel:
+    runs-on: macos-13        # Last Intel-based macOS runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Download ffmpeg (macOS Intel x64)
+        run: |
+          mkdir -p ffmpeg-bin
+          base="https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          curl -fL -o ffmpeg-bin/ffmpeg-osx-x64  "$base/ffmpeg-osx-x64"
+          curl -fL -o ffmpeg-bin/ffprobe-osx-x64 "$base/ffprobe-osx-x64"
+          chmod +x ffmpeg-bin/ffmpeg-osx-x64 ffmpeg-bin/ffprobe-osx-x64
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip .app (preserving macOS metadata)
+        run: ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac-intel.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-mac-intel
+          path: PostBridge-mac-intel.zip
+          retention-days: 30

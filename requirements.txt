@@ -1,0 +1,20 @@
+# PostBridge — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Core GUI (included with Python on Windows/macOS, may need separate install on Linux)
+# tkinter is part of the stdlib; install python3-tk via your system package manager if missing
+
+# ── Drag-and-drop support (optional but recommended)
+tkinterdnd2>=0.3.0
+
+# ── Whisper transcription backend
+faster-whisper>=1.0.0
+
+# ── AAF parsing (required for Script→AAF and AAF→XML workflows)
+pyaaf2>=1.7.0
+
+# ── Audio/video processing (ffmpeg must also be installed separately on PATH)
+# ffmpeg-python is NOT required — PostBridge calls ffmpeg directly via subprocess
+
+# ── NumPy for waveform blob detection (optional — gracefully disabled if absent)
+numpy>=1.24.0

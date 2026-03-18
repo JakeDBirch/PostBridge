@@ -1,0 +1,2406 @@
+import os, re, io, json, tempfile, subprocess, time, wave, hashlib
+from xml.etree.ElementTree import Element, SubElement, ElementTree, indent
+
+try:
+    from faster_whisper import WhisperModel
+    HAS_WHISPER = True
+except ImportError:
+    HAS_WHISPER = False
+
+try:
+    import aaf2
+    HAS_AAF = True
+except ImportError:
+    HAS_AAF = False
+
+from config import *
+from utils import *
+
+# ── Sentinel exception ─────────────────────────────────────────────────────────
+class BuildCancelled(Exception):
+    """Raised inside build_aaf when the caller sets the cancel_event."""
+
+# ── Globals ────────────────────────────────────────────────────────────────────
+_cache_dir = None   # Will be set by App when script is loaded
+_channel_cache = {}
+_model_cache = {}
+
+# ── Audio extraction (uses bundled ffmpeg if not on PATH) ───────────────────────
+def _ffmpeg_cmd():
+    try:
+        from ffmpeg_bundled import get_ffmpeg_cmd
+        return get_ffmpeg_cmd()
+    except Exception:
+        return ["ffmpeg"]
+
+
+def _ffprobe_cmd():
+    try:
+        from ffmpeg_bundled import get_ffprobe_cmd
+        return get_ffprobe_cmd()
+    except Exception:
+        return ["ffprobe"]
+
+
+def check_ffmpeg():
+    """
+    Ensure ffmpeg/ffprobe are available (system or auto-downloaded). Return (True, "") if ready.
+    """
+    try:
+        from ffmpeg_bundled import check_ffmpeg as _check
+        return _check()
+    except Exception as e:
+        return False, str(e)
+
+
+def extract_window(media_path, start_s, end_s, out_path):
+    """
+    Extract a window of audio from media_path to out_path (WAV).
+    Returns (True, None) on success, (False, error_message) on failure.
+    """
+    duration = max(1.0, end_s - start_s)
+    ff = _ffmpeg_cmd()
+    cmd = ff + [
+        "-y",
+        "-ss", str(max(0, start_s)),
+        "-t", str(duration),
+        "-i", media_path,
+        "-ar", "16000",
+        "-ac", "1",
+        "-vn",
+        out_path
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+        if r.returncode == 0:
+            return True, None
+        err = (r.stderr or r.stdout or "").strip()
+        if not err:
+            err = "ffmpeg exited with code {}".format(r.returncode)
+        # If default failed with "multiple streams" or similar, try explicit first audio
+        if "Stream specifier" in err or "Invalid stream" in err or "does not contain any stream" in err.lower():
+            cmd2 = ff + [
+                "-y",
+                "-ss", str(max(0, start_s)),
+                "-t", str(duration),
+                "-i", media_path,
+                "-map", "0:a:0",
+                "-ar", "16000",
+                "-ac", "1",
+                "-vn",
+                out_path
+            ]
+            r2 = subprocess.run(cmd2, capture_output=True, timeout=60, text=True)
+            if r2.returncode == 0:
+                return True, None
+            err = (r2.stderr or r2.stdout or "").strip() or err
+        return False, err
+    except FileNotFoundError:
+        return False, "ffmpeg not found"
+    except subprocess.TimeoutExpired:
+        return False, "ffmpeg timed out after 60s"
+    except Exception as e:
+        return False, str(e)
+
+def get_media_duration(path):
+    try:
+        r = subprocess.run(
+            _ffprobe_cmd() + ["-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10)
+        return float(r.stdout.strip())
+    except Exception:
+        return None
+
+def get_audio_channels(path):
+    try:
+        r = subprocess.run(
+            _ffprobe_cmd() + ["-v", "quiet",
+             "-select_streams", "a:0",
+             "-show_entries", "stream=channels",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10)
+        val = r.stdout.strip()
+        return int(val) if val.isdigit() else 2
+    except Exception:
+        return 2
+
+# ── Transcript cache ───────────────────────────────────────────────────────────
+def _cache_path(media_path):
+    if not _cache_dir:
+        return None
+    import hashlib
+    key = hashlib.md5(os.path.abspath(media_path).encode()).hexdigest()[:16]
+    return os.path.join(_cache_dir, "{}.json".format(key))
+
+def _cache_key_meta(media_path):
+    try:
+        mtime = os.path.getmtime(media_path)
+    except OSError:
+        mtime = 0
+    return {
+        "path":    os.path.abspath(media_path),
+        "mtime":   mtime,
+        "version": CACHE_VERSION,
+    }
+
+def cache_load(media_path):
+    cp = _cache_path(media_path)
+    if not cp or not os.path.exists(cp):
+        return None
+    try:
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+        meta = _cache_key_meta(media_path)
+        if data.get("path") != meta["path"]:       return None
+        if abs(data.get("mtime",0) - meta["mtime"]) > 1: return None
+        if data.get("version") != meta["version"]: return None
+        return data["words"]
+    except Exception:
+        return None
+
+def cache_save(media_path, words, blobs=None):
+    cp = _cache_path(media_path)
+    if not cp:
+        return
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        meta = _cache_key_meta(media_path)
+        meta["words"] = words
+        if blobs is not None:
+            meta["blobs"] = blobs
+        with open(cp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
+
+def cache_load_blobs(media_path):
+    """Return cached blob list for media_path, or None if not cached / unavailable."""
+    cp = _cache_path(media_path)
+    if not cp or not os.path.exists(cp):
+        return None
+    try:
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+        meta = _cache_key_meta(media_path)
+        if data.get("path") != meta["path"]:       return None
+        if abs(data.get("mtime",0) - meta["mtime"]) > 1: return None
+        if data.get("version") != meta["version"]: return None
+        return data.get("blobs")   # None if this cache entry pre-dates blob detection
+    except Exception:
+        return None
+
+# ── Pull-result cache ───────────────────────────────────────────────────────────
+# Caches the final reconciliation result for a pull so that re-runs after a
+# crash or cancel don't need to re-transcribe already-matched clips.
+# Only "ok" results are stored — low_confidence / no_match always retry so the
+# user can fix assignments or the script and get a fresh attempt.
+
+def _pull_result_cache_path(pull, transcript_path, pad):
+    """Return the cache file path for a specific pull computation, or None."""
+    if not _cache_dir or not transcript_path:
+        return None
+    import hashlib
+    try:
+        mtime = round(os.path.getmtime(transcript_path), 2)
+    except OSError:
+        mtime = 0
+    key_obj = {
+        "transcript": os.path.abspath(transcript_path),
+        "mtime":      mtime,
+        "in_s":       pull["in_seconds"],
+        "out_s":      pull["out_seconds"],
+        "quote":      pull.get("quote_text", "").strip(),
+        "pad":        pad,
+        "version":    CACHE_VERSION,
+    }
+    digest = hashlib.md5(
+        json.dumps(key_obj, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return os.path.join(_cache_dir, "pull_{}.json".format(digest))
+
+def pull_result_cache_load(pull, transcript_path, pad):
+    """Return a cached reconciliation result dict, or None on miss."""
+    cp = _pull_result_cache_path(pull, transcript_path, pad)
+    if not cp or not os.path.exists(cp):
+        return None
+    try:
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+        result = data.get("result")
+        if result:
+            result["from_cache"] = True
+        return result
+    except Exception:
+        return None
+
+def pull_result_cache_save(pull, transcript_path, pad, result):
+    """Persist an ok-status reconciliation result for future runs."""
+    cp = _pull_result_cache_path(pull, transcript_path, pad)
+    if not cp:
+        return
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        # Strip transient flag before writing
+        payload = {k: v for k, v in result.items() if k != "from_cache"}
+        with open(cp, "w", encoding="utf-8") as f:
+            json.dump({"result": payload}, f)
+    except Exception:
+        pass
+
+# ── Transcription ──────────────────────────────────────────────────────────────
+def get_model(size=WHISPER_MODEL):
+    if size not in _model_cache:
+        try:
+            import torch
+            device  = "cuda" if torch.cuda.is_available() else "cpu"
+            compute = "float16" if device == "cuda" else "int8"
+        except ImportError:
+            device = "cpu"; compute = "int8"
+        _model_cache[size] = WhisperModel(size, device=device, compute_type=compute)
+    return _model_cache[size]
+
+def transcribe_clip(wav_path):
+    model = get_model()
+    # condition_on_previous_text=False  — each segment decoded independently;
+    #   prevents cascading hallucination loops (the #1 cause of infinite hangs).
+    # vad_filter=True                   — skip silence/noise regions before
+    #   decoding so the model never tries to transcribe an empty or noisy clip.
+    # no_speech_threshold=0.6           — treat segments with high no-speech
+    #   probability as silence and discard them without running beam search.
+    segments, _ = model.transcribe(
+        wav_path,
+        word_timestamps=True,
+        language="en",
+        beam_size=5,
+        condition_on_previous_text=False,
+        vad_filter=True,
+        no_speech_threshold=0.6,
+    )
+    words = []
+    for seg in segments:
+        if seg.words:
+            for w in seg.words:
+                words.append({
+                    "word":  re.sub(r"[^a-z']", "", w.word.lower()),
+                    "start": w.start,
+                    "end":   w.end,
+                })
+        else:
+            for w in re.findall(r"[a-z']+", seg.text.lower()):
+                words.append({"word": w, "start": seg.start, "end": seg.end})
+    return [w for w in words if w["word"]]
+
+# ── Quote matching ─────────────────────────────────────────────────────────────
+def _overlap(query, candidate):
+    if not query: return 0.0
+    cset = set(candidate)
+    return sum(1 for w in query if w in cset) / len(query)
+
+def _find_chunk_bounds(cwords, word_list, search_from=0):
+    ANCHOR_N = 4
+    MIN_SCORE = 0.45
+
+    n = len(word_list)
+    if search_from >= n or not cwords:
+        return None
+
+    first_anchor = cwords[:ANCHOR_N]
+    last_anchor  = cwords[-ANCHOR_N:] if len(cwords) >= ANCHOR_N else cwords
+
+    best_start       = None
+    best_start_score = 0.0
+    fa_set           = set(first_anchor)
+
+    for i in range(search_from, n):
+        if word_list[i] not in fa_set:
+            continue
+        window = word_list[i:i + len(first_anchor) + 3]
+        score  = _overlap(first_anchor, window)
+        if score > best_start_score:
+            best_start_score = score
+            best_start       = i
+        if best_start_score >= 0.9:
+            break
+
+    if best_start is None or best_start_score < 0.3:
+        return None
+
+    min_end    = best_start + max(1, len(cwords) - 4)
+    max_end    = min(best_start + len(cwords) * 2 + 8, n)
+    la_set     = set(last_anchor)
+    best_end   = min(best_start + len(cwords) - 1, n - 1)
+    best_end_s = 0.0
+
+    for j in range(best_start, max_end):
+        if word_list[j] not in la_set:
+            continue
+        end_candidate = j
+        for k in range(j, min(j + len(last_anchor) + 3, max_end)):
+            if word_list[k] in la_set:
+                end_candidate = k
+        window = word_list[end_candidate - len(last_anchor) + 1:end_candidate + 1]
+        score  = _overlap(last_anchor, window)
+        if score > best_end_s:
+            best_end_s = score
+            best_end   = end_candidate
+        if best_end_s >= 0.9:
+            break
+
+    span  = word_list[best_start:best_end + 1]
+    score = _overlap(cwords, span)
+
+    if score < MIN_SCORE:
+        return None
+
+    return (best_start, best_end, round(score, 3))
+
+def _split_on_gaps(seg_words, gap_thresh):
+    if not seg_words:
+        return []
+    chunks      = []
+    chunk_start = seg_words[0]
+    prev        = seg_words[0]
+    for w in seg_words[1:]:
+        if w["start"] - prev["end"] > gap_thresh:
+            chunks.append((chunk_start["start"], prev["end"]))
+            chunk_start = w
+        prev = w
+    chunks.append((chunk_start["start"], prev["end"]))
+    return chunks
+
+def match_segments(quote_text, words, gap_thresh=GAP_THRESH):
+    if not words or not quote_text.strip():
+        return None
+
+    chunks = re.split(r'[.]{2,}|[\u2026]', quote_text)
+    chunks = [c.strip().strip('\u201c\u201d\u2018\u2019"\'') for c in chunks]
+    chunks = [c for c in chunks if c.strip()]
+    if not chunks:
+        return None
+
+    word_list     = [w["word"] for w in words]
+    search_from   = 0
+    all_segs      = []
+    all_scores    = []
+    matched_parts = []
+    n_gap_cuts    = 0
+
+    for chunk_text in chunks:
+        cwords = clean_words(chunk_text)
+        if not cwords:
+            continue
+
+        hit = _find_chunk_bounds(cwords, word_list, search_from)
+        if hit is None:
+            continue
+
+        s_idx, e_idx, score = hit
+        all_scores.append(score)
+
+        span = words[s_idx:e_idx + 1]
+        matched_parts.append(" ".join(w["word"] for w in span))
+
+        gap_segs    = _split_on_gaps(span, gap_thresh)
+        all_segs.extend(gap_segs)
+        n_gap_cuts += max(0, len(gap_segs) - 1)
+
+        search_from = e_idx + 1
+
+    if not all_segs:
+        return None
+
+    return {
+        "segments":        all_segs,
+        "confidence":      round(sum(all_scores) / len(all_scores), 3),
+        "matched_text":    " \u2026 ".join(matched_parts),
+        "n_internal_cuts": max(0, len(chunks) - 1),
+        "n_gap_cuts":      n_gap_cuts,
+    }
+
+def _match_last(quote_text, words, gap_thresh=GAP_THRESH, conf_floor=0.35):
+    """
+    Find the last (final-take) occurrence of quote_text in words.
+
+    Walks forward through the word list, keeping each new match that meets
+    conf_floor.  Returns the last match so that false starts / flubs that
+    appear earlier in the recording are skipped in favour of the final take.
+    Falls back to the first match if only one is found (normal case).
+    Returns None if no match meets conf_floor.
+    """
+    if not words or not quote_text.strip():
+        return None
+
+    best     = None
+    word_idx = 0   # start of the next search window (index into words)
+
+    while word_idx < len(words):
+        candidate = match_segments(quote_text, words[word_idx:], gap_thresh)
+        if candidate is None or not candidate["segments"]:
+            break
+        # Advance past the end of this match (+1.5 s gap ensures we skip over
+        # any trailing silence and don't re-match the same take again).
+        last_end_s = candidate["segments"][-1][1]
+        advance = next(
+            (i for i, w in enumerate(words[word_idx:])
+             if w.get("start", 0) > last_end_s + 1.5),
+            None,
+        )
+
+        # Only keep this match if it meets the confidence floor.  We still
+        # advance past it regardless so a severely-truncated false start
+        # (conf < floor) doesn't block discovery of the correct final take.
+        if candidate["confidence"] >= conf_floor:
+            best = candidate
+
+        if advance is None:
+            break   # nothing further in the recording
+        word_idx += advance
+
+    return best
+
+# ── Per-pull reconciler helpers ────────────────────────────────────────────────
+def _clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+def _snap_to_speech(words, clip_start, orig_in, orig_out, pad):
+    """
+    Return (snapped_in, snapped_out) by finding word boundaries in the
+    transcript that are closest to the original timecodes, within ±pad seconds.
+    Used when no quote text is available to guide a text-match.
+    """
+    abs_starts = [clip_start + w.get("start", 0.0) for w in words]
+    abs_ends   = [clip_start + w.get("end",   0.0) for w in words]
+
+    in_candidates = [
+        (abs(t - orig_in), t) for t in abs_starts
+        if orig_in - pad <= t <= orig_in + pad
+    ]
+    out_candidates = [
+        (abs(t - orig_out), t) for t in abs_ends
+        if orig_out - pad <= t <= orig_out + pad
+    ]
+
+    snapped_in  = min(in_candidates,  key=lambda x: x[0])[1] if in_candidates  else orig_in
+    snapped_out = min(out_candidates, key=lambda x: x[0])[1] if out_candidates else orig_out
+    return round(snapped_in, 3), round(snapped_out, 3)
+
+# ── Per-pull reconciler ────────────────────────────────────────────────────────
+def _base_result(pull):
+    orig_in  = pull["in_seconds"]
+    orig_out = pull["out_seconds"]
+    return {
+        "order":          pull["order"],
+        "token":          pull["token"],
+        "in_tc":          pull["in_tc"],
+        "out_tc":         pull["out_tc"],
+        "part_index":     pull["part_index"],
+        "quote_text":     pull.get("quote_text", ""),
+        "orig_in_s":      orig_in,
+        "orig_out_s":     orig_out,
+        "rec_in_s":       orig_in,
+        "rec_out_s":      orig_out,
+        "rec_in_tc":      pull["in_tc"],
+        "rec_out_tc":     pull["out_tc"],
+        "confidence":     1.0,
+        "matched_text":   "",
+        "delta_in":       0.0,
+        "delta_out":      0.0,
+        "segments":       [(orig_in, orig_out)],
+        "n_internal_cuts":0,
+        "n_gap_cuts":     0,
+        "status":         "direct",
+        "gap_after":      pull.get("gap_after", True),
+    }
+
+def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
+    """
+    Reconcile a single @PULL against its source transcript.
+
+    Always transcribes the padded window so the audio conforms to the script
+    regardless of whether the script contains quote text:
+
+      - Quote text present  → Whisper match snaps in/out to actual speech
+        boundaries and detects any internal editorial cuts.
+      - No quote text (or match failed)  → Whisper word timestamps snap in/out
+        to the nearest speech boundary within ±pad of each timecode.
+
+    In both cases, when WAVEFORM_CONFORM is enabled a waveform blob pass runs
+    on the same extracted clip to push edges to ms / sample precision — the
+    same refinement applied to VO blocks.
+    """
+    orig_in  = pull["in_seconds"]
+    orig_out = pull["out_seconds"]
+    result   = _base_result(pull)
+
+    if not transcript_file:
+        return result
+
+    # ── Pull-result cache hit ───────────────────────────────────────────────────
+    cached = pull_result_cache_load(pull, transcript_file, pad)
+    if cached is not None:
+        return cached
+
+    clip_start = max(0.0, orig_in - pad)
+    clip_end   = orig_out + pad
+
+    # Guard against sentinel out-points (e.g. 99:59:59 meaning "end of file").
+    # Capping to MAX_EXTRACT_S prevents Whisper from transcribing an entire
+    # multi-hour recording just to find a 30-second quote.
+    if clip_end - clip_start > MAX_EXTRACT_S:
+        clip_end = clip_start + MAX_EXTRACT_S
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        tmp_wav = tf.name
+    try:
+        ok, _ = extract_window(transcript_file, clip_start, clip_end, tmp_wav)
+        if not ok:
+            return result
+
+        words = transcribe_clip(tmp_wav)
+        if not words:
+            return result
+
+        # ── Waveform blob detection for ms-level edge snapping ──────────────
+        # Run on the same extracted clip window.  Blob timestamps come back
+        # clip-relative (0 … clip_duration), so offset them into absolute
+        # file time so refine_segment_endpoints can compare against the
+        # absolute-time segments produced below.
+        blobs = None
+        if WAVEFORM_CONFORM:
+            raw_blobs = detect_speech_blobs(tmp_wav)
+            if raw_blobs:
+                blobs = [
+                    {**b,
+                     "raw_start": b["raw_start"] + clip_start,
+                     "raw_end":   b["raw_end"]   + clip_start,
+                     "onset":     b["onset"]      + clip_start}
+                    for b in raw_blobs
+                ]
+
+        quote   = pull.get("quote_text", "").strip()
+        matched = False
+
+        if quote:
+            match = match_segments(quote, words)
+            if match is not None and match["segments"]:
+                matched  = True
+                abs_segs = [
+                    (round(clip_start + s, 3), round(clip_start + e, 3))
+                    for s, e in match["segments"]
+                ]
+                # Always snap endpoints to matched speech boundaries.
+                # Clamp within ±pad of the original timecodes so a poor
+                # match can't drift the clip far from its intended position.
+                new_in  = _clamp(abs_segs[0][0],  orig_in  - pad, orig_in  + pad)
+                new_out = _clamp(abs_segs[-1][1], orig_out - pad, orig_out + pad)
+                abs_segs[0]  = (new_in,  abs_segs[0][1])
+                abs_segs[-1] = (abs_segs[-1][0], new_out)
+                abs_segs = [(s, e) for s, e in abs_segs if s < e]
+                if not abs_segs:
+                    abs_segs = [(orig_in, orig_out)]
+
+                if blobs:
+                    abs_segs = refine_segment_endpoints(abs_segs, blobs)
+
+                result.update({
+                    "segments":        abs_segs,
+                    "rec_in_s":        abs_segs[0][0],
+                    "rec_out_s":       abs_segs[-1][1],
+                    "rec_in_tc":       secs_tc(abs_segs[0][0]),
+                    "rec_out_tc":      secs_tc(abs_segs[-1][1]),
+                    "confidence":      match["confidence"],
+                    "matched_text":    match["matched_text"],
+                    "n_internal_cuts": match["n_internal_cuts"],
+                    "n_gap_cuts":      match["n_gap_cuts"],
+                    "delta_in":        round(abs_segs[0][0]  - orig_in,  3),
+                    "delta_out":       round(abs_segs[-1][1] - orig_out, 3),
+                    "status":          "ok" if match["confidence"] >= MATCH_THRESH
+                                       else "low_confidence",
+                })
+
+        if not matched:
+            # No quote text, or quote didn't match — snap to nearest speech
+            # boundary within ±pad via Whisper word timestamps, then refine
+            # to the waveform edge if blobs are available.
+            snapped_in, snapped_out = _snap_to_speech(
+                words, clip_start, orig_in, orig_out, pad)
+            abs_segs = [(snapped_in, snapped_out)]
+            if blobs:
+                abs_segs = refine_segment_endpoints(abs_segs, blobs)
+
+            result.update({
+                "rec_in_s":   abs_segs[0][0],
+                "rec_out_s":  abs_segs[-1][1],
+                "rec_in_tc":  secs_tc(abs_segs[0][0]),
+                "rec_out_tc": secs_tc(abs_segs[-1][1]),
+                "delta_in":   round(abs_segs[0][0]  - orig_in,  3),
+                "delta_out":  round(abs_segs[-1][1] - orig_out, 3),
+                "segments":   abs_segs,
+                "status":     "snapped",
+            })
+
+        # ── Cache ok results so re-runs skip transcription for matched pulls ────
+        if result["status"] == "ok":
+            pull_result_cache_save(pull, transcript_file, pad, result)
+    finally:
+        try: os.unlink(tmp_wav)
+        except: pass
+
+    return result
+
+# ── Waveform blob detection ─────────────────────────────────────────────────────
+
+def detect_speech_blobs(audio_path,
+                        silence_db=None,
+                        min_speech_ms=None,
+                        min_silence_ms=None):
+    """
+    Detect speech blobs (non-silent regions) in an audio file via RMS energy.
+
+    Returns a list of dicts:
+        {"raw_start": float, "raw_end": float, "onset": float}
+    where raw_start/raw_end are file-seconds and onset is the first frame of
+    sustained speech within the blob (skips breath/rustle at the blob head).
+
+    Returns None if numpy is unavailable, ffmpeg fails, or no blobs are found.
+    """
+    if silence_db   is None: silence_db   = BLOB_SILENCE_DB
+    if min_speech_ms  is None: min_speech_ms  = BLOB_MIN_SPEECH_MS
+    if min_silence_ms is None: min_silence_ms = BLOB_MIN_SILENCE_MS
+
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    SR     = 4000       # Hz — enough resolution for energy detection
+    WIN_MS = 20         # ms per RMS window
+    WIN_N  = int(SR * WIN_MS / 1000)   # samples per window = 80
+
+    # ── Extract raw PCM via ffmpeg (pipe to avoid temp file) ──────────────────
+    cmd = _ffmpeg_cmd() + [
+        "-y", "-v", "quiet",
+        "-i", audio_path,
+        "-ac", "1",
+        "-ar", str(SR),
+        "-f", "f32le",
+        "pipe:1",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode != 0:
+            return None
+        data = np.frombuffer(r.stdout, dtype=np.float32)
+    except Exception:
+        return None
+
+    if len(data) < WIN_N * 2:
+        return None
+
+    # ── RMS per window ────────────────────────────────────────────────────────
+    n_wins  = len(data) // WIN_N
+    frames  = data[:n_wins * WIN_N].reshape(n_wins, WIN_N)
+    rms     = np.sqrt(np.mean(frames ** 2, axis=1))
+    rms_db  = 20.0 * np.log10(np.maximum(rms, 1e-9))
+    is_sp   = rms_db >= silence_db   # bool array, True = speech
+
+    min_sp_frames  = max(1, int(min_speech_ms  / WIN_MS))
+    min_sil_frames = max(1, int(min_silence_ms / WIN_MS))
+
+    def frame_to_s(f):
+        return round(f * WIN_MS / 1000.0, 4)
+
+    # ── Build run-length list: [(start_frame, end_frame, is_speech)] ──────────
+    transitions = np.where(np.diff(is_sp.astype(np.int8)) != 0)[0] + 1
+    bounds      = np.concatenate([[0], transitions, [n_wins]])
+    runs = [(int(bounds[i]), int(bounds[i+1]), bool(is_sp[bounds[i]]))
+            for i in range(len(bounds) - 1)]
+
+    # ── Pass 1: merge short silences between speech regions ───────────────────
+    merged = []
+    i = 0
+    while i < len(runs):
+        s, e, speech = runs[i]
+        if (not speech
+                and (e - s) < min_sil_frames
+                and merged and merged[-1][2]          # preceded by speech
+                and i + 1 < len(runs) and runs[i+1][2]):  # followed by speech
+            # Absorb: extend previous speech run through this silence and the next
+            prev_s, _, _ = merged[-1]
+            _, next_e, _ = runs[i + 1]
+            merged[-1] = (prev_s, next_e, True)
+            i += 2
+        else:
+            merged.append((s, e, speech))
+            i += 1
+
+    # ── Pass 2: keep only speech runs long enough ─────────────────────────────
+    blobs = []
+    for s, e, speech in merged:
+        if speech and (e - s) >= min_sp_frames:
+            blobs.append({"raw_start": frame_to_s(s), "raw_end": frame_to_s(e)})
+
+    if not blobs:
+        return None
+
+    # ── Find onset within each blob (first sustained speech, skip breath) ─────
+    ONSET_CONSEC = 3   # consecutive above-threshold windows = real speech start
+    for blob in blobs:
+        start_f = max(0, int(blob["raw_start"] / (WIN_MS / 1000.0)))
+        end_f   = min(n_wins, int(blob["raw_end"]   / (WIN_MS / 1000.0)))
+        onset_f = start_f
+        consec  = 0
+        for fi in range(start_f, end_f):
+            if is_sp[fi]:
+                consec += 1
+                if consec >= ONSET_CONSEC:
+                    onset_f = fi - (ONSET_CONSEC - 1)
+                    break
+            else:
+                consec = 0
+        blob["onset"] = frame_to_s(onset_f)
+
+    return blobs
+
+
+def transcribe_with_blobs(audio_path, blobs):
+    """
+    Stitch all speech blobs into one WAV, transcribe once, map timestamps back.
+    Calling the Whisper encoder once avoids MKL memory exhaustion that occurs
+    when transcribe_clip is called per-blob in a loop.
+    """
+    if not blobs:
+        return []
+
+    tmp_clips      = []   # paths to per-blob WAV clips (cleaned up in finally)
+    mapping        = []   # {stitched_start, stitched_end, file_offset}
+    stitched_path  = None
+    cursor         = 0.0
+
+    try:
+        # ── 1. Extract each blob to a temp WAV ─────────────────────────────────
+        for blob in blobs:
+            tf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tf.close()
+            ok, _ = extract_window(audio_path, blob["raw_start"], blob["raw_end"], tf.name)
+            if not ok:
+                try: os.unlink(tf.name)
+                except: pass
+                continue
+            duration = blob["raw_end"] - blob["raw_start"]
+            tmp_clips.append(tf.name)
+            mapping.append({
+                "stitched_start": cursor,
+                "stitched_end":   cursor + duration,
+                "file_offset":    blob["raw_start"],
+            })
+            cursor += duration
+
+        if not tmp_clips:
+            return []
+
+        # ── 2. Stitch clips into one WAV via Python's wave module ───────────────
+        if len(tmp_clips) == 1:
+            stitched_path = tmp_clips.pop()   # reuse; nothing extra to clean up
+        else:
+            tf_out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tf_out.close()
+            stitched_path = tf_out.name
+            with wave.open(stitched_path, "wb") as out_w:
+                params_written = False
+                for p in tmp_clips:
+                    with wave.open(p, "rb") as in_w:
+                        if not params_written:
+                            out_w.setparams(in_w.getparams())
+                            params_written = True
+                        out_w.writeframes(in_w.readframes(in_w.getnframes()))
+
+        # ── 3. Single model call ────────────────────────────────────────────────
+        raw_words = transcribe_clip(stitched_path)
+
+    finally:
+        for p in tmp_clips:
+            try: os.unlink(p)
+            except: pass
+        if stitched_path:
+            try: os.unlink(stitched_path)
+            except: pass
+
+    # ── 4. Map stitched timestamps back to original file positions ──────────────
+    all_words = []
+    for w in raw_words:
+        ws = w["start"]
+        for m in mapping:
+            if m["stitched_start"] - 0.05 <= ws < m["stitched_end"] + 0.05:
+                offset = m["file_offset"] - m["stitched_start"]
+                all_words.append({
+                    "word":  w["word"],
+                    "start": round(ws + offset, 4),
+                    "end":   round(w["end"] + offset, 4),
+                })
+                break
+    return all_words
+
+
+def detect_silence_splits(audio_path, silence_db=None,
+                          min_silence_s=None, max_chunk_s=None):
+    """
+    Analyse audio_path for silence regions >= min_silence_s and return a list
+    of (chunk_start, chunk_end) tuples that tile the entire file end-to-end.
+
+    Chunks are split at the midpoint of each qualifying silence gap so that
+    every chunk begins and ends in silence, giving Whisper clean context on
+    both ends.  Any chunk longer than max_chunk_s is force-split at its
+    midpoint regardless of silence content.
+
+    Returns list of (start_s, end_s) floats, or None on failure.
+    """
+    if silence_db    is None: silence_db    = BLOB_SILENCE_DB
+    if min_silence_s is None: min_silence_s = CHUNK_SILENCE_S
+    if max_chunk_s   is None: max_chunk_s   = CHUNK_MAX_S
+
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    SR     = 4000
+    WIN_MS = 20
+    WIN_N  = int(SR * WIN_MS / 1000)
+
+    cmd = _ffmpeg_cmd() + [
+        "-y", "-v", "quiet",
+        "-i", audio_path,
+        "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode != 0:
+            return None
+        data = np.frombuffer(r.stdout, dtype=np.float32)
+    except Exception:
+        return None
+
+    if len(data) < WIN_N * 2:
+        return None
+
+    n_wins  = len(data) // WIN_N
+    total_s = round(n_wins * WIN_MS / 1000.0, 3)
+    frames  = data[:n_wins * WIN_N].reshape(n_wins, WIN_N)
+    rms     = np.sqrt(np.mean(frames ** 2, axis=1))
+    rms_db  = 20.0 * np.log10(np.maximum(rms, 1e-9))
+    is_sil  = rms_db < silence_db
+
+    def frame_to_s(f):
+        return round(f * WIN_MS / 1000.0, 3)
+
+    min_sil_frames = max(1, int(min_silence_s * 1000 / WIN_MS))
+
+    # Find silence runs >= min_silence_s and collect their midpoints as splits
+    transitions = np.where(np.diff(is_sil.astype(np.int8)) != 0)[0] + 1
+    bounds      = np.concatenate([[0], transitions, [n_wins]])
+    split_points = []
+    for i in range(len(bounds) - 1):
+        s, e = int(bounds[i]), int(bounds[i + 1])
+        if is_sil[s] and (e - s) >= min_sil_frames:
+            split_points.append(frame_to_s((s + e) // 2))
+
+    # Build initial chunk list from split midpoints
+    edges  = [0.0] + split_points + [total_s]
+    chunks = [(round(edges[i], 3), round(edges[i + 1], 3))
+              for i in range(len(edges) - 1)
+              if edges[i + 1] - edges[i] >= 1.0]   # skip sub-second slivers
+
+    # Force-split any chunk that exceeds max_chunk_s
+    final = []
+    for cs, ce in chunks:
+        while ce - cs > max_chunk_s:
+            mid = round(cs + (ce - cs) / 2.0, 3)
+            final.append((cs, mid))
+            cs = mid
+        final.append((cs, ce))
+
+    return final if final else None
+
+
+def transcribe_in_chunks(audio_path, chunks):
+    """
+    Transcribe audio_path in independent segments defined by `chunks`
+    (list of (start_s, end_s) pairs from detect_silence_splits).
+
+    Each chunk is extracted to a temp WAV and transcribed by Whisper
+    separately, then word timestamps are offset back to absolute file
+    position.  Returns a complete, gap-free word list for the whole file.
+    """
+    all_words = []
+    for chunk_start, chunk_end in chunks:
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                tmp = tf.name
+            ok, _ = extract_window(audio_path, chunk_start, chunk_end, tmp)
+            if not ok:
+                continue
+            words = transcribe_clip(tmp)
+            for w in words:
+                all_words.append({
+                    "word":  w["word"],
+                    "start": round(w["start"] + chunk_start, 4),
+                    "end":   round(w["end"]   + chunk_start, 4),
+                })
+        finally:
+            if tmp:
+                try: os.unlink(tmp)
+                except: pass
+    return all_words
+
+
+def refine_segment_endpoints(segments, blobs, snap_thresh=None):
+    """
+    Snap matched segment edges to waveform blob boundaries when they are close:
+      - in-points  → snapped to blob["onset"]   (first sustained speech)
+      - out-points → snapped to blob["raw_end"]  (waveform silence start)
+
+    Only snaps when the Whisper-derived edge falls within snap_thresh seconds
+    of a blob boundary AND inside that blob's range.
+
+    Returns a new segment list (same length as input).
+    """
+    if snap_thresh is None:
+        snap_thresh = BLOB_SNAP_THRESH
+    if not blobs or not segments:
+        return segments
+
+    def containing_blob(ts):
+        for b in blobs:
+            if b["raw_start"] <= ts <= b["raw_end"]:
+                return b
+        return None
+
+    refined = []
+    for seg_in, seg_out in segments:
+        new_in  = seg_in
+        new_out = seg_out
+
+        b_in = containing_blob(seg_in)
+        if b_in and abs(seg_in - b_in["onset"]) < snap_thresh:
+            new_in = b_in["onset"]
+
+        b_out = containing_blob(seg_out)
+        if b_out and abs(seg_out - b_out["raw_end"]) < snap_thresh:
+            new_out = b_out["raw_end"]
+
+        refined.append((new_in, new_out))
+    return refined
+
+
+def _vo_base_result(vo_block):
+    """Build the skeleton result dict for a VO block."""
+    return {
+        "order":          vo_block["order"],
+        "vo_id":          vo_block["id"],
+        "token":          "VO_PART_{:02d}".format(vo_block["part_index"]),
+        "part_index":     vo_block["part_index"],
+        "quote_text":     vo_block["text"],
+        "orig_in_s":      0.0,
+        "orig_out_s":     0.0,
+        "rec_in_s":       0.0,
+        "rec_out_s":      0.0,
+        "rec_in_tc":      "00:00:00",
+        "rec_out_tc":     "00:00:00",
+        "in_tc":          "00:00:00",
+        "out_tc":         "00:00:00",
+        "confidence":     0.0,
+        "matched_text":   "",
+        "delta_in":       0.0,
+        "delta_out":      0.0,
+        "segments":       [],
+        "n_internal_cuts":0,
+        "n_gap_cuts":     0,
+        "takes_data":     [],
+        "status":         "not_run",
+        "is_vo":          True,
+        "gap_after":      vo_block.get("gap_after", True),
+    }
+
+
+def reconcile_vo_part(vo_blocks, takes):
+    """
+    Reconcile all VO blocks for one script part in sequence, maintaining a
+    per-take time cursor so each block only searches the portion of the audio
+    that follows the previous match.  This prevents the matcher from getting
+    lost inside very long takes (e.g. 2000+ word continuous sessions).
+
+    Selection rule: among all takes, prefer the match with the latest start
+    timestamp — i.e. the *last* recorded iteration of a line wins, so false
+    starts and warm-up reads are naturally discarded in favour of the final
+    delivery.
+
+    Returns a list of result dicts (one per vo_block, in the same order as
+    the input list).
+    """
+    _LOOKBACK_S = 15.0   # seconds before cursor to include as safety margin
+
+    # Unpack takes once
+    unpacked = []
+    for entry in takes:
+        if len(entry) == 5:
+            audio_words, v_offset, vpath, apath, blobs = entry
+        else:
+            audio_words, v_offset, vpath, apath = entry
+            blobs = None
+        unpacked.append((audio_words, v_offset, vpath, apath, blobs))
+
+    # Per-take cursor: seconds — don't search before (cursor - LOOKBACK)
+    cursors = [0.0] * len(unpacked)
+
+    results = []
+    for vo_block in sorted(vo_blocks, key=lambda b: b["order"]):
+        base = _vo_base_result(vo_block)
+        text = vo_block.get("text", "").strip()
+
+        if not text:
+            base["status"] = "no_quote"
+            results.append(base)
+            continue
+
+        if not unpacked:
+            base["status"] = "no_transcript"
+            results.append(base)
+            continue
+
+        best_match      = None
+        best_segs       = None
+        best_take_index = 0
+        best_start_s    = -1.0
+        best_v_offset   = 0.0
+        best_vpath      = None
+        best_apath      = None
+        takes_data      = []
+
+        for ti, (audio_words, v_offset, vpath, apath, blobs) in enumerate(unpacked):
+            if not audio_words:
+                takes_data.append(None)
+                continue
+
+            # Window: only search words at or after (cursor - lookback)
+            window_start = max(0.0, cursors[ti] - _LOOKBACK_S)
+            window = [w for w in audio_words if w.get("start", 0.0) >= window_start]
+            if not window:
+                takes_data.append(None)
+                continue
+
+            # _match_last finds the final occurrence within this window
+            # so that any repeated lines within the window resolve to the
+            # last delivery (the correct one).
+            match = _match_last(text, window)
+            if match is None or not match["segments"]:
+                takes_data.append(None)
+                continue
+
+            segs = refine_segment_endpoints(match["segments"], blobs)
+            seg_start = segs[0][0] if segs else 0.0
+
+            takes_data.append({
+                "segments": segs,
+                "vpath":    vpath,
+                "apath":    apath,
+                "v_offset": v_offset,
+            })
+
+            # Prefer the match that starts latest — last iteration wins
+            if seg_start > best_start_s:
+                best_start_s    = seg_start
+                best_match      = match
+                best_segs       = segs
+                best_take_index = ti
+                best_v_offset   = v_offset
+                best_vpath      = vpath
+                best_apath      = apath
+
+        # Filter out None placeholders for takes_data stored on result
+        takes_data_clean = [td for td in takes_data if td is not None]
+
+        if best_match is None or best_segs is None:
+            base["status"] = "no_match"
+            results.append(base)
+            continue
+
+        # Advance cursor for the winning take so the next block starts here
+        cursors[best_take_index] = best_segs[-1][1]
+
+        abs_in  = best_segs[0][0]
+        abs_out = best_segs[-1][1]
+        conf    = round(best_match["confidence"], 3)
+
+        base.update({
+            "takes_data":      takes_data_clean,
+            "best_take_index": best_take_index,
+            "segments":        best_segs,
+            "rec_in_s":        abs_in,
+            "rec_out_s":       abs_out,
+            "rec_in_tc":       secs_tc(abs_in),
+            "rec_out_tc":      secs_tc(abs_out),
+            "in_tc":           secs_tc(abs_in),
+            "out_tc":          secs_tc(abs_out),
+            "confidence":      conf,
+            "matched_text":    best_match["matched_text"],
+            "n_internal_cuts": best_match["n_internal_cuts"],
+            "n_gap_cuts":      best_match["n_gap_cuts"],
+            "status":          "ok" if conf >= MATCH_THRESH else "low_confidence",
+        })
+        results.append(base)
+
+    return results
+
+
+def reconcile_vo_block(vo_block, takes):
+    """Single-block wrapper kept for error-path / legacy callers."""
+    results = reconcile_vo_part([vo_block], takes)
+    return results[0] if results else _vo_base_result(vo_block)
+
+# ── XML builder ────────────────────────────────────────────────────────────────
+def f2fr(secs, fps):
+    return round(secs * fps)
+
+def make_rate(el, fps):
+    _NTSC_MAP = {
+        23.976: 24, 47.952: 48,
+        29.97:  30, 59.94:  60,
+    }
+    ntsc  = "FALSE"
+    base  = fps
+    for frac, integer in _NTSC_MAP.items():
+        if abs(fps - frac) < 0.01:
+            base = integer
+            ntsc = "TRUE"
+            break
+    r = SubElement(el, "rate")
+    SubElement(r, "timebase").text = str(int(round(base)))
+    SubElement(r, "ntsc").text     = ntsc
+
+def make_tc(el, fps):
+    tc = SubElement(el, "timecode")
+    make_rate(tc, fps)
+    SubElement(tc, "string").text        = "00:00:00:00"
+    SubElement(tc, "frame").text         = "0"
+    SubElement(tc, "displayformat").text = "NDF"
+
+def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
+    if not audio_path or not video_path:
+        return 0.0
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+
+    def extract_mono(src_path, duration, out_sr):
+        with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tf:
+            tmp = tf.name
+        try:
+            cmd = _ffmpeg_cmd() + [
+                '-y', '-v', 'quiet',
+                '-i', src_path,
+                '-t', str(duration),
+                '-ac', '1',
+                '-ar', str(out_sr),
+                '-f', 'f32le',
+                tmp
+            ]
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            if r.returncode != 0:
+                return None
+            data = np.frombuffer(open(tmp, 'rb').read(), dtype=np.float32)
+            rms = np.sqrt(np.mean(data ** 2))
+            if rms > 0:
+                data = data / rms
+            return data
+        except Exception:
+            return None
+        finally:
+            try: os.unlink(tmp)
+            except: pass
+
+    a_data = extract_mono(audio_path, search_secs, sr)
+    v_data = extract_mono(video_path, search_secs, sr)
+
+    if a_data is None or v_data is None:
+        return 0.0
+    if len(a_data) < sr or len(v_data) < sr:
+        return 0.0
+
+    n      = len(a_data) + len(v_data) - 1
+    n_fft  = 1 << (n - 1).bit_length()
+    A      = np.fft.rfft(a_data, n=n_fft)
+    V      = np.fft.rfft(v_data, n=n_fft)
+    corr   = np.fft.irfft(V * np.conj(A), n=n_fft)
+
+    peak   = int(np.argmax(corr))
+    if peak > n_fft // 2:
+        peak -= n_fft
+    offset = round(peak / sr, 3)
+
+    if abs(offset) > search_secs * 0.9:
+        return 0.0
+
+    return offset
+
+def pair_takes(paths):
+    videos = sorted([p for p in paths if p and is_video(p)])
+    audios = sorted([p for p in paths if p and not is_video(p)])
+    n = max(len(videos), len(audios))
+    takes = []
+    for i in range(n):
+        vp = videos[i] if i < len(videos) else None
+        ap = audios[i] if i < len(audios) else None
+        takes.append((vp, ap))
+    return takes
+
+def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
+                   src_in_fr, src_out_fr, fps,
+                   is_video, is_first_use,
+                   seq_w=1280, seq_h=720, seq_sr=44100,
+                   channels=None, name_prefix="", enabled=True):
+    _ = channels
+    ci = Element("clipitem", id=cid)
+    SubElement(ci, "name").text     = name_prefix + basename(filepath)
+    SubElement(ci, "enabled").text  = "TRUE" if enabled else "FALSE"
+    SubElement(ci, "duration").text = str(src_out_fr - src_in_fr)
+    make_rate(ci, fps)
+    SubElement(ci, "start").text    = str(start_fr)
+    SubElement(ci, "end").text      = str(end_fr)
+    SubElement(ci, "in").text       = str(src_in_fr)
+    SubElement(ci, "out").text      = str(src_out_fr)
+
+    f_el = SubElement(ci, "file", id=fid)
+    if is_first_use:
+        SubElement(f_el, "name").text    = basename(filepath)
+        SubElement(f_el, "pathurl").text = pathurl(filepath)
+        make_rate(f_el, fps)
+        if is_video:
+            mc = SubElement(f_el, "media")
+            vc = SubElement(mc, "video")
+            vc_ch = SubElement(vc, "samplecharacteristics")
+            make_rate(vc_ch, fps)
+            SubElement(vc_ch, "width").text  = str(seq_w)
+            SubElement(vc_ch, "height").text = str(seq_h)
+            ac = SubElement(mc, "audio")
+            ac_ch = SubElement(ac, "samplecharacteristics")
+            SubElement(ac_ch, "depth").text      = "16"
+            SubElement(ac_ch, "samplerate").text = str(seq_sr)
+        else:
+            mc = SubElement(f_el, "media")
+            ac = SubElement(mc, "audio")
+            ac_ch = SubElement(ac, "samplecharacteristics")
+            SubElement(ac_ch, "depth").text      = "16"
+            SubElement(ac_ch, "samplerate").text = str(seq_sr)
+
+    return ci
+
+def probe_media_settings(all_paths):
+    best_w   = 0
+    best_h   = 0
+    best_fps = 0.0
+    best_sr  = 0
+
+    for path in all_paths:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            r = subprocess.run(
+                _ffprobe_cmd() + ["-v", "quiet",
+                 "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,r_frame_rate",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=10)
+            for line in (r.stdout or "").strip().splitlines():
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if len(parts) >= 3:
+                    try:
+                        w = int(parts[0]); h = int(parts[1])
+                        num, den = parts[2].split("/")
+                        fps = round(int(num) / int(den), 3)
+                        if w * h > best_w * best_h:
+                            best_w, best_h = w, h
+                        if fps > best_fps:
+                            best_fps = fps
+                    except Exception:
+                        pass
+            r2 = subprocess.run(
+                _ffprobe_cmd() + ["-v", "quiet",
+                 "-select_streams", "a:0",
+                 "-show_entries", "stream=sample_rate",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=10)
+            for line in (r2.stdout or "").strip().splitlines():
+                try:
+                    sr = int(line.strip())
+                    if sr > best_sr:
+                        best_sr = sr
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def snap_fps(f):
+        for std in (23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0,
+                    50.0, 59.94, 60.0):
+            if abs(f - std) < 0.1:
+                return std
+        return f if f > 0 else 24.0
+
+    return (
+        best_w   if best_w  > 0 else 1280,
+        best_h   if best_h  > 0 else 720,
+        snap_fps(best_fps),
+        best_sr  if best_sr > 0 else 44100,
+    )
+
+def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
+              seq_w=1280, seq_h=720, seq_fps=24, seq_sr=44100,
+              vo_takes_with_offset=None):
+    fps    = seq_fps
+    gap_fr = round(gap_secs * fps)
+    defined = set()
+    ctr     = 0
+
+    from collections import defaultdict
+    clip_pos = defaultdict(int)
+
+    max_vo_takes = 0
+    vo_takes_by_part = {}
+    if vo_takes_with_offset:
+        for pi, takes_list in vo_takes_with_offset.items():
+            vo_takes_by_part[pi] = [(e[1], e[2], e[3]) for e in takes_list]
+            max_vo_takes = max(max_vo_takes, len(takes_list))
+    else:
+        for pi, vb in vo_bins.items():
+            paths = vb.get_paths() if hasattr(vb, "get_paths") else []
+            takes = pair_takes(paths)
+            vo_takes_by_part[pi] = [(0.0, vp, ap) for vp, ap in takes]
+            max_vo_takes = max(max_vo_takes, len(takes))
+
+    HOST_LC  = HOST_NAME.lower()
+    max_iv   = max_ia = 2
+
+    total_v = max_iv + max(max_vo_takes, 1)
+    total_a = max_ia + max(max_vo_takes, 1)
+
+    v_tracks = [[] for _ in range(total_v)]
+    a_tracks = [[] for _ in range(total_a)]
+
+    cursor    = 0
+    skipped   = []
+    part_start = {}
+
+    _vo_anchors = {}
+    _vo_orders_by_part = {}
+    for _r in results:
+        if _r.get("is_vo"):
+            _pi  = _r.get("part_index", 0)
+            _ord = _r.get("order", 0)
+            _vo_orders_by_part.setdefault(_pi, []).append(_ord)
+            if _r.get("takes_data") and _r.get("rec_out_s", 0) > _r.get("rec_in_s", 0):
+                _vo_anchors[(_pi, _ord)] = (
+                    _r.get("rec_in_s", 0.0), _r.get("rec_out_s", 0.0))
+    for _pi in _vo_orders_by_part:
+        _vo_orders_by_part[_pi].sort()
+
+    def _vo_fallback_span(pi, order, vb):
+        orders = _vo_orders_by_part.get(pi, [])
+        try:   i2 = orders.index(order)
+        except ValueError: i2 = -1
+        prev_out = next((
+            _vo_anchors[(pi, o)][1]
+            for o in reversed(orders[:i2])
+            if (pi, o) in _vo_anchors), None)
+        next_in = next((
+            _vo_anchors[(pi, o)][0]
+            for o in (orders[i2+1:] if i2 >= 0 else [])
+            if (pi, o) in _vo_anchors), None)
+        ap  = vb.get_audio() if hasattr(vb, "get_audio") else None
+        vp  = vb.get_video() if hasattr(vb, "get_video") else None
+        dur = get_media_duration(ap or vp)
+        s   = prev_out if prev_out is not None else 0.0
+        e   = next_in  if next_in  is not None else (dur or 0.0)
+        if e <= s:
+            s, e = 0.0, (dur or 0.0)
+        return s, e
+
+    for res in sorted(results, key=lambda r: r["order"]):
+        is_vo = res.get("is_vo", False)
+        in_s  = res.get("rec_in_s", 0.0)
+        out_s = res.get("rec_out_s", 0.0)
+        st    = res.get("status", "")
+
+        if st in ("extract_failed", "no_transcript", "cancelled", "no_file"):
+            skipped.append(res); continue
+        if not is_vo and in_s >= out_s:
+            skipped.append(res); continue
+
+        segments = res.get("segments") or [(in_s, out_s)]
+        pi       = res.get("part_index", 0)
+
+        if is_vo:
+            takes    = vo_takes_by_part.get(pi, [])
+            takes_data = res.get("takes_data", [])
+
+            if not takes_data:
+                vb = vo_bins.get(pi)
+                if not vb:
+                    skipped.append(res); continue
+                fb_in, fb_out = _vo_fallback_span(pi, res.get("order", 0), vb)
+                if fb_out <= fb_in:
+                    skipped.append(res); continue
+                part_takes = takes
+                if not part_takes:
+                    vp = vb.get_video() if hasattr(vb, "get_video") else None
+                    ap = vb.get_audio() if hasattr(vb, "get_audio") else None
+                    part_takes = [(0.0, vp, ap)]
+                takes_data = []
+                for _v_off, _vp, _ap in part_takes:
+                    takes_data.append({
+                        "segments":    [(fb_in, fb_out)],
+                        "vpath":       _vp,
+                        "apath":       _ap,
+                        "v_offset":    _v_off,
+                        "is_fallback": True,
+                    })
+
+            if pi not in part_start:
+                part_start[pi] = cursor
+
+            max_dur_fr = 0
+            for td in takes_data:
+                td_segs = td.get("segments") or segments
+                if not td_segs: continue
+                total_fr = sum(
+                    f2fr(e, fps) - f2fr(s, fps)
+                    for s, e in td_segs if e > s
+                )
+                max_dur_fr = max(max_dur_fr, total_fr)
+
+            if max_dur_fr == 0:
+                skipped.append(res); continue
+
+            vo_st = res.get("status", "ok")
+            vo_prefix = ""
+            if any(td.get("is_fallback") for td in takes_data):
+                vo_prefix = "[?] "
+            elif vo_st == "low_confidence":
+                vo_prefix = "[~] "
+
+            for take_i, td in enumerate(takes_data):
+                tv_idx = max_iv + take_i
+                ta_idx = max_ia + take_i
+                td_segs = td.get("segments") or segments
+                vp      = td.get("vpath")
+                ap      = td.get("apath")
+                v_off   = td.get("v_offset", 0.0)
+
+                take_cursor = cursor
+
+                for si, (seg_in_s, seg_out_s) in enumerate(td_segs):
+                    if seg_in_s >= seg_out_s: continue
+                    seg_in_fr  = f2fr(seg_in_s, fps)
+                    seg_out_fr = f2fr(seg_out_s, fps)
+                    dur        = seg_out_fr - seg_in_fr
+                    sf = take_cursor
+                    ef = take_cursor + dur
+                    is_last = (si == len(td_segs) - 1)
+
+                    group = []
+
+                    if vp and tv_idx < len(v_tracks):
+                        v_in_fr  = f2fr(seg_in_s  + v_off, fps)
+                        v_out_fr = f2fr(seg_out_s + v_off, fps)
+                        fid  = "file-vo-v-{}-{}".format(pi, take_i)
+                        cid  = "clip-{}".format(ctr); ctr += 1
+                        first = fid not in defined
+                        if first: defined.add(fid)
+                        clip_pos[("v", tv_idx+1)] += 1
+                        ci = _make_clipitem(cid, fid, vp, sf, ef,
+                                            v_in_fr, v_out_fr, fps,
+                                            True, first, seq_w, seq_h, seq_sr,
+                                            name_prefix=vo_prefix,
+                                            enabled=(take_i == 0))
+                        v_tracks[tv_idx].append(ci)
+                        group.append({"el":ci,"cid":cid,"mediatype":"video",
+                                      "track_idx":tv_idx+1,
+                                      "clip_pos":clip_pos[("v",tv_idx+1)]})
+
+                    if ap and ta_idx < len(a_tracks):
+                        fid  = "file-vo-a-{}-{}".format(pi, take_i)
+                        cid  = "clip-{}".format(ctr); ctr += 1
+                        first = fid not in defined
+                        if first: defined.add(fid)
+                        clip_pos[("a", ta_idx+1)] += 1
+                        ci = _make_clipitem(cid, fid, ap, sf, ef,
+                                            seg_in_fr, seg_out_fr, fps,
+                                            False, first, seq_w, seq_h, seq_sr,
+                                            name_prefix=vo_prefix,
+                                            enabled=(take_i == 0))
+                        a_tracks[ta_idx].append(ci)
+                        group.append({"el":ci,"cid":cid,"mediatype":"audio",
+                                      "track_idx":ta_idx+1,
+                                      "clip_pos":clip_pos[("a",ta_idx+1)]})
+
+                    if len(group) > 1:
+                        for item in group:
+                            for ref in group:
+                                lk = SubElement(item["el"], "link")
+                                SubElement(lk, "linkclipref").text = ref["cid"]
+                                SubElement(lk, "mediatype").text   = ref["mediatype"]
+                                SubElement(lk, "trackindex").text  = str(ref["track_idx"])
+                                SubElement(lk, "clipindex").text   = str(ref["clip_pos"])
+
+                    take_cursor = ef + (0 if not is_last else 0)
+
+            cursor += max_dur_fr + (gap_fr if res.get("gap_after", True) else 0)
+
+        else:
+            tok    = res["token"]
+            paths  = int_assets.get(tok, [])
+
+            def _is_host_file(p):
+                return HOST_LC in os.path.basename(p).lower()
+
+            host_vpaths  = [p for p in paths if p and is_video(p)     and _is_host_file(p)]
+            guest_vpaths = [p for p in paths if p and is_video(p)     and not _is_host_file(p)]
+            host_apaths  = [p for p in paths if p and not is_video(p) and _is_host_file(p)]
+            guest_apaths = [p for p in paths if p and not is_video(p) and not _is_host_file(p)]
+
+            participants = [
+                (0, host_vpaths,  host_apaths),
+                (1, guest_vpaths, guest_apaths),
+            ]
+
+            iv_st     = res.get("status", "ok")
+            iv_prefix = "[~] " if iv_st == "low_confidence" else ""
+
+            if pi not in part_start:
+                part_start[pi] = cursor
+
+            for si, (seg_in_s, seg_out_s) in enumerate(segments):
+                if seg_in_s >= seg_out_s: continue
+
+                seg_in_fr  = f2fr(seg_in_s,  fps)
+                seg_out_fr = f2fr(seg_out_s, fps)
+                dur        = seg_out_fr - seg_in_fr
+                sf, ef     = cursor, cursor + dur
+                is_last    = (si == len(segments) - 1)
+                group      = []
+
+                for slot, vps, aps in participants:
+                    if vps and slot < max_iv:
+                        vp    = vps[0]
+                        fid   = "file-v-{}-{}".format(tok, slot)
+                        cid   = "clip-{}".format(ctr); ctr += 1
+                        first = fid not in defined
+                        if first: defined.add(fid)
+                        clip_pos[("v", slot+1)] += 1
+                        ci = _make_clipitem(cid, fid, vp, sf, ef,
+                                            seg_in_fr, seg_out_fr, fps,
+                                            True, first, seq_w, seq_h, seq_sr,
+                                            name_prefix=iv_prefix)
+                        v_tracks[slot].append(ci)
+                        group.append({"el":ci,"cid":cid,"mediatype":"video",
+                                      "track_idx":slot+1,
+                                      "clip_pos":clip_pos[("v",slot+1)]})
+
+                    if aps and slot < max_ia:
+                        ap    = aps[0]
+                        fid   = "file-a-{}-{}".format(tok, slot)
+                        cid   = "clip-{}".format(ctr); ctr += 1
+                        first = fid not in defined
+                        if first: defined.add(fid)
+                        clip_pos[("a", slot+1)] += 1
+                        ci = _make_clipitem(cid, fid, ap, sf, ef,
+                                            seg_in_fr, seg_out_fr, fps,
+                                            False, first, seq_w, seq_h, seq_sr,
+                                            name_prefix=iv_prefix)
+                        a_tracks[slot].append(ci)
+                        group.append({"el":ci,"cid":cid,"mediatype":"audio",
+                                      "track_idx":slot+1,
+                                      "clip_pos":clip_pos[("a",slot+1)]})
+
+                if len(group) > 1:
+                    for item in group:
+                        for ref in group:
+                            lk = SubElement(item["el"], "link")
+                            SubElement(lk, "linkclipref").text = ref["cid"]
+                            SubElement(lk, "mediatype").text   = ref["mediatype"]
+                            SubElement(lk, "trackindex").text  = str(ref["track_idx"])
+                            SubElement(lk, "clipindex").text   = str(ref["clip_pos"])
+
+                cursor = ef + (gap_fr if (is_last and res.get("gap_after", True)) else 0)
+
+    total = cursor
+
+    xmeml = Element("xmeml", version="4")
+    seq   = SubElement(xmeml, "sequence", id="sequence-1")
+    SubElement(seq, "name").text     = seq_name
+    SubElement(seq, "duration").text = str(total)
+    make_rate(seq, fps); make_tc(seq, fps)
+
+    for part in parts:
+        psf = part_start.get(part["index"], 0)
+        mk  = SubElement(seq, "marker")
+        SubElement(mk, "name").text    = part["name"]
+        SubElement(mk, "in").text      = str(psf)
+        SubElement(mk, "out").text     = "-1"
+        SubElement(mk, "comment").text = ""
+
+    media = SubElement(seq, "media")
+    vel   = SubElement(media, "video")
+    vf    = SubElement(vel, "format")
+    vc    = SubElement(vf, "samplecharacteristics")
+    make_rate(vc, fps)
+    SubElement(vc, "width").text            = str(seq_w)
+    SubElement(vc, "height").text           = str(seq_h)
+    SubElement(vc, "anamorphic").text       = "FALSE"
+    SubElement(vc, "pixelaspectratio").text = "square"
+    SubElement(vc, "fielddominance").text   = "none"
+    SubElement(vc, "colordepth").text       = "32"
+
+    for clips in v_tracks:
+        t = SubElement(vel, "track")
+        for c in clips: t.append(c)
+
+    ael = SubElement(media, "audio")
+    af  = SubElement(ael, "format")
+    ac  = SubElement(af, "samplecharacteristics")
+    SubElement(ac, "depth").text      = "32"
+    SubElement(ac, "samplerate").text = str(seq_sr)
+
+    for clips in a_tracks:
+        t = SubElement(ael, "track")
+        for c in clips: t.append(c)
+
+    return xmeml, skipped
+
+def write_xml(xmeml, out_path):
+    try: indent(xmeml)
+    except: pass
+    buf = io.BytesIO()
+    ElementTree(xmeml).write(buf, encoding="utf-8", xml_declaration=False)
+    with open(out_path, "wb") as f:
+        f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n')
+        f.write(buf.getvalue())
+
+def build_xml_from_pt(clips_with_media, track_names, seq_name,
+                      seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000):
+    fps     = seq_fps
+    defined = set()
+    ctr     = 0
+
+    v_tracks = {tn: [] for tn in track_names}
+    a_tracks = {tn: [] for tn in track_names}
+
+    for clip in sorted(clips_with_media, key=lambda c: c["start_secs"]):
+        tn       = clip["track_name"]
+        start_fr   = f2fr(clip["start_secs"], fps)
+        end_fr     = f2fr(clip["end_secs"],   fps)
+        v_offset   = clip.get("video_offset_secs", 0.0)
+        clip_dur_s = clip["end_secs"] - clip["start_secs"]
+        src_in_s   = clip.get("src_in_secs", clip["start_secs"])
+        src_out_s  = clip.get("src_out_secs", src_in_s + clip_dur_s)
+        src_in     = f2fr(src_in_s  + v_offset, fps)
+        src_out    = f2fr(src_out_s + v_offset, fps)
+        dur_fr   = end_fr - start_fr
+        if dur_fr <= 0:
+            continue
+
+        vp = clip.get("video_path")
+        ap = clip.get("audio_path")
+
+        if vp and tn in v_tracks:
+            fid   = "file-v-{}".format(os.path.basename(vp).replace(" ", "_"))
+            cid   = "clip-{}".format(ctr); ctr += 1
+            first = fid not in defined
+            if first: defined.add(fid)
+            ci = _make_clipitem(cid, fid, vp, start_fr, end_fr,
+                                src_in, src_out, fps,
+                                True, first, seq_w, seq_h, seq_sr)
+            v_tracks[tn].append(ci)
+
+        if ap and tn in a_tracks:
+            fid   = "file-a-{}".format(os.path.basename(ap).replace(" ", "_"))
+            cid   = "clip-{}".format(ctr); ctr += 1
+            first = fid not in defined
+            if first: defined.add(fid)
+            ci = _make_clipitem(cid, fid, ap, start_fr, end_fr,
+                                src_in, src_out, fps,
+                                False, first, seq_w, seq_h, seq_sr)
+            a_tracks[tn].append(ci)
+
+    total = 0
+    for clips in list(v_tracks.values()) + list(a_tracks.values()):
+        for c in clips:
+            e = c.find("end")
+            if e is not None and e.text:
+                total = max(total, int(e.text))
+
+    xmeml = Element("xmeml", version="4")
+    seq   = SubElement(xmeml, "sequence", id="sequence-1")
+    SubElement(seq, "name").text     = seq_name
+    SubElement(seq, "duration").text = str(total)
+    make_rate(seq, fps); make_tc(seq, fps)
+
+    media = SubElement(seq, "media")
+    vel   = SubElement(media, "video")
+    vf    = SubElement(vel, "format")
+    vc    = SubElement(vf, "samplecharacteristics")
+    make_rate(vc, fps)
+    SubElement(vc, "width").text            = str(seq_w)
+    SubElement(vc, "height").text           = str(seq_h)
+    SubElement(vc, "anamorphic").text       = "FALSE"
+    SubElement(vc, "pixelaspectratio").text = "square"
+    SubElement(vc, "fielddominance").text   = "none"
+    SubElement(vc, "colordepth").text       = "32"
+
+    for tn in track_names:
+        t = SubElement(vel, "track")
+        for c in v_tracks.get(tn, []):
+            t.append(c)
+
+    ael = SubElement(media, "audio")
+    af  = SubElement(ael, "format")
+    ac  = SubElement(af, "samplecharacteristics")
+    SubElement(ac, "depth").text      = "32"
+    SubElement(ac, "samplerate").text = str(seq_sr)
+
+    for tn in track_names:
+        t = SubElement(ael, "track")
+        for c in a_tracks.get(tn, []):
+            t.append(c)
+
+    return xmeml
+
+# ── AAF builder ────────────────────────────────────────────────────────────────
+def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
+              seq_fps=24, seq_sr=48000, vo_takes_with_offset=None,
+              out_path="output.aaf", progress_cb=None, cancel_event=None):
+    """Build a multi-track AAF where:
+      • Each guest token gets its own audio track.
+      • All VO parts share a single "VO" track.
+      • The host (HOST_NAME) gets a single shared track regardless of
+        how many interview segments they appear in.
+    Clips are placed at absolute timeline positions so gaps appear correctly
+    in Pro Tools when the session is opened.
+    """
+    if not HAS_AAF:
+        raise RuntimeError("pyaaf2 is not installed. Run: pip install pyaaf2")
+
+    import struct as _struct
+    from urllib.parse import quote as _url_quote
+
+    def _wave_summary(n_ch, s_rate, n_bits):
+        """Build a minimal RIFF/WAVE header for WAVEDescriptor.Summary.
+        This is exactly the format Premiere Pro writes, which Pro Tools expects."""
+        blk   = n_ch * (n_bits // 8)
+        brate = s_rate * blk
+        fmt   = _struct.pack('<HHIIHH', 1, n_ch, s_rate, brate, blk, n_bits)
+        hdr   = (b'RIFF' + _struct.pack('<I', 36) +
+                 b'WAVE' +
+                 b'fmt ' + _struct.pack('<I', 16) + fmt +
+                 b'data' + _struct.pack('<I', 0))
+        return list(hdr)
+
+    def _file_uri(path):
+        """Build a percent-encoded file:// URI matching Premiere Pro's format.
+        e.g. F:\\My Files\\x.wav  →  file:///F%3a/My%20Files/x.wav"""
+        fwd = os.path.abspath(path).replace('\\', '/')
+        encoded = '/'.join(_url_quote(p, safe='') for p in fwd.split('/'))
+        return 'file:///' + encoded
+
+    def _prog(msg):
+        if callable(progress_cb):
+            progress_cb(msg)
+
+    def _check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise BuildCancelled("Build cancelled by user")
+
+    sr          = seq_sr
+    sample_rate = aaf2.rational.AAFRational("{}/1".format(sr))
+    gap_sa      = round(gap_secs * sr)
+    HOST_LC     = HOST_NAME.lower()
+
+    def s2sa(secs):
+        return round(secs * sr)
+
+    vo_takes_by_part = {}
+    if vo_takes_with_offset:
+        for pi, takes_list in vo_takes_with_offset.items():
+            vo_takes_by_part[pi] = [(e[1], e[2], e[3]) for e in takes_list]
+    else:
+        for pi, vb in vo_bins.items():
+            paths = vb.get_paths() if hasattr(vb, "get_paths") else []
+            takes = pair_takes(paths)
+            vo_takes_by_part[pi] = [(0.0, vp, ap) for vp, ap in takes]
+
+    cursor      = 0  # samples — advances identically for all tracks
+    skipped     = []
+    # slots: (filepath, start_sa, dur_sa, src_in_sa, track_name)
+    slots       = []
+    part_starts = {}  # part_index → sample position of first content in that part
+
+    for res in sorted(results, key=lambda r: r["order"]):
+        _check_cancel()
+        is_vo    = res.get("is_vo", False)
+        st       = res.get("status", "")
+        segments = res.get("segments") or []
+
+        if st in ("extract_failed", "no_transcript", "cancelled", "no_file"):
+            skipped.append(res); continue
+        if not is_vo and not segments:
+            skipped.append(res); continue
+
+        # ── Guard: cap clips whose source range is unreasonably long ──────────
+        # A segment spanning > 30 minutes almost always means a typo in the
+        # script @PULL timecodes.  Instead of skipping the clip entirely,
+        # cap each over-long segment to _CAP_SECS from its declared start so
+        # the clip still appears at the right spot in the timeline.
+        _MAX_SEG_SECS = 1800   # 30 minutes
+        _CAP_SECS     = 10.0   # fallback duration when a segment is over-long
+        _check_segs   = segments
+        if is_vo:
+            _td0 = (res.get("takes_data") or [{}])[0]
+            _check_segs = _td0.get("segments") or segments
+        if any((e - s) > _MAX_SEG_SECS for s, e in _check_segs if e > s):
+            _max_dur = max((e - s) for s, e in _check_segs if e > s)
+            _prog("WARNING: capping {} @ {} — source span {:.0f}s → {}s placeholder".format(
+                res.get("token", "?"), res.get("in_tc", "?"),
+                _max_dur, int(_CAP_SECS)))
+            # Cap non-VO segments directly
+            segments = [
+                (s, s + _CAP_SECS) if (e - s) > _MAX_SEG_SECS else (s, e)
+                for s, e in segments if e > s
+            ]
+            # Cap VO takes_data segments
+            if is_vo:
+                _new_td = []
+                for _td in (res.get("takes_data") or []):
+                    _capped = [
+                        (s, s + _CAP_SECS) if (e - s) > _MAX_SEG_SECS else (s, e)
+                        for s, e in (_td.get("segments") or []) if e > s
+                    ]
+                    _new_td.append(dict(_td, segments=_capped))
+                res = dict(res, takes_data=_new_td, segments=segments)
+            # Fall through — clip is placed with capped duration
+
+        # Record where this part first starts in the timeline
+        _pi = res.get("part_index", 0)
+        if _pi not in part_starts:
+            part_starts[_pi] = cursor
+
+        # ── Track assignment ──────────────────────────────────────────────────
+        if is_vo:
+            track = "VO"
+        elif res.get("token", "").lower() == HOST_LC:
+            # All host lines share a single track (e.g. all JORDAN questions)
+            track = res["token"].upper()
+        else:
+            track = res.get("token", "UNKNOWN")
+
+        if is_vo:
+            takes_data = res.get("takes_data", [])
+            if not takes_data:
+                skipped.append(res); continue
+            # Use the take that produced the best match, not necessarily [0].
+            best_i  = res.get("best_take_index", 0)
+            td      = takes_data[best_i] if best_i < len(takes_data) else takes_data[0]
+            td_segs = td.get("segments") or segments
+            ap      = td.get("apath")
+            if ap:
+                for seg_in_s, seg_out_s in td_segs:
+                    if seg_in_s >= seg_out_s: continue
+                    # Add a short tail so Whisper's last-word timestamp doesn't
+                    # abruptly cut off natural decay / room tone.
+                    dur_sa = s2sa(seg_out_s - seg_in_s + VO_TAIL_SECS)
+                    slots.append((ap, cursor, dur_sa, s2sa(seg_in_s), track))
+                    cursor += dur_sa
+            cursor += (gap_sa if res.get("gap_after", True) else 0)
+        else:
+            tok    = res["token"]
+            paths  = int_assets.get(tok, [])
+            apaths = [p for p in paths if p and not is_video(p)]
+            if not apaths:
+                skipped.append(res); continue
+
+            # Riverside recordings come as pairs: one guest mic, one host mic.
+            # Identify the host side by HOST_NAME appearing in the filename.
+            host_paths  = [p for p in apaths
+                           if HOST_LC in os.path.basename(p).lower()]
+            guest_paths = [p for p in apaths
+                           if HOST_LC not in os.path.basename(p).lower()]
+
+            for si, (seg_in_s, seg_out_s) in enumerate(segments):
+                if seg_in_s >= seg_out_s: continue
+                dur_sa  = s2sa(seg_out_s - seg_in_s)
+                is_last = (si == len(segments) - 1)
+                # Shift the source read-start forward by CLIP_SRC_OFFSET so that
+                # script timecodes (which tend to be slightly early) land on the
+                # actual speech onset.  Duration is unchanged — the window moves.
+                src_in  = s2sa(seg_in_s + CLIP_SRC_OFFSET)
+
+                # Guest audio → token's own track
+                if guest_paths:
+                    slots.append((guest_paths[0], cursor, dur_sa, src_in, track))
+                # Host audio → Jordan's shared track, same timeline position
+                if host_paths:
+                    slots.append((host_paths[0], cursor, dur_sa, src_in,
+                                  HOST_NAME.upper()))
+
+                cursor += dur_sa + (gap_sa if (is_last and res.get("gap_after", True)) else 0)
+
+    _prog("Analysing {} clips across {} tracks…".format(len(slots),
+          len(set(s[4] for s in slots))))
+
+    # ── Determine track order: VO first, host second, guests alphabetically ────
+    seen_tracks = list(dict.fromkeys(s[4] for s in slots))  # preserve first-seen order
+
+    def _track_sort_key(t):
+        if t == "VO":             return (0, t)
+        if t.lower() == HOST_LC:  return (1, t)
+        return (2, t)
+
+    track_order = sorted(seen_tracks, key=_track_sort_key)
+
+    # ── Create audio output directory ─────────────────────────────────────────
+    # All converted WAVs land in "{aaf_stem} Audio Files/" next to the AAF.
+    # Files are named after the SourceMob's UMID (SMPTE ID) — the same
+    # convention Premiere/Avid uses — so Pro Tools can resolve them
+    # automatically without a manual relink step.
+    aaf_stem    = os.path.splitext(os.path.basename(out_path))[0]
+    audio_dir   = os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                               aaf_stem + " Audio Files")
+    os.makedirs(audio_dir, exist_ok=True)
+    ff          = _ffmpeg_cmd()
+    unique_srcs = list(dict.fromkeys(s[0] for s in slots))
+
+    # 2-second silent WAV used as source for PARTS marker clips.
+    # Must be at least ~0.5 s so Pro Tools renders the clip wide enough to
+    # show its name label in the track.
+    import wave as _wave
+    marker_dur_sa   = sr * 2         # 2 seconds in samples
+    marker_wav_path = os.path.join(audio_dir, "_part_markers.wav")
+    try:
+        with _wave.open(marker_wav_path, "w") as _wf:
+            _wf.setnchannels(1); _wf.setsampwidth(3); _wf.setframerate(sr)
+            _wf.writeframes(b"\x00" * 3 * marker_dur_sa)   # 2 seconds of silence
+    except Exception:
+        marker_wav_path = None
+
+    with aaf2.open(out_path, "w") as f:
+        comp_mob = f.create.CompositionMob(seq_name)
+        comp_mob.usage = "Usage_TopLevel"
+        f.content.mobs.append(comp_mob)
+
+        # ── One timeline slot per track ───────────────────────────────────────
+        track_seqs    = {}   # track_name → Sequence
+        track_lengths = {}   # track_name → samples written so far (O(1) gap calc)
+        for track_name in track_order:
+            seq        = f.create.Sequence(media_kind="sound")
+            comp_slot  = comp_mob.create_timeline_slot(sample_rate)
+            comp_slot.segment = seq
+            comp_slot.name    = track_name   # becomes the Pro Tools track label
+            track_seqs[track_name]    = seq
+            track_lengths[track_name] = 0
+
+        # ── PARTS marker track ────────────────────────────────────────────────
+        parts_seq = None
+        parts_cur = 0
+        if parts and part_starts and marker_wav_path:
+            parts_seq  = f.create.Sequence(media_kind="sound")
+            parts_slot = comp_mob.create_timeline_slot(sample_rate)
+            parts_slot.segment = parts_seq
+            parts_slot.name    = "PARTS"
+
+        # ── One SourceMob + MasterMob per unique source file ─────────────────
+        # The SourceMob is created FIRST so its MobID (UMID) is known before
+        # we convert the WAV.  The WAV is then saved as "{UMID}.wav", which
+        # is exactly the filename Pro Tools looks for when opening a linked AAF
+        # (the same convention used by Premiere when exporting AAF + audio).
+        file_mobs = {}
+        n_srcs    = len(unique_srcs)
+
+        for src_i, src in enumerate(unique_srcs):
+            _check_cancel()
+
+            # Preserve the source channel layout up to stereo.  Anything wider
+            # (5.1, 7.1, etc.) is folded to stereo so Pro Tools doesn't choke.
+            # Mono sources stay mono — no upmix.
+            src_chans = min(get_audio_channels(src), 2)
+
+            # Deterministic WAV name: SHA-1 of absolute source path + channel
+            # count + sample rate.  Including conversion parameters means a
+            # change (e.g. mono→stereo on rebuild) forces a fresh conversion
+            # rather than silently reusing the wrong file.
+            src_hash = hashlib.sha1(
+                "{}|{}|{}".format(
+                    os.path.abspath(src), src_chans, sr
+                ).encode()
+            ).hexdigest()[:32].upper()
+            wav_name = src_hash + ".wav"
+            wav_path = os.path.join(audio_dir, wav_name)
+
+            if os.path.isfile(wav_path):
+                _prog("File {} of {}  —  {}  [skipping — already converted]".format(
+                    src_i + 1, n_srcs, os.path.basename(src)))
+            else:
+                ch_label = "stereo" if src_chans == 2 else "mono"
+                _prog("Converting file {} of {}  —  {}  ({})".format(
+                    src_i + 1, n_srcs, os.path.basename(src), ch_label))
+                cmd = ff + [
+                    "-y", "-i", src,
+                    "-vn",                      # audio only
+                    "-ac", str(src_chans),      # preserve mono/stereo; fold >2ch
+                    "-ar", str(sr),             # resample to session rate
+                    "-c:a", "pcm_s24le",        # 24-bit PCM
+                    wav_path,
+                ]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=600)
+                    if r.returncode != 0:
+                        wav_path = src   # fall back to original on ffmpeg error
+                except Exception:
+                    wav_path = src       # fall back on timeout / missing ffmpeg
+
+            # ── SourceMob (physical file) ─────────────────────────────────────
+            src_mob = f.create.SourceMob()
+            f.content.mobs.append(src_mob)
+            src_mob.name = basename(src)   # human-readable name shown in Pro Tools
+
+            n_chan      = src_chans
+            file_dur_s  = get_media_duration(wav_path) or 7200.0
+            file_dur_sa = s2sa(file_dur_s)
+            bits        = 24
+            blk         = n_chan * (bits // 8)
+
+            # SourceMob slot: null SourceClip (end-of-chain) — matches Premiere
+            src_slot         = src_mob.create_timeline_slot(sample_rate)
+            src_slot.name    = "A1"
+            sc               = f.create.SourceClip(media_kind="sound",
+                                                   length=file_dur_sa)
+            src_slot.segment = sc
+
+            # WAVEDescriptor with embedded RIFF header — what Pro Tools expects
+            desc = f.create.WAVEDescriptor()
+            desc["Summary"].value    = _wave_summary(n_chan, sr, bits)
+            desc["SampleRate"].value = sample_rate
+            desc.length              = file_dur_sa
+            try:
+                desc["ContainerFormat"].value = f.dictionary.lookup_containerdef(
+                    "ContainerDef_AAFKLV")
+            except Exception:
+                pass
+            src_mob.descriptor = desc
+
+            # NetworkLocator — percent-encoded URI matching Premiere's format
+            # NOTE: desc.locator returns a new throwaway list each access;
+            # desc["Locator"].append() is the only API that actually persists.
+            loc = f.create.NetworkLocator()
+            loc["URLString"].value = _file_uri(wav_path)
+            src_mob.descriptor["Locator"].append(loc)
+
+            # ── MasterMob (clip mob) ──────────────────────────────────────────
+            master      = f.create.MasterMob(basename(src))  # original filename = clip name in PT
+            master_slot = master.create_timeline_slot(sample_rate)
+            master_slot.segment = src_mob.create_source_clip(
+                slot_id=src_slot.slot_id, media_kind="sound")
+            f.content.mobs.append(master)
+            file_mobs[src] = (master, master_slot)
+
+        _prog("Writing AAF timeline ({} clips)…".format(len(slots)))
+
+        for filepath, start_sa, dur_sa, src_in_sa, track_name in slots:
+            master, master_slot = file_mobs[filepath]
+            seq     = track_seqs[track_name]
+            cur_len = track_lengths[track_name]
+
+            # Pad this track to the correct timeline position
+            if start_sa > cur_len:
+                seq.components.append(
+                    f.create.Filler(media_kind="sound",
+                                    length=start_sa - cur_len))
+
+            clip = master.create_source_clip(
+                slot_id=master_slot.slot_id, length=dur_sa, start=src_in_sa)
+            seq.components.append(clip)
+            track_lengths[track_name] = start_sa + dur_sa
+
+        # ── Part markers (PARTS track) ────────────────────────────────────────
+        # DescriptiveMarker/EventMobSlot objects are not surfaced by Pro Tools
+        # on AAF import.  Instead we create a dedicated "PARTS" audio track
+        # with one named 1-sample clip per part boundary.  Pro Tools shows the
+        # clip names inline on the track, giving clear visual part markers.
+        if parts_seq is not None and part_starts:
+            # SourceMob for the silent marker WAV
+            mk_src = f.create.SourceMob()
+            mk_src.name = "_part_markers"
+            f.content.mobs.append(mk_src)
+            mk_src_slot      = mk_src.create_timeline_slot(sample_rate)
+            mk_src_slot.name = "A1"
+            mk_src_slot.segment = f.create.SourceClip(media_kind="sound",
+                                                       length=marker_dur_sa)
+            mk_desc = f.create.WAVEDescriptor()
+            mk_desc["Summary"].value    = _wave_summary(1, sr, 24)
+            mk_desc["SampleRate"].value = sample_rate
+            mk_desc.length              = marker_dur_sa
+            try:
+                mk_desc["ContainerFormat"].value = f.dictionary.lookup_containerdef(
+                    "ContainerDef_AAFKLV")
+            except Exception:
+                pass
+            mk_src.descriptor = mk_desc
+            mk_loc = f.create.NetworkLocator()
+            mk_loc["URLString"].value = _file_uri(marker_wav_path)
+            mk_src.descriptor["Locator"].append(mk_loc)
+
+            part_map = {p["index"]: p["name"] for p in parts}
+            for pi, pos_sa in sorted(part_starts.items()):
+                pname = part_map.get(pi, "Part {}".format(pi + 1))
+                # MasterMob whose name becomes the clip label in Pro Tools
+                mk_master      = f.create.MasterMob(pname)
+                mk_master_slot = mk_master.create_timeline_slot(sample_rate)
+                mk_master_slot.name    = "A1"
+                mk_master_slot.segment = mk_src.create_source_clip(
+                    slot_id=mk_src_slot.slot_id, media_kind="sound")
+                f.content.mobs.append(mk_master)
+                # Pad PARTS track up to this part's position
+                if pos_sa > parts_cur:
+                    parts_seq.components.append(
+                        f.create.Filler(media_kind="sound",
+                                        length=pos_sa - parts_cur))
+                clip = mk_master.create_source_clip(
+                    slot_id=mk_master_slot.slot_id, length=marker_dur_sa, start=0)
+                parts_seq.components.append(clip)
+                parts_cur = pos_sa + marker_dur_sa
+
+    return out_path, skipped
+
+def generate_report(results, skipped, parts, seq_name, xml_path):
+    import datetime
+    W = 72
+
+    def hr(ch="─"): return ch * W
+    def section(title):
+        return "\n{}\n  {}\n{}".format(hr("═"), title.upper(), hr("═"))
+    def subsection(title):
+        return "\n  {}\n  {}".format(title, hr("─")[2:])
+    def dur(in_s, out_s):
+        d = max(0, (out_s or 0) - (in_s or 0))
+        return "{:d}s".format(int(d))
+
+    lines = []
+    now   = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
+
+    lines += [
+        hr("═"),
+        "  BLOOD TRAILS — RECONCILE REPORT",
+        "  {}".format(seq_name),
+        "  Generated: {}".format(now),
+        "  XML: {}".format(xml_path),
+        hr("═"),
+    ]
+
+    all_results = results + skipped
+    iv_results  = [r for r in all_results if not r.get("is_vo")]
+    vo_results  = [r for r in all_results if r.get("is_vo")]
+
+    status_counts = {}
+    for r in all_results:
+        st = r.get("status", "unknown")
+        status_counts[st] = status_counts.get(st, 0) + 1
+
+    ok_iv    = sum(1 for r in iv_results if r.get("status") == "ok")
+    direct   = sum(1 for r in iv_results if r.get("status") == "direct")
+    low_iv   = sum(1 for r in iv_results if r.get("status") == "low_confidence")
+    miss_iv  = sum(1 for r in iv_results if r.get("status") in ("no_match","no_quote","no_transcript","error"))
+    skip_iv  = sum(1 for r in skipped    if not r.get("is_vo"))
+
+    ok_vo    = sum(1 for r in vo_results if r.get("status") in ("ok","direct"))
+    low_vo   = sum(1 for r in vo_results if r.get("status") == "low_confidence")
+    fall_vo  = sum(1 for r in vo_results if r.get("status") == "no_match")
+    skip_vo  = sum(1 for r in skipped    if r.get("is_vo"))
+
+    total_in_timeline = len(results)
+    total_skipped     = len(skipped)
+
+    lines += ["", "  SUMMARY", "  " + hr()]
+    lines += ["  {:<30} {}".format(k, v) for k, v in [
+        ("Sequence",                seq_name),
+        ("Parts / markers",         len(parts)),
+        ("",                        ""),
+        ("Interview pulls placed",  ok_iv + direct + low_iv),
+        ("  ✓  Clean match",        ok_iv),
+        ("  ✓  Direct (no whisper)",direct),
+        ("  ⚠  Low confidence",     low_iv),
+        ("  ✕  Failed / missing",   miss_iv + skip_iv),
+        ("",                        ""),
+        ("VO blocks placed",        ok_vo + low_vo + fall_vo),
+        ("  ✓  Matched",            ok_vo),
+        ("  ⚠  Low confidence",     low_vo),
+        ("  ?  Fallback span used", fall_vo),
+        ("  ✕  Skipped",            skip_vo),
+        ("",                        ""),
+        ("Total clips in timeline", total_in_timeline),
+        ("Total skipped",           total_skipped),
+    ] if k or v]
+
+    lines += [section("Part-by-part breakdown")]
+
+    part_map = {p["index"]: p["name"] for p in parts}
+    part_indices = sorted(part_map)
+
+    for pi in part_indices:
+        pname    = part_map[pi]
+        p_iv     = [r for r in all_results if not r.get("is_vo") and r.get("part_index") == pi]
+        p_vo     = [r for r in all_results if r.get("is_vo")     and r.get("part_index") == pi]
+
+        lines += [subsection("PART {}  —  {}".format(pi + 1, pname))]
+
+        if p_iv:
+            lines.append("")
+            lines.append("  Interview pulls:")
+            for r in sorted(p_iv, key=lambda x: x.get("order", 0)):
+                st      = r.get("status", "?")
+                tok     = r.get("token", "?")
+                in_tc   = r.get("in_tc", "?")
+                segs    = r.get("segments") or []
+                in_s    = r.get("rec_in_s")
+                out_s   = r.get("rec_out_s")
+                conf    = r.get("confidence")
+                quote   = (r.get("quote_text") or "").strip()[:60]
+
+                if st == "ok":
+                    flag = "✓"
+                elif st == "direct":
+                    flag = "✓ direct"
+                elif st == "low_confidence":
+                    flag = "⚠ LOW CONF"
+                elif st in ("no_match",):
+                    flag = "✕ NO MATCH"
+                elif st == "no_transcript":
+                    flag = "✕ NO TRANSCRIPT"
+                elif st == "no_quote":
+                    flag = "✕ NO QUOTE"
+                elif st in ("error", "extract_failed"):
+                    flag = "✕ ERROR"
+                elif st in ("cancelled", "no_file"):
+                    flag = "✕ SKIPPED"
+                elif st == "too_long":
+                    segs = r.get("segments") or []
+                    max_dur = max((e-s) for s,e in segs if e>s) if segs else 0
+                    flag = "✕ TOO LONG ({:.0f}s)".format(max_dur)
+                else:
+                    flag = "? {}".format(st)
+
+                conf_str = "  conf={:.0%}".format(conf) if conf is not None else ""
+                dur_str  = "  ({})".format(dur(in_s, out_s)) if in_s is not None else ""
+                segs_str = "  {} seg{}".format(len(segs), "s" if len(segs) != 1 else "") if segs else ""
+
+                lines.append("    [{flag:<12}] {tok:<12} @{in_tc}{conf}{dur}{segs}".format(
+                    flag=flag, tok=tok, in_tc=in_tc,
+                    conf=conf_str, dur=dur_str, segs=segs_str))
+                if quote:
+                    lines.append("                       '{}'".format(quote))
+
+        if p_vo:
+            lines.append("")
+            lines.append("  VO blocks:")
+            for r in sorted(p_vo, key=lambda x: x.get("order", 0)):
+                st         = r.get("status", "?")
+                takes_data = r.get("takes_data") or []
+                n_takes    = len(takes_data)
+                fallback   = any(td.get("is_fallback") for td in takes_data)
+                quote      = (r.get("quote_text") or "").strip()[:60]
+
+                if fallback:
+                    flag = "?  FALLBACK"
+                elif st in ("ok", "direct"):
+                    flag = "✓ ({} take{})".format(n_takes, "s" if n_takes != 1 else "")
+                elif st == "low_confidence":
+                    flag = "⚠ LOW CONF ({} takes)".format(n_takes)
+                elif st == "no_match":
+                    flag = "✕ NO MATCH"
+                elif st == "not_run":
+                    flag = "– NOT RUN"
+                else:
+                    flag = "? {}".format(st)
+
+                lines.append("    [{flag:<14}]  '{quote}'".format(
+                    flag=flag,
+                    quote=quote if quote else "(no text)"))
+
+    issues = []
+    for r in all_results:
+        st  = r.get("status", "")
+        tok = r.get("token", "")
+        pi  = r.get("part_index", 0)
+        pnm = part_map.get(pi, "Part {}".format(pi+1))
+        itc = r.get("in_tc", "")
+        qt  = (r.get("quote_text") or "").strip()[:50]
+
+        if st == "low_confidence":
+            conf = r.get("confidence")
+            cs   = " ({:.0%})".format(conf) if conf is not None else ""
+            issues.append(("⚠  Low confidence{}".format(cs),
+                           tok, pnm, itc, qt))
+        elif st == "no_match":
+            if r.get("is_vo"):
+                issues.append(("?  VO fallback span used",
+                               tok, pnm, itc, qt))
+            else:
+                issues.append(("✕  No match found",
+                               tok, pnm, itc, qt))
+        elif st in ("no_quote", "no_transcript", "error", "extract_failed"):
+            issues.append(("✕  {}".format(st.replace("_"," ").title()),
+                           tok, pnm, itc, qt))
+
+    if issues:
+        lines += [section("Issues requiring attention  ({})".format(len(issues)))]
+        lines.append("  These clips need manual review in the timeline.\n")
+        for flag, tok, pnm, itc, qt in issues:
+            lines.append("  {}".format(flag))
+            lines.append("    Session : {}".format(tok))
+            lines.append("    Part    : {}".format(pnm))
+            if itc:
+                lines.append("    Script TC: {}".format(itc))
+            if qt:
+                lines.append("    Quote   : '{}'".format(qt))
+            lines.append("")
+    else:
+        lines += [section("Issues requiring attention"), "",
+                  "  None — all clips matched cleanly.", ""]
+
+    if skipped:
+        lines += [section("Skipped  ({} clips NOT in timeline)".format(len(skipped)))]
+        lines.append("  These were excluded entirely.\n")
+        for r in skipped:
+            st  = r.get("status", "?")
+            tok = r.get("token", "?")
+            itc = r.get("in_tc", "")
+            qt  = (r.get("quote_text") or "").strip()[:55]
+            lines.append("  ✕ [{:<16}] {:<14} @{}".format(st, tok, itc))
+            if qt:
+                lines.append("      '{}'".format(qt))
+        lines.append("")
+
+    lines += ["", hr("═"),
+              "  End of report  —  {}".format(now),
+              hr("═"), ""]
+
+    text = "\n".join(lines)
+
+    report_path = os.path.splitext(xml_path)[0] + "_report.txt"
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        report_path = None
+
+    return text, report_path

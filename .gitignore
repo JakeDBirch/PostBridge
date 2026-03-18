@@ -1,0 +1,6 @@
+dist/ 
+build/ 
+ffmpeg-bin/ 
+__pycache__/ 
+*.pyc 
+.bt_cache/ 

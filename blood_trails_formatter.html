@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blood Trails Script Formatter</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #111318;
+    --surface:  #1c1f27;
+    --border:   #2e3140;
+    --accent:   #e94560;
+    --blue:     #4a90d9;
+    --green:    #3dba7e;
+    --text:     #e0e4f0;
+    --muted:    #7a7f95;
+    --input-bg: #13151c;
+    --radius:   6px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 32px 16px 64px;
+  }
+
+  header {
+    max-width: 640px;
+    margin: 0 auto 32px;
+  }
+  header h1 { font-size: 20px; color: var(--accent); font-weight: 700; letter-spacing: .3px; }
+  header p  { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+  .page { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .card h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 5px; margin-top: 12px; }
+  label:first-of-type { margin-top: 0; }
+
+  input[type="text"],
+  textarea,
+  select {
+    width: 100%;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 13px;
+    padding: 9px 12px;
+    outline: none;
+    transition: border-color .15s;
+    font-family: inherit;
+  }
+  input[type="text"]:focus,
+  textarea:focus,
+  select:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 90px; line-height: 1.5; }
+  select option { background: var(--surface); }
+
+  .tc-row { display: flex; gap: 10px; }
+  .tc-row > div { flex: 1; }
+
+  /* Split HH:MM:SS inputs */
+  .tc-group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 10px;
+    transition: border-color .15s;
+  }
+  .tc-group:focus-within { border-color: var(--accent); }
+  .tc-group.valid         { border-color: var(--green) !important; }
+  .tc-group.invalid       { border-color: var(--accent) !important; }
+  .tc-part {
+    width: 26px !important;
+    padding: 9px 0 !important;
+    border: none !important;
+    background: transparent !important;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 13px;
+    letter-spacing: 1px;
+    text-align: center;
+    color: var(--text);
+    outline: none;
+    border-radius: 0 !important;
+  }
+  .tc-sep {
+    color: var(--muted);
+    font-family: monospace;
+    user-select: none;
+    padding: 0 1px;
+  }
+
+  .validation-msg {
+    font-size: 11px;
+    min-height: 16px;
+    margin-top: 6px;
+    color: var(--accent);
+  }
+  .validation-msg.ok   { color: var(--green); }
+  .validation-msg.warn { color: #f0a840; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 16px;
+    border-radius: var(--radius);
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s, transform .08s;
+    white-space: nowrap;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+  .btn-primary  { background: var(--accent); color: #fff; }
+  .btn-blue     { background: var(--blue);   color: #fff; }
+  .btn-green    { background: var(--green);  color: #fff; }
+  .btn-outline  { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .btn:hover:not(:disabled) { opacity: .85; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+
+  .output-box {
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    font-size: 13px;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 12px;
+    min-height: 40px;
+  }
+
+  .copy-feedback {
+    font-size: 11px;
+    color: var(--green);
+    min-height: 16px;
+    margin-top: 5px;
+    transition: opacity .3s;
+  }
+
+  .token-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; min-height: 26px; }
+  .chip {
+    background: #1a2035;
+    border: 1px solid var(--blue);
+    color: var(--blue);
+    border-radius: 20px;
+    padding: 3px 11px;
+    font-size: 11px;
+    font-family: monospace;
+    letter-spacing: .5px;
+  }
+  .chip-empty { color: var(--muted); border-color: var(--border); background: transparent; font-style: italic; font-family: inherit; font-size: 11px; }
+
+  .divider { border: none; border-top: 1px solid var(--border); margin: 4px 0; }
+
+  .section-note {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Blood Trails Script Formatter</h1>
+  <p>Build script blocks and copy them to your clipboard for pasting into the episode doc.</p>
+</header>
+
+<div class="page">
+
+  <!-- ── TOKENS ─────────────────────────────────────────────── -->
+  <div class="card" id="card-tokens">
+    <h2>Episode Tokens</h2>
+
+    <label for="tokenInput">Token names — one per line (e.g. INTERVIEW_A)</label>
+    <textarea id="tokenInput" placeholder="INTERVIEW_A&#10;BROLL_CAMP&#10;DRONE_WIDE" oninput="onTokensChanged()"></textarea>
+
+    <div class="token-chips" id="tokenChips">
+      <span class="chip-empty">No tokens yet</span>
+    </div>
+
+    <label style="margin-top:14px;">Asset block for document header</label>
+    <div class="output-box" id="assetBlockOutput" style="color:var(--muted);font-style:italic;">Enter tokens above</div>
+    <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+      <button class="btn btn-blue" id="copyAssetBtn" onclick="copyAssetBlock()" disabled>Copy Asset Block</button>
+      <span class="copy-feedback" id="assetCopyFeedback"></span>
+    </div>
+    <p class="section-note">Paste this block into the doc once, near the top, before any @PART lines.</p>
+  </div>
+
+  <!-- ── @PART ──────────────────────────────────────────────── -->
+  <div class="card">
+    <h2>Insert @PART</h2>
+
+    <label for="partTitle">Part title</label>
+    <input type="text" id="partTitle" placeholder="e.g. Open" oninput="buildPart()" onkeydown="enterCopy(event,'copyPartBtn')">
+
+    <div class="output-box" id="partOutput" style="color:var(--muted);font-style:italic;">—</div>
+    <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+      <button class="btn btn-primary" id="copyPartBtn" onclick="copyPart()" disabled>Copy @PART</button>
+      <span class="copy-feedback" id="partCopyFeedback"></span>
+    </div>
+  </div>
+
+  <!-- ── @VO ────────────────────────────────────────────────── -->
+  <div class="card">
+    <h2>Insert @VO</h2>
+    <p class="section-note" style="margin:0 0 12px;">Copies <code style="font-family:monospace;color:var(--text);">@VO</code> to your clipboard — paste it into the doc, then type your VO copy on the line below it.</p>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button class="btn btn-primary" onclick="copyVO()">Copy @VO</button>
+      <span class="copy-feedback" id="voCopyFeedback"></span>
+    </div>
+  </div>
+
+  <!-- ── @PULL ─────────────────────────────────────────────── -->
+  <div class="card">
+    <h2>Insert @PULL</h2>
+
+    <label for="pullToken">Token</label>
+    <select id="pullToken" onchange="buildPull()">
+      <option value="">— select token —</option>
+    </select>
+
+    <div class="tc-row" style="margin-top:12px;">
+      <div>
+        <label>IN timecode</label>
+        <div class="tc-group" id="tcGroupIn">
+          <input type="text" class="tc-part" id="in_h"  maxlength="2" placeholder="HH" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,'in_m')"  onkeydown="tcPartKey(event,null,'in_m')">
+          <span class="tc-sep">:</span>
+          <input type="text" class="tc-part" id="in_m"  maxlength="2" placeholder="MM" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,'in_s')"  onkeydown="tcPartKey(event,'in_h','in_s')">
+          <span class="tc-sep">:</span>
+          <input type="text" class="tc-part" id="in_s"  maxlength="2" placeholder="SS" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,null)"    onkeydown="tcPartKey(event,'in_m',null)">
+        </div>
+      </div>
+      <div>
+        <label>OUT timecode</label>
+        <div class="tc-group" id="tcGroupOut">
+          <input type="text" class="tc-part" id="out_h" maxlength="2" placeholder="HH" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,'out_m')" onkeydown="tcPartKey(event,null,'out_m')">
+          <span class="tc-sep">:</span>
+          <input type="text" class="tc-part" id="out_m" maxlength="2" placeholder="MM" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,'out_s')" onkeydown="tcPartKey(event,'out_h','out_s')">
+          <span class="tc-sep">:</span>
+          <input type="text" class="tc-part" id="out_s" maxlength="2" placeholder="SS" value="00"
+                 onfocus="this.select()" onblur="tcPartBlur(this)" oninput="tcPartInput(this,null)"    onkeydown="tcPartKey(event,'out_m',null)">
+        </div>
+      </div>
+    </div>
+
+    <div class="validation-msg" id="pullValidation"></div>
+    <div class="output-box" id="pullOutput" style="color:var(--muted);font-style:italic;">—</div>
+    <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+      <button class="btn btn-primary" id="copyPullBtn" onclick="copyPull()" disabled>Copy @PULL</button>
+      <button class="btn btn-outline" onclick="clearPull()">Clear</button>
+      <span class="copy-feedback" id="pullCopyFeedback"></span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let tokens = [];
+
+// ── Token handling ─────────────────────────────────────────────────────────
+function onTokensChanged() {
+  const raw = document.getElementById('tokenInput').value;
+  tokens = raw.split('\n')
+    .map(t => t.trim().toUpperCase().replace(/[^A-Z0-9_]/g, ''))
+    .filter(t => t.length > 0);
+
+  // Remove duplicates
+  tokens = [...new Set(tokens)];
+
+  renderChips();
+  renderAssetBlock();
+  refreshPullTokenSelect();
+  buildPull();
+}
+
+function renderChips() {
+  const el = document.getElementById('tokenChips');
+  if (tokens.length === 0) {
+    el.innerHTML = '<span class="chip-empty">No tokens yet</span>';
+  } else {
+    el.innerHTML = tokens.map(t => `<span class="chip">${t}</span>`).join('');
+  }
+}
+
+function renderAssetBlock() {
+  const outEl  = document.getElementById('assetBlockOutput');
+  const copyBtn = document.getElementById('copyAssetBtn');
+  if (tokens.length === 0) {
+    outEl.textContent = '';
+    outEl.style.color = 'var(--muted)';
+    outEl.style.fontStyle = 'italic';
+    outEl.textContent = 'Enter tokens above';
+    copyBtn.disabled = true;
+    return;
+  }
+  const block = '--- EPISODE ASSETS START ---\n' +
+    tokens.map(t => `[${t}]`).join('\n') +
+    '\n--- EPISODE ASSETS END ---';
+  outEl.textContent = block;
+  outEl.style.color = '';
+  outEl.style.fontStyle = '';
+  copyBtn.disabled = false;
+}
+
+function refreshPullTokenSelect() {
+  const sel = document.getElementById('pullToken');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— select token —</option>';
+  tokens.forEach(t => {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    sel.appendChild(opt);
+  });
+  if (tokens.includes(current)) sel.value = current;
+}
+
+// ── @PART ──────────────────────────────────────────────────────────────────
+function buildPart() {
+  const title  = document.getElementById('partTitle').value.trim();
+  const outEl  = document.getElementById('partOutput');
+  const copyBtn = document.getElementById('copyPartBtn');
+  if (!title) {
+    outEl.textContent = '—';
+    outEl.style.color = 'var(--muted)';
+    outEl.style.fontStyle = 'italic';
+    copyBtn.disabled = true;
+    return;
+  }
+  outEl.textContent = '@PART ' + title;
+  outEl.style.color = '';
+  outEl.style.fontStyle = '';
+  copyBtn.disabled = false;
+}
+
+// ── @PULL — split HH/MM/SS inputs ─────────────────────────────────────────
+
+/** Pad a single digit to "0X" on blur and re-validate. */
+function tcPartBlur(input) {
+  if (input.value.length === 1) {
+    input.value = '0' + input.value;
+  }
+  buildPull();
+}
+
+/** Only allow digits in a tc-part input; auto-advance when full. */
+function tcPartInput(input, nextId) {
+  // Strip non-digits
+  input.value = input.value.replace(/\D/g, '');
+  // Auto-advance to next field when 2 digits entered
+  if (input.value.length === 2 && nextId) {
+    document.getElementById(nextId).focus();
+    document.getElementById(nextId).select();
+  }
+  buildPull();
+}
+
+/** Backspace on empty field moves focus to previous; block non-digit keys. */
+function tcPartKey(e, prevId, nextId) {
+  if (e.key === 'Backspace' && e.target.value === '' && prevId) {
+    e.preventDefault();
+    const prev = document.getElementById(prevId);
+    prev.focus();
+    prev.setSelectionRange(prev.value.length, prev.value.length);
+    return;
+  }
+  if (e.key === 'Tab') return;
+  if (e.key === 'Enter') {
+    const btn = document.getElementById('copyPullBtn');
+    if (btn && !btn.disabled) btn.click();
+    return;
+  }
+  // Block anything that isn't a digit, arrow key, or editing key
+  if (!/^\d$/.test(e.key) && !['Backspace','Delete','ArrowLeft','ArrowRight','Home','End'].includes(e.key)) {
+    e.preventDefault();
+  }
+}
+
+/** Assemble HH:MM:SS from the three sub-inputs for a given prefix (in/out). */
+function getTc(prefix) {
+  const h = document.getElementById(prefix + '_h').value.padStart(2,'0');
+  const m = document.getElementById(prefix + '_m').value.padStart(2,'0');
+  const s = document.getElementById(prefix + '_s').value.padStart(2,'0');
+  if (!document.getElementById(prefix + '_h').value &&
+      !document.getElementById(prefix + '_m').value &&
+      !document.getElementById(prefix + '_s').value) return '';
+  return h + ':' + m + ':' + s;
+}
+
+/** True if a HH:MM:SS-group is fully filled (all three parts have 2 digits). */
+function tcComplete(prefix) {
+  return document.getElementById(prefix + '_h').value.length === 2 &&
+         document.getElementById(prefix + '_m').value.length === 2 &&
+         document.getElementById(prefix + '_s').value.length === 2;
+}
+
+function isValidTc(tc) {
+  if (!tc || !/^\d{2}:\d{2}:\d{2}$/.test(tc)) return false;
+  const [, m, s] = tc.split(':').map(Number);
+  return m < 60 && s < 60;
+}
+
+function tcToSecs(tc) {
+  const [h, m, s] = tc.split(':').map(Number);
+  return h * 3600 + m * 60 + s;
+}
+
+function buildPull() {
+  const token    = document.getElementById('pullToken').value;
+  const inDone   = tcComplete('in');
+  const outDone  = tcComplete('out');
+  const inTc     = inDone  ? getTc('in')  : '';
+  const outTc    = outDone ? getTc('out') : '';
+  const msgEl    = document.getElementById('pullValidation');
+  const displayEl = document.getElementById('pullOutput');
+  const copyBtn  = document.getElementById('copyPullBtn');
+  const grpIn    = document.getElementById('tcGroupIn');
+  const grpOut   = document.getElementById('tcGroupOut');
+
+  // Reset border states
+  grpIn.classList.remove('valid','invalid');
+  grpOut.classList.remove('valid','invalid');
+  msgEl.className = 'validation-msg';
+  msgEl.textContent = '';
+  displayEl.textContent = '—';
+  displayEl.style.color = 'var(--muted)';
+  displayEl.style.fontStyle = 'italic';
+  copyBtn.disabled = true;
+
+  // Not ready yet — fields incomplete, stay neutral, no errors shown
+  if (!token || !inDone || !outDone) return;
+
+  const inOk  = isValidTc(inTc);
+  const outOk = isValidTc(outTc);
+  const errs  = [];
+
+  if (!inOk)  { errs.push('IN timecode is invalid (MM/SS must be < 60).'); grpIn.classList.add('invalid'); }
+  else          grpIn.classList.add('valid');
+
+  if (!outOk) { errs.push('OUT timecode is invalid (MM/SS must be < 60).'); grpOut.classList.add('invalid'); }
+  else          grpOut.classList.add('valid');
+
+  if (inOk && outOk && tcToSecs(outTc) <= tcToSecs(inTc)) {
+    errs.push('OUT must be after IN.');
+    grpOut.classList.remove('valid');
+    grpOut.classList.add('invalid');
+  }
+
+  if (errs.length > 0) {
+    msgEl.textContent = errs.join('  ');
+    return;
+  }
+
+  const line = `@PULL ${token} [${inTc}-${outTc}]`;
+  displayEl.textContent = line;
+  displayEl.style.color = '';
+  displayEl.style.fontStyle = '';
+  copyBtn.disabled = false;
+
+  const durSecs = tcToSecs(outTc) - tcToSecs(inTc);
+  if (durSecs > 300) {
+    msgEl.className = 'validation-msg warn';
+    msgEl.textContent = `⚠ Duration is ${formatDur(durSecs)} — confirm this timing is correct`;
+  } else {
+    msgEl.className = 'validation-msg ok';
+    msgEl.textContent = '✓ Looks good';
+  }
+}
+
+function formatDur(secs) {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m + 'm ' + (s > 0 ? s + 's' : '');
+}
+
+function clearPull() {
+  ['in_h','in_m','in_s','out_h','out_m','out_s'].forEach(id => {
+    document.getElementById(id).value = '00';
+  });
+  document.getElementById('pullToken').value = '';
+  document.getElementById('tcGroupIn').classList.remove('valid','invalid');
+  document.getElementById('tcGroupOut').classList.remove('valid','invalid');
+  buildPull();
+}
+
+// ── Copy helpers ───────────────────────────────────────────────────────────
+function copyToClipboard(text, feedbackId) {
+  navigator.clipboard.writeText(text).then(() => {
+    const el = document.getElementById(feedbackId);
+    el.textContent = '✓ Copied!';
+    setTimeout(() => { el.textContent = ''; }, 2000);
+  }).catch(() => {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    const el = document.getElementById(feedbackId);
+    el.textContent = '✓ Copied!';
+    setTimeout(() => { el.textContent = ''; }, 2000);
+  });
+}
+
+function copyAssetBlock() {
+  const text = document.getElementById('assetBlockOutput').textContent;
+  copyToClipboard(text, 'assetCopyFeedback');
+}
+
+function copyPart() {
+  const text = document.getElementById('partOutput').textContent;
+  copyToClipboard(text, 'partCopyFeedback');
+}
+
+function copyVO() {
+  copyToClipboard('@VO', 'voCopyFeedback');
+}
+
+function copyPull() {
+  const text = document.getElementById('pullOutput').textContent;
+  copyToClipboard(text, 'pullCopyFeedback');
+}
+
+// ── Enter key on any field triggers its copy button ───────────────────────
+function enterCopy(event, btnId) {
+  if (event.key === 'Enter') {
+    const btn = document.getElementById(btnId);
+    if (btn && !btn.disabled) btn.click();
+  }
+}
+</script>
+</body>
+</html>
