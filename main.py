@@ -430,7 +430,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         wf_label = "AAF" if self.workflow == "script_aaf" else "XML"
         self._section("STEP 1 — LOAD SCRIPT  (Script → {})".format(wf_label))
 
-        card = tk.Frame(self.body, bg=SURF,
+        # ── Nav pinned to bottom first so it's always visible ─────────────────
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8,0))
+        self._btn(nav, "← HOME", self._home).pack(side="left")
+        self._step1_nav = nav   # NEXT button appended here once script is loaded
+
+        # ── Scrollable content area fills remaining space ─────────────────────
+        sf = self._scroll_frame(self.body)
+
+        card = tk.Frame(sf, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="x")
         if HAS_DND:
@@ -453,15 +462,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── Media pre-load (optional — populates Step 2 automatically) ────────
         self._make_prefetch_panel(
-            self.body, self._prefetch_media,
+            sf, self._prefetch_media,
             title="MEDIA FILES",
             hint="Drop audio/video files here — they will be pre-loaded into Step 2  (optional)",
         )
-
-        nav = tk.Frame(self.body, bg=BG)
-        nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "← HOME", self._home).pack(side="left")
-        self._step1_nav = nav   # NEXT button appended here once script is loaded
 
     def _load_script(self, path):
         if not path or not os.path.isfile(path): return
@@ -520,7 +524,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       "Adjust any incorrect assignments via the dropdown on each row.",
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
-        sf = self._scroll_frame(self.body, height=500)
+        # ── Nav pinned to bottom first so it's always visible ─────────────────
+        cache_row = tk.Frame(self.body, bg=BG)
+        cache_row.pack(side="bottom", fill="x", pady=(4,0))
+        self._btn(cache_row, "CLEAR TRANSCRIPTS", lambda: self._clear_cache("transcripts"),
+                  small=True).pack(side="right", padx=(0, 4))
+        self._btn(cache_row, "CLEAR RESULTS", lambda: self._clear_cache("results"),
+                  small=True).pack(side="right", padx=(0, 8))
+
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8,0))
+        self._btn(nav, "← BACK",         self._step1).pack(side="left")
+        self._btn(nav, "SAVE SETUP",     self._save_setup).pack(side="left", padx=(8,0))
+        self._btn(nav, "LOAD SETUP",     self._load_setup).pack(side="left", padx=(4,0))
+        self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(4,0))
+        self._btn(nav, "RECONCILE  →",   self._start_reconcile,
+                  color=ACCENT).pack(side="right")
+
+        # ── Scrollable content area fills remaining space ─────────────────────
+        sf = self._scroll_frame(self.body)
 
         self._pool = MediaPool(sf, self.tokens, self.parts,
                               aaf_mode=(self.workflow == "script_aaf"))
@@ -543,20 +565,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._pool._rebuild_src_dropdowns()
             self._pool._refresh_count()
             del self._redo_setup
-
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "← BACK",         self._step1).pack(side="left")
-        self._btn(nav, "SAVE SETUP",     self._save_setup).pack(side="left", padx=(8,0))
-        self._btn(nav, "LOAD SETUP",     self._load_setup).pack(side="left", padx=(4,0))
-        self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(4,0))
-        self._btn(nav, "RECONCILE  →",   self._start_reconcile,
-                  color=ACCENT).pack(side="right")
-        # Cache utilities on a separate right-aligned row so they don't crowd RECONCILE
-        cache_row = tk.Frame(self.body, bg=BG); cache_row.pack(fill="x", pady=(4,0))
-        self._btn(cache_row, "CLEAR TRANSCRIPTS", lambda: self._clear_cache("transcripts"),
-                  small=True).pack(side="right", padx=(0, 4))
-        self._btn(cache_row, "CLEAR RESULTS", lambda: self._clear_cache("results"),
-                  small=True).pack(side="right", padx=(0, 8))
 
     def _setup_sidecar_path(self):
         if not hasattr(self, '_script_path') or not self._script_path:
