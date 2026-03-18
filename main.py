@@ -2216,7 +2216,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_step1_next_added  = False
         self._section("STEP 1 — LOAD PRO TOOLS AAF EXPORT  (AAF → XML)")
 
-        card = tk.Frame(self.body, bg=SURF,
+        # ── Nav pinned to bottom first so it's always visible ─────────────────
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8,0))
+        self._btn(nav, "\u2190 HOME", self._home).pack(side="left")
+        self._aaf_step1_nav = nav   # NEXT button appended here once AAF is loaded
+
+        # ── Scrollable content area fills remaining space ─────────────────────
+        sf = self._scroll_frame(self.body)
+
+        card = tk.Frame(sf, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="x")
         if HAS_DND:
@@ -2245,14 +2254,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── Media pre-load (optional — populates Step 2 video/audio pools) ───
         self._make_prefetch_panel(
-            self.body, self._prefetch_aaf_media,
+            sf, self._prefetch_aaf_media,
             title="VIDEO & AUDIO FILES",
             hint="Drop video and/or reference audio files here — they will be pre-loaded into Step 2  (optional)",
         )
-
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "\u2190 HOME", self._home).pack(side="left")
-        self._aaf_step1_nav = nav   # NEXT button appended here once AAF is loaded
 
     def _aaf_load(self, path):
         if not path or not os.path.isfile(path): return
