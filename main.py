@@ -37,9 +37,10 @@ from utils import basename, secs_tc, tc_secs, is_video, is_audio, is_media, MEDI
 from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
-                     detect_sync_offset, detect_slate_offset)
+                     detect_sync_offset)
 from gui_components import VoBin, MediaPool, _SlimScrollbar, _FlatDropdown, _FlatProgressBar
 import engines
+from sync_preview import SyncPreviewDialog
 
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
@@ -741,10 +742,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         MEDIA_EXTS = {
             # Professional / camera formats
             ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v", ".webm",
+            ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts",
+            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari",
             # Broadcast / studio audio
             ".wav", ".aif", ".aiff",
             # Consumer / archival audio
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+            ".wma", ".caf",
         }
 
         # Collect source directories BEFORE removing anything so we don't
@@ -2506,15 +2510,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  font=FB, bg=SURF, fg=SUB).pack(side="left")
         self._btn(ah, "REMOVE UNASSIGNED",
                   self._aaf_remove_unassigned_sources, small=True).pack(side="right")
+        self._btn(ah, "SYNC ALL",
+                  self._aaf_sync_all, small=True).pack(side="right", padx=(0, 4))
 
         # Column headers
         col_hdr = tk.Frame(assign_frame, bg=SURF)
         col_hdr.pack(fill="x", padx=12, pady=(2, 0))
         tk.Label(col_hdr, text="VIDEO FILE", font=FB, bg=SURF, fg=SUB,
-                 width=44, anchor="w").pack(side="right")
+                 width=40, anchor="w").pack(side="right")
         tk.Label(col_hdr, text="PT TRACK", font=FB, bg=SURF, fg=SUB,
-                 width=16, anchor="w").pack(side="right", padx=(4, 0))
-        tk.Label(col_hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
                  width=14, anchor="w").pack(side="right", padx=(4, 0))
         tk.Label(col_hdr, text="\u2715", font=FB, bg=SURF, fg=SUB,
                  width=3).pack(side="right", padx=(4, 0))
@@ -2523,12 +2527,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._aaf_assign_frame = tk.Frame(assign_frame, bg=SURF)
         self._aaf_assign_frame.pack(fill="x", padx=12, pady=(0,10))
-        self._aaf_source_file_vars      = {}   # base -> StringVar  (video filename)
-        self._aaf_source_sync_vars      = {}   # base -> BooleanVar (sync applied flag)
-        self._aaf_source_syncaudio_vars = {}   # base -> StringVar  (ref audio path)
-        self._aaf_source_offset_vars    = {}   # base -> StringVar  (offset seconds)
-        self._aaf_source_sync_label_vars= {}   # base -> StringVar  (button display text)
-        self._aaf_sync_btns             = {}   # base -> Button widget (current rebuild)
+        self._aaf_source_file_vars        = {}   # base -> StringVar  (video filename)
+        self._aaf_source_sync_vars        = {}   # base -> BooleanVar (sync applied flag)
+        self._aaf_source_syncaudio_vars   = {}   # base -> StringVar  (ref audio full path)
+        self._aaf_source_audio_disp_vars  = {}   # base -> StringVar  (ref audio basename for dropdown)
+        self._aaf_source_offset_vars      = {}   # base -> StringVar  (offset seconds)
+        self._aaf_source_sync_label_vars  = {}   # base -> StringVar  (button display text)
+        self._aaf_sync_btns               = {}   # base -> Button widget (current rebuild)
 
         self._rebuild_aaf_source_rows()
 
@@ -2585,7 +2590,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             w.destroy()
         self._aaf_sync_btns = {}   # stale widget refs — repopulated below
 
-        options   = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        options      = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        aud_options  = ["— no audio —"] + [basename(p) for p in self._aaf_audio_paths]
+        aud_by_name  = {basename(p): p for p in self._aaf_audio_paths}
+
         vid_fns   = [basename(p) for p in self._aaf_video_paths]
         vid_color = {fn: self._ASSIGN_PALETTE[i % len(self._ASSIGN_PALETTE)]
                      for i, fn in enumerate(vid_fns)}
@@ -2593,26 +2601,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         def _row_bg(sv_val):
             return vid_color.get(sv_val, self._UNASSIGNED_ROW)
 
-        def _apply_color(container, row, color):
+        def _apply_color(container, color):
             container.config(bg=color)
-            row.config(bg=color)
-            for w in row.winfo_children():
+            def _recurse(w):
                 if hasattr(w, "set_bg"):
                     w.set_bg(color)
                 else:
                     try:    w.config(bg=color)
                     except: pass
+                for child in w.winfo_children():
+                    _recurse(child)
+            _recurse(container)
 
         for base in self._aaf_sources:
-            # ── Per-source StringVars (survive rebuilds) ──────────────────────
+            # ── Persistent vars (survive rebuilds) ────────────────────────────
             if base not in self._aaf_source_file_vars:
-                self._aaf_source_file_vars[base] = tk.StringVar(value="— no video —")
+                self._aaf_source_file_vars[base]      = tk.StringVar(value="— no video —")
             if base not in self._aaf_source_sync_vars:
-                self._aaf_source_sync_vars[base] = tk.BooleanVar(value=False)
+                self._aaf_source_sync_vars[base]      = tk.BooleanVar(value=False)
             if base not in self._aaf_source_syncaudio_vars:
                 self._aaf_source_syncaudio_vars[base] = tk.StringVar(value="")
             if base not in self._aaf_source_offset_vars:
-                self._aaf_source_offset_vars[base] = tk.StringVar(value="0.000")
+                self._aaf_source_offset_vars[base]    = tk.StringVar(value="0.000")
             if base not in self._aaf_source_sync_label_vars:
                 self._aaf_source_sync_label_vars[base] = tk.StringVar(value="")
 
@@ -2620,47 +2630,102 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if sv.get() not in options:
                 sv.set("— no video —")
 
-            # ── Row ───────────────────────────────────────────────────────────
+            # ── Audio display var — recreated fresh each rebuild to avoid ──────
+            # stale trace accumulation.  Derives initial value from the
+            # full-path var (which persists across rebuilds).
+            cur_full = self._aaf_source_syncaudio_vars[base].get()
+            cur_bn   = basename(cur_full) if cur_full else ""
+            init_disp = cur_bn if cur_bn else "— no audio —"
+            aud_disp  = tk.StringVar(value=init_disp)
+            self._aaf_source_audio_disp_vars[base] = aud_disp
+
+            # ── Container ─────────────────────────────────────────────────────
             bg = _row_bg(sv.get())
-            container = tk.Frame(self._aaf_assign_frame, bg=bg)
+            container = tk.Frame(self._aaf_assign_frame, bg=bg,
+                                 highlightbackground=BORDER, highlightthickness=1)
             container.pack(fill="x", pady=2)
 
-            row = tk.Frame(container, bg=bg)
-            row.pack(fill="x")
+            # ── Row 1: source name + video assignment ─────────────────────────
+            row1 = tk.Frame(container, bg=bg)
+            row1.pack(fill="x", padx=6, pady=(4, 0))
 
             # ✕ remove (far right)
-            rm_lbl = tk.Label(row, text=" \u2715 ", font=FB, bg=bg, fg=SUB,
+            rm_lbl = tk.Label(row1, text=" \u2715 ", font=FB, bg=bg, fg=SUB,
                               cursor="hand2", width=3)
             rm_lbl.pack(side="right")
             rm_lbl.bind("<Button-1>",
                         lambda e, b=base, c=container: self._aaf_remove_source(b, c))
 
-            # SYNC button
-            sync_btn = self._btn(row, "SYNC",
-                                 lambda b=base: self._aaf_do_sync(b),
-                                 small=True)
-            sync_btn.pack(side="right", padx=(6, 0))
-            self._aaf_sync_btns[base] = sync_btn
-            self._aaf_refresh_sync_btn(base, sync_btn)
-
             # Video dropdown
-            _FlatDropdown(row, textvariable=sv, values=options,
-                          state="readonly", font=FB, width=44).pack(side="right")
+            _FlatDropdown(row1, textvariable=sv, values=options,
+                          state="readonly", font=FB, width=40).pack(side="right")
 
             # PT track label
             tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
-            tk.Label(row, text=tracks_str, font=FB, bg=bg, fg=SUB,
-                     width=16, anchor="w").pack(side="right", padx=(4, 0))
+            tk.Label(row1, text=tracks_str, font=FB, bg=bg, fg=SUB,
+                     width=14, anchor="w").pack(side="right", padx=(4, 0))
 
             # Source name (expands)
-            name_lbl = tk.Label(row, text=base, font=FB, bg=bg, fg=TEXT, anchor="w")
+            name_lbl = tk.Label(row1, text=base, font=FB, bg=bg, fg=TEXT, anchor="w")
             name_lbl.pack(side="left", fill="x", expand=True)
             self._tooltip(name_lbl, base)
 
-            # ── Live color update when dropdown changes ────────────────────────
-            def _on_change(*args, c=container, r=row, s=sv):
-                _apply_color(c, r, _row_bg(s.get()))
-            sv.trace_add("write", _on_change)
+            # ── Row 2: sync — apply checkbox + ref audio dropdown + SYNC btn ──
+            row2 = tk.Frame(container, bg=bg)
+            row2.pack(fill="x", padx=6, pady=(2, 4))
+
+            # SYNC button (right-pinned; shows offset result)
+            sync_btn = self._btn(row2, "SYNC",
+                                 lambda b=base: self._aaf_do_sync(b),
+                                 small=True)
+            sync_btn.pack(side="right", padx=(4, 0))
+            self._aaf_sync_btns[base] = sync_btn
+            self._aaf_refresh_sync_btn(base, sync_btn)
+
+            # "↳" indent
+            tk.Label(row2, text="\u21b3", font=FB, bg=bg, fg=SUB).pack(side="left")
+
+            # "apply sync" checkbox
+            ck = tk.Checkbutton(row2,
+                                variable=self._aaf_source_sync_vars[base],
+                                text="apply sync", font=FB, bg=bg, fg=SUB,
+                                activebackground=bg, activeforeground=TEXT,
+                                selectcolor=BG, relief="flat", bd=0,
+                                cursor="hand2")
+            ck.pack(side="left", padx=(2, 8))
+
+            # Reference audio dropdown (fills remaining space)
+            aud_dd = _FlatDropdown(row2, textvariable=aud_disp,
+                                   values=aud_options,
+                                   state="readonly", font=FB, width=36)
+            aud_dd.pack(side="left", fill="x", expand=True)
+
+            # ── Live color update when video dropdown changes ──────────────────
+            # Remove any stale traces from previous rebuilds before adding a new one.
+            for _tr in list(sv.trace_info()):
+                if _tr[0] == "write":
+                    try: sv.trace_remove("write", _tr[1])
+                    except Exception: pass
+            def _on_vid_change(*args, c=container, s=sv):
+                _apply_color(c, _row_bg(s.get()))
+            sv.trace_add("write", _on_vid_change)
+
+            # ── Audio dropdown → full-path var + sync label reset ─────────────
+            # aud_disp is recreated each rebuild so no old traces exist.
+            # Look up the full path dynamically from the live pool so the trace
+            # is never stale regardless of when audio files were added.
+            def _on_aud_change(*args, b=base, dv=aud_disp):
+                fn   = dv.get()
+                full = {basename(p): p for p in self._aaf_audio_paths}.get(fn, "")
+                self._aaf_source_syncaudio_vars[b].set(full)
+                # Clear stale sync result so user knows a re-SYNC is needed
+                lv = self._aaf_source_sync_label_vars.get(b)
+                if lv and lv.get():
+                    lv.set("")
+                    btn = self._aaf_sync_btns.get(b)
+                    if btn:
+                        self._aaf_refresh_sync_btn(b, btn)
+            aud_disp.trace_add("write", _on_aud_change)
 
         self._aaf_auto_match()
 
@@ -2696,7 +2761,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     result = subprocess.run(
                         ["ffprobe", "-v", "quiet", "-print_format", "json",
                          "-show_streams", vp],
-                        capture_output=True, text=True, timeout=10)
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
                     info = _json.loads(result.stdout)
                     for stream in info.get("streams", []):
                         if stream.get("codec_type") != "video":
@@ -2743,25 +2808,54 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             pass   # ffprobe not available or thread error — leave FPS as typed
 
     def _aaf_auto_match(self):
-        """Auto-assign video files to unassigned sources by name similarity."""
-        if not self._aaf_video_paths:
+        """Auto-assign video AND reference audio files to unassigned sources."""
+        vid_options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
+
+        for base in self._aaf_sources:
+            # Video auto-match (never override a manual assignment)
+            sv = self._aaf_source_file_vars.get(base)
+            if sv and sv.get() == "— no video —" and self._aaf_video_paths:
+                vp = match_source_to_video(base, self._aaf_video_paths)
+                if vp:
+                    fn = basename(vp)
+                    if fn in vid_options:
+                        sv.set(fn)
+
+            # Audio auto-match (never override a manual assignment)
+            aud_disp = self._aaf_source_audio_disp_vars.get(base)
+            full_var = self._aaf_source_syncaudio_vars.get(base)
+            if (aud_disp and full_var
+                    and aud_disp.get() == "— no audio —"
+                    and self._aaf_audio_paths):
+                ap = match_source_to_video(base, self._aaf_audio_paths)
+                if ap:
+                    fn = basename(ap)
+                    if fn in aud_by_name:
+                        # Set display var; the trace will update the full-path var
+                        aud_disp.set(fn)
+
+    def _aaf_sync_all(self):
+        """Run sync detection for every source that has a video AND reference audio assigned."""
+        sources_to_sync = [
+            base for base in self._aaf_sources
+            if (self._aaf_source_file_vars.get(base, tk.StringVar()).get() != "— no video —"
+                and self._aaf_source_audio_disp_vars.get(base, tk.StringVar()).get() != "— no audio —")
+        ]
+        if not sources_to_sync:
+            messagebox.showwarning("Nothing to sync",
+                "Assign both a video file and a reference audio file to at least one source.")
             return
-        options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
-        for base, sv in self._aaf_source_file_vars.items():
-            if sv.get() != "— no video —":
-                continue  # never override a manual assignment
-            vp = match_source_to_video(base, self._aaf_video_paths)
-            if vp:
-                fn = basename(vp)
-                if fn in options:
-                    sv.set(fn)
+        for base in sources_to_sync:
+            self._aaf_do_sync(base)
 
     def _aaf_remove_source(self, base, container):
         """Remove one source from the assignment list (does not affect the AAF parse)."""
         if base in self._aaf_sources:
             self._aaf_sources.remove(base)
         for d in (self._aaf_source_file_vars, self._aaf_source_sync_vars,
-                  self._aaf_source_syncaudio_vars, self._aaf_source_offset_vars):
+                  self._aaf_source_syncaudio_vars, self._aaf_source_audio_disp_vars,
+                  self._aaf_source_offset_vars):
             d.pop(base, None)
         container.destroy()
 
@@ -2784,7 +2878,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for base in to_remove:
             self._aaf_sources.remove(base)
             for d in (self._aaf_source_file_vars, self._aaf_source_sync_vars,
-                      self._aaf_source_syncaudio_vars, self._aaf_source_offset_vars):
+                      self._aaf_source_syncaudio_vars, self._aaf_source_audio_disp_vars,
+                      self._aaf_source_offset_vars):
                 d.pop(base, None)
         self._rebuild_aaf_source_rows()
 
@@ -2797,26 +2892,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         elif text.startswith("\u2713"):          # ✓ green
             btn.config(text=text, fg=SUCCESS)
         elif text.startswith("\u26a0"):          # ⚠ orange or red
-            clr = "#e05050" if "no match" in text else "#e0a030"
+            # "verify ref audio!" means a large (suspicious) offset was detected
+            clr = "#e05050" if ("no match" in text or "verify ref" in text) else "#e0a030"
             btn.config(text=text, fg=clr)
         else:
             btn.config(text=text, fg=SUB)
 
     def _aaf_do_sync(self, base):
-        """One-click sync: auto-match reference audio then detect offset."""
+        """Run sync detection for this source using the selected reference audio."""
         btn = self._aaf_sync_btns.get(base)
 
-        # Auto-match reference audio from pool if not already set
+        # The reference audio is whatever the user has selected in the dropdown.
+        # If nothing is selected yet, try one last auto-match.
         audio_var = self._aaf_source_syncaudio_vars.get(base)
+        aud_disp  = self._aaf_source_audio_disp_vars.get(base)
         if audio_var and not audio_var.get() and self._aaf_audio_paths:
-            matched = match_source_to_video(base, self._aaf_audio_paths)
-            if matched:
-                audio_var.set(matched)
+            ap = match_source_to_video(base, self._aaf_audio_paths)
+            if ap:
+                audio_var.set(ap)
+                if aud_disp:
+                    aud_disp.set(basename(ap))
 
         if not audio_var or not audio_var.get():
             messagebox.showwarning("No Reference Audio",
-                "Add reference audio files to the pool first.\n"
-                "PostBridge will match them to sources by name.")
+                "Select a reference audio file for this source using the dropdown,\n"
+                "or add audio files to the reference audio pool.")
             return
 
         # Validate video assignment
@@ -2837,12 +2937,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Reference audio file not found:\n{}".format(ap))
             return
 
+        # Always probe from the start of both files.  Each source is its own
+        # video + audio pair, so there's no reason to seek — the beginning of
+        # both recordings is where the overlap lives.
+        start_offset = 0.0
+
         # Disable button while running
         if btn:
             btn.config(text="SYNCING\u2026", state="disabled", fg=SUB)
 
+        _ap_basename = basename(ap)
+
         def _run():
-            return detect_sync_offset(vp, ap)
+            return detect_sync_offset(vp, ap, probe_duration=300.0,
+                                         start_offset=start_offset)
 
         def _done(fut):
             try:
@@ -2866,7 +2974,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     sync_var.set(True)
 
                 pct = int(confidence * 100)
-                if confidence >= 0.5:
+                # Large offsets (>10 s) are almost always wrong-reference-file
+                # matches — flag them distinctly regardless of confidence.
+                large = abs(offset) > 10.0
+                if large:
+                    lbl = "\u26a0 {:.3f}s ({:d}%)  — verify ref audio!".format(offset, pct)
+                elif confidence >= 0.5:
                     lbl = "\u2713 {:.3f}s ({:d}%)".format(offset, pct)
                 elif confidence >= 0.25:
                     lbl = "\u26a0 {:.3f}s ({:d}%)".format(offset, pct)
@@ -2879,6 +2992,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     btn.config(state="normal")
                     self._aaf_refresh_sync_btn(base, btn)
 
+                # Open the sync preview dialog so the user can verify / adjust.
+                self._aaf_open_sync_preview(base, vp, ap, offset)
+
             self.after(0, _apply)
 
         from concurrent.futures import ThreadPoolExecutor
@@ -2886,6 +3002,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         fut = ex.submit(_run)
         fut.add_done_callback(_done)
         ex.shutdown(wait=False)
+
+    # ── Sync Preview ────────────────────────────────────────────────────────
+
+    def _aaf_open_sync_preview(self, base, video_path, audio_path, offset):
+        """Open the waveform sync-preview dialog for manual verification."""
+        def _on_accept(accepted_offset):
+            ov = self._aaf_source_offset_vars.get(base)
+            if ov:
+                ov.set("{:.3f}".format(accepted_offset))
+            sv = self._aaf_source_sync_vars.get(base)
+            if sv:
+                sv.set(True)
+            lv = self._aaf_source_sync_label_vars.get(base)
+            if lv:
+                lv.set("\u2713 {:.3f}s (manual)".format(accepted_offset))
+            btn = self._aaf_sync_btns.get(base)
+            if btn:
+                self._aaf_refresh_sync_btn(base, btn)
+
+        SyncPreviewDialog(
+            self, video_path, audio_path,
+            initial_offset=offset,
+            on_accept=_on_accept,
+            source_name=base)
 
     # ── Reference-audio pool ─────────────────────────────────────────────────
 
@@ -2946,6 +3086,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         n = len(self._aaf_audio_paths)
         self._aaf_audio_count_lbl.config(
             text="{} file{}".format(n, "s" if n != 1 else ""))
+        # Rebuild source rows so audio dropdowns include the new files
+        # and auto-match can populate unassigned rows.
+        if hasattr(self, "_aaf_assign_frame"):
+            self._rebuild_aaf_source_rows()
 
     # ── Video pool ───────────────────────────────────────────────────────────
 
@@ -3156,11 +3300,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if base in self._aaf_source_file_vars and fn in options:
                 self._aaf_source_file_vars[base].set(fn)
 
+        aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
         for base, sd in data.get("sync", {}).items():
             if base in self._aaf_source_sync_vars:
                 self._aaf_source_sync_vars[base].set(sd.get("enabled", False))
             if base in self._aaf_source_syncaudio_vars:
-                self._aaf_source_syncaudio_vars[base].set(sd.get("audio_path", ""))
+                full = sd.get("audio_path", "")
+                self._aaf_source_syncaudio_vars[base].set(full)
+                # Populate display var so the dropdown shows the filename
+                bn = basename(full) if full else ""
+                if base not in self._aaf_source_audio_disp_vars:
+                    self._aaf_source_audio_disp_vars[base] = tk.StringVar()
+                self._aaf_source_audio_disp_vars[base].set(
+                    bn if bn in aud_by_name else ("— no audio —" if not bn else bn))
             if base in self._aaf_source_offset_vars:
                 self._aaf_source_offset_vars[base].set(sd.get("offset", "0.000"))
             if base in self._aaf_source_sync_label_vars:
@@ -3313,6 +3465,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._aaf_build_progress(55, "Probing media settings\u2026")
                 seq_w, seq_h, fps_det, _sr = engines.probe_media_settings(vpaths)
                 # Don't auto-override FPS — user set it explicitly
+
+            self._aaf_build_progress(70, "Writing diagnostic report\u2026")
+            try:
+                diag_path = engines.write_build_diagnostic(
+                    clips_with_media, fps, seq_w, seq_h, sr)
+                print("Diagnostic report: {}".format(diag_path))
+            except Exception as diag_exc:
+                print("Diagnostic report failed: {}".format(diag_exc))
 
             self._aaf_build_progress(80, "Building XML\u2026")
             xmeml = engines.build_xml_from_pt(

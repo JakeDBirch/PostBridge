@@ -547,8 +547,10 @@ class MediaPool(tk.Frame):
             title="Select episode media files",
             filetypes=[("Media",
                         "*.mp4 *.mov *.mxf *.avi *.mkv *.m4v *.webm "
-                        "*.wav *.aif *.aiff *.mp3 *.m4a *.aac *.flac *.ogg *.opus "
-                        "*.MP4 *.MOV *.MXF *.M4V *.WAV *.MP3 *.M4A *.FLAC"),
+                        "*.wmv *.mpg *.mpeg *.ts *.mts *.m2ts "
+                        "*.flv *.ogv *.3gp *.dv *.r3d *.braw *.ari "
+                        "*.wav *.aif *.aiff *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.wma *.caf "
+                        "*.MP4 *.MOV *.MXF *.M4V *.WMV *.WAV *.MP3 *.M4A *.FLAC *.WMA"),
                        ("All","*.*")])
         for p in paths: self._add(p)
 
@@ -559,10 +561,13 @@ class MediaPool(tk.Frame):
         EXTS = {
             # Professional / camera formats
             ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v", ".webm",
+            ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts",
+            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari",
             # Broadcast / studio audio
             ".wav", ".aif", ".aiff",
             # Consumer / archival audio
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+            ".wma", ".caf",
         }
         for root, _, files in os.walk(folder):
             for fn in sorted(files):

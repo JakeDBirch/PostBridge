@@ -45,6 +45,8 @@ SUCCESS = "#5aab61"   # muted green
 WARN    = "#e8a020"   # amber
 ERR     = "#d94040"   # red
 INFO    = "#e05c00"   # same as accent
+WAVE_REF = "#20a080"  # teal — reference audio waveform
+WAVE_VID = "#e05c00"  # orange — video embedded audio waveform
 
 # Font stack: Segoe UI on Windows, SF Pro on macOS, fallback to Helvetica
 _SANS = "Segoe UI" if sys.platform == "win32" else (

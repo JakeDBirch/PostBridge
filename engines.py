@@ -42,6 +42,14 @@ def _ffprobe_cmd():
         return ["ffprobe"]
 
 
+def snap_fps(f):
+    for std in (23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0,
+                50.0, 59.94, 60.0):
+        if abs(f - std) < 0.1:
+            return std
+    return f if f > 0 else 24.0
+
+
 def check_ffmpeg():
     """
     Ensure ffmpeg/ffprobe are available (system or auto-downloaded). Return (True, "") if ready.
@@ -71,7 +79,7 @@ def extract_window(media_path, start_s, end_s, out_path):
         out_path
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+        r = subprocess.run(cmd, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
         if r.returncode == 0:
             return True, None
         err = (r.stderr or r.stdout or "").strip()
@@ -90,7 +98,7 @@ def extract_window(media_path, start_s, end_s, out_path):
                 "-vn",
                 out_path
             ]
-            r2 = subprocess.run(cmd2, capture_output=True, timeout=60, text=True)
+            r2 = subprocess.run(cmd2, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
             if r2.returncode == 0:
                 return True, None
             err = (r2.stderr or r2.stdout or "").strip() or err
@@ -102,12 +110,60 @@ def extract_window(media_path, start_s, end_s, out_path):
     except Exception as e:
         return False, str(e)
 
+def extract_mono_pcm(media_path, sample_rate=8000):
+    """
+    Extract full mono audio from *media_path* as a numpy float32 array
+    normalised to [-1, 1].  Pipes raw PCM from ffmpeg — no temp file needed.
+
+    Returns a 1-D numpy float32 array, or raises RuntimeError on failure.
+    """
+    import numpy as _np
+    cmd = _ffmpeg_cmd() + [
+        "-i", media_path,
+        "-ac", "1", "-ar", str(sample_rate),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-vn", "pipe:1",
+    ]
+    r = subprocess.run(cmd, capture_output=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg failed extracting PCM from {}:\n{}".format(
+                os.path.basename(media_path),
+                r.stderr.decode(errors="replace")[-400:]))
+    return _np.frombuffer(r.stdout, _np.int16).astype(_np.float32) / 32768.0
+
+
+def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
+                          sample_rate=16000):
+    """
+    Extract a short audio segment to a WAV file for playback preview.
+
+    Returns True on success, raises RuntimeError on failure.
+    """
+    cmd = _ffmpeg_cmd() + [
+        "-y",
+        "-ss", "{:.3f}".format(max(0.0, start_s)),
+        "-t", "{:.3f}".format(duration_s),
+        "-i", media_path,
+        "-ar", str(sample_rate), "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "-vn", out_wav_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg failed extracting segment from {}:\n{}".format(
+                os.path.basename(media_path),
+                r.stderr.decode(errors="replace")[-400:]))
+    return True
+
+
 def get_media_duration(path):
     try:
         r = subprocess.run(
             _ffprobe_cmd() + ["-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         return float(r.stdout.strip())
     except Exception:
         return None
@@ -119,7 +175,7 @@ def get_audio_channels(path):
              "-select_streams", "a:0",
              "-show_entries", "stream=channels",
              "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         val = r.stdout.strip()
         return int(val) if val.isdigit() else 2
     except Exception:
@@ -1313,7 +1369,7 @@ def probe_media_settings(all_paths):
                  "-select_streams", "v:0",
                  "-show_entries", "stream=width,height,r_frame_rate",
                  "-of", "csv=p=0", path],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
             for line in (r.stdout or "").strip().splitlines():
                 parts = [p.strip() for p in line.split(",") if p.strip()]
                 if len(parts) >= 3:
@@ -1332,7 +1388,7 @@ def probe_media_settings(all_paths):
                  "-select_streams", "a:0",
                  "-show_entries", "stream=sample_rate",
                  "-of", "csv=p=0", path],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
             for line in (r2.stdout or "").strip().splitlines():
                 try:
                     sr = int(line.strip())
@@ -1342,13 +1398,6 @@ def probe_media_settings(all_paths):
                     pass
         except Exception:
             pass
-
-    def snap_fps(f):
-        for std in (23.976, 24.0, 25.0, 29.97, 30.0, 47.952, 48.0,
-                    50.0, 59.94, 60.0):
-            if abs(f - std) < 0.1:
-                return std
-        return f if f > 0 else 24.0
 
     return (
         best_w   if best_w  > 0 else 1280,
@@ -1689,6 +1738,129 @@ def write_xml(xmeml, out_path):
         f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n')
         f.write(buf.getvalue())
 
+def _probe_file_fps(path):
+    """Return (r_frame_rate_str, avg_frame_rate_str, fps_float) for a video file."""
+    if not path or not os.path.isfile(path):
+        return ("n/a", "n/a", 0.0)
+    try:
+        r = subprocess.run(
+            _ffprobe_cmd() + ["-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+        parts = [p.strip() for p in (r.stdout or "").strip().split(",") if p.strip()]
+        rfr = parts[0] if len(parts) >= 1 else "n/a"
+        afr = parts[1] if len(parts) >= 2 else "n/a"
+        try:
+            num, den = rfr.split("/")
+            fps_f = int(num) / int(den)
+        except Exception:
+            fps_f = 0.0
+        return (rfr, afr, fps_f)
+    except Exception:
+        return ("error", "error", 0.0)
+
+
+def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
+                           out_path=None):
+    """Write a diagnostic report of all data flowing into build_xml_from_pt."""
+    import datetime
+    if out_path is None:
+        out_path = os.path.join(os.path.expanduser("~"), "Downloads",
+                                "postbridge_build_diagnostic.txt")
+    fps = seq_fps
+    lines = []
+    lines.append("=" * 80)
+    lines.append("PostBridge Build Diagnostic Report")
+    lines.append("Generated: {}".format(datetime.datetime.now().isoformat()))
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("SEQUENCE SETTINGS")
+    lines.append("  fps:         {}".format(fps))
+    lines.append("  resolution:  {}x{}".format(seq_w, seq_h))
+    lines.append("  sample_rate: {}".format(seq_sr))
+    lines.append("")
+
+    # Collect unique video and audio files
+    video_files = sorted(set(c.get("video_path", "") for c in clips_with_media if c.get("video_path")))
+    audio_files = sorted(set(c.get("audio_path", "") for c in clips_with_media if c.get("audio_path")))
+
+    lines.append("VIDEO FILES (native fps)")
+    lines.append("-" * 80)
+    for vp in video_files:
+        rfr, afr, fps_f = _probe_file_fps(vp)
+        snapped = snap_fps(fps_f) if fps_f > 0 else "n/a"
+        match = "OK" if abs(fps_f - fps) < 0.05 else "** MISMATCH **"
+        lines.append("  {}".format(os.path.basename(vp)))
+        lines.append("    r_frame_rate:   {} ({:.4f} fps)".format(rfr, fps_f))
+        lines.append("    avg_frame_rate: {}".format(afr))
+        lines.append("    snapped:        {}".format(snapped))
+        lines.append("    vs sequence:    {} (seq={})".format(match, fps))
+    lines.append("")
+
+    lines.append("AUDIO FILES (reference)")
+    lines.append("-" * 80)
+    for ap in audio_files:
+        lines.append("  {}".format(os.path.basename(ap)))
+    lines.append("")
+
+    # Per-source summary
+    lines.append("PER-SOURCE SYNC OFFSETS")
+    lines.append("-" * 80)
+    seen_sources = {}
+    for clip in clips_with_media:
+        base = clip.get("source_base", clip.get("clip_name", "?"))
+        if base in seen_sources:
+            continue
+        seen_sources[base] = True
+        v_offset = clip.get("video_offset_secs", 0.0)
+        vp = clip.get("video_path", "")
+        ap = clip.get("audio_path", "")
+        lines.append("  Source: {}".format(base))
+        lines.append("    video:      {}".format(os.path.basename(vp) if vp else "NONE"))
+        lines.append("    ref audio:  {}".format(os.path.basename(ap) if ap else "NONE"))
+        lines.append("    v_offset:   {:.6f} s".format(v_offset))
+    lines.append("")
+
+    # First 20 clips detail
+    lines.append("CLIP DETAIL (first 50 clips)")
+    lines.append("-" * 80)
+    sorted_clips = sorted(clips_with_media, key=lambda c: c["start_secs"])
+    for i, clip in enumerate(sorted_clips[:50]):
+        base     = clip.get("source_base", clip.get("clip_name", "?"))
+        v_offset = clip.get("video_offset_secs", 0.0)
+        src_in_s = clip.get("src_in_secs", clip["start_secs"])
+        src_out_s = clip.get("src_out_secs", src_in_s + (clip["end_secs"] - clip["start_secs"]))
+        a_src_in  = f2fr(src_in_s, fps)
+        v_src_in  = max(0, f2fr(src_in_s - v_offset, fps))
+        a_src_out = f2fr(src_out_s, fps)
+        v_src_out = max(0, f2fr(src_out_s - v_offset, fps))
+        vp = clip.get("video_path", "")
+        ap = clip.get("audio_path", "")
+
+        lines.append("  [{:3d}] {}".format(i, base))
+        lines.append("        timeline:     {:.3f}s - {:.3f}s".format(
+            clip["start_secs"], clip["end_secs"]))
+        lines.append("        src_in:       {:.6f}s  (audio frame {})".format(src_in_s, a_src_in))
+        lines.append("        v_offset:     {:.6f}s".format(v_offset))
+        lines.append("        v_src_in:     {:.6f}s  (video frame {})".format(
+            src_in_s - v_offset, v_src_in))
+        lines.append("        a_src_in fr:  {}   v_src_in fr: {}   delta fr: {}".format(
+            a_src_in, v_src_in, v_src_in - a_src_in))
+        lines.append("        video file:   {}".format(os.path.basename(vp) if vp else "NONE"))
+        lines.append("        audio file:   {}".format(os.path.basename(ap) if ap else "NONE"))
+        if vp:
+            _, _, vfps = _probe_file_fps(vp)
+            lines.append("        video native: {:.4f} fps  (seq: {})".format(vfps, fps))
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("END OF REPORT")
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return out_path
+
+
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000):
     fps     = seq_fps
@@ -1706,11 +1878,19 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         clip_dur_s = clip["end_secs"] - clip["start_secs"]
         src_in_s   = clip.get("src_in_secs", clip["start_secs"])
         src_out_s  = clip.get("src_out_secs", src_in_s + clip_dur_s)
-        src_in     = f2fr(src_in_s  + v_offset, fps)
-        src_out    = f2fr(src_out_s + v_offset, fps)
         dur_fr   = end_fr - start_fr
         if dur_fr <= 0:
             continue
+
+        # Audio uses the reference-audio src position directly (no camera offset).
+        # Video subtracts v_offset to correct the camera-to-recorder sync, clamped ≥ 0.
+        a_src_in  = f2fr(src_in_s,  fps)
+        a_src_out = f2fr(src_out_s, fps)
+        v_src_in  = max(0, f2fr(src_in_s  - v_offset, fps))
+        v_src_out = max(0, f2fr(src_out_s - v_offset, fps))
+        # If clamping collapsed the video window, push out by clip duration
+        if v_src_out <= v_src_in:
+            v_src_out = v_src_in + dur_fr
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
@@ -1721,7 +1901,7 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             first = fid not in defined
             if first: defined.add(fid)
             ci = _make_clipitem(cid, fid, vp, start_fr, end_fr,
-                                src_in, src_out, fps,
+                                v_src_in, v_src_out, fps,
                                 True, first, seq_w, seq_h, seq_sr)
             v_tracks[tn].append(ci)
 
@@ -1731,7 +1911,7 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             first = fid not in defined
             if first: defined.add(fid)
             ci = _make_clipitem(cid, fid, ap, start_fr, end_fr,
-                                src_in, src_out, fps,
+                                a_src_in, a_src_out, fps,
                                 False, first, seq_w, seq_h, seq_sr)
             a_tracks[tn].append(ci)
 

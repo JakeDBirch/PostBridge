@@ -337,16 +337,30 @@ def match_source_to_video(source_base, video_paths):
     • For longer video filenames: Jaccard word overlap (same as
       match_pt_clip_to_media), good for descriptive names like 'Eddie_Alday'.
 
-    Only tokens of 4+ characters are considered significant to avoid false
-    positives from short date components ('05', '21', etc.).
+    Significant tokens are:
+    • Any alphanumeric token of 4+ characters
+    • Pure numeric tokens (1, 2, 3 …) — distinguishes "Take 1" from "Take 2"
+    • Roman-numeral tokens i–xii — distinguishes "Part I" from "Part III"
 
     Returns the best matching path, or None if no confident match found.
     """
     import re as _re
 
+    # Standalone roman numerals that are worth distinguishing as ordinals.
+    # Single-char 'i', 'v', 'x' are included because in file names they almost
+    # always appear as ordinals ("Part I", "Episode V") rather than as letters.
+    _ROMAN = frozenset({
+        'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix',
+        'x', 'xi', 'xii',
+    })
+
     def _sig_words(text):
-        """Lowercase alphanumeric tokens of 4+ characters."""
-        return {w for w in _re.findall(r'[a-z0-9]+', text.lower()) if len(w) >= 4}
+        """Lowercase alphanumeric tokens that are 4+ chars, pure digits, or roman numerals."""
+        result = set()
+        for w in _re.findall(r'[a-z0-9]+', text.lower()):
+            if len(w) >= 4 or w.isdigit() or w in _ROMAN:
+                result.add(w)
+        return result
 
     src_sig = _sig_words(source_base)
     if not src_sig:
@@ -379,7 +393,8 @@ def match_source_to_video(source_base, video_paths):
     return best_path if best_score >= 0.5 else None
 
 
-def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=8000):
+def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=8000,
+                       start_offset=0.0):
     """
     Detect the sync offset between a video file's embedded audio and a reference
     audio file using FFT-based cross-correlation.
@@ -392,6 +407,10 @@ def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=
 
     confidence: z-score of the correlation peak relative to the noise floor,
       scaled so that ~20 sigma = 1.0.  Values ≥ 0.5 are reliable.
+
+    start_offset: seek both files to this position (seconds) before probing.
+      Use this for clips that are deep into a long recording so the cross-
+      correlation is run against the correct section of the file.
 
     Requires ffmpeg in PATH and numpy.
     """
@@ -406,20 +425,27 @@ def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=
             "numpy is required for sync detection.\n"
             "Run:  pip install numpy")
 
+    # Build a safe seek prefix: seek slightly before the target to avoid
+    # landing on a keyframe boundary, then let ffmpeg trim to exact position.
+    seek_s = max(0.0, start_offset - 2.0)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         vid_wav = os.path.join(tmpdir, "vid.wav")
         ref_wav = os.path.join(tmpdir, "ref.wav")
 
         # Force 16-bit signed PCM output so _read_wav always gets the same format
         for src, dst in ((video_path, vid_wav), (audio_path, ref_wav)):
-            r = _sp.run(
-                ["ffmpeg", "-y",
-                 "-t", str(probe_duration),
-                 "-i", src,
-                 "-ac", "1", "-ar", str(sample_rate),
-                 "-acodec", "pcm_s16le",
-                 "-vn", dst],
-                capture_output=True, timeout=60)
+            cmd = ["ffmpeg", "-y"]
+            if seek_s > 0:
+                cmd += ["-ss", "{:.3f}".format(seek_s)]
+            cmd += [
+                "-t", str(probe_duration + max(0.0, start_offset - seek_s) + 2.0),
+                "-i", src,
+                "-ac", "1", "-ar", str(sample_rate),
+                "-acodec", "pcm_s16le",
+                "-vn", dst,
+            ]
+            r = _sp.run(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 raise RuntimeError(
                     "ffmpeg failed extracting audio from {}:\n{}".format(
@@ -431,8 +457,19 @@ def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=
                 data = w.readframes(w.getnframes())
             return _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
 
-        a = _read_wav(vid_wav)   # video embedded audio
-        b = _read_wav(ref_wav)   # reference (session / recorder) audio
+        a_full = _read_wav(vid_wav)   # video embedded audio
+        b_full = _read_wav(ref_wav)   # reference (session / recorder) audio
+
+    # When a start_offset was requested, trim the pre-roll we extracted so
+    # both arrays start at the requested offset position.
+    trim = int((start_offset - seek_s) * sample_rate)
+    a = a_full[trim:] if trim > 0 else a_full
+    b = b_full[trim:] if trim > 0 else b_full
+
+    # Keep only probe_duration worth of samples
+    n_probe = int(probe_duration * sample_rate)
+    a = a[:n_probe]
+    b = b[:n_probe]
 
     # Skip the first 2 s of pre-roll silence (same window on both signals so
     # the relative lag is unaffected)
@@ -454,28 +491,49 @@ def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=
         return 0.0, 0.0   # one signal is essentially silent
     a /= std_a;  b /= std_b
 
-    # FFT cross-correlation: c[k] = Σ_t b[t+k]·a[t]
-    # Peak at lag k means reference (b) leads video (a) by k samples →
-    # same content appears k/sr seconds later in the video file →
-    # video_src_in = audio_src_in − k/sr  →  offset = −lag/sr.
-    n = len(a) + len(b) - 1
-    N = 1 << int(_np.ceil(_np.log2(max(n, 1))))
-    C   = _np.fft.irfft(_np.fft.rfft(b, N) * _np.conj(_np.fft.rfft(a, N)), N)[:n]
-    pk  = int(_np.argmax(_np.abs(C)))
-    lag = pk if pk < n // 2 else pk - n   # signed lag in samples
+    # --- Helper: FFT cross-correlation + z-score confidence -----------------
+    def _xcorr(x, y):
+        """Return (signed_lag_in_samples, confidence_0_to_1)."""
+        n_ = len(x) + len(y) - 1
+        N_ = 1 << int(_np.ceil(_np.log2(max(n_, 1))))
+        C_ = _np.fft.irfft(
+            _np.fft.rfft(y, N_) * _np.conj(_np.fft.rfft(x, N_)), N_)[:n_]
+        pk_ = int(_np.argmax(_np.abs(C_)))
+        lag_ = pk_ if pk_ < n_ // 2 else pk_ - n_
+        C_abs_     = _np.abs(C_)
+        noise_mean = float(_np.mean(C_abs_))
+        noise_std  = float(_np.std(C_abs_))
+        z_ = (float(C_abs_[pk_]) - noise_mean) / max(noise_std, 1e-9)
+        return lag_, min(1.0, z_ / 20.0)
 
-    # Confidence = z-score of the peak above the correlation noise floor.
-    # Cross-correlation of two independent signals has mean ≈ 0 and std that
-    # scales with sqrt(N).  A real sync peak stands many sigma above this floor
-    # even when the two mics sound quite different.
-    # We scale so z ≈ 20 → confidence 1.0; anything ≥ 10 (≥0.5) is reliable.
-    C_abs      = _np.abs(C)
-    noise_mean = float(_np.mean(C_abs))
-    noise_std  = float(_np.std(C_abs))
-    z_score    = (float(C_abs[pk]) - noise_mean) / max(noise_std, 1e-9)
-    confidence = min(1.0, z_score / 20.0)
+    # --- Method 1: Waveform cross-correlation (best for matched mics) -----
+    wf_lag, wf_conf = _xcorr(a, b)
+    wf_offset = -wf_lag / sample_rate
 
-    return -lag / sample_rate, confidence
+    # --- Method 2: Envelope cross-correlation (robust to mic differences) --
+    # Compares RMS amplitude envelopes instead of raw waveforms.  This strips
+    # away spectral differences between mics and captures only the timing of
+    # speech energy (talk vs. silence), which is identical regardless of mic
+    # quality, proximity, or room acoustics.
+    env_win = int(0.015 * sample_rate)  # 15 ms RMS window (sub-frame at 60 fps)
+    env_conf = 0.0
+    env_offset = 0.0
+    na = (len(a) // env_win) * env_win
+    nb = (len(b) // env_win) * env_win
+    if na >= env_win and nb >= env_win:
+        a_env = _np.sqrt(_np.mean(a[:na].reshape(-1, env_win) ** 2, axis=1))
+        b_env = _np.sqrt(_np.mean(b[:nb].reshape(-1, env_win) ** 2, axis=1))
+        a_env -= _np.mean(a_env);  b_env -= _np.mean(b_env)
+        std_ae = _np.std(a_env);   std_be = _np.std(b_env)
+        if std_ae > 1e-9 and std_be > 1e-9:
+            a_env /= std_ae;  b_env /= std_be
+            env_lag, env_conf = _xcorr(a_env, b_env)
+            env_offset = -env_lag * env_win / sample_rate
+
+    # Return whichever method found a stronger match.
+    if env_conf > wf_conf:
+        return env_offset, env_conf
+    return wf_offset, wf_conf
 
 
 def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=8000):
