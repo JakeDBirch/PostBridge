@@ -42,14 +42,36 @@ from gui_components import VoBin, MediaPool, _SlimScrollbar, _FlatDropdown, _Fla
 import engines
 from sync_preview import SyncPreviewDialog
 
+# Sequence preset table: (display_name, width, height, fps)
+# width/height/fps = None means "detect from media" or "custom — leave fields as-is"
+_AAF_SEQ_PRESETS = [
+    ("Detect from media",  None,  None,   None),
+    ("1080p  23.976 fps",  1920,  1080,  23.976),
+    ("1080p  24 fps",      1920,  1080,  24.0),
+    ("1080p  25 fps",      1920,  1080,  25.0),
+    ("1080p  29.97 fps",   1920,  1080,  29.97),
+    ("1080p  30 fps",      1920,  1080,  30.0),
+    ("4K UHD  23.976 fps", 3840,  2160,  23.976),
+    ("4K UHD  24 fps",     3840,  2160,  24.0),
+    ("4K UHD  25 fps",     3840,  2160,  25.0),
+    ("4K UHD  29.97 fps",  3840,  2160,  29.97),
+    ("4K UHD  30 fps",     3840,  2160,  30.0),
+    ("720p  29.97 fps",    1280,   720,  29.97),
+    ("720p  30 fps",       1280,   720,  30.0),
+    ("Custom",             None,  None,   None),
+]
+_AAF_PRESET_LOOKUP = {p[0]: p[1:] for p in _AAF_SEQ_PRESETS}
+
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PostBridge")
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.minsize(820, 600)
-        self._center(920, 800)
+        self.minsize(960, 700)
+        self._center(1440, 1000)
+        if sys.platform == "win32":
+            self.state("zoomed")   # start maximized on Windows
 
         self._init_styles()
 
@@ -73,13 +95,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._header()
         self.body = tk.Frame(self, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=36, pady=(0,28))
+        self.body.pack(fill="both", expand=True, padx=44, pady=(0,32))
         self._home()
 
     def _center(self, w, h):
         self.update_idletasks()
-        x = (self.winfo_screenwidth()  - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        # Use requested size or 85% of screen, whichever is smaller
+        w = min(w, int(sw * 0.85))
+        h = min(h, int(sh * 0.85))
+        x = (sw - w) // 2
+        y = (sh - h) // 2
         self.geometry("{}x{}+{}+{}".format(w, h, x, y))
 
     def _init_styles(self):
@@ -130,7 +157,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         )
 
     def _header(self):
-        tk.Frame(self, bg=ACCENT, height=4).pack(fill="x")
+        tk.Frame(self, bg=ACCENT, height=6).pack(fill="x")
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=36, pady=(20,10))
         tk.Label(bar, text="POSTBRIDGE", font=FH, bg=BG, fg=TEXT).pack(side="left")
@@ -179,7 +206,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Frame(self.body, bg=BG, height=30).pack()
 
         tk.Label(self.body, text="Choose a workflow",
-                 font=FL, bg=BG, fg=SUB).pack(pady=(0,20))
+                 font=FBT, bg=BG, fg=SUB).pack(pady=(0,24))
 
         cards_frame = tk.Frame(self.body, bg=BG)
         cards_frame.pack(fill="x", padx=20)
@@ -210,10 +237,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for title, wf_key, desc, available in workflows:
             card = tk.Frame(cards_frame, bg=SURF,
                             highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=(0,10))
+            card.pack(fill="x", pady=(0,12))
+
+            # Left accent stripe (always shown; brighter when available)
+            stripe_color = ACCENT if available else BORDER
+            tk.Frame(card, bg=stripe_color, width=4).pack(side="left", fill="y")
 
             inner = tk.Frame(card, bg=SURF)
-            inner.pack(fill="x", padx=24, pady=18)
+            inner.pack(fill="x", padx=24, pady=20)
 
             left = tk.Frame(inner, bg=SURF)
             left.pack(side="left", fill="both", expand=True)
@@ -262,9 +293,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _select_workflow(self, key):
         self.workflow = key
         if key in ("script_aaf", "script_xml"):
-            self._step1()
+            path = filedialog.askopenfilename(
+                title="Open Script",
+                filetypes=[("Text", "*.txt"), ("All", "*.*")])
+            if not path:
+                self.workflow = None   # user cancelled — stay on home
+                return
+            self._load_script(path)
         elif key == "pt_xml":
-            self._aaf_step1()
+            path = filedialog.askopenfilename(
+                title="Open Pro Tools AAF Export",
+                filetypes=[("AAF", "*.aaf"), ("All", "*.*")])
+            if not path:
+                self.workflow = None   # user cancelled — stay on home
+                return
+            self._aaf_load(path)
 
     def _tooltip(self, widget, text):
         """Attach a hover tooltip showing full text to any widget."""
@@ -286,7 +329,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _btn(self, parent, label, cmd, small=False, color=None):
         bg  = color or SURF3
-        pad = (6,3) if small else (14,7)
+        pad = (8,4) if small else (16,8)
         w   = tk.Label(parent, text=label,
                        font=FB if small else FBT,
                        bg=bg, fg=TEXT,
@@ -307,8 +350,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return w
 
     def _section(self, text):
-        tk.Label(self.body, text=text, font=FL, bg=BG,
-                 fg=ACCENT).pack(anchor="w", pady=(16,4))
+        f = tk.Frame(self.body, bg=BG)
+        f.pack(fill="x", pady=(20, 6))
+        tk.Frame(f, bg=ACCENT, width=3, height=20).pack(side="left", padx=(0, 10))
+        tk.Label(f, text=text, font=FL, bg=BG, fg=TEXT).pack(side="left", anchor="w")
 
     def _scroll_frame(self, parent, height=420):
         outer  = tk.Frame(parent, bg=BG)
@@ -472,7 +517,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _step1(self):
         self._clear()
-        self._prefetch_media     = []     # reset on fresh entry
         self._step1_next_added   = False
         wf_label = "AAF" if self.workflow == "script_aaf" else "XML"
         self._section("STEP 1 — LOAD SCRIPT  (Script → {})".format(wf_label))
@@ -507,13 +551,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       filedialog.askopenfilename(
                           filetypes=[("Text","*.txt"),("All","*.*")]))).pack()
 
-        # ── Media pre-load (optional — populates Step 2 automatically) ────────
-        self._make_prefetch_panel(
-            sf, self._prefetch_media,
-            title="MEDIA FILES",
-            hint="Drop audio/video files here — they will be pre-loaded into Step 2  (optional)",
-        )
-
     def _load_script(self, path):
         if not path or not os.path.isfile(path): return
         self._script_path = os.path.abspath(path)
@@ -543,22 +580,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         
         self.seq_name.set("{} (AUTO)".format(doc_title))
 
-        self._s1.config(
-            text="✓  {}  ·  {} pulls  ·  {} parts  ·  {} tokens: {}{}".format(
-                doc_title, len(pulls), len(parts), len(tokens),
-                "  ".join(tokens),
-                "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
-            fg=SUCCESS if not no_quote else WARN)
+        if hasattr(self, "_s1"):
+            self._s1.config(
+                text="✓  {}  ·  {} pulls  ·  {} parts  ·  {} tokens: {}{}".format(
+                    doc_title, len(pulls), len(parts), len(tokens),
+                    "  ".join(tokens),
+                    "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
+                fg=SUCCESS if not no_quote else WARN)
 
         if warnings:
             messagebox.showwarning("Warnings", "\n".join(warnings[:10]))
-        # Add NEXT button to the step 1 nav bar (once, even if script is reloaded)
+        # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
         if hasattr(self, "_step1_nav") and not getattr(self, "_step1_next_added", False):
             self._btn(self._step1_nav, "NEXT  →  ASSIGN MEDIA",
                       self._step2, color=ACCENT).pack(side="right")
             self._step1_next_added = True
-        elif not hasattr(self, "_step1_nav"):
-            self.after(350, self._step2)
+        else:
+            self.after(0, self._step2)
 
     def _step2(self):
         self._clear()
@@ -581,7 +619,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
-        self._btn(nav, "← BACK",         self._step1).pack(side="left")
+        self._btn(nav, "← HOME",          self._home).pack(side="left")
         self._btn(nav, "SAVE SETUP",     self._save_setup).pack(side="left", padx=(8,0))
         self._btn(nav, "LOAD SETUP",     self._load_setup).pack(side="left", padx=(4,0))
         self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(4,0))
@@ -2262,7 +2300,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_step1(self):
         self._clear()
-        self._prefetch_aaf_media    = []    # reset on fresh entry
         self._aaf_step1_next_added  = False
         self._section("STEP 1 — LOAD PRO TOOLS AAF EXPORT  (AAF → XML)")
 
@@ -2302,17 +2339,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       filedialog.askopenfilename(
                           filetypes=[("AAF","*.aaf"),("All","*.*")]))).pack()
 
-        # ── Media pre-load (optional — populates Step 2 video/audio pools) ───
-        self._make_prefetch_panel(
-            sf, self._prefetch_aaf_media,
-            title="VIDEO & AUDIO FILES",
-            hint="Drop video and/or reference audio files here — they will be pre-loaded into Step 2  (optional)",
-        )
+        # If we already have parsed AAF data (e.g. user pressed Back from Step 2),
+        # restore the status label and show the NEXT button immediately — no reload needed.
+        if self._aaf_data:
+            total_clips = sum(len(t["clips"]) for t in self._aaf_data["tracks"])
+            self._aaf_s1.config(
+                text="\u2713  {}  \u00b7  {} tracks  \u00b7  {} clips  \u00b7  {} sources".format(
+                    self._aaf_data["session_name"],
+                    len(self._aaf_data["tracks"]),
+                    total_clips,
+                    len(getattr(self, "_aaf_sources", []))),
+                fg=SUCCESS)
+            self._btn(nav, "NEXT  \u2192  ASSIGN VIDEO",
+                      self._aaf_step2, color=ACCENT).pack(side="right")
+            self._aaf_step1_next_added = True
 
     def _aaf_load(self, path):
         if not path or not os.path.isfile(path): return
-        self._aaf_s1.config(text="Parsing AAF\u2026", fg=SUB)
-        self.update_idletasks()
+        if hasattr(self, "_aaf_s1"):
+            self._aaf_s1.config(text="Parsing AAF\u2026", fg=SUB)
+            self.update_idletasks()
         try:
             parsed = parse_aaf_session(path)
         except Exception as e:
@@ -2340,23 +2386,35 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_sources       = sorted(sources.keys())
         self._aaf_source_tracks = sources   # base_name -> set of track names
 
-        self._aaf_s1.config(
-            text="\u2713  {}  \u00b7  {} tracks  \u00b7  {} clips  \u00b7  {} sources".format(
-                parsed["session_name"], len(parsed["tracks"]),
-                total_clips, len(self._aaf_sources)),
-            fg=SUCCESS)
+        if hasattr(self, "_aaf_s1"):
+            self._aaf_s1.config(
+                text="\u2713  {}  \u00b7  {} tracks  \u00b7  {} clips  \u00b7  {} sources".format(
+                    parsed["session_name"], len(parsed["tracks"]),
+                    total_clips, len(self._aaf_sources)),
+                fg=SUCCESS)
 
         self.seq_name.set(parsed["session_name"])
+        # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
         if hasattr(self, "_aaf_step1_nav") and not getattr(self, "_aaf_step1_next_added", False):
             self._btn(self._aaf_step1_nav, "NEXT  →  ASSIGN VIDEO",
                       self._aaf_step2, color=ACCENT).pack(side="right")
             self._aaf_step1_next_added = True
-        elif not hasattr(self, "_aaf_step1_nav"):
-            self.after(350, self._aaf_step2)
+        else:
+            self.after(0, self._aaf_step2)
 
     def _aaf_step2(self):
+        # Preserve pool state so Back → Next doesn't lose work
+        _saved_vpaths = list(getattr(self, "_aaf_video_paths", []))
+        _saved_apaths = list(getattr(self, "_aaf_audio_paths", []))
         self._clear()
-        self._section("STEP 2 — ASSIGN VIDEO MEDIA")
+        # Header row: step title on left, "CLEAN UP" button on right
+        _hdr = tk.Frame(self.body, bg=BG)
+        _hdr.pack(fill="x", pady=(20, 6))
+        tk.Frame(_hdr, bg=ACCENT, width=3, height=20).pack(side="left", padx=(0, 10))
+        tk.Label(_hdr, text="STEP 2 \u2014 ASSIGN VIDEO MEDIA",
+                 font=FL, bg=BG, fg=TEXT).pack(side="left", anchor="w")
+        self._btn(_hdr, "CLEAN UP",
+                  self._aaf_remove_unassigned, small=True).pack(side="right")
 
         total_clips  = sum(len(t["clips"]) for t in self._aaf_data["tracks"])
         has_prefetch = bool(getattr(self, "_prefetch_aaf_media", []))
@@ -2379,12 +2437,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
-        self._btn(nav, "\u2190 BACK",    self._aaf_step1).pack(side="left")
+        self._btn(nav, "\u2190 HOME",    self._home).pack(side="left")
         self._btn(nav, "SAVE SETUP",     self._aaf_save_setup).pack(side="left", padx=(8,0))
         self._btn(nav, "LOAD SETUP",     self._aaf_load_setup).pack(side="left", padx=(4,0))
         self._aaf_build_btn = self._btn(nav, "BUILD XML  \u2192", self._aaf_build,
                                         color=ACCENT)
         self._aaf_build_btn.pack(side="right")
+
+        # ── Fixed toolbar (always visible above scroll area) ──────────────────
+        _ftbar = tk.Frame(self.body, bg=BG)
+        _ftbar.pack(fill="x", pady=(2, 4))
+        self._btn(_ftbar, "\u21b6 UNDO",
+                  self._aaf_sync_undo, small=True).pack(side="left")
+        self._btn(_ftbar, "\u21b7 REDO",
+                  self._aaf_sync_redo, small=True).pack(side="left", padx=(4, 0))
+        # Keyboard bindings (idempotent — safe to re-bind each visit)
+        self.bind_all("<Control-z>", lambda e: self._aaf_sync_undo())
+        self.bind_all("<Control-y>", lambda e: self._aaf_sync_redo())
 
         # ── Scrollable content area fills remaining space ─────────────────────
         sf = self._scroll_frame(self.body)
@@ -2395,18 +2464,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         pool_frame.pack(fill="x", pady=(0,8), padx=2)
 
         v_body = tk.Frame(pool_frame, bg=SURF)   # collapsible content
-        v_open = [not has_prefetch]
+        v_open = [False]
 
         ph = tk.Frame(pool_frame, bg=SURF, cursor="hand2")
         ph.pack(fill="x", padx=12, pady=(10,4))
 
-        v_arrow = tk.Label(ph, text="\u25bc" if not has_prefetch else "\u25b6",
+        v_arrow = tk.Label(ph, text="\u25b6",
                            font=FB, bg=SURF, fg=ACCENT, cursor="hand2")
         v_arrow.pack(side="left", padx=(0, 6))
         tk.Label(ph, text="VIDEO FILES", font=FL, bg=SURF, fg=ACCENT,
                  cursor="hand2").pack(side="left")
         self._aaf_count_lbl = tk.Label(ph, text="0 files", font=FB, bg=SURF, fg=SUB)
         self._aaf_count_lbl.pack(side="right")
+        self._btn(ph, "+ BROWSE FOLDER", self._aaf_browse_folder,
+                  small=True).pack(side="right", padx=(0, 4))
+        self._btn(ph, "+ BROWSE FILES",  self._aaf_browse_files,
+                  small=True).pack(side="right", padx=(0, 4))
 
         def _toggle_vpool(arr=v_arrow, body=v_body, state=v_open):
             if state[0]:
@@ -2421,21 +2494,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for w in (ph, v_arrow):
             w.bind("<Button-1>", lambda e: _toggle_vpool())
 
-        # Body contents — only expand on initial render if no files were pre-loaded
-        if not has_prefetch:
-            v_body.pack(fill="x")
+        # Body starts collapsed
         self._aaf_video_paths = []
         self._aaf_file_list   = tk.Frame(v_body, bg=SURF)
         self._aaf_file_list.pack(fill="x", padx=12)
 
-        btn_row = tk.Frame(v_body, bg=SURF)
-        btn_row.pack(anchor="w", padx=12, pady=(4,10))
-        self._btn(btn_row, "+ BROWSE FILES",  self._aaf_browse_files,
-                  small=True).pack(side="left", padx=(0,8))
-        self._btn(btn_row, "+ BROWSE FOLDER", self._aaf_browse_folder,
-                  small=True).pack(side="left", padx=(0,8))
-        self._aaf_status_lbl = tk.Label(btn_row, text="", font=FB, bg=SURF, fg=SUB)
-        self._aaf_status_lbl.pack(side="left")
+        self._aaf_status_lbl = tk.Label(v_body, text="", font=FB, bg=SURF, fg=SUB)
+        self._aaf_status_lbl.pack(anchor="w", padx=12, pady=(4, 10))
 
         if HAS_DND:
             for w in [pool_frame, ph]:
@@ -2449,12 +2514,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         apool_frame.pack(fill="x", pady=(0, 8), padx=2)
 
         a_body = tk.Frame(apool_frame, bg=SURF)   # collapsible content
-        a_open = [not has_prefetch]
+        a_open = [False]
 
         aph = tk.Frame(apool_frame, bg=SURF, cursor="hand2")
         aph.pack(fill="x", padx=12, pady=(10, 4))
 
-        a_arrow = tk.Label(aph, text="\u25bc" if not has_prefetch else "\u25b6",
+        a_arrow = tk.Label(aph, text="\u25b6",
                            font=FB, bg=SURF, fg=ACCENT, cursor="hand2")
         a_arrow.pack(side="left", padx=(0, 6))
         tk.Label(aph, text="REFERENCE AUDIO FILES", font=FL, bg=SURF, fg=ACCENT,
@@ -2464,6 +2529,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_audio_count_lbl = tk.Label(aph, text="0 files", font=FB,
                                              bg=SURF, fg=SUB)
         self._aaf_audio_count_lbl.pack(side="right")
+        self._btn(aph, "+ BROWSE FOLDER", self._aaf_browse_audio_folder,
+                  small=True).pack(side="right", padx=(0, 4))
+        self._btn(aph, "+ BROWSE FILES",  self._aaf_browse_audio_files,
+                  small=True).pack(side="right", padx=(0, 4))
 
         def _toggle_apool(arr=a_arrow, body=a_body, state=a_open):
             if state[0]:
@@ -2478,19 +2547,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for w in (aph, a_arrow):
             w.bind("<Button-1>", lambda e: _toggle_apool())
 
-        # Body contents — only expand on initial render if no files were pre-loaded
-        if not has_prefetch:
-            a_body.pack(fill="x")
+        # Body starts collapsed
         self._aaf_audio_paths     = []
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
-
-        abtn_row = tk.Frame(a_body, bg=SURF)
-        abtn_row.pack(anchor="w", padx=12, pady=(4, 10))
-        self._btn(abtn_row, "+ BROWSE FILES",  self._aaf_browse_audio_files,
-                  small=True).pack(side="left", padx=(0, 8))
-        self._btn(abtn_row, "+ BROWSE FOLDER", self._aaf_browse_audio_folder,
-                  small=True).pack(side="left", padx=(0, 8))
 
         if HAS_DND:
             for w in [apool_frame, aph]:
@@ -2504,36 +2564,92 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         assign_frame.pack(fill="x", pady=(0,8), padx=2)
 
         ah = tk.Frame(assign_frame, bg=SURF)
-        ah.pack(fill="x", padx=12, pady=(10,4))
-        tk.Label(ah, text="SOURCE \u2192 VIDEO ASSIGNMENTS", font=FL, bg=SURF, fg=ACCENT).pack(side="left")
-        tk.Label(ah, text="  (assign each clip source to a video file, or leave as no video)",
-                 font=FB, bg=SURF, fg=SUB).pack(side="left")
-        self._btn(ah, "REMOVE UNASSIGNED",
-                  self._aaf_remove_unassigned_sources, small=True).pack(side="right")
+        ah.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(ah, text="SOURCES", font=FL, bg=SURF, fg=ACCENT).pack(side="left")
+
+        # ── Initialise page-mode var NOW so _make_tab can read it ─────────────
+        if not hasattr(self, "_aaf_page_mode"):
+            self._aaf_page_mode = tk.StringVar(value="assign")
+        if not hasattr(self, "_aaf_sync_state_vars"):
+            self._aaf_sync_state_vars = {}
+        if not hasattr(self, "_aaf_sync_dot_labels"):
+            self._aaf_sync_dot_labels = {}   # base → dot Label widget
+        if not hasattr(self, "_aaf_qa_btns"):
+            self._aaf_qa_btns = {}           # base → QA button widget
+        if not hasattr(self, "_aaf_qa_playing"):
+            self._aaf_qa_playing = None      # base currently being QA-played
+        if not hasattr(self, "_aaf_needs_sync_vars"):
+            self._aaf_needs_sync_vars = {}   # base → BooleanVar: "show on sync page"
+        if not hasattr(self, "_aaf_sync_locked_vars"):
+            self._aaf_sync_locked_vars = {}  # base → BooleanVar: sync frozen
+        if not hasattr(self, "_aaf_confirm_btns"):
+            self._aaf_confirm_btns = {}      # base → confirm Label widget
+        if not hasattr(self, "_aaf_lock_btns"):
+            self._aaf_lock_btns = {}         # base → lock Label widget
+
+        # ── Column widths and order (persist across rebuilds) ─────────────────
+        if not hasattr(self, "_aaf_col_widths"):
+            self._aaf_col_widths = {"name": 200, "tracks": 110}  # pixels
+        if not hasattr(self, "_aaf_col_order"):
+            self._aaf_col_order = ["tracks", "video"]  # ASSIGN middle columns
+
+        # ── Page toggle: ASSIGN  /  SYNC ──────────────────────────────────────
+        tab_frame = tk.Frame(ah, bg=SURF)
+        tab_frame.pack(side="left", padx=(14, 0))
+        self._aaf_assign_tab_btn = None
+        self._aaf_sync_tab_btn   = None
+
+        def _make_tab(parent, label, mode):
+            active  = self._aaf_page_mode.get() == mode
+            bg      = ACCENT if active else SURF3
+            fg      = BG     if active else SUB
+            b = tk.Label(parent, text=label, font=FB, bg=bg, fg=fg,
+                         cursor="hand2", padx=10, pady=2, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            def _click(e, m=mode):
+                self._aaf_page_mode.set(m)
+                self._rebuild_aaf_source_rows()
+            b.bind("<ButtonRelease-1>", _click)
+            return b
+
+        self._aaf_assign_tab_btn = _make_tab(tab_frame, "ASSIGN", "assign")
+        self._aaf_assign_tab_btn.pack(side="left")
+        self._aaf_sync_tab_btn = _make_tab(tab_frame, "SYNC", "sync")
+        self._aaf_sync_tab_btn.pack(side="left", padx=(2, 0))
+
         self._btn(ah, "SYNC ALL",
                   self._aaf_sync_all, small=True).pack(side="right", padx=(0, 4))
 
-        # Column headers
-        col_hdr = tk.Frame(assign_frame, bg=SURF)
-        col_hdr.pack(fill="x", padx=12, pady=(2, 0))
-        tk.Label(col_hdr, text="VIDEO FILE", font=FB, bg=SURF, fg=SUB,
-                 width=40, anchor="w").pack(side="right")
-        tk.Label(col_hdr, text="PT TRACK", font=FB, bg=SURF, fg=SUB,
-                 width=14, anchor="w").pack(side="right", padx=(4, 0))
-        tk.Label(col_hdr, text="\u2715", font=FB, bg=SURF, fg=SUB,
-                 width=3).pack(side="right", padx=(4, 0))
-        tk.Label(col_hdr, text="SOURCE CLIP", font=FB, bg=SURF, fg=SUB,
-                 anchor="w").pack(side="left", fill="x", expand=True)
+        # Undo / Redo — only meaningful on the SYNC page
+        if not hasattr(self, "_sync_undo_stack"):
+            self._sync_undo_stack = []
+            self._sync_redo_stack = []
+
+        # Column headers (rebuilt by _rebuild_aaf_source_rows)
+        self._aaf_col_hdr_frame = tk.Frame(assign_frame, bg=SURF)
+        self._aaf_col_hdr_frame.pack(fill="x", padx=12, pady=(2, 0))
 
         self._aaf_assign_frame = tk.Frame(assign_frame, bg=SURF)
         self._aaf_assign_frame.pack(fill="x", padx=12, pady=(0,10))
-        self._aaf_source_file_vars        = {}   # base -> StringVar  (video filename)
-        self._aaf_source_sync_vars        = {}   # base -> BooleanVar (sync applied flag)
-        self._aaf_source_syncaudio_vars   = {}   # base -> StringVar  (ref audio full path)
-        self._aaf_source_audio_disp_vars  = {}   # base -> StringVar  (ref audio basename for dropdown)
-        self._aaf_source_offset_vars      = {}   # base -> StringVar  (offset seconds)
-        self._aaf_source_sync_label_vars  = {}   # base -> StringVar  (button display text)
-        self._aaf_sync_btns               = {}   # base -> Button widget (current rebuild)
+        # Preserve assignment state across back-navigation; only init on first visit
+        if not hasattr(self, "_aaf_source_file_vars"):
+            self._aaf_source_file_vars       = {}
+        if not hasattr(self, "_aaf_source_sync_vars"):
+            self._aaf_source_sync_vars       = {}
+        if not hasattr(self, "_aaf_source_syncaudio_vars"):
+            self._aaf_source_syncaudio_vars  = {}
+        if not hasattr(self, "_aaf_source_audio_disp_vars"):
+            self._aaf_source_audio_disp_vars = {}
+        if not hasattr(self, "_aaf_source_offset_vars"):
+            self._aaf_source_offset_vars     = {}
+        if not hasattr(self, "_aaf_source_sync_label_vars"):
+            self._aaf_source_sync_label_vars = {}
+        self._aaf_sync_btns = {}   # always reset — widget refs are stale after _clear()
+        # Close any sync preview dialogs left open from a previous visit
+        for _dlg in getattr(self, "_aaf_sync_previews", {}).values():
+            try: _dlg.close()
+            except Exception: pass
+        self._aaf_sync_previews = {}
 
         self._rebuild_aaf_source_rows()
 
@@ -2558,25 +2674,126 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            font=FB, bg=SURF, fg=TEXT, activebackground=SURF,
                            selectcolor=BG).pack(side="left", padx=(0,14))
 
-        row_fps = tk.Frame(settings_frame, bg=SURF)
-        row_fps.pack(anchor="w", padx=12, pady=(0,10))
-        tk.Label(row_fps, text="Output FPS:", font=FB, bg=SURF, fg=TEXT,
+        # ── Sequence settings (preset + editable resolution/fps) ──────────────
+        if not hasattr(self, "_aaf_preset_var"):
+            self._aaf_preset_var = tk.StringVar(value="Detect from media")
+        if not hasattr(self, "_aaf_fps_var"):
+            self._aaf_fps_var = tk.StringVar(value="29.97")
+        if not hasattr(self, "_aaf_seq_w_var"):
+            self._aaf_seq_w_var = tk.StringVar(value="")
+        if not hasattr(self, "_aaf_seq_h_var"):
+            self._aaf_seq_h_var = tk.StringVar(value="")
+
+        def _on_preset_change(*_):
+            name = self._aaf_preset_var.get()
+            # Fixed preset?
+            if name in _AAF_PRESET_LOOKUP:
+                pw, ph, pfps = _AAF_PRESET_LOOKUP[name]
+                if pw is not None:
+                    self._aaf_seq_w_var.set(str(pw))
+                    self._aaf_seq_h_var.set(str(ph))
+                    self._aaf_fps_var.set(
+                        "{:.3f}".format(pfps).rstrip("0").rstrip("."))
+                elif name == "Detect from media":
+                    self._aaf_seq_w_var.set("")
+                    self._aaf_seq_h_var.set("")
+                    self._aaf_schedule_detect_fps()
+                # "Custom" — leave fields untouched so user can type freely
+                return
+            # Detected-from-source entry?
+            detected = getattr(self, "_aaf_detected_presets", {})
+            if name in detected:
+                pw, ph, pfps = detected[name]
+                self._aaf_seq_w_var.set(str(pw))
+                self._aaf_seq_h_var.set(str(ph))
+                self._aaf_fps_var.set(
+                    "{:.3f}".format(pfps).rstrip("0").rstrip("."))
+
+        self._aaf_preset_var.trace_add("write", _on_preset_change)
+
+        row_preset = tk.Frame(settings_frame, bg=SURF)
+        row_preset.pack(anchor="w", padx=12, pady=(0, 4))
+        tk.Label(row_preset, text="Sequence Preset:", font=FB, bg=SURF, fg=TEXT,
                  width=18, anchor="w").pack(side="left")
-        self._aaf_fps_var = tk.StringVar(value="29.97")
-        fps_entry = tk.Entry(row_fps, textvariable=self._aaf_fps_var,
-                             font=FB, bg=SURF2, fg=TEXT,
-                             insertbackground=TEXT, relief="flat", width=8)
-        fps_entry.pack(side="left")
-        tk.Label(row_fps, text="  (29.97 DF for standard broadcast; override if needed)",
+        self._aaf_preset_dd = _FlatDropdown(row_preset, self._aaf_preset_var,
+                                            [p[0] for p in _AAF_SEQ_PRESETS],
+                                            font=FB, width=26)
+        self._aaf_preset_dd.pack(side="left")
+
+        row_fps = tk.Frame(settings_frame, bg=SURF)
+        row_fps.pack(anchor="w", padx=12, pady=(0, 10))
+        tk.Label(row_fps, text="Resolution / FPS:", font=FB, bg=SURF, fg=TEXT,
+                 width=18, anchor="w").pack(side="left")
+        tk.Entry(row_fps, textvariable=self._aaf_seq_w_var,
+                 font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", width=5).pack(side="left")
+        tk.Label(row_fps, text=" × ", font=FB, bg=SURF, fg=SUB).pack(side="left")
+        tk.Entry(row_fps, textvariable=self._aaf_seq_h_var,
+                 font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", width=5).pack(side="left")
+        tk.Label(row_fps, text="   FPS:", font=FB, bg=SURF, fg=TEXT).pack(side="left", padx=(10, 4))
+        tk.Entry(row_fps, textvariable=self._aaf_fps_var,
+                 font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", width=8).pack(side="left")
+        tk.Label(row_fps, text="  (auto-filled from preset; edit to override)",
                  font=FB, bg=SURF, fg=SUB).pack(side="left")
 
-        # Pre-load any video/audio files dropped at Step 1
-        prefetch = getattr(self, "_prefetch_aaf_media", [])
-        if prefetch:
-            vp = [p for p in prefetch if is_video(p)]
-            ap = [p for p in prefetch if is_audio(p)]
-            if vp: self._aaf_add_video_batch(vp)
-            if ap: self._aaf_add_audio_batch(ap)
+        # ── Stereo mix (optional full-sequence audio track) ───────────────────
+        mix_frame = tk.Frame(sf, bg=SURF,
+                             highlightbackground=BORDER, highlightthickness=1)
+        mix_frame.pack(fill="x", pady=(0, 8), padx=2)
+
+        mh = tk.Frame(mix_frame, bg=SURF)
+        mh.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(mh, text="STEREO MIX", font=FL, bg=SURF, fg=ACCENT).pack(side="left")
+        tk.Label(mh, text="  (optional — full-sequence stereo mix that syncs to picture)",
+                 font=FB, bg=SURF, fg=SUB).pack(side="left")
+
+        if not hasattr(self, "_aaf_mix_var"):
+            self._aaf_mix_var = tk.StringVar(value="")
+
+        mix_body = tk.Frame(mix_frame, bg=SURF)
+        mix_body.pack(fill="x", padx=12, pady=(0, 10))
+
+        mix_disp = tk.Label(mix_body, textvariable=self._aaf_mix_var,
+                            font=FB, bg=SURF2, fg=TEXT, anchor="w",
+                            relief="flat", padx=8, pady=4)
+        mix_disp.pack(fill="x", pady=(0, 6))
+
+        mix_btn_row = tk.Frame(mix_body, bg=SURF)
+        mix_btn_row.pack(anchor="w")
+        self._btn(mix_btn_row, "+ BROWSE MIX FILE", self._aaf_browse_mix,
+                  small=True).pack(side="left", padx=(0, 8))
+        self._btn(mix_btn_row, "✕ CLEAR", lambda: self._aaf_mix_var.set(""),
+                  small=True).pack(side="left")
+
+        if HAS_DND:
+            mix_frame.drop_target_register(DND_FILES)
+            mix_frame.dnd_bind("<<Drop>>",
+                               lambda e: self._aaf_set_mix(engines.parse_dnd(e.data)))
+
+        # ── Camera audio option ───────────────────────────────────────────────
+        if not hasattr(self, "_aaf_cam_audio_var"):
+            self._aaf_cam_audio_var = tk.BooleanVar(value=False)
+        cam_row = tk.Frame(sf, bg=SURF)
+        cam_row.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Checkbutton(cam_row, text="Include camera audio from video files",
+                       variable=self._aaf_cam_audio_var,
+                       font=FB, bg=SURF, fg=TEXT, selectcolor=SURF2,
+                       activebackground=SURF, activeforeground=TEXT,
+                       relief="flat", bd=0).pack(side="left")
+
+        # Restore pool contents: back-navigation takes priority over prefetch
+        if _saved_vpaths or _saved_apaths:
+            if _saved_vpaths: self._aaf_add_video_batch(_saved_vpaths)
+            if _saved_apaths: self._aaf_add_audio_batch(_saved_apaths)
+        else:
+            prefetch = getattr(self, "_prefetch_aaf_media", [])
+            if prefetch:
+                vp = [p for p in prefetch if is_video(p)]
+                ap = [p for p in prefetch if is_audio(p)]
+                if vp: self._aaf_add_video_batch(vp)
+                if ap: self._aaf_add_audio_batch(ap)
 
     # Palette of subtle background tints — one per assigned video file.
     # Unassigned rows use a warm amber tint so they stand out immediately.
@@ -2585,10 +2802,97 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     _UNASSIGNED_ROW  = "#2a1a08"
 
     def _rebuild_aaf_source_rows(self):
-        """Rebuild per-source video assignment dropdowns based on current video pool."""
+        """Rebuild per-source rows; layout depends on current page mode."""
         for w in self._aaf_assign_frame.winfo_children():
             w.destroy()
-        self._aaf_sync_btns = {}   # stale widget refs — repopulated below
+        self._aaf_sync_btns       = {}   # stale widget refs — repopulated below
+        self._aaf_sync_dot_labels = getattr(self, "_aaf_sync_dot_labels", {})
+        self._aaf_sync_dot_labels.clear()
+        self._aaf_qa_btns = getattr(self, "_aaf_qa_btns", {})
+        self._aaf_qa_btns.clear()
+        self._aaf_confirm_btns = getattr(self, "_aaf_confirm_btns", {})
+        self._aaf_confirm_btns.clear()
+        self._aaf_lock_btns = getattr(self, "_aaf_lock_btns", {})
+        self._aaf_lock_btns.clear()
+
+        # Ensure vars exist even if called before full page init
+        if not hasattr(self, "_aaf_page_mode"):
+            self._aaf_page_mode = tk.StringVar(value="assign")
+        if not hasattr(self, "_aaf_sync_state_vars"):
+            self._aaf_sync_state_vars = {}
+
+        # ── Update tab button appearance ───────────────────────────────────────
+        mode = self._aaf_page_mode.get()
+        for btn, m in [(getattr(self, "_aaf_assign_tab_btn", None), "assign"),
+                       (getattr(self, "_aaf_sync_tab_btn",   None), "sync")]:
+            if btn:
+                try:
+                    active = (mode == m)
+                    btn.config(bg=ACCENT if active else SURF3,
+                               fg=BG     if active else SUB)
+                except Exception:
+                    pass
+
+        # ── Rebuild column headers ─────────────────────────────────────────────
+        hdr = getattr(self, "_aaf_col_hdr_frame", None)
+        if hdr:
+            for w in hdr.winfo_children():
+                w.destroy()
+            if mode == "assign":
+                # ✕ always rightmost
+                tk.Label(hdr, text="\u2715", font=FB, bg=SURF, fg=SUB,
+                         width=3).pack(side="right", padx=(4, 0))
+                # SYNC? always left of ✕
+                tk.Label(hdr, text="SYNC?", font=FB, bg=SURF, fg=SUB,
+                         width=6, anchor="w").pack(side="right", padx=(0, 4))
+
+                # Name header (fixed pixel width)
+                _col_widths = getattr(self, "_aaf_col_widths", {"name": 200, "tracks": 110})
+                _col_order  = getattr(self, "_aaf_col_order",  ["tracks", "video"])
+
+                nf = tk.Frame(hdr, bg=SURF, width=_col_widths["name"])
+                nf.pack_propagate(False)
+                nf.pack(side="left")
+                tk.Label(nf, text="SOURCE CLIP", font=FB, bg=SURF, fg=SUB,
+                         anchor="w").pack(fill="x")
+                self._aaf_col_sash(hdr, "name", SURF)
+
+                # Middle columns in stored order
+                for _ci, _col in enumerate(_col_order):
+                    if _col == "tracks":
+                        tf = tk.Frame(hdr, bg=SURF,
+                                      width=_col_widths.get("tracks", 110))
+                        tf.pack_propagate(False)
+                        tf.pack(side="left")
+                        # Reorder handle: click+drag to swap with neighbour
+                        _th = tk.Label(tf, text="PT TRACK \u2195", font=FB,
+                                       bg=SURF, fg=SUB, cursor="fleur", anchor="w")
+                        _th.pack(fill="x")
+                        _th.bind("<ButtonRelease-1>",
+                                 lambda e, ci=_ci, c="tracks":
+                                     self._aaf_col_reorder(ci, c))
+                        self._aaf_col_sash(hdr, "tracks", SURF)
+                    elif _col == "video":
+                        _vh = tk.Label(hdr, text="VIDEO FILE \u2195", font=FB,
+                                       bg=SURF, fg=SUB, cursor="fleur", anchor="w")
+                        _vh.pack(side="left", fill="x", expand=True)
+                        _vh.bind("<ButtonRelease-1>",
+                                 lambda e, ci=_ci, c="video":
+                                     self._aaf_col_reorder(ci, c))
+            else:
+                tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
+                         width=10, anchor="w").pack(side="right")
+                tk.Label(hdr, text="OFFSET", font=FB, bg=SURF, fg=SUB,
+                         width=10, anchor="e").pack(side="right", padx=(0, 8))
+                _aw = getattr(self, "_aaf_col_widths", {}).get("audio", 260)
+                af = tk.Frame(hdr, bg=SURF, width=_aw)
+                af.pack_propagate(False)
+                af.pack(side="right", padx=(4, 0))
+                tk.Label(af, text="REFERENCE AUDIO", font=FB, bg=SURF, fg=SUB,
+                         anchor="w").pack(fill="x")
+                self._aaf_col_sash(hdr, "audio", SURF)
+                tk.Label(hdr, text="\u25cf SOURCE CLIP", font=FB, bg=SURF, fg=SUB,
+                         anchor="w").pack(side="left", fill="x", expand=True)
 
         options      = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
         aud_options  = ["— no audio —"] + [basename(p) for p in self._aaf_audio_paths]
@@ -2602,6 +2906,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return vid_color.get(sv_val, self._UNASSIGNED_ROW)
 
         def _apply_color(container, color):
+            try:
+                if not container.winfo_exists():
+                    return
+            except Exception:
+                return
             container.config(bg=color)
             def _recurse(w):
                 if hasattr(w, "set_bg"):
@@ -2613,30 +2922,36 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _recurse(child)
             _recurse(container)
 
+        # Sync state dot colours
+        _STATE_DOT = {"": SUB, "auto": WARN, "manual": SUCCESS}
+
         for base in self._aaf_sources:
             # ── Persistent vars (survive rebuilds) ────────────────────────────
             if base not in self._aaf_source_file_vars:
-                self._aaf_source_file_vars[base]      = tk.StringVar(value="— no video —")
+                self._aaf_source_file_vars[base]       = tk.StringVar(value="— no video —")
             if base not in self._aaf_source_sync_vars:
-                self._aaf_source_sync_vars[base]      = tk.BooleanVar(value=False)
+                self._aaf_source_sync_vars[base]       = tk.BooleanVar(value=False)
             if base not in self._aaf_source_syncaudio_vars:
-                self._aaf_source_syncaudio_vars[base] = tk.StringVar(value="")
+                self._aaf_source_syncaudio_vars[base]  = tk.StringVar(value="")
             if base not in self._aaf_source_offset_vars:
-                self._aaf_source_offset_vars[base]    = tk.StringVar(value="0.000")
+                self._aaf_source_offset_vars[base]     = tk.StringVar(value="0.000")
             if base not in self._aaf_source_sync_label_vars:
                 self._aaf_source_sync_label_vars[base] = tk.StringVar(value="")
+            if base not in self._aaf_sync_state_vars:
+                self._aaf_sync_state_vars[base]        = tk.StringVar(value="")
+            if base not in self._aaf_needs_sync_vars:
+                self._aaf_needs_sync_vars[base]        = tk.BooleanVar(value=False)
+            if base not in self._aaf_sync_locked_vars:
+                self._aaf_sync_locked_vars[base]       = tk.BooleanVar(value=False)
 
             sv = self._aaf_source_file_vars[base]
             if sv.get() not in options:
                 sv.set("— no video —")
 
-            # ── Audio display var — recreated fresh each rebuild to avoid ──────
-            # stale trace accumulation.  Derives initial value from the
-            # full-path var (which persists across rebuilds).
-            cur_full = self._aaf_source_syncaudio_vars[base].get()
-            cur_bn   = basename(cur_full) if cur_full else ""
-            init_disp = cur_bn if cur_bn else "— no audio —"
-            aud_disp  = tk.StringVar(value=init_disp)
+            # ── Audio display var — recreated fresh each rebuild ───────────────
+            cur_full  = self._aaf_source_syncaudio_vars[base].get()
+            cur_bn    = basename(cur_full) if cur_full else ""
+            aud_disp  = tk.StringVar(value=cur_bn if cur_bn else "— no audio —")
             self._aaf_source_audio_disp_vars[base] = aud_disp
 
             # ── Container ─────────────────────────────────────────────────────
@@ -2645,87 +2960,224 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                  highlightbackground=BORDER, highlightthickness=1)
             container.pack(fill="x", pady=2)
 
-            # ── Row 1: source name + video assignment ─────────────────────────
             row1 = tk.Frame(container, bg=bg)
             row1.pack(fill="x", padx=6, pady=(4, 0))
 
-            # ✕ remove (far right)
-            rm_lbl = tk.Label(row1, text=" \u2715 ", font=FB, bg=bg, fg=SUB,
-                              cursor="hand2", width=3)
-            rm_lbl.pack(side="right")
-            rm_lbl.bind("<Button-1>",
-                        lambda e, b=base, c=container: self._aaf_remove_source(b, c))
+            if mode == "assign":
+                # ── ASSIGN mode: [name col] [middle cols in order] [sync?] [✕] ──
+                _col_widths = getattr(self, "_aaf_col_widths", {"name": 200, "tracks": 110})
+                _col_order  = getattr(self, "_aaf_col_order",  ["tracks", "video"])
 
-            # Video dropdown
-            _FlatDropdown(row1, textvariable=sv, values=options,
-                          state="readonly", font=FB, width=40).pack(side="right")
+                # ✕ remove (always rightmost)
+                rm_lbl = tk.Label(row1, text=" \u2715 ", font=FB, bg=bg, fg=SUB,
+                                  cursor="hand2", width=3)
+                rm_lbl.pack(side="right")
+                rm_lbl.bind("<Button-1>",
+                            lambda e, b=base, c=container: self._aaf_remove_source(b, c))
 
-            # PT track label
-            tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
-            tk.Label(row1, text=tracks_str, font=FB, bg=bg, fg=SUB,
-                     width=14, anchor="w").pack(side="right", padx=(4, 0))
+                # "Needs sync" checkbox (right of name, left of columns)
+                ck_sync = tk.Checkbutton(row1,
+                                         variable=self._aaf_needs_sync_vars[base],
+                                         text="sync", font=FB, bg=bg, fg=ACCENT,
+                                         activebackground=bg, activeforeground=ACCENT,
+                                         selectcolor=BG, relief="flat", bd=0,
+                                         cursor="hand2")
+                ck_sync.pack(side="right", padx=(0, 4))
 
-            # Source name (expands)
-            name_lbl = tk.Label(row1, text=base, font=FB, bg=bg, fg=TEXT, anchor="w")
-            name_lbl.pack(side="left", fill="x", expand=True)
-            self._tooltip(name_lbl, base)
+                # Name column (fixed pixel width)
+                nf = tk.Frame(row1, bg=bg, width=_col_widths["name"])
+                nf.pack_propagate(False)
+                nf.pack(side="left", fill="y")
+                name_lbl = tk.Label(nf, text=base, font=FB, bg=bg, fg=TEXT,
+                                    anchor="w")
+                name_lbl.pack(fill="x")
+                self._tooltip(name_lbl, base)
 
-            # ── Row 2: sync — apply checkbox + ref audio dropdown + SYNC btn ──
-            row2 = tk.Frame(container, bg=bg)
-            row2.pack(fill="x", padx=6, pady=(2, 4))
+                # Middle columns in stored order
+                tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
+                for _col in _col_order:
+                    if _col == "tracks":
+                        tf = tk.Frame(row1, bg=bg,
+                                      width=_col_widths.get("tracks", 110))
+                        tf.pack_propagate(False)
+                        tf.pack(side="left", fill="y", padx=(1, 0))
+                        tk.Label(tf, text=tracks_str, font=FB, bg=bg, fg=SUB,
+                                 anchor="w").pack(fill="x")
+                    elif _col == "video":
+                        _FlatDropdown(row1, textvariable=sv, values=options,
+                                      state="readonly", font=FB,
+                                      width=20).pack(side="left", fill="x",
+                                                     expand=True, padx=(1, 0))
 
-            # SYNC button (right-pinned; shows offset result)
-            sync_btn = self._btn(row2, "SYNC",
-                                 lambda b=base: self._aaf_do_sync(b),
-                                 small=True)
-            sync_btn.pack(side="right", padx=(4, 0))
-            self._aaf_sync_btns[base] = sync_btn
-            self._aaf_refresh_sync_btn(base, sync_btn)
+                # Remove stale video-change traces then re-add
+                for _tr in list(sv.trace_info()):
+                    if _tr[0] == "write":
+                        try: sv.trace_remove("write", _tr[1])
+                        except Exception: pass
+                def _on_vid_change(*args, c=container, s=sv):
+                    _apply_color(c, _row_bg(s.get()))
+                sv.trace_add("write", _on_vid_change)
 
-            # "↳" indent
-            tk.Label(row2, text="\u21b3", font=FB, bg=bg, fg=SUB).pack(side="left")
+                # Pad bottom of assign-mode row
+                tk.Frame(container, bg=bg, height=4).pack()
 
-            # "apply sync" checkbox
-            ck = tk.Checkbutton(row2,
-                                variable=self._aaf_source_sync_vars[base],
-                                text="apply sync", font=FB, bg=bg, fg=SUB,
-                                activebackground=bg, activeforeground=TEXT,
-                                selectcolor=BG, relief="flat", bd=0,
-                                cursor="hand2")
-            ck.pack(side="left", padx=(2, 8))
+            else:
+                # ── SYNC mode: only show sources marked "needs sync" ───────────
+                if not self._aaf_needs_sync_vars[base].get():
+                    container.destroy()
+                    continue
 
-            # Reference audio dropdown (fills remaining space)
-            aud_dd = _FlatDropdown(row2, textvariable=aud_disp,
-                                   values=aud_options,
-                                   state="readonly", font=FB, width=36)
-            aud_dd.pack(side="left", fill="x", expand=True)
+                locked = self._aaf_sync_locked_vars[base].get()
 
-            # ── Live color update when video dropdown changes ──────────────────
-            # Remove any stale traces from previous rebuilds before adding a new one.
-            for _tr in list(sv.trace_info()):
-                if _tr[0] == "write":
-                    try: sv.trace_remove("write", _tr[1])
-                    except Exception: pass
-            def _on_vid_change(*args, c=container, s=sv):
-                _apply_color(c, _row_bg(s.get()))
-            sv.trace_add("write", _on_vid_change)
+                # ── Row 1: dot | name | video label | [✓ ACCEPT] [🔒] [SYNC] ──
+                state_val = self._aaf_sync_state_vars[base].get()
+                dot_color = _STATE_DOT.get(state_val, SUB)
+                dot_lbl = tk.Label(row1, text="\u25cf", font=FB, bg=bg,
+                                   fg=dot_color, padx=2)
+                dot_lbl.pack(side="left")
+                self._aaf_sync_dot_labels[base] = dot_lbl
 
-            # ── Audio dropdown → full-path var + sync label reset ─────────────
-            # aud_disp is recreated each rebuild so no old traces exist.
-            # Look up the full path dynamically from the live pool so the trace
-            # is never stale regardless of when audio files were added.
-            def _on_aud_change(*args, b=base, dv=aud_disp):
-                fn   = dv.get()
-                full = {basename(p): p for p in self._aaf_audio_paths}.get(fn, "")
-                self._aaf_source_syncaudio_vars[b].set(full)
-                # Clear stale sync result so user knows a re-SYNC is needed
-                lv = self._aaf_source_sync_label_vars.get(b)
-                if lv and lv.get():
-                    lv.set("")
-                    btn = self._aaf_sync_btns.get(b)
-                    if btn:
-                        self._aaf_refresh_sync_btn(b, btn)
-            aud_disp.trace_add("write", _on_aud_change)
+                name_lbl = tk.Label(row1, text=base, font=FB, bg=bg, fg=TEXT, anchor="w")
+                name_lbl.pack(side="left", fill="x", expand=True)
+                self._tooltip(name_lbl, base)
+
+                # Video label (read-only in sync mode)
+                vid_val = sv.get()
+                vid_short = vid_val if vid_val != "— no video —" else "no video"
+                tk.Label(row1, text=vid_short, font=FB, bg=bg, fg=SUB,
+                         width=20, anchor="e").pack(side="right", padx=(4, 0))
+
+                # SYNC button (rightmost)
+                sync_btn = self._btn(row1, "SYNC",
+                                     lambda b=base: self._aaf_do_sync(b),
+                                     small=True)
+                sync_btn.pack(side="right", padx=(4, 0))
+                if locked:
+                    sync_btn.config(state="disabled", fg=SUB)
+                self._aaf_sync_btns[base] = sync_btn
+                self._aaf_refresh_sync_btn(base, sync_btn)
+
+                # 🔒 Lock toggle
+                lock_text = "\U0001f512" if locked else "\U0001f513"
+                lock_fg   = WARN if locked else SUB
+                lock_btn  = tk.Label(row1, text=lock_text, font=FB, bg=SURF3,
+                                     fg=lock_fg, cursor="hand2", padx=6, pady=2,
+                                     bd=0, highlightbackground=BORDER,
+                                     highlightthickness=1)
+                lock_btn.pack(side="right", padx=(4, 0))
+                lock_btn.bind("<Enter>",  lambda e, w=lock_btn: w.config(bg=ACCENT))
+                lock_btn.bind("<Leave>",  lambda e, w=lock_btn: w.config(bg=SURF3))
+                lock_btn.bind("<ButtonRelease-1>",
+                              lambda e, b=base: self._aaf_toggle_lock(b))
+                self._aaf_lock_btns[base] = lock_btn
+
+                # ✓ ACCEPT button (confirm auto result without opening dialog)
+                cfm_text, cfm_fg = self._confirm_btn_style(state_val)
+                cfm_btn = tk.Label(row1, text=cfm_text, font=FB, bg=SURF3,
+                                   fg=cfm_fg, cursor="hand2", padx=6, pady=2,
+                                   bd=0, highlightbackground=BORDER,
+                                   highlightthickness=1)
+                cfm_btn.pack(side="right", padx=(4, 0))
+                cfm_btn.bind("<Enter>",  lambda e, w=cfm_btn: w.config(bg=ACCENT))
+                cfm_btn.bind("<Leave>",  lambda e, w=cfm_btn: w.config(bg=SURF3))
+                cfm_btn.bind("<ButtonRelease-1>",
+                             lambda e, b=base: self._aaf_confirm_sync(b))
+                if locked:
+                    cfm_btn.config(state="disabled", fg=SUB)
+                self._aaf_confirm_btns[base] = cfm_btn
+
+                # ── Sync mode row 2: apply | audio | offset | PREVIEW | ↺ | ALIGN
+                row2 = tk.Frame(container, bg=bg)
+                row2.pack(fill="x", padx=6, pady=(2, 4))
+
+                # ↳ indent
+                tk.Label(row2, text="\u21b3", font=FB, bg=bg, fg=SUB).pack(side="left")
+
+                # Apply-sync checkbox
+                ck = tk.Checkbutton(row2,
+                                    variable=self._aaf_source_sync_vars[base],
+                                    text="apply", font=FB, bg=bg, fg=SUB,
+                                    activebackground=bg, activeforeground=TEXT,
+                                    selectcolor=BG, relief="flat", bd=0,
+                                    cursor="hand2")
+                ck.pack(side="left", padx=(2, 6))
+                if locked:
+                    ck.config(state="disabled")
+
+                # Reference audio dropdown
+                aud_dd_state = "disabled" if locked else "readonly"
+                _aw_chars = max(20, getattr(self, "_aaf_col_widths", {}).get("audio", 260) // 8)
+                aud_dd = _FlatDropdown(row2, textvariable=aud_disp,
+                                       values=aud_options,
+                                       state=aud_dd_state, font=FB, width=_aw_chars)
+                aud_dd.pack(side="left", fill="x", expand=True)
+
+                # Offset readout
+                tk.Label(row2, textvariable=self._aaf_source_offset_vars[base],
+                         font=FB, bg=bg, fg=ACCENT,
+                         width=9, anchor="e").pack(side="right", padx=(6, 2))
+                tk.Label(row2, text="s", font=FB, bg=bg, fg=SUB).pack(side="right")
+
+                # ▶ PREVIEW / ■ STOP toggle button
+                prev_btn = tk.Label(row2, text="\u25b6 PREVIEW", font=FB, bg=SURF3,
+                                    fg=TEXT, cursor="hand2", padx=6, pady=2, bd=0,
+                                    highlightbackground=BORDER, highlightthickness=1)
+                prev_btn.pack(side="right", padx=(4, 0))
+                prev_btn.bind("<Enter>",  lambda e, w=prev_btn: w.config(bg=ACCENT))
+                prev_btn.bind("<Leave>",  lambda e, w=prev_btn: w.config(bg=SURF3))
+                prev_btn.bind("<ButtonRelease-1>",
+                              lambda e, b=base: self._aaf_qa_toggle(b))
+                self._aaf_qa_btns[base] = prev_btn
+
+                # ↺ Reset button (disabled when locked)
+                rst_btn = tk.Label(row2, text="\u21ba", font=FB, bg=SURF3,
+                                   fg=SUB, cursor="hand2", padx=6, pady=2, bd=0,
+                                   highlightbackground=BORDER, highlightthickness=1)
+                rst_btn.pack(side="right", padx=(4, 0))
+                if locked:
+                    rst_btn.config(state="disabled", cursor="")
+                else:
+                    rst_btn.bind("<Enter>",  lambda e, w=rst_btn: w.config(bg="#5a2020"))
+                    rst_btn.bind("<Leave>",  lambda e, w=rst_btn: w.config(bg=SURF3))
+                    rst_btn.bind("<ButtonRelease-1>",
+                                 lambda e, b=base: self._aaf_reset_sync(b))
+
+                # ALIGN… button (disabled when locked)
+                align_btn = tk.Label(row2, text="ALIGN\u2026", font=FB, bg=SURF3,
+                                     fg=SUB if locked else TEXT,
+                                     cursor="" if locked else "hand2",
+                                     padx=6, pady=2, bd=0,
+                                     highlightbackground=BORDER, highlightthickness=1)
+                align_btn.pack(side="right", padx=(4, 0))
+                if not locked:
+                    align_btn.bind("<Enter>",  lambda e, w=align_btn: w.config(bg=ACCENT))
+                    align_btn.bind("<Leave>",  lambda e, w=align_btn: w.config(bg=SURF3))
+                    align_btn.bind("<ButtonRelease-1>",
+                                   lambda e, b=base: self._aaf_open_align(b))
+
+                # Audio dropdown trace (clear stale sync on ref change)
+                def _on_aud_change(*args, b=base, dv=aud_disp):
+                    fn   = dv.get()
+                    full = {basename(p): p for p in self._aaf_audio_paths}.get(fn, "")
+                    self._aaf_source_syncaudio_vars[b].set(full)
+                    lv = self._aaf_source_sync_label_vars.get(b)
+                    if lv and lv.get():
+                        lv.set("")
+                        btn_ = self._aaf_sync_btns.get(b)
+                        if btn_:
+                            self._aaf_refresh_sync_btn(b, btn_)
+                aud_disp.trace_add("write", _on_aud_change)
+
+        # Show placeholder when SYNC page has nothing to display
+        if mode == "sync":
+            visible = [b for b in self._aaf_sources
+                       if self._aaf_needs_sync_vars.get(b, tk.BooleanVar()).get()]
+            if not visible:
+                tk.Label(self._aaf_assign_frame,
+                         text="No sources marked for sync.\n"
+                              "Go to ASSIGN and tick the \u201csync\u201d checkbox on each source that needs it.",
+                         font=FB, bg=SURF, fg=SUB, justify="center",
+                         pady=20).pack(fill="x")
 
         self._aaf_auto_match()
 
@@ -2793,8 +3245,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
             def _apply():
                 if best_fps is not None:
-                    display = "{:.3f}".format(best_fps).rstrip("0").rstrip(".")
-                    self._aaf_fps_var.set(display)
+                    # Only auto-fill FPS when a fixed preset hasn't been chosen
+                    preset = getattr(self, "_aaf_preset_var", None)
+                    preset_val = preset.get() if preset else "Detect from media"
+                    if preset_val in ("Detect from media", "Custom"):
+                        display = "{:.3f}".format(best_fps).rstrip("0").rstrip(".")
+                        self._aaf_fps_var.set(display)
                 self._aaf_set_status("")
             self.after(0, _apply)
 
@@ -2806,6 +3262,57 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             ex.shutdown(wait=False)
         except Exception:
             pass   # ffprobe not available or thread error — leave FPS as typed
+
+    def _aaf_update_seq_presets(self):
+        """Probe loaded video files and add detected (W×H @ fps) options to the
+        sequence preset dropdown below a divider, so the user can pick directly
+        from their source media without having to look it up."""
+        dd = getattr(self, "_aaf_preset_dd", None)
+        if dd is None:
+            return
+        vpaths = list(getattr(self, "_aaf_video_paths", []))
+
+        def _probe():
+            seen     = set()
+            detected = []
+            for vp in vpaths:
+                if not os.path.isfile(vp):
+                    continue
+                try:
+                    w, h, fps, _ = engines.probe_media_settings([vp])
+                    if w > 0 and h > 0 and fps > 0:
+                        key = (w, h, round(fps, 3))
+                        if key not in seen:
+                            seen.add(key)
+                            fps_s = "{:.3f}".format(fps).rstrip("0").rstrip(".")
+                            label = "{}×{}  @  {}fps".format(w, h, fps_s)
+                            detected.append((w, h, fps, label))
+                except Exception:
+                    pass
+            return detected
+
+        def _apply(detected):
+            base_names = [p[0] for p in _AAF_SEQ_PRESETS]
+            new_values = list(base_names)
+            if detected:
+                new_values.append(
+                    _FlatDropdown.separator("──── Detected from source ────"))
+                for _, _, _, label in detected:
+                    new_values.append(label)
+            dd.configure(values=new_values)
+            self._aaf_detected_presets = {
+                label: (w, h, fps) for w, h, fps, label in detected}
+
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            ex = ThreadPoolExecutor(max_workers=1)
+            fut = ex.submit(_probe)
+            fut.add_done_callback(
+                lambda f: self.after(0,
+                    lambda: _apply([] if f.exception() else f.result())))
+            ex.shutdown(wait=False)
+        except Exception:
+            pass
 
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
@@ -2836,51 +3343,149 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         aud_disp.set(fn)
 
     def _aaf_sync_all(self):
-        """Run sync detection for every source that has a video AND reference audio assigned."""
+        """Run sync detection for every source marked 'needs sync' that has video + audio."""
         sources_to_sync = [
             base for base in self._aaf_sources
-            if (self._aaf_source_file_vars.get(base, tk.StringVar()).get() != "— no video —"
+            if (self._aaf_needs_sync_vars.get(base, tk.BooleanVar()).get()
+                and self._aaf_source_file_vars.get(base, tk.StringVar()).get() != "— no video —"
                 and self._aaf_source_audio_disp_vars.get(base, tk.StringVar()).get() != "— no audio —")
         ]
         if not sources_to_sync:
             messagebox.showwarning("Nothing to sync",
-                "Assign both a video file and a reference audio file to at least one source.")
+                "Tick the 'sync' checkbox on at least one source that has both a video "
+                "and a reference audio file assigned.")
             return
         for base in sources_to_sync:
             self._aaf_do_sync(base)
 
     def _aaf_remove_source(self, base, container):
         """Remove one source from the assignment list (does not affect the AAF parse)."""
+        self._aaf_push_full_undo()
         if base in self._aaf_sources:
             self._aaf_sources.remove(base)
         for d in (self._aaf_source_file_vars, self._aaf_source_sync_vars,
                   self._aaf_source_syncaudio_vars, self._aaf_source_audio_disp_vars,
-                  self._aaf_source_offset_vars):
+                  self._aaf_source_offset_vars, self._aaf_sync_state_vars,
+                  self._aaf_needs_sync_vars, self._aaf_sync_locked_vars):
             d.pop(base, None)
         container.destroy()
 
     def _aaf_remove_unassigned_sources(self):
-        """Remove all sources that have no video file assigned."""
-        to_remove = [b for b in self._aaf_sources
-                     if self._aaf_source_file_vars.get(
-                         b, tk.StringVar(value="— no video —")).get() == "— no video —"]
-        if not to_remove:
-            messagebox.showinfo("Remove Unassigned",
-                                "Every source already has a video file assigned.")
+        """Remove all sources that have no video file assigned (legacy helper)."""
+        self._aaf_remove_unassigned()
+
+    def _aaf_remove_unassigned(self):
+        """
+        Clean up three categories of unused items:
+          1. Source clips with no video assigned
+          2. Video files in the pool not assigned to any source
+          3. Audio files in the pool not used as sync audio for any source
+        Confirms once before doing anything.
+        """
+        # 1 — unassigned sources
+        dead_sources = [b for b in self._aaf_sources
+                        if self._aaf_source_file_vars.get(
+                            b, tk.StringVar(value="— no video —")).get() == "— no video —"]
+
+        # 2 — video pool files not used by any source
+        used_vid_fns = {sv.get() for sv in self._aaf_source_file_vars.values()
+                        if sv.get() not in ("— no video —", "")}
+        dead_vids = [p for p in self._aaf_video_paths
+                     if basename(p) not in used_vid_fns]
+
+        # 3 — audio pool files not used as sync reference by any source
+        used_aud_paths = {sv.get() for sv in self._aaf_source_syncaudio_vars.values()
+                          if sv.get()}
+        dead_auds = [p for p in self._aaf_audio_paths
+                     if p not in used_aud_paths]
+
+        if not dead_sources and not dead_vids and not dead_auds:
+            messagebox.showinfo("Clean Up", "Nothing to remove — everything is assigned.")
             return
-        msg = "Remove {} unassigned source{}?\n\n{}{}".format(
-            len(to_remove),
-            "s" if len(to_remove) != 1 else "",
-            "\n".join(to_remove[:10]),
-            "\n…and {} more".format(len(to_remove) - 10) if len(to_remove) > 10 else "")
-        if not messagebox.askyesno("Remove Unassigned", msg):
+
+        lines = []
+        if dead_sources:
+            lines.append("{} unassigned source{}:".format(
+                len(dead_sources), "s" if len(dead_sources) != 1 else ""))
+            lines += ["  " + b for b in dead_sources[:5]]
+            if len(dead_sources) > 5:
+                lines.append("  … and {} more".format(len(dead_sources) - 5))
+        if dead_vids:
+            lines.append("{} unused video file{}".format(
+                len(dead_vids), "s" if len(dead_vids) != 1 else ""))
+        if dead_auds:
+            lines.append("{} unused audio file{}".format(
+                len(dead_auds), "s" if len(dead_auds) != 1 else ""))
+
+        if not messagebox.askyesno("Clean Up", "\n".join(lines) + "\n\nRemove all?"):
             return
-        for base in to_remove:
+
+        self._aaf_push_full_undo()
+        for base in dead_sources:
             self._aaf_sources.remove(base)
             for d in (self._aaf_source_file_vars, self._aaf_source_sync_vars,
                       self._aaf_source_syncaudio_vars, self._aaf_source_audio_disp_vars,
-                      self._aaf_source_offset_vars):
+                      self._aaf_source_offset_vars, self._aaf_sync_state_vars,
+                      self._aaf_needs_sync_vars, self._aaf_sync_locked_vars):
                 d.pop(base, None)
+
+        for p in dead_vids:
+            if p in self._aaf_video_paths:
+                self._aaf_video_paths.remove(p)
+        nv = len(self._aaf_video_paths)
+        if hasattr(self, "_aaf_count_lbl"):
+            self._aaf_count_lbl.config(
+                text="{} file{}".format(nv, "s" if nv != 1 else ""))
+
+        for p in dead_auds:
+            if p in self._aaf_audio_paths:
+                self._aaf_audio_paths.remove(p)
+        na = len(self._aaf_audio_paths)
+        if hasattr(self, "_aaf_audio_count_lbl"):
+            self._aaf_audio_count_lbl.config(
+                text="{} file{}".format(na, "s" if na != 1 else ""))
+
+        self._rebuild_aaf_source_rows()
+
+    def _aaf_col_sash(self, parent, col_key, bg):
+        """
+        Create a thin drag-handle between column headers.
+        Dragging it adjusts _aaf_col_widths[col_key] and triggers a row rebuild.
+        """
+        sash = tk.Frame(parent, bg=SURF3, width=5, cursor="sb_h_double_arrow")
+        sash.pack(side="left", fill="y", padx=0)
+        drag = {}
+        def _press(e, k=col_key):
+            drag["x0"] = e.x_root
+            drag["w0"] = getattr(self, "_aaf_col_widths", {}).get(k, 150)
+        def _release(e, k=col_key):
+            delta = e.x_root - drag.get("x0", e.x_root)
+            old   = drag.get("w0", 150)
+            new_w = max(60, old + delta)
+            if not hasattr(self, "_aaf_col_widths"):
+                self._aaf_col_widths = {}
+            self._aaf_col_widths[k] = new_w
+            self._rebuild_aaf_source_rows()
+        sash.bind("<ButtonPress-1>",   _press)
+        sash.bind("<ButtonRelease-1>", _release)
+        # Visual feedback on hover
+        sash.bind("<Enter>",  lambda e, w=sash: w.config(bg=ACCENT))
+        sash.bind("<Leave>",  lambda e, w=sash: w.config(bg=SURF3))
+
+    def _aaf_col_reorder(self, clicked_idx, col_name):
+        """
+        Reorder ASSIGN columns by swapping the clicked column with its neighbour.
+        Each click on a column header rotates it one position to the right
+        (wraps around).
+        """
+        order = getattr(self, "_aaf_col_order", ["tracks", "video"])
+        if col_name not in order:
+            return
+        idx = order.index(col_name)
+        # Swap with next (wraps to 0)
+        next_idx = (idx + 1) % len(order)
+        order[idx], order[next_idx] = order[next_idx], order[idx]
+        self._aaf_col_order = order
         self._rebuild_aaf_source_rows()
 
     def _aaf_refresh_sync_btn(self, base, btn):
@@ -2900,6 +3505,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_do_sync(self, base):
         """Run sync detection for this source using the selected reference audio."""
+        if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        self._aaf_push_undo(base)
         btn = self._aaf_sync_btns.get(base)
 
         # The reference audio is whatever the user has selected in the dropdown.
@@ -2950,7 +3558,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         def _run():
             return detect_sync_offset(vp, ap, probe_duration=300.0,
-                                         start_offset=start_offset)
+                                      start_offset=start_offset)
 
         def _done(fut):
             try:
@@ -2992,8 +3600,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     btn.config(state="normal")
                     self._aaf_refresh_sync_btn(base, btn)
 
-                # Open the sync preview dialog so the user can verify / adjust.
-                self._aaf_open_sync_preview(base, vp, ap, offset)
+                # Mark as auto-synced (amber dot) until manually confirmed
+                self._aaf_set_sync_state(base, "auto")
 
             self.after(0, _apply)
 
@@ -3005,9 +3613,34 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     # ── Sync Preview ────────────────────────────────────────────────────────
 
+    def _aaf_open_align(self, base):
+        """Open the waveform alignment dialog for manual verification/adjustment."""
+        if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
+        if fn == "— no video —":
+            messagebox.showwarning("No Video",
+                "Assign a video file to this source before opening alignment.")
+            return
+        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        vp = path_by_fn.get(fn)
+        if not vp:
+            return
+        ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
+        if not ap or not os.path.isfile(ap):
+            messagebox.showwarning("No Reference Audio",
+                "Select a reference audio file for this source before aligning.")
+            return
+        try:
+            offset = float(self._aaf_source_offset_vars[base].get())
+        except (KeyError, ValueError):
+            offset = 0.0
+        self._aaf_open_sync_preview(base, vp, ap, offset)
+
     def _aaf_open_sync_preview(self, base, video_path, audio_path, offset):
         """Open the waveform sync-preview dialog for manual verification."""
         def _on_accept(accepted_offset):
+            self._aaf_push_undo(base)
             ov = self._aaf_source_offset_vars.get(base)
             if ov:
                 ov.set("{:.3f}".format(accepted_offset))
@@ -3020,12 +3653,427 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             btn = self._aaf_sync_btns.get(base)
             if btn:
                 self._aaf_refresh_sync_btn(base, btn)
+            # Mark as manually confirmed (green dot) and auto-lock
+            self._aaf_set_sync_state(base, "manual")
+            self._aaf_apply_lock(base, True)
 
-        SyncPreviewDialog(
+        # Close any existing preview for this source before opening a fresh one
+        prev = self._aaf_sync_previews.get(base)
+        if prev is not None:
+            try: prev.close()
+            except Exception: pass
+
+        dlg = SyncPreviewDialog(
             self, video_path, audio_path,
             initial_offset=offset,
             on_accept=_on_accept,
             source_name=base)
+        self._aaf_sync_previews[base] = dlg
+
+    # ── Sync helpers ─────────────────────────────────────────────────────────
+
+    _STATE_DOT_COLORS = {"": SUB, "auto": WARN, "manual": SUCCESS}
+
+    @staticmethod
+    def _confirm_btn_style(state):
+        """Return (text, fg) for the ACCEPT confirm button given sync state."""
+        if state == "auto":
+            return "\u2713 ACCEPT", WARN
+        if state == "manual":
+            return "\u2713 ACCEPTED", SUCCESS
+        return "\u2713 ACCEPT", SUB
+
+    def _aaf_sync_snapshot(self, base):
+        """Return a dict capturing the current sync state of *base*."""
+        return {
+            "offset":  self._aaf_source_offset_vars.get(base, tk.StringVar()).get(),
+            "state":   self._aaf_sync_state_vars.get(base, tk.StringVar()).get(),
+            "locked":  self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get(),
+            "enabled": self._aaf_source_sync_vars.get(base, tk.BooleanVar()).get(),
+            "label":   self._aaf_source_sync_label_vars.get(base, tk.StringVar()).get(),
+        }
+
+    def _aaf_push_undo(self, base):
+        """Snapshot current state onto the undo stack; clear redo stack."""
+        stack = getattr(self, "_sync_undo_stack", None)
+        if stack is None:
+            self._sync_undo_stack = []
+            self._sync_redo_stack = []
+            stack = self._sync_undo_stack
+        stack.append((base, self._aaf_sync_snapshot(base)))
+        if len(stack) > 30:
+            stack.pop(0)
+        self._sync_redo_stack.clear()
+
+    def _aaf_full_snapshot(self):
+        """Capture the complete source list and all state for full undo (e.g. source removal)."""
+        snap = {
+            "__type__": "full",
+            "sources": list(self._aaf_sources),
+            "assignments": {b: sv.get()
+                            for b, sv in self._aaf_source_file_vars.items()},
+            "sync": {},
+        }
+        for b in self._aaf_sources:
+            snap["sync"][b] = {
+                "enabled":    self._aaf_source_sync_vars.get(b, tk.BooleanVar()).get(),
+                "audio_path": self._aaf_source_syncaudio_vars.get(b, tk.StringVar()).get(),
+                "audio_disp": self._aaf_source_audio_disp_vars.get(b, tk.StringVar()).get(),
+                "offset":     self._aaf_source_offset_vars.get(b, tk.StringVar(value="0.000")).get(),
+                "label":      self._aaf_source_sync_label_vars.get(b, tk.StringVar()).get(),
+                "state":      self._aaf_sync_state_vars.get(b, tk.StringVar()).get(),
+                "needs_sync": self._aaf_needs_sync_vars.get(b, tk.BooleanVar()).get(),
+                "locked":     self._aaf_sync_locked_vars.get(b, tk.BooleanVar()).get(),
+            }
+        return snap
+
+    def _aaf_push_full_undo(self):
+        """Push a full-state snapshot — used before destructive operations like source removal."""
+        stack = getattr(self, "_sync_undo_stack", None)
+        if stack is None:
+            self._sync_undo_stack = []
+            self._sync_redo_stack = []
+            stack = self._sync_undo_stack
+        stack.append(self._aaf_full_snapshot())
+        if len(stack) > 30:
+            stack.pop(0)
+        self._sync_redo_stack.clear()
+
+    def _aaf_full_restore(self, snap):
+        """Restore a full-state snapshot captured by _aaf_full_snapshot."""
+        saved_sources = snap.get("sources", [])
+        assignments   = snap.get("assignments", {})
+        sync_data     = snap.get("sync", {})
+
+        # Restore source list order (only sources present in the snapshot)
+        self._aaf_sources[:] = [b for b in saved_sources if b in self._aaf_sources
+                                 or b in sync_data]
+
+        # Re-create any vars that were removed
+        options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        for b in saved_sources:
+            if b not in self._aaf_source_file_vars:
+                self._aaf_source_file_vars[b]       = tk.StringVar(value="— no video —")
+            if b not in self._aaf_source_sync_vars:
+                self._aaf_source_sync_vars[b]       = tk.BooleanVar(value=False)
+            if b not in self._aaf_source_syncaudio_vars:
+                self._aaf_source_syncaudio_vars[b]  = tk.StringVar(value="")
+            if b not in self._aaf_source_audio_disp_vars:
+                self._aaf_source_audio_disp_vars[b] = tk.StringVar(value="— no audio —")
+            if b not in self._aaf_source_offset_vars:
+                self._aaf_source_offset_vars[b]     = tk.StringVar(value="0.000")
+            if b not in self._aaf_source_sync_label_vars:
+                self._aaf_source_sync_label_vars[b] = tk.StringVar(value="")
+            if b not in self._aaf_sync_state_vars:
+                self._aaf_sync_state_vars[b]        = tk.StringVar(value="")
+            if b not in self._aaf_needs_sync_vars:
+                self._aaf_needs_sync_vars[b]        = tk.BooleanVar(value=False)
+            if b not in self._aaf_sync_locked_vars:
+                self._aaf_sync_locked_vars[b]       = tk.BooleanVar(value=False)
+
+        # Apply saved values
+        for b in saved_sources:
+            fn = assignments.get(b, "— no video —")
+            if fn in options:
+                self._aaf_source_file_vars[b].set(fn)
+            sd = sync_data.get(b, {})
+            self._aaf_source_sync_vars[b].set(sd.get("enabled", False))
+            self._aaf_source_syncaudio_vars[b].set(sd.get("audio_path", ""))
+            self._aaf_source_audio_disp_vars[b].set(sd.get("audio_disp", "— no audio —"))
+            self._aaf_source_offset_vars[b].set(sd.get("offset", "0.000"))
+            self._aaf_source_sync_label_vars[b].set(sd.get("label", ""))
+            self._aaf_sync_state_vars[b].set(sd.get("state", ""))
+            self._aaf_needs_sync_vars[b].set(sd.get("needs_sync", False))
+            self._aaf_sync_locked_vars[b].set(sd.get("locked", False))
+
+        self._rebuild_aaf_source_rows()
+
+    def _aaf_sync_restore(self, base, snap):
+        """Apply a snapshot dict to *base* and refresh the UI."""
+        ov = self._aaf_source_offset_vars.get(base)
+        if ov: ov.set(snap.get("offset", "0.000"))
+        lv = self._aaf_source_sync_label_vars.get(base)
+        if lv: lv.set(snap.get("label", ""))
+        sv = self._aaf_source_sync_vars.get(base)
+        if sv: sv.set(snap.get("enabled", False))
+        lkv = self._aaf_sync_locked_vars.get(base)
+        if lkv: lkv.set(snap.get("locked", False))
+        self._aaf_set_sync_state(base, snap.get("state", ""))
+        btn = self._aaf_sync_btns.get(base)
+        if btn:
+            self._aaf_refresh_sync_btn(base, btn)
+        # If locked state changed, rebuild so button enable/disable updates
+        self._rebuild_aaf_source_rows()
+
+    def _aaf_sync_undo(self):
+        stack = getattr(self, "_sync_undo_stack", [])
+        if not stack:
+            return
+        entry = stack.pop()
+        if isinstance(entry, dict) and entry.get("__type__") == "full":
+            redo = self._aaf_full_snapshot()
+            getattr(self, "_sync_redo_stack", []).append(redo)
+            self._aaf_full_restore(entry)
+        else:
+            base, snap = entry
+            redo_snap = self._aaf_sync_snapshot(base)
+            getattr(self, "_sync_redo_stack", []).append((base, redo_snap))
+            self._aaf_sync_restore(base, snap)
+
+    def _aaf_sync_redo(self):
+        stack = getattr(self, "_sync_redo_stack", [])
+        if not stack:
+            return
+        entry = stack.pop()
+        if isinstance(entry, dict) and entry.get("__type__") == "full":
+            undo = self._aaf_full_snapshot()
+            getattr(self, "_sync_undo_stack", []).append(undo)
+            self._aaf_full_restore(entry)
+        else:
+            base, snap = entry
+            undo_snap = self._aaf_sync_snapshot(base)
+            getattr(self, "_sync_undo_stack", []).append((base, undo_snap))
+            self._aaf_sync_restore(base, snap)
+
+    def _aaf_set_sync_state(self, base, state):
+        """Set sync state var and update dot + confirm button colours."""
+        ssv = self._aaf_sync_state_vars.get(base)
+        if ssv:
+            ssv.set(state)
+        dot = getattr(self, "_aaf_sync_dot_labels", {}).get(base)
+        if dot:
+            try:
+                dot.config(fg=self._STATE_DOT_COLORS.get(state, SUB))
+            except Exception:
+                pass
+        cfm = getattr(self, "_aaf_confirm_btns", {}).get(base)
+        if cfm:
+            try:
+                text, fg = self._confirm_btn_style(state)
+                # Only update colour if not locked (locked items are greyed out)
+                locked = self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get()
+                if not locked:
+                    cfm.config(text=text, fg=fg)
+            except Exception:
+                pass
+
+    def _aaf_confirm_sync(self, base):
+        """Accept the auto-detected offset, mark as confirmed, and lock."""
+        if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        state = self._aaf_sync_state_vars.get(base, tk.StringVar()).get()
+        if not state:
+            return   # nothing to confirm
+        self._aaf_push_undo(base)
+        sv = self._aaf_source_sync_vars.get(base)
+        if sv:
+            sv.set(True)
+        self._aaf_set_sync_state(base, "manual")
+        # Auto-lock after accepting so it can't be accidentally changed
+        self._aaf_apply_lock(base, True)
+
+    def _aaf_apply_lock(self, base, locked):
+        """Set lock state and refresh lock button + dependent widgets."""
+        lkv = self._aaf_sync_locked_vars.get(base)
+        if lkv:
+            lkv.set(locked)
+        lock_btn = getattr(self, "_aaf_lock_btns", {}).get(base)
+        if lock_btn:
+            try:
+                lock_btn.config(text="\U0001f512" if locked else "\U0001f513",
+                                fg=WARN if locked else SUB)
+            except Exception:
+                pass
+        # Rebuild so all dependent buttons (SYNC, ALIGN, RESET, apply ck) update
+        self._rebuild_aaf_source_rows()
+
+    def _aaf_toggle_lock(self, base):
+        """Toggle the sync lock for *base*."""
+        current = self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get()
+        self._aaf_push_undo(base)
+        self._aaf_apply_lock(base, not current)
+
+    def _aaf_reset_sync(self, base):
+        """Reset sync state for *base* back to zero."""
+        if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        self._aaf_push_undo(base)
+        ov = self._aaf_source_offset_vars.get(base)
+        if ov: ov.set("0.000")
+        sv = self._aaf_source_sync_vars.get(base)
+        if sv: sv.set(False)
+        lv = self._aaf_source_sync_label_vars.get(base)
+        if lv: lv.set("")
+        self._aaf_set_sync_state(base, "")
+        btn = self._aaf_sync_btns.get(base)
+        if btn:
+            self._aaf_refresh_sync_btn(base, btn)
+
+    def _aaf_qa_stop(self):
+        """Stop any currently-playing QA audio and reset its button."""
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        prev = getattr(self, "_aaf_qa_playing", None)
+        if prev:
+            btn = self._aaf_qa_btns.get(prev)
+            if btn:
+                try:
+                    btn.config(text="\u25b6 PREVIEW", fg=TEXT)
+                except Exception:
+                    pass
+        self._aaf_qa_playing = None
+
+    def _aaf_qa_toggle(self, base):
+        """Toggle QA playback: start if idle/different source, stop if already playing."""
+        if getattr(self, "_aaf_qa_playing", None) == base:
+            self._aaf_qa_stop()
+            return
+        self._aaf_qa_stop()   # stop any other source first
+        self._aaf_qa_play(base)
+
+    def _aaf_qa_play(self, base):
+        """Extract a 10-second middle segment of the aligned pair and play it."""
+        fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
+        if fn == "— no video —":
+            messagebox.showwarning("No Video",
+                "Assign a video file to this source before QA playback.")
+            return
+        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        vp = path_by_fn.get(fn)
+        if not vp:
+            return
+        ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
+        if not ap or not os.path.isfile(ap):
+            messagebox.showwarning("No Reference Audio",
+                "Select and sync a reference audio file before QA playback.")
+            return
+        try:
+            offset_s = float(self._aaf_source_offset_vars[base].get())
+        except (KeyError, ValueError):
+            offset_s = 0.0
+
+        import tempfile, wave as _wave
+        tmp_dir = getattr(self, "_qa_tmp_dir", None)
+        if not tmp_dir or not os.path.isdir(tmp_dir):
+            self._qa_tmp_dir = tempfile.mkdtemp(prefix="pb_qa_")
+            tmp_dir = self._qa_tmp_dir
+
+        QA_DUR = 10.0
+        QA_SR  = 16000
+
+        # Mark as playing and switch button to stop icon
+        self._aaf_qa_playing = base
+        btn = self._aaf_qa_btns.get(base)
+        if btn:
+            try:
+                btn.config(text="\u25a0 STOP", fg=WARN)
+            except Exception:
+                pass
+
+        def _run():
+            import numpy as _np
+            # Probe reference duration; fall back to 60s estimate if probe fails
+            ref_dur = engines._probe_duration(ap)
+            if ref_dur <= 0:
+                ref_dur = 60.0   # assume at least 60 s and try anyway
+
+            # Try to find a speech-rich region near the middle of the file
+            # using blob detection; fall back to simple midpoint if it fails.
+            mid = ref_dur / 2.0
+            start_s = max(0.0, mid - QA_DUR / 2.0)
+            try:
+                blobs = engines.detect_speech_blobs(ap)
+                if blobs:
+                    # Pick the blob whose onset is closest to the file midpoint
+                    best = min(blobs, key=lambda b: abs(b["onset"] - mid))
+                    # Start just before the onset so the speech begins naturally
+                    start_s = max(0.0, best["onset"] - 0.5)
+            except Exception:
+                pass
+
+            vid_start = max(0.0, start_s + offset_s)
+
+            ref_wav = os.path.join(tmp_dir, "_qa_ref.wav")
+            vid_wav = os.path.join(tmp_dir, "_qa_vid.wav")
+            out_wav = os.path.join(tmp_dir, "_qa_mix.wav")
+
+            engines.extract_audio_segment(ap, start_s,   QA_DUR, ref_wav, sample_rate=QA_SR)
+            engines.extract_audio_segment(vp, vid_start, QA_DUR, vid_wav, sample_rate=QA_SR)
+
+            def _rd(path):
+                with _wave.open(path, "rb") as w:
+                    data = w.readframes(w.getnframes())
+                arr = _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
+                rms = _np.sqrt(_np.mean(arr ** 2))
+                return arr / rms * 0.4 if rms > 1e-6 else arr
+
+            a = _rd(ref_wav); b = _rd(vid_wav)
+            n = max(len(a), len(b))
+            a = _np.pad(a, (0, n - len(a))); b = _np.pad(b, (0, n - len(b)))
+            # Stereo: reference (DAW) → left ear, camera audio → right ear.
+            # Interleave L/R samples: [L0, R0, L1, R1, ...]
+            stereo = _np.empty(n * 2, dtype=_np.float32)
+            stereo[0::2] = _np.clip(a, -1.0, 1.0)   # left  = reference
+            stereo[1::2] = _np.clip(b, -1.0, 1.0)   # right = camera
+            pcm = (stereo * 32767).astype(_np.int16)
+            with _wave.open(out_wav, "wb") as w:
+                w.setnchannels(2); w.setsampwidth(2)
+                w.setframerate(QA_SR); w.writeframes(pcm.tobytes())
+            return out_wav
+
+        def _done(fut):
+            try:
+                wav = fut.result()
+            except Exception as exc:
+                def _err():
+                    self._aaf_qa_stop()
+                    messagebox.showerror("QA Play failed", str(exc))
+                self.after(0, _err)
+                return
+            if not wav:
+                self.after(0, self._aaf_qa_stop)
+                return
+
+            def _play():
+                # Guard: user may have clicked stop while extraction was running
+                if getattr(self, "_aaf_qa_playing", None) != base:
+                    return
+                try:
+                    import winsound
+                    winsound.PlaySound(wav,
+                        winsound.SND_FILENAME | winsound.SND_ASYNC)
+                except Exception:
+                    pass
+                # winsound async gives no completion callback; poll until silent
+                self._qa_poll(base, wav)
+
+            self.after(0, _play)
+
+        from concurrent.futures import ThreadPoolExecutor
+        ex = ThreadPoolExecutor(max_workers=1)
+        ex.submit(_run).add_done_callback(_done)
+        ex.shutdown(wait=False)
+
+    def _qa_poll(self, base, wav_path):
+        """Poll every 500 ms; reset button when the file has finished playing."""
+        if getattr(self, "_aaf_qa_playing", None) != base:
+            return   # stopped manually
+        import os as _os
+        # Heuristic: re-check if winsound is still holding the file open
+        # by attempting a no-op rename — not reliable cross-platform, so
+        # instead we estimate from file duration.
+        try:
+            import wave as _wave
+            with _wave.open(wav_path, "rb") as w:
+                dur_ms = int(w.getnframes() / w.getframerate() * 1000)
+        except Exception:
+            dur_ms = 10000  # 10 s fallback
+        # Schedule the reset slightly after the expected end
+        self.after(dur_ms + 200, lambda: self._aaf_qa_stop() if
+                   getattr(self, "_aaf_qa_playing", None) == base else None)
 
     # ── Reference-audio pool ─────────────────────────────────────────────────
 
@@ -3091,6 +4139,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if hasattr(self, "_aaf_assign_frame"):
             self._rebuild_aaf_source_rows()
 
+    def _aaf_browse_mix(self):
+        path = filedialog.askopenfilename(
+            title="Select stereo mix file",
+            filetypes=[("Audio files", "*.wav *.aiff *.aif *.mp3 *.m4a *.flac"),
+                       ("All files", "*.*")])
+        if path:
+            self._aaf_mix_var.set(path)
+
+    def _aaf_set_mix(self, paths):
+        """Accept a DnD drop for the mix file — use the first valid audio path."""
+        for p in (paths or []):
+            if p and is_audio(p):
+                self._aaf_mix_var.set(p)
+                return
+
     # ── Video pool ───────────────────────────────────────────────────────────
 
     def _aaf_add_video(self, path, _batch=False):
@@ -3131,6 +4194,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
         if hasattr(self, "_aaf_assign_frame"):
             self._rebuild_aaf_source_rows()
+        self._aaf_update_seq_presets()
 
     def _aaf_remove_unmatched(self):
         """Remove any pooled video files that aren't assigned to any source clip."""
@@ -3170,6 +4234,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         n = len(self._aaf_video_paths)
         self._aaf_count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
         self._rebuild_aaf_source_rows()
+        self._aaf_update_seq_presets()
 
     def _aaf_browse_files(self):
         from utils import VIDEO_EXTS
@@ -3212,6 +4277,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.update_idletasks()
             self._rebuild_aaf_source_rows()
         self._aaf_schedule_detect_fps()
+        self._aaf_update_seq_presets()
 
     def _aaf_set_status(self, msg):
         """Update the import status label (no-op if label not yet created)."""
@@ -3239,13 +4305,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "offset":     self._aaf_source_offset_vars[base].get(),
                     "label":      self._aaf_source_sync_label_vars.get(
                                       base, tk.StringVar()).get(),
+                    "state":      self._aaf_sync_state_vars.get(
+                                      base, tk.StringVar()).get(),
+                    "needs_sync": self._aaf_needs_sync_vars.get(
+                                      base, tk.BooleanVar()).get(),
+                    "locked":     self._aaf_sync_locked_vars.get(
+                                      base, tk.BooleanVar()).get(),
                 }
                 for base in self._aaf_sources
                 if base in self._aaf_source_sync_vars
             },
-            "grouping":    self._aaf_group_var.get(),
-            "fps":         self._aaf_fps_var.get(),
-            "seq_name":    self.seq_name.get(),
+            "grouping":      self._aaf_group_var.get(),
+            "fps":           self._aaf_fps_var.get(),
+            "seq_preset":    getattr(self, "_aaf_preset_var",  tk.StringVar(value="Detect from media")).get(),
+            "seq_w":         getattr(self, "_aaf_seq_w_var",   tk.StringVar()).get(),
+            "seq_h":         getattr(self, "_aaf_seq_h_var",   tk.StringVar()).get(),
+            "seq_name":      self.seq_name.get(),
+            "mix_path":      getattr(self, "_aaf_mix_var", tk.StringVar()).get(),
+            "camera_audio":  getattr(self, "_aaf_cam_audio_var", tk.BooleanVar()).get(),
         }
         sidecar   = self._aaf_sidecar_path()
         init_dir  = os.path.dirname(sidecar)  if sidecar else ""
@@ -3317,6 +4394,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._aaf_source_offset_vars[base].set(sd.get("offset", "0.000"))
             if base in self._aaf_source_sync_label_vars:
                 self._aaf_source_sync_label_vars[base].set(sd.get("label", ""))
+            if base in self._aaf_sync_state_vars:
+                self._aaf_sync_state_vars[base].set(sd.get("state", ""))
+            if base in self._aaf_needs_sync_vars:
+                self._aaf_needs_sync_vars[base].set(sd.get("needs_sync", False))
+            if base in self._aaf_sync_locked_vars:
+                self._aaf_sync_locked_vars[base].set(sd.get("locked", False))
 
         # Single rebuild + FPS probe for the entire load
         if hasattr(self, "_aaf_assign_frame"):
@@ -3326,7 +4409,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Restore other settings
         if "grouping" in data:  self._aaf_group_var.set(data["grouping"])
         if "fps"      in data:  self._aaf_fps_var.set(data["fps"])
+        if "seq_preset" in data:
+            if not hasattr(self, "_aaf_preset_var"):
+                self._aaf_preset_var = tk.StringVar()
+            self._aaf_preset_var.set(data["seq_preset"])
+        if "seq_w" in data:
+            if not hasattr(self, "_aaf_seq_w_var"):
+                self._aaf_seq_w_var = tk.StringVar()
+            self._aaf_seq_w_var.set(str(data.get("seq_w", "")))
+        if "seq_h" in data:
+            if not hasattr(self, "_aaf_seq_h_var"):
+                self._aaf_seq_h_var = tk.StringVar()
+            self._aaf_seq_h_var.set(str(data.get("seq_h", "")))
         if "seq_name" in data:  self.seq_name.set(data["seq_name"])
+        if "mix_path" in data:
+            if not hasattr(self, "_aaf_mix_var"):
+                self._aaf_mix_var = tk.StringVar()
+            self._aaf_mix_var.set(data["mix_path"])
+        if "camera_audio" in data:
+            if not hasattr(self, "_aaf_cam_audio_var"):
+                self._aaf_cam_audio_var = tk.BooleanVar()
+            self._aaf_cam_audio_var.set(bool(data["camera_audio"]))
+
+        # Probe loaded files and populate the "Detected from source" preset entries
+        self._aaf_update_seq_presets()
 
         if missing:
             messagebox.showwarning("Missing files",
@@ -3339,7 +4445,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if frame is None:
             return
         if not frame.winfo_ismapped():
-            frame.pack(fill="x", pady=(6, 0))
+            frame.pack(side="bottom", fill="x", pady=(6, 0))
         self._aaf_prog_lbl.config(text=text)
         self._aaf_prog_bar.set(pct, 100)
         self.update_idletasks()
@@ -3460,30 +4566,126 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         try:
             sr = self._aaf_data.get("sample_rate", 48000)
-            seq_w, seq_h = 1280, 720
-            if vpaths:
+
+            # Sequence dimensions: use values from the UI if set; else probe.
+            try:
+                seq_w = int(getattr(self, "_aaf_seq_w_var", tk.StringVar()).get() or "0")
+                seq_h = int(getattr(self, "_aaf_seq_h_var", tk.StringVar()).get() or "0")
+            except ValueError:
+                seq_w, seq_h = 0, 0
+
+            if (seq_w <= 0 or seq_h <= 0) and vpaths:
                 self._aaf_build_progress(55, "Probing media settings\u2026")
-                seq_w, seq_h, fps_det, _sr = engines.probe_media_settings(vpaths)
-                # Don't auto-override FPS — user set it explicitly
+                seq_w, seq_h, _, _ = engines.probe_media_settings(vpaths)
+            if seq_w <= 0:
+                seq_w = 1280
+            if seq_h <= 0:
+                seq_h = 720
+
+            # ── Fragment auto-sync ─────────────────────────────────────────
+            # When an AAF source's audio file is a short rendered fragment
+            # (AudioSuite/RX/bounce) rather than the original full recording,
+            # src_in from the AAF is relative to the fragment — not the
+            # assigned video.  Detect where the fragment appears in the video
+            # via cross-correlation so the video <in> points are correct.
+            self._aaf_build_progress(60, "Scanning for audio fragments\u2026")
+
+            # Pass 1: identify which clips are fragments.
+            # Each RX render is a unique file from a unique point in the video,
+            # so we key by source_file (not base name, which collapses them).
+            fragment_jobs = []   # (clip_index, source_file, video_path, src_dur, vid_dur)
+            frag_seen_sf = set()
+            for idx, c in enumerate(clips_with_media):
+                sf = c.get("source_file", "")
+                if not sf or sf in frag_seen_sf:
+                    continue
+                base = get_clip_base_name(c["clip_name"])
+                off = source_offset.get(base, 0.0)
+                has_sync_audio = bool(source_syncaudio.get(base))
+                if (not c.get("video_path")
+                        or abs(off) >= 0.002  # >2 ms = intentional global sync
+                        or has_sync_audio):
+                    reason = ("no video" if not c.get("video_path")
+                              else "has global offset {:.3f}s".format(off) if abs(off) >= 0.002
+                              else "has sync audio")
+                    print("Fragment skip [{}]: {}".format(reason,
+                          os.path.basename(sf)))
+                    frag_seen_sf.add(sf)
+                    continue
+                vp = c["video_path"]
+                if not os.path.isfile(sf):
+                    frag_seen_sf.add(sf)
+                    continue
+                src_dur = engines._probe_duration(sf)
+                vid_dur = engines._probe_duration(vp)
+                if src_dur <= 0 or vid_dur <= 0:
+                    frag_seen_sf.add(sf)
+                    continue
+                if src_dur >= vid_dur * 0.5:
+                    frag_seen_sf.add(sf)
+                    continue
+                frag_seen_sf.add(sf)
+                fragment_jobs.append((sf, vp, src_dur, vid_dur))
+
+            # Pass 2: cross-correlate each fragment with progress
+            # Key by source_file path so each RX render gets its own offset
+            frag_offsets = {}   # source_file → offset_s
+            n_frags = len(fragment_jobs)
+            for i, (sf, vp, src_dur, vid_dur) in enumerate(fragment_jobs, 1):
+                clip_label = os.path.basename(sf)
+                if len(clip_label) > 45:
+                    clip_label = clip_label[:42] + "\u2026"
+                self._aaf_build_progress(
+                    60 + int(9 * i / max(n_frags, 1)),
+                    "Fragment sync {}/{}: {}".format(i, n_frags, clip_label))
+                print("Fragment auto-sync: {} ({:.1f}s) vs {} ({:.1f}s)".format(
+                    os.path.basename(sf), src_dur,
+                    os.path.basename(vp), vid_dur))
+                T = engines.detect_rx_offset(sf, vp)
+                if T != 0.0:
+                    # build_xml_from_pt uses  v_src_in = src_in_s + v_offset,
+                    # and T is the video position where the fragment starts,
+                    # so v_offset = T directly (positive = camera further along)
+                    frag_offsets[os.path.normpath(sf).lower()] = T
+                    print("  -> T={:.3f}s (video_offset_secs={:.3f}s)".format(T, T))
+                else:
+                    print("  -> detection failed, keeping v_offset=0")
+
+            # Apply per-fragment offsets to matching clips
+            if frag_offsets:
+                for c in clips_with_media:
+                    sf = c.get("source_file", "")
+                    if sf:
+                        key = os.path.normpath(sf).lower()
+                        if key in frag_offsets:
+                            c["video_offset_secs"] = frag_offsets[key]
 
             self._aaf_build_progress(70, "Writing diagnostic report\u2026")
             try:
-                diag_path = engines.write_build_diagnostic(
-                    clips_with_media, fps, seq_w, seq_h, sr)
+                diag_path = os.path.splitext(out)[0] + "_diagnostic.txt"
+                engines.write_build_diagnostic(
+                    clips_with_media, fps, seq_w, seq_h, sr, out_path=diag_path)
                 print("Diagnostic report: {}".format(diag_path))
             except Exception as diag_exc:
                 print("Diagnostic report failed: {}".format(diag_exc))
 
             self._aaf_build_progress(80, "Building XML\u2026")
+            mix_path = getattr(self, "_aaf_mix_var", None)
+            mix_path = mix_path.get() if mix_path else ""
+            cam_audio = getattr(self, "_aaf_cam_audio_var", None)
             xmeml = engines.build_xml_from_pt(
                 clips_with_media,
                 track_names_ordered,
                 self.seq_name.get() or self._aaf_data.get("session_name","PostBridge"),
-                seq_w=seq_w, seq_h=seq_h, seq_fps=fps, seq_sr=sr)
+                seq_w=seq_w, seq_h=seq_h, seq_fps=fps, seq_sr=sr,
+                mix_path=mix_path or None,
+                include_camera_audio=bool(cam_audio and cam_audio.get()))
 
             self._aaf_build_progress(95, "Writing file\u2026")
             engines.write_xml(xmeml, out)
+            engines.clear_rx_cache()
         except Exception as e:
+            engines.clear_rx_cache()
             messagebox.showerror("Build Error", str(e)); return
 
         self.out_path.set(out)
@@ -3523,12 +4725,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             tk.Label(self.body, text="CLIP DETAIL",
                      font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(0,4))
             log_outer = tk.Frame(self.body, bg=BG)
-            log_outer.pack(fill="x", pady=(0,6))
+            log_outer.pack(fill="both", expand=True, pady=(0,6))
             log = tk.Text(log_outer,
                           font=("Courier New", 10), bg=SURF, fg=TEXT,
                           relief="flat", bd=0,
-                          state="normal", wrap="none",
-                          height=min(18, len(clip_results) + 1))
+                          state="normal", wrap="none")
             sbv = tk.Scrollbar(log_outer, orient="vertical",   command=log.yview)
             sbh = tk.Scrollbar(log_outer, orient="horizontal", command=log.xview)
             log.configure(yscrollcommand=sbv.set, xscrollcommand=sbh.set)

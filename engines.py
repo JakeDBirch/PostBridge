@@ -347,6 +347,98 @@ def transcribe_clip(wav_path):
                 words.append({"word": w, "start": seg.start, "end": seg.end})
     return [w for w in words if w["word"]]
 
+
+def detect_sync_via_whisper(video_path, audio_path, probe_duration=120.0):
+    """
+    Find the sync offset between a video file's embedded camera audio and a
+    reference audio file by transcribing both with Whisper and aligning
+    matching word sequences.
+
+    This is substantially more robust than FFT cross-correlation for
+    dual-system recordings because Whisper normalises away microphone
+    frequency response, room acoustics, and gain differences — the same
+    speech produces the same text regardless of which mic captured it.
+
+    Returns (offset_secs: float, confidence: float 0..1)
+        offset_secs: ref_time - vid_time — add to the video's position to
+                     get the corresponding position in the reference timeline.
+        confidence:  fraction of matching word sequences that agree on the
+                     returned offset, weighted by how many matches were found.
+                     ≥ 0.5 is reliable; < 0.2 indicates insufficient speech.
+    """
+    if not HAS_WHISPER:
+        raise RuntimeError("faster-whisper is not installed")
+
+    try:
+        import numpy as _np
+    except ImportError:
+        return 0.0, 0.0
+
+    # Extract the probe window from both sources as 16 kHz mono WAVs.
+    # 16 kHz matches Whisper's native rate (no resampling artefacts).
+    def _extract(src, dst):
+        cmd = _ffmpeg_cmd() + [
+            "-t", "{:.3f}".format(probe_duration + 2),
+            "-i", src,
+            "-ac", "1", "-ar", "16000",
+            "-acodec", "pcm_s16le", "-vn", dst,
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg failed extracting probe from {}:\n{}".format(
+                    os.path.basename(src),
+                    r.stderr.decode(errors="replace")[-300:]))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vid_wav = os.path.join(tmpdir, "vid.wav")
+        ref_wav = os.path.join(tmpdir, "ref.wav")
+        _extract(video_path, vid_wav)
+        _extract(audio_path, ref_wav)
+        vid_words = transcribe_clip(vid_wav)
+        ref_words = transcribe_clip(ref_wav)
+
+    if not vid_words or not ref_words:
+        return 0.0, 0.0   # no speech detected in one or both sources
+
+    # Build a lookup table of 4-word sequences (N-grams) from the reference,
+    # keyed by the tuple of words, valued by the start time of the first word.
+    # N=4 is long enough to be unique but short enough to find matches even
+    # when Whisper makes the occasional substitution in one recording.
+    N = 4
+    ref_ngrams = {}
+    for i in range(len(ref_words) - N + 1):
+        ngram = tuple(w["word"] for w in ref_words[i:i + N])
+        # Skip N-grams that contain very short tokens (fillers, punctuation)
+        if any(len(t) < 2 for t in ngram):
+            continue
+        ref_ngrams.setdefault(ngram, []).append(ref_words[i]["start"])
+
+    # Walk the video transcription and collect offsets wherever an N-gram
+    # from the video also appears in the reference.
+    offsets = []
+    for i in range(len(vid_words) - N + 1):
+        ngram = tuple(w["word"] for w in vid_words[i:i + N])
+        if any(len(t) < 2 for t in ngram):
+            continue
+        for ref_t in ref_ngrams.get(ngram, []):
+            vid_t = vid_words[i]["start"]
+            offsets.append(ref_t - vid_t)
+
+    if not offsets:
+        return 0.0, 0.0   # no matching word sequences found
+
+    offsets = _np.array(offsets)
+    median_offset = float(_np.median(offsets))
+
+    # Confidence: fraction of matches within ±0.5 s of the median, scaled by
+    # how many total matches we found (more matches → higher ceiling).
+    agreement = float(_np.mean(_np.abs(offsets - median_offset) < 0.5))
+    confidence = min(1.0, agreement * min(1.0, len(offsets) / 5.0))
+
+    return median_offset, confidence
+
+
 # ── Quote matching ─────────────────────────────────────────────────────────────
 def _overlap(query, candidate):
     if not query: return 0.0
@@ -1302,6 +1394,130 @@ def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
 
     return offset
 
+def _extract_mono(src_path, duration, out_sr):
+    """Extract mono audio from any media file as float32 numpy array."""
+    import numpy as np
+    with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tf:
+        tmp = tf.name
+    try:
+        cmd = _ffmpeg_cmd() + [
+            '-y', '-v', 'quiet',
+            '-i', src_path,
+            '-t', str(duration),
+            '-ac', '1',
+            '-ar', str(out_sr),
+            '-f', 'f32le',
+            tmp
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=300,
+                           encoding='utf-8', errors='replace')
+        if r.returncode != 0:
+            return None
+        data = np.frombuffer(open(tmp, 'rb').read(), dtype=np.float32)
+        rms = np.sqrt(np.mean(data ** 2))
+        if rms > 0:
+            data = data / rms
+        return data
+    except Exception:
+        return None
+    finally:
+        try: os.unlink(tmp)
+        except: pass
+
+
+def _probe_duration(path):
+    """Return file duration in seconds, or 0 on failure."""
+    try:
+        cmd = _ffprobe_cmd() + [
+            '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'csv=p=0', path
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=30,
+                           encoding='utf-8', errors='replace')
+        return float(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+# Cache for extracted video audio (keyed by video path)
+_video_audio_cache = {}   # path → (vid_data_np, vid_dur)
+
+
+def detect_rx_offset(rx_audio_path, video_path, sr=1000):
+    """Detect where an AudioSuite-rendered (RX) audio clip appears in a video.
+
+    Returns the offset T (seconds) such that position 0 in the RX audio
+    corresponds to position T in the video.  The caller should set
+    v_offset = -T  so that  v_src_in = src_in_s - (-T) = src_in_s + T.
+
+    Falls back to 0.0 on any failure.
+    """
+    if not rx_audio_path or not video_path:
+        return 0.0
+    if not os.path.isfile(rx_audio_path) or not os.path.isfile(video_path):
+        return 0.0
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+
+    # Get the RX clip's actual duration
+    rx_dur = _probe_duration(rx_audio_path)
+    if rx_dur <= 0:
+        rx_dur = 30
+    rx_dur += 1  # small margin
+
+    # Extract RX audio
+    rx_data = _extract_mono(rx_audio_path, rx_dur, sr)
+    if rx_data is None or len(rx_data) < sr // 2:
+        return 0.0
+
+    # Extract video audio (with cache for multiple RX clips from same video)
+    vid_key = os.path.normpath(video_path).lower()
+    if vid_key in _video_audio_cache:
+        vid_data, vid_dur = _video_audio_cache[vid_key]
+    else:
+        vid_dur = _probe_duration(video_path)
+        if vid_dur <= 0:
+            vid_dur = 7200
+        vid_dur += 1
+        vid_data = _extract_mono(video_path, vid_dur, sr)
+        if vid_data is not None and len(vid_data) >= sr:
+            _video_audio_cache[vid_key] = (vid_data, vid_dur)
+    if vid_data is None or len(vid_data) < sr:
+        return 0.0
+
+    # Cross-correlate: find where rx_data appears in vid_data.
+    # We only search positive lags [0, len(vid_data) - 1]: the fragment must
+    # appear somewhere inside the video, never before it.  Using n_fft that is
+    # strictly >= len(rx_data) + len(vid_data) - 1 avoids circular aliasing so
+    # every lag [0..len(vid_data)-1] maps to its true linear-correlation value.
+    n_lin = len(rx_data) + len(vid_data) - 1
+    n_fft = 1 << (n_lin - 1).bit_length()   # next power-of-2 ≥ n_lin
+    R     = np.fft.rfft(rx_data,  n=n_fft)
+    V     = np.fft.rfft(vid_data, n=n_fft)
+    corr  = np.fft.irfft(V * np.conj(R), n=n_fft)
+
+    # Only search [0, len(vid_data)] — valid positive lags.
+    # Do NOT apply the n_fft/2 wrap-around correction: that correction is for
+    # two-sided searches and would incorrectly map lags > n_fft/2 to negative
+    # values, causing fragments in the second half of a long video to return 0.
+    valid_len = min(len(vid_data), n_fft)
+    peak      = int(np.argmax(corr[:valid_len]))
+    offset_s  = round(peak / sr, 3)
+
+    # Sanity: offset must be a plausible positive position within the video
+    if offset_s < 0 or offset_s > vid_dur:
+        return 0.0
+
+    return offset_s
+
+
+def clear_rx_cache():
+    """Clear the video audio cache after a build completes."""
+    _video_audio_cache.clear()
+
+
 def pair_takes(paths):
     videos = sorted([p for p in paths if p and is_video(p)])
     audios = sorted([p for p in paths if p and not is_video(p)])
@@ -1317,7 +1533,8 @@ def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
                    src_in_fr, src_out_fr, fps,
                    is_video, is_first_use,
                    seq_w=1280, seq_h=720, seq_sr=44100,
-                   channels=None, name_prefix="", enabled=True):
+                   channels=None, name_prefix="", enabled=True,
+                   audio_source_track=None, file_audio_channels=None):
     _ = channels
     ci = Element("clipitem", id=cid)
     SubElement(ci, "name").text     = name_prefix + basename(filepath)
@@ -1345,12 +1562,22 @@ def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
             ac_ch = SubElement(ac, "samplecharacteristics")
             SubElement(ac_ch, "depth").text      = "16"
             SubElement(ac_ch, "samplerate").text = str(seq_sr)
+            SubElement(ac, "channelcount").text  = "2"
         else:
             mc = SubElement(f_el, "media")
             ac = SubElement(mc, "audio")
             ac_ch = SubElement(ac, "samplecharacteristics")
             SubElement(ac_ch, "depth").text      = "16"
             SubElement(ac_ch, "samplerate").text = str(seq_sr)
+            if file_audio_channels is not None:
+                SubElement(ac, "channelcount").text = str(file_audio_channels)
+
+    # Tell the NLE which stream to read (needed when a video file is used on an
+    # audio track so it reads the audio channel instead of defaulting to video).
+    if audio_source_track is not None:
+        st = SubElement(ci, "sourcetrack")
+        SubElement(st, "mediatype").text  = "audio"
+        SubElement(st, "trackindex").text = str(audio_source_track)
 
     return ci
 
@@ -1720,8 +1947,9 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     ael = SubElement(media, "audio")
     af  = SubElement(ael, "format")
     ac  = SubElement(af, "samplecharacteristics")
-    SubElement(ac, "depth").text      = "32"
-    SubElement(ac, "samplerate").text = str(seq_sr)
+    SubElement(ac, "depth").text        = "32"
+    SubElement(ac, "samplerate").text   = str(seq_sr)
+    SubElement(ac, "channelcount").text = "2"
 
     for clips in a_tracks:
         t = SubElement(ael, "track")
@@ -1816,10 +2044,21 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
         v_offset = clip.get("video_offset_secs", 0.0)
         vp = clip.get("video_path", "")
         ap = clip.get("audio_path", "")
-        lines.append("  Source: {}".format(base))
+        sf = clip.get("source_file", "")
+        # Detect fragment: source audio much shorter than assigned video
+        is_fragment = False
+        if sf and vp and os.path.isfile(sf) and os.path.isfile(vp):
+            sd = _probe_duration(sf)
+            vd = _probe_duration(vp)
+            if sd > 0 and vd > 0 and sd < vd * 0.5:
+                is_fragment = True
+        lines.append("  Source: {}{}".format(base, "  [fragment]" if is_fragment else ""))
         lines.append("    video:      {}".format(os.path.basename(vp) if vp else "NONE"))
         lines.append("    ref audio:  {}".format(os.path.basename(ap) if ap else "NONE"))
-        lines.append("    v_offset:   {:.6f} s".format(v_offset))
+        if sf:
+            lines.append("    source file: {}".format(os.path.basename(sf)))
+        lines.append("    v_offset:   {:.6f} s{}".format(
+            v_offset, "  (auto-detected)" if is_fragment and v_offset != 0 else ""))
     lines.append("")
 
     # First 20 clips detail
@@ -1832,9 +2071,9 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
         src_in_s = clip.get("src_in_secs", clip["start_secs"])
         src_out_s = clip.get("src_out_secs", src_in_s + (clip["end_secs"] - clip["start_secs"]))
         a_src_in  = f2fr(src_in_s, fps)
-        v_src_in  = max(0, f2fr(src_in_s - v_offset, fps))
+        v_src_in  = max(0, f2fr(src_in_s + v_offset, fps))
         a_src_out = f2fr(src_out_s, fps)
-        v_src_out = max(0, f2fr(src_out_s - v_offset, fps))
+        v_src_out = max(0, f2fr(src_out_s + v_offset, fps))
         vp = clip.get("video_path", "")
         ap = clip.get("audio_path", "")
 
@@ -1862,35 +2101,79 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
 
 
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
-                      seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000):
-    fps     = seq_fps
-    defined = set()
+                      seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
+                      mix_path=None, include_camera_audio=False):
+    fps        = seq_fps
+    defined    = set()
+    link_pairs = []      # (video_element, cam_audio_element, track_name)
     ctr     = 0
 
-    v_tracks = {tn: [] for tn in track_names}
-    a_tracks = {tn: [] for tn in track_names}
+    v_tracks   = {tn: [] for tn in track_names}
+    a_tracks   = {tn: [] for tn in track_names}
+    cam_tracks = {tn: [] for tn in track_names}  # camera audio from video file
 
-    for clip in sorted(clips_with_media, key=lambda c: c["start_secs"]):
-        tn       = clip["track_name"]
-        start_fr   = f2fr(clip["start_secs"], fps)
-        end_fr     = f2fr(clip["end_secs"],   fps)
+    # ── Pre-pass: detect crossfades and halve fade durations ─────────────────
+    # For a crossfade the AAF has one Fade clip whose duration equals both the
+    # outgoing fade-out and the incoming fade-in.  We want the two clips to
+    # meet in the middle rather than having the outgoing clip hold all the way
+    # through.  Detection: consecutive clips on the same track where
+    # fade_out_secs ≈ fade_in_secs ≈ the gap between them.
+    frame_s = 1.0 / fps if fps else 1.0   # one frame in seconds (tolerance)
+    sorted_clips = sorted(clips_with_media, key=lambda c: c["start_secs"])
+    for i in range(len(sorted_clips) - 1):
+        ca, cb = sorted_clips[i], sorted_clips[i + 1]
+        if ca["track_name"] != cb["track_name"]:
+            continue
+        fo  = ca.get("fade_out_secs", 0.0)
+        fi  = cb.get("fade_in_secs",  0.0)
+        gap = cb["start_secs"] - ca["end_secs"]
+        if fo > 0 and fi > 0 and abs(gap - fo) <= frame_s:
+            ca["fade_out_secs"] = fo / 2.0
+            cb["fade_in_secs"]  = fi / 2.0
+
+    # Track per-track previous clip end (after fade extension) so head extensions
+    # don't cause overlap with the preceding clip.
+    track_prev_end = {}   # tn → end_fr after extension
+
+    for clip in sorted_clips:
+        tn         = clip["track_name"]
+        orig_start = f2fr(clip["start_secs"], fps)
+        orig_end   = f2fr(clip["end_secs"],   fps)
         v_offset   = clip.get("video_offset_secs", 0.0)
         clip_dur_s = clip["end_secs"] - clip["start_secs"]
         src_in_s   = clip.get("src_in_secs", clip["start_secs"])
         src_out_s  = clip.get("src_out_secs", src_in_s + clip_dur_s)
-        dur_fr   = end_fr - start_fr
+
+        # ── Exact fade extensions from AAF fade-clip durations ────────────────
+        # fade_in_secs / fade_out_secs are set by parse_aaf_session from the
+        # actual "Fade N" clip lengths adjacent to this clip.  Using them here
+        # fills the precise gap rather than guessing.
+        fi_fr = max(0, f2fr(clip.get("fade_in_secs",  0.0), fps))
+        fo_fr = max(0, f2fr(clip.get("fade_out_secs", 0.0), fps))
+
+        # Head: extend backward, clamped so we don't overlap the previous clip.
+        prev_end  = track_prev_end.get(tn, 0)
+        start_fr  = max(prev_end, orig_start - fi_fr)
+        head_ext  = orig_start - start_fr      # actual frames added at head
+
+        # Tail: extend forward by the fade-out frames.
+        end_fr    = orig_end + fo_fr
+        track_prev_end[tn] = end_fr
+
+        dur_fr = orig_end - orig_start        # clip's own (non-extended) duration
         if dur_fr <= 0:
             continue
 
         # Audio uses the reference-audio src position directly (no camera offset).
-        # Video subtracts v_offset to correct the camera-to-recorder sync, clamped ≥ 0.
-        a_src_in  = f2fr(src_in_s,  fps)
-        a_src_out = f2fr(src_out_s, fps)
-        v_src_in  = max(0, f2fr(src_in_s  - v_offset, fps))
-        v_src_out = max(0, f2fr(src_out_s - v_offset, fps))
+        # Video ADDS v_offset: positive offset = camera started before DAW (common).
+        # Convention matches detect_av_offset / detect_sync_offset and build_xml.
+        a_src_in  = max(0, f2fr(src_in_s,  fps) - head_ext)
+        a_src_out = f2fr(src_out_s, fps) + fo_fr
+        v_src_in  = max(0, f2fr(src_in_s  + v_offset, fps) - head_ext)
+        v_src_out = max(0, f2fr(src_out_s + v_offset, fps)) + fo_fr
         # If clamping collapsed the video window, push out by clip duration
         if v_src_out <= v_src_in:
-            v_src_out = v_src_in + dur_fr
+            v_src_out = v_src_in + (end_fr - start_fr)
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
@@ -1905,6 +2188,22 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                                 True, first, seq_w, seq_h, seq_sr)
             v_tracks[tn].append(ci)
 
+            if include_camera_audio and tn in cam_tracks:
+                # Reuse the video clip's fid (just a reference, no redefinition).
+                # Premiere only honours <links> when both the video and audio
+                # clipitem reference the *same* fid — a separate file-cam-... fid
+                # silently prevents linking even when clip IDs cross-reference.
+                # <sourcetrack> is still needed to tell Premiere which stream to read.
+                cam_cid = "clip-{}".format(ctr); ctr += 1
+                cam_ci  = _make_clipitem(cam_cid, fid, vp, start_fr, end_fr,
+                                         v_src_in, v_src_out, fps,
+                                         False, False, seq_w, seq_h, seq_sr,
+                                         audio_source_track=1)
+                cam_tracks[tn].append(cam_ci)
+                # Record for cross-link patching after track indices are known.
+                # fid is included so the patching pass can set <masterclipid>.
+                link_pairs.append((ci, cam_ci, tn, fid))
+
         if ap and tn in a_tracks:
             fid   = "file-a-{}".format(os.path.basename(ap).replace(" ", "_"))
             cid   = "clip-{}".format(ctr); ctr += 1
@@ -1916,7 +2215,7 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             a_tracks[tn].append(ci)
 
     total = 0
-    for clips in list(v_tracks.values()) + list(a_tracks.values()):
+    for clips in list(v_tracks.values()) + list(a_tracks.values()) + list(cam_tracks.values()):
         for c in clips:
             e = c.find("end")
             if e is not None and e.text:
@@ -1940,21 +2239,169 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     SubElement(vc, "fielddominance").text   = "none"
     SubElement(vc, "colordepth").text       = "32"
 
+    # ── Video tracks — skip completely empty tracks ───────────────────────────
     for tn in track_names:
+        clips = v_tracks.get(tn, [])
+        if not clips:
+            continue
         t = SubElement(vel, "track")
-        for c in v_tracks.get(tn, []):
+        for c in clips:
             t.append(c)
 
     ael = SubElement(media, "audio")
     af  = SubElement(ael, "format")
     ac  = SubElement(af, "samplecharacteristics")
-    SubElement(ac, "depth").text      = "32"
-    SubElement(ac, "samplerate").text = str(seq_sr)
+    SubElement(ac, "depth").text        = "32"
+    SubElement(ac, "samplerate").text   = str(seq_sr)
+    SubElement(ac, "channelcount").text = "2"
 
+    # ── AAF audio tracks — skip empty tracks, count what's written ───────────
+    n_audio_written = 0
     for tn in track_names:
+        clips = a_tracks.get(tn, [])
+        if not clips:
+            continue
         t = SubElement(ael, "track")
-        for c in a_tracks.get(tn, []):
+        for c in clips:
             t.append(c)
+        n_audio_written += 1
+
+    # ── Camera audio tracks — skip empty tracks, count what's written ─────────
+    n_cam_written = 0
+    if include_camera_audio:
+        for tn in track_names:
+            clips = cam_tracks.get(tn, [])
+            if not clips:
+                continue
+            t = SubElement(ael, "track")
+            for c in clips:
+                t.append(c)
+            n_cam_written += 1
+
+    # ── Stereo mix track (full-file, not clamped to AAF length) ──────────────
+    if mix_path and os.path.isfile(mix_path):
+        mix_dur_s  = get_media_duration(mix_path) or 0.0
+        mix_total  = f2fr(mix_dur_s, fps) if mix_dur_s > 0 else total
+        if mix_total > total:
+            total = mix_total
+            seq_dur_el = seq.find("duration")
+            if seq_dur_el is not None:
+                seq_dur_el.text = str(total)
+
+        fid      = "file-mix-{}".format(os.path.basename(mix_path).replace(" ", "_"))
+        mix_name = os.path.basename(mix_path)
+
+        # Two linked mono tracks (L + R) — the only approach that reliably
+        # imports as a stereo pair in Premiere.  <link> elements (direct children
+        # of each clipitem, no wrapper) cross-reference the two clips so Premiere
+        # treats them as locked/stereo rather than independent mono tracks.
+        mix_L_tidx = n_audio_written + n_cam_written + 1
+        mix_R_tidx = n_audio_written + n_cam_written + 2
+
+        def _mix_ci(cid, chan_idx, include_file):
+            el = Element("clipitem", id=cid)
+            SubElement(el, "masterclipid").text = fid
+            SubElement(el, "name").text         = mix_name
+            SubElement(el, "enabled").text      = "TRUE"
+            SubElement(el, "duration").text     = str(mix_total)
+            SubElement(el, "channelcount").text = "1"
+            make_rate(el, fps)
+            SubElement(el, "start").text = "0"
+            SubElement(el, "end").text   = str(mix_total)
+            SubElement(el, "in").text    = "0"
+            SubElement(el, "out").text   = str(mix_total)
+            if include_file:
+                f_el = SubElement(el, "file", id=fid)
+                SubElement(f_el, "name").text    = mix_name
+                SubElement(f_el, "pathurl").text = pathurl(mix_path)
+                make_rate(f_el, fps)
+                mc2   = SubElement(f_el, "media")
+                ac2   = SubElement(mc2, "audio")
+                ac_ch = SubElement(ac2, "samplecharacteristics")
+                SubElement(ac_ch, "depth").text      = "16"
+                SubElement(ac_ch, "samplerate").text = str(seq_sr)
+                SubElement(ac2, "channelcount").text = "2"
+            else:
+                SubElement(el, "file", id=fid)   # reference only, no redefinition
+            st = SubElement(el, "sourcetrack")
+            SubElement(st, "mediatype").text  = "audio"
+            SubElement(st, "trackindex").text = str(chan_idx)
+            return el
+
+        ci_L = _mix_ci("clip-mix-L", 1, True)
+        ci_R = _mix_ci("clip-mix-R", 2, False)
+
+        # Cross-links — direct <link> children, no wrapper element
+        for target_ci in (ci_L, ci_R):
+            for ref_cid, ref_tidx in (("clip-mix-L", mix_L_tidx),
+                                      ("clip-mix-R", mix_R_tidx)):
+                lk = SubElement(target_ci, "link")
+                SubElement(lk, "linkclipref").text = ref_cid
+                SubElement(lk, "mediatype").text   = "audio"
+                SubElement(lk, "trackindex").text  = str(ref_tidx)
+                SubElement(lk, "clipindex").text   = "1"
+
+        mix_track_L = SubElement(ael, "track")
+        mix_track_L.append(ci_L)
+        SubElement(mix_track_L, "outputchannelindex").text = "1"
+
+        mix_track_R = SubElement(ael, "track")
+        mix_track_R.append(ci_R)
+        SubElement(mix_track_R, "outputchannelindex").text = "2"
+
+    # ── Patch video↔camera-audio links ───────────────────────────────────────
+    # Now that we know which tracks are non-empty (and their 1-based indices),
+    # add <links> to each matched video/camera-audio clip pair so Premiere
+    # shows them as linked (lock-step move, sync indicators, etc.).
+    if link_pairs:
+        # 1-based index of each non-empty video track in the <video> section
+        v_track_idx = {}
+        vi = 0
+        for tn in track_names:
+            if v_tracks.get(tn):
+                vi += 1
+                v_track_idx[tn] = vi
+
+        # 1-based index of each non-empty cam track in the <audio> section
+        # (comes after the non-empty a_tracks)
+        cam_track_idx = {}
+        ci_base = n_audio_written
+        for tn in track_names:
+            if cam_tracks.get(tn):
+                ci_base += 1
+                cam_track_idx[tn] = ci_base
+
+        for v_el, ca_el, tn, pair_fid in link_pairs:
+            vtidx  = v_track_idx.get(tn, 1)
+            catidx = cam_track_idx.get(tn, 1)
+            v_cid  = v_el.get("id")
+            ca_cid = ca_el.get("id")
+
+            # <masterclipid> (inserted at position 0) is what Premiere uses to
+            # recognise that a video and audio clipitem come from the same source.
+            # Without it, <link> cross-references alone do not produce linking.
+            for el in (v_el, ca_el):
+                mc_el = Element("masterclipid")
+                mc_el.text = pair_fid
+                el.insert(0, mc_el)
+
+            # 1-based position of each clip within its own track list
+            v_pos  = v_tracks[tn].index(v_el)  + 1
+            ca_pos = cam_tracks[tn].index(ca_el) + 1
+
+            # <link> elements are direct children of clipitem (no wrapper).
+            # Both sides carry the full pair so Premiere locks them together.
+            link_entries = [
+                (v_cid,  "video", vtidx,  v_pos),
+                (ca_cid, "audio", catidx, ca_pos),
+            ]
+            for target_el in (v_el, ca_el):
+                for ref_cid, ref_media, ref_tidx, ref_pos in link_entries:
+                    lk = SubElement(target_el, "link")
+                    SubElement(lk, "linkclipref").text = ref_cid
+                    SubElement(lk, "mediatype").text   = ref_media
+                    SubElement(lk, "trackindex").text  = str(ref_tidx)
+                    SubElement(lk, "clipindex").text   = str(ref_pos)
 
     return xmeml
 
@@ -2106,7 +2553,11 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         else:
             tok    = res["token"]
             paths  = int_assets.get(tok, [])
-            apaths = [p for p in paths if p and not is_video(p)]
+            # Prefer pure-audio files; fall back to video files whose embedded
+            # audio will be extracted by ffmpeg (-vn) during the WAV conversion.
+            apaths = [p for p in paths if p and is_audio(p)]
+            if not apaths:
+                apaths = [p for p in paths if p and is_video(p)]
             if not apaths:
                 skipped.append(res); continue
 

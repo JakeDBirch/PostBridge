@@ -215,6 +215,12 @@ class _FlatDropdown(tk.Frame):
                              padx=6, pady=5)
         self._arr.pack(side="right")
 
+        # Tooltip shows full selected value on hover (useful for long filenames)
+        self._tip     = None
+        self._tip_job = None
+        self._lbl.bind("<Enter>", self._tip_schedule)
+        self._lbl.bind("<Leave>", self._tip_cancel)
+
         if state != "disabled":
             for w in (self, self._lbl, self._arr):
                 w.bind("<Button-1>", self._toggle)
@@ -227,6 +233,46 @@ class _FlatDropdown(tk.Frame):
         self.config(bg=color)
         self._lbl.config(bg=color)
         self._arr.config(bg=color)
+
+    # ── Separator support ─────────────────────────────────────────────────────
+    @staticmethod
+    def separator(label=""):
+        """Return a value string that renders as a non-selectable divider row."""
+        return "\x00" + label
+
+    def _is_sep(self, v):
+        return isinstance(v, str) and v.startswith("\x00")
+
+    def _disp(self, v):
+        return v[1:] if self._is_sep(v) else v
+
+    # ── Tooltip for the selected label ────────────────────────────────────────
+    def _tip_schedule(self, event):
+        self._tip_cancel(None)
+        val = self._var.get()
+        if not val or val.startswith("—"):
+            return
+        self._tip_job = self._lbl.after(600, lambda: self._tip_show(event.x_root, event.y_root, val))
+
+    def _tip_cancel(self, event):
+        if self._tip_job:
+            try: self._lbl.after_cancel(self._tip_job)
+            except Exception: pass
+            self._tip_job = None
+        if self._tip:
+            try: self._tip.destroy()
+            except Exception: pass
+            self._tip = None
+
+    def _tip_show(self, rx, ry, text):
+        self._tip = tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+        tk.Label(tw, text=text, font=self._font, bg="#2a2a2a", fg=TEXT,
+                 padx=8, pady=4, relief="flat",
+                 highlightthickness=1, highlightbackground=BORDER).pack()
+        tw.update_idletasks()
+        tw.geometry("+{}+{}".format(rx + 12, ry + 16))
 
     def _tint(self, on):
         if self._popup:
@@ -272,8 +318,11 @@ class _FlatDropdown(tk.Frame):
             lb.config(yscrollcommand=sb.set)
         lb.pack(side="left", fill="both", expand=True, padx=1, pady=1)
 
-        for v in self._values:
-            lb.insert("end", v)
+        for i, v in enumerate(self._values):
+            lb.insert("end", "  " + self._disp(v))
+            if self._is_sep(v):
+                lb.itemconfig(i, fg=SUB,
+                              selectbackground=SURF2, selectforeground=SUB)
 
         try:
             idx = self._values.index(self._var.get())
@@ -284,7 +333,7 @@ class _FlatDropdown(tk.Frame):
         def _motion(e):
             lb.selection_clear(0, "end")
             i = lb.nearest(e.y)
-            if 0 <= i < len(self._values):
+            if 0 <= i < len(self._values) and not self._is_sep(self._values[i]):
                 lb.selection_set(i)
 
         lb.bind("<Motion>",        _motion)
@@ -315,20 +364,37 @@ class _FlatDropdown(tk.Frame):
         py = ry + rh
         if py + ph > self.winfo_screenheight() - 40:
             py = ry - ph
-        top.geometry("{}x{}+{}+{}".format(rw, ph, rx, py))
+        # Make the popup wide enough to show the longest item without truncation
+        try:
+            import tkinter.font as _tkfont
+            _f = _tkfont.Font(font=self._font)
+            max_text_w = max((_f.measure("  " + self._disp(v))
+                              for v in self._values), default=0) + 32
+        except Exception:
+            max_text_w = rw
+        # Also constrain to screen width; anchor left edge at dropdown left
+        screen_w  = self.winfo_screenwidth()
+        popup_w   = max(rw, min(max_text_w, screen_w - rx - 8))
+        top.geometry("{}x{}+{}+{}".format(popup_w, ph, rx, py))
         lb.focus_set()
 
     def _nav(self, lb, delta):
         sel = lb.curselection()
         cur = sel[0] if sel else -1
-        nxt = max(0, min(cur + delta, len(self._values) - 1))
+        nxt = cur + delta
+        # Skip over separator rows
+        while 0 <= nxt < len(self._values) and self._is_sep(self._values[nxt]):
+            nxt += delta
+        nxt = max(0, min(nxt, len(self._values) - 1))
         lb.selection_clear(0, "end"); lb.selection_set(nxt); lb.see(nxt)
 
     def _pick(self, lb):
         sel = lb.curselection()
         if sel:
-            self._var.set(self._values[sel[0]])
-            self.event_generate("<<ComboboxSelected>>")
+            v = self._values[sel[0]]
+            if not self._is_sep(v):
+                self._var.set(v)
+                self.event_generate("<<ComboboxSelected>>")
         self._close()
 
     def _close(self):

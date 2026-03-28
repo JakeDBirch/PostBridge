@@ -33,14 +33,14 @@ CHUNK_MAX_S          = 90     # max chunk length (seconds); longer chunks are fo
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 # MeatEater dark theme — charcoal/near-black backgrounds, orange accent
-BG      = "#1c1c1c"   # near-black app background
-SURF    = "#252525"   # card / panel surface
-SURF2   = "#2e2e2e"   # subtle inset / input background
-SURF3   = "#383838"   # alternate row / deeper inset
-BORDER  = "#444444"   # divider
+BG      = "#191919"   # near-black app background
+SURF    = "#232323"   # card / panel surface
+SURF2   = "#2c2c2c"   # subtle inset / input background
+SURF3   = "#363636"   # alternate row / deeper inset
+BORDER  = "#3e3e3e"   # divider
 ACCENT  = "#e05c00"   # MeatEater orange
 TEXT    = "#f0ede8"   # warm off-white
-SUB     = "#888888"   # secondary / muted text
+SUB     = "#9a9a9a"   # secondary / muted text (lighter for readability)
 SUCCESS = "#5aab61"   # muted green
 WARN    = "#e8a020"   # amber
 ERR     = "#d94040"   # red
@@ -51,8 +51,8 @@ WAVE_VID = "#e05c00"  # orange — video embedded audio waveform
 # Font stack: Segoe UI on Windows, SF Pro on macOS, fallback to Helvetica
 _SANS = "Segoe UI" if sys.platform == "win32" else (
         "SF Pro Display" if sys.platform == "darwin" else "Helvetica Neue")
-FH  = (_SANS, 20, "bold")
-FS  = (_SANS, 11, "italic")
-FL  = (_SANS, 11, "bold")
-FB  = (_SANS, 11)
-FBT = (_SANS, 12, "bold")
+FH  = (_SANS, 22, "bold")
+FS  = (_SANS, 12, "italic")
+FL  = (_SANS, 12, "bold")
+FB  = (_SANS, 12)
+FBT = (_SANS, 13, "bold")

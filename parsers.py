@@ -393,30 +393,29 @@ def match_source_to_video(source_base, video_paths):
     return best_path if best_score >= 0.5 else None
 
 
-def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=8000,
+def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate=8000,
                        start_offset=0.0):
     """
-    Detect the sync offset between a video file's embedded audio and a reference
-    audio file using FFT-based cross-correlation.
+    Hierarchical multi-scale sync detection.
 
     Returns (offset_secs: float, confidence: float 0..1)
 
-    offset_secs: add this to the video's src_in to align it with the audio timeline.
-      Negative → video started after the recorder (camera came in late).
-      Positive → video started before the recorder (camera rolled early).
+    offset_secs  — add this to video src_in to get the aligned camera position.
+                   Positive = camera rolled before DAW; negative = camera came in late.
+    confidence   — 0..1; values ≥ 0.4 are reliable.
 
-    confidence: z-score of the correlation peak relative to the noise floor,
-      scaled so that ~20 sigma = 1.0.  Values ≥ 0.5 are reliable.
+    Algorithm: three progressively finer stages, each narrowing the search
+    window around the previous estimate.  Uses RMS-envelope cross-correlation
+    at every stage so spectral differences between the camera mic and the DAW
+    reference recording do not matter — only the amplitude pattern (talk /
+    silence rhythm) needs to be similar, which it always is.
 
-    start_offset: seek both files to this position (seconds) before probing.
-      Use this for clips that are deep into a long recording so the cross-
-      correlation is run against the correct section of the file.
-
-    Requires ffmpeg in PATH and numpy.
+    Stage 1  –  1 Hz RMS envelope, full probe window  → accuracy ±0.5 s
+    Stage 2  – 50 Hz RMS envelope, ±10 s search       → accuracy ±10 ms
+    Stage 3  – 2 ms RMS envelope,  ±0.5 s search      → accuracy ±1 ms
     """
     import subprocess as _sp
     import tempfile
-    import wave as _wave
 
     try:
         import numpy as _np
@@ -425,115 +424,206 @@ def detect_sync_offset(video_path, audio_path, probe_duration=45.0, sample_rate=
             "numpy is required for sync detection.\n"
             "Run:  pip install numpy")
 
-    # Build a safe seek prefix: seek slightly before the target to avoid
-    # landing on a keyframe boundary, then let ffmpeg trim to exact position.
-    seek_s = max(0.0, start_offset - 2.0)
+    # ── Low-level helpers ──────────────────────────────────────────────────
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        vid_wav = os.path.join(tmpdir, "vid.wav")
-        ref_wav = os.path.join(tmpdir, "ref.wav")
-
-        # Force 16-bit signed PCM output so _read_wav always gets the same format
-        for src, dst in ((video_path, vid_wav), (audio_path, ref_wav)):
-            cmd = ["ffmpeg", "-y"]
-            if seek_s > 0:
-                cmd += ["-ss", "{:.3f}".format(seek_s)]
-            cmd += [
-                "-t", str(probe_duration + max(0.0, start_offset - seek_s) + 2.0),
-                "-i", src,
-                "-ac", "1", "-ar", str(sample_rate),
-                "-acodec", "pcm_s16le",
-                "-vn", dst,
-            ]
+    def _extract(path, t_start, t_dur, out_sr):
+        """Extract mono float32 audio as numpy array; returns None on failure."""
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
+            tmp = tf.name
+        try:
+            cmd = ["ffmpeg", "-y", "-v", "quiet"]
+            if t_start > 0.5:
+                cmd += ["-ss", "{:.3f}".format(t_start)]
+            cmd += ["-t",  "{:.3f}".format(max(t_dur, 0.1)),
+                    "-i",  path,
+                    "-ac", "1",
+                    "-ar", str(int(out_sr)),
+                    "-f",  "f32le",
+                    tmp]
             r = _sp.run(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
-                raise RuntimeError(
-                    "ffmpeg failed extracting audio from {}:\n{}".format(
-                        basename(src),
-                        r.stderr.decode(errors="replace")[-400:]))
+                return None
+            raw = open(tmp, "rb").read()
+            if not raw:
+                return None
+            data = _np.frombuffer(raw, dtype=_np.float32).copy()
+            rms = float(_np.sqrt(_np.mean(data ** 2)))
+            if rms > 1e-9:
+                data /= rms
+            return data
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
-        def _read_wav(path):
-            with _wave.open(path, "rb") as w:
-                data = w.readframes(w.getnframes())
-            return _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
+    def _peak_env(sig, win_samples, top_pct=20):
+        """
+        Peak-selective RMS envelope.
 
-        a_full = _read_wav(vid_wav)   # video embedded audio
-        b_full = _read_wav(ref_wav)   # reference (session / recorder) audio
+        Compute per-window RMS, then zero out every window below the
+        (100 - top_pct) percentile — keeping only the loudest top_pct %
+        of frames.  Zeroes are then zero-meaned and unit-std normalised.
 
-    # When a start_offset was requested, trim the pre-roll we extracted so
-    # both arrays start at the requested offset position.
-    trim = int((start_offset - seek_s) * sample_rate)
-    a = a_full[trim:] if trim > 0 else a_full
-    b = b_full[trim:] if trim > 0 else b_full
+        This is the numerical equivalent of what you do visually: ignore the
+        noise floor, match only the loud events (speech bursts, transients).
+        It is completely noise-floor independent because the threshold is
+        derived from each signal's own peak distribution, not an absolute level.
 
-    # Keep only probe_duration worth of samples
-    n_probe = int(probe_duration * sample_rate)
-    a = a[:n_probe]
-    b = b[:n_probe]
+        top_pct=15  → keep the loudest 15 % of windows  (coarse pass, high SNR)
+        top_pct=25  → keep the loudest 25 %             (medium pass)
+        top_pct=35  → keep the loudest 35 %             (fine pass, more events)
+        """
+        n = (len(sig) // win_samples) * win_samples
+        if n < win_samples:
+            return None
+        rms = _np.sqrt(_np.mean(sig[:n].reshape(-1, win_samples) ** 2, axis=1))
+        if len(rms) < 4:
+            return None
+        gate = float(_np.percentile(rms, 100 - top_pct))
+        env  = _np.maximum(0.0, rms - gate)
+        env -= _np.mean(env)
+        std  = float(_np.std(env))
+        if std < 1e-9:
+            return None
+        return env / std
 
-    # Skip the first 2 s of pre-roll silence (same window on both signals so
-    # the relative lag is unaffected)
-    skip = min(int(2 * sample_rate), len(a) // 8, len(b) // 8)
-    a = a[skip:];  b = b[skip:]
+    def _xcorr_bounded(a_sig, b_sig, max_lag_samp):
+        """
+        Cross-correlate a_sig and b_sig.
+        C[L] = sum_t  a_sig[t] * b_sig[t + L]
 
-    # Zero-mean
-    a -= _np.mean(a);  b -= _np.mean(b)
+        Peaks at L means b_sig leads a_sig by L samples (positive = b ahead).
+        Search restricted to |L| ≤ max_lag_samp to avoid false peaks.
+        Returns (signed_lag_samples_float, confidence_0_to_1).
+        Lag is a float thanks to parabolic sub-sample interpolation.
+        """
+        na, nb = len(a_sig), len(b_sig)
+        n   = na + nb - 1
+        N   = 1 << int(_np.ceil(_np.log2(max(n, 1))))
+        C   = _np.fft.irfft(
+                  _np.fft.rfft(b_sig, N) * _np.conj(_np.fft.rfft(a_sig, N)),
+                  N)[:n]
+        C_abs = _np.abs(C)
 
-    # Crude high-pass via first-order differencing: kills DC and sub-80 Hz
-    # rumble (camera handling noise, HVAC) that differs strongly between mics
-    # and would otherwise swamp the speech-band correlation.
-    a = _np.diff(a, prepend=a[:1])
-    b = _np.diff(b, prepend=b[:1])
+        # Restrict to ±max_lag in the circular-index layout:
+        #   positive lags: C[0 .. max_lag]
+        #   negative lags: C[n-max_lag .. n-1]
+        ml = min(max_lag_samp, n // 2 - 1)
+        pos_idx = list(range(0, ml + 1))
+        neg_idx = list(range(n - ml, n)) if ml > 0 else []
+        win_idx = pos_idx + neg_idx
 
-    # Re-normalise to unit variance after high-pass
-    std_a = _np.std(a);  std_b = _np.std(b)
-    if std_a < 1e-6 or std_b < 1e-6:
-        return 0.0, 0.0   # one signal is essentially silent
-    a /= std_a;  b /= std_b
+        best_i  = int(max(win_idx, key=lambda i: C_abs[i]))
+        lag_int = best_i if best_i <= n // 2 else best_i - n
 
-    # --- Helper: FFT cross-correlation + z-score confidence -----------------
-    def _xcorr(x, y):
-        """Return (signed_lag_in_samples, confidence_0_to_1)."""
-        n_ = len(x) + len(y) - 1
-        N_ = 1 << int(_np.ceil(_np.log2(max(n_, 1))))
-        C_ = _np.fft.irfft(
-            _np.fft.rfft(y, N_) * _np.conj(_np.fft.rfft(x, N_)), N_)[:n_]
-        pk_ = int(_np.argmax(_np.abs(C_)))
-        lag_ = pk_ if pk_ < n_ // 2 else pk_ - n_
-        C_abs_     = _np.abs(C_)
-        noise_mean = float(_np.mean(C_abs_))
-        noise_std  = float(_np.std(C_abs_))
-        z_ = (float(C_abs_[pk_]) - noise_mean) / max(noise_std, 1e-9)
-        return lag_, min(1.0, z_ / 20.0)
+        # Parabolic interpolation for sub-sample accuracy.
+        # Fits a parabola through (best_i-1, best_i, best_i+1) and finds
+        # the true peak fractional position, clamped to ±0.5 samples.
+        lag = float(lag_int)
+        if 0 < best_i < n - 1:
+            y0 = float(C_abs[best_i - 1])
+            y1 = float(C_abs[best_i])
+            y2 = float(C_abs[best_i + 1])
+            denom = y0 - 2.0 * y1 + y2
+            if abs(denom) > 1e-12:
+                frac = 0.5 * (y0 - y2) / denom
+                lag += max(-0.5, min(0.5, frac))
 
-    # --- Method 1: Waveform cross-correlation (best for matched mics) -----
-    wf_lag, wf_conf = _xcorr(a, b)
-    wf_offset = -wf_lag / sample_rate
+        vals        = C_abs[_np.array(win_idx)]
+        noise_mean  = float(_np.mean(vals))
+        noise_std   = float(_np.std(vals))
+        z           = (float(C_abs[best_i]) - noise_mean) / max(noise_std, 1e-9)
+        conf        = min(1.0, z / 20.0)
+        return lag, conf
 
-    # --- Method 2: Envelope cross-correlation (robust to mic differences) --
-    # Compares RMS amplitude envelopes instead of raw waveforms.  This strips
-    # away spectral differences between mics and captures only the timing of
-    # speech energy (talk vs. silence), which is identical regardless of mic
-    # quality, proximity, or room acoustics.
-    env_win = int(0.015 * sample_rate)  # 15 ms RMS window (sub-frame at 60 fps)
-    env_conf = 0.0
-    env_offset = 0.0
-    na = (len(a) // env_win) * env_win
-    nb = (len(b) // env_win) * env_win
-    if na >= env_win and nb >= env_win:
-        a_env = _np.sqrt(_np.mean(a[:na].reshape(-1, env_win) ** 2, axis=1))
-        b_env = _np.sqrt(_np.mean(b[:nb].reshape(-1, env_win) ** 2, axis=1))
-        a_env -= _np.mean(a_env);  b_env -= _np.mean(b_env)
-        std_ae = _np.std(a_env);   std_be = _np.std(b_env)
-        if std_ae > 1e-9 and std_be > 1e-9:
-            a_env /= std_ae;  b_env /= std_be
-            env_lag, env_conf = _xcorr(a_env, b_env)
-            env_offset = -env_lag * env_win / sample_rate
+    # ── Stage 1: 1 Hz RMS envelope, full probe window ─────────────────────
+    # One RMS sample per second.  Handles offsets up to ±probe_duration/2 s.
+    # Accuracy: ±0.5 s.
+    SR1   = 1          # 1 Hz
+    DUR1  = min(probe_duration, 600.0)
+    WIN1  = 8000       # ffmpeg extract SR before computing 1-sample/s envelope
 
-    # Return whichever method found a stronger match.
-    if env_conf > wf_conf:
-        return env_offset, env_conf
-    return wf_offset, wf_conf
+    raw_a1 = _extract(video_path, start_offset, DUR1, WIN1)
+    raw_b1 = _extract(audio_path, start_offset, DUR1, WIN1)
+
+    if raw_a1 is None or raw_b1 is None:
+        return 0.0, 0.0
+
+    env_a1 = _peak_env(raw_a1, WIN1, top_pct=15)   # 1 sample per second, loudest 15 %
+    env_b1 = _peak_env(raw_b1, WIN1, top_pct=15)
+
+    if env_a1 is None or env_b1 is None or len(env_a1) < 4 or len(env_b1) < 4:
+        return 0.0, 0.0
+
+    # audio first, video second — C[L] = sum_t AUDIO[t] * VIDEO[t+L]
+    # Peak at L=+10 means VIDEO leads AUDIO by 10s (camera started 10s early) → T1=+10
+    # Consistent with Stage 2 and Stage 3 argument order.
+    lag1, conf1 = _xcorr_bounded(env_b1, env_a1, len(env_b1) // 2)
+    # Both extractions started at start_offset; v_start = a_start, so:
+    T1 = float(lag1) / SR1   # seconds; positive = camera started before DAW
+
+    # ── Stage 2: 50 Hz RMS envelope, ±10 s search around T1 ──────────────
+    # Accuracy: ±10 ms.
+    SR2      = 8000
+    WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
+    PROBE2   = 60.0            # seconds to extract
+    SEARCH2  = 10.0            # ±10 s search
+
+    a_start2 = start_offset
+    # Centre the video extraction on the Stage-1 estimate.
+    # v_start2 - a_start2 encodes the expected offset so the lag is small.
+    v_start2 = max(0.0, start_offset + T1)
+
+    raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
+    raw_v2 = _extract(video_path,  v_start2, PROBE2, SR2)
+
+    T2, conf2 = T1, conf1   # fallback
+    if raw_a2 is not None and raw_v2 is not None:
+        env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
+        env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
+        if env_a2 is not None and env_v2 is not None:
+            sr2_eff  = SR2 // WIN2                       # 50 Hz effective
+            max_lag2 = int(SEARCH2 * sr2_eff)
+            lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
+            T2 = (v_start2 - a_start2) + float(lag2) / sr2_eff
+
+    # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
+    # Accuracy: ±1 ms (sub-frame).
+    SR3      = 8000
+    WIN3     = SR3 // 500      # 2 ms RMS windows → 500 effective Hz
+    PROBE3   = 10.0            # seconds to extract
+    SEARCH3  = 0.5             # ±0.5 s search
+
+    # Anchor at 30 % into probe2 to use a different region than stage 2
+    a_start3 = a_start2 + PROBE2 * 0.3
+    v_start3 = max(0.0, a_start3 + T2)
+
+    raw_a3 = _extract(audio_path, a_start3, PROBE3, SR3)
+    raw_v3 = _extract(video_path,  v_start3, PROBE3, SR3)
+
+    T3, conf3 = T2, conf2   # fallback
+    if raw_a3 is not None and raw_v3 is not None:
+        env_a3 = _peak_env(raw_a3, WIN3, top_pct=35)
+        env_v3 = _peak_env(raw_v3, WIN3, top_pct=35)
+        if env_a3 is not None and env_v3 is not None:
+            sr3_eff  = SR3 // WIN3                       # 500 Hz effective
+            max_lag3 = int(SEARCH3 * sr3_eff)
+            lag3, conf3 = _xcorr_bounded(env_a3, env_v3, max_lag3)
+            T3 = (v_start3 - a_start3) + float(lag3) / sr3_eff
+
+    # ── Return finest reliable result ──────────────────────────────────────
+    # Stage 3 searches ±0.5 s around Stage 2's estimate, which itself searched
+    # ±10 s around Stage 1.  If Stage 3 ran at all, it is always at least as
+    # accurate as Stage 2 — prefer it whenever it has any meaningful signal.
+    # Use very permissive thresholds to avoid falling back to coarser stages.
+    if conf3 >= 0.05:
+        return round(T3, 6), round(conf3, 4)
+    if conf2 >= 0.05:
+        return round(T2, 6), round(conf2, 4)
+    return round(T1, 4), round(conf1, 4)
 
 
 def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=8000):
@@ -653,7 +743,7 @@ def get_clip_base_name(clip_name):
     # Strip any remaining trailing .L/.R channel designator
     name = _re.sub(r'\.[LR]$', '', name)
     # Strip common audio/video file extensions
-    name = _re.sub(r'\.(wav|aif|aiff|mp3|m4v|mp4|mxf|mov)$', '', name,
+    name = _re.sub(r'\.(wav|aif|aiff|mp3|m4v|mp4|mxf|mov|wmv|avi|mkv)$', '', name,
                    flags=_re.IGNORECASE)
     return name or None
 
@@ -691,6 +781,21 @@ def parse_aaf_session(aaf_path):
     except ImportError:
         raise RuntimeError(
             "aaf2 library is required for AAF parsing. Run: pip install pyaaf2")
+
+    def _url_to_path(url):
+        """Convert file:///... URL to a local file path."""
+        if not url:
+            return ""
+        try:
+            from urllib.parse import unquote, urlparse
+            parsed = urlparse(url)
+            path = unquote(parsed.path)
+            # Windows: file:///C:/... → C:/...
+            if len(path) > 2 and path[0] == '/' and path[2] == ':':
+                path = path[1:]
+            return path.replace('/', os.sep)
+        except Exception:
+            return ""
 
     result = {
         "session_name": os.path.splitext(os.path.basename(aaf_path))[0],
@@ -747,9 +852,10 @@ def parse_aaf_session(aaf_path):
             if seg_cn != 'Sequence':
                 continue
 
-            track_clips    = []
-            is_marker_slot = False
-            timeline_pos   = 0
+            track_clips     = []
+            is_marker_slot  = False
+            timeline_pos    = 0
+            pending_fade_in = 0.0   # fade duration queued for next real clip's head
 
             for comp in seg.components:
                 ccn = _cn(comp)
@@ -788,6 +894,9 @@ def parse_aaf_session(aaf_path):
 
                 # ── Gap ────────────────────────────────────────────────────────
                 if ccn == 'Filler':
+                    # Intentional silence: reset any pending fade-in so it isn't
+                    # incorrectly attached to the clip that follows the gap.
+                    pending_fade_in = 0.0
                     timeline_pos += comp_len
                     continue
 
@@ -812,6 +921,7 @@ def parse_aaf_session(aaf_path):
                     except: tc_offset = 0
 
                     # Resolve MasterMob → clip name and physical source in-point
+                    source_file = ""
                     master = mob_index.get(src_mob_id)
                     if master is not None:
                         try: clip_name = master.name or ''
@@ -829,12 +939,39 @@ def parse_aaf_session(aaf_path):
                                     src_in_units  = master_src_in + tc_offset
                                     mrate         = _rate(mslot)
                                     src_in_secs   = src_in_units / mrate if mrate else 0.0
+
+                                    # Follow to FileSourceMob for the on-disk file path
+                                    try:
+                                        file_mob_id = str(mseg['SourceID'].value)
+                                        file_mob = mob_index.get(file_mob_id)
+                                        if file_mob and hasattr(file_mob, 'descriptor'):
+                                            desc = file_mob.descriptor
+                                            if desc:
+                                                for loc in desc.locator:
+                                                    try:
+                                                        url = loc['URLString'].value
+                                                        source_file = _url_to_path(url)
+                                                    except Exception:
+                                                        pass
+                                                    break
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                             break   # first matching slot is enough
 
-                    # Skip fades and any clip get_clip_base_name can't resolve
+                    # ── Fade clips — record duration, don't emit a track clip ──
                     if get_clip_base_name(clip_name) is None:
+                        fade_dur = comp_len / rate if rate else 0.0
+                        if fade_dur > 0:
+                            # Annotate the preceding real clip's tail (fade-out /
+                            # crossfade outgoing side).
+                            if track_clips:
+                                track_clips[-1]["fade_out_secs"] = (
+                                    track_clips[-1].get("fade_out_secs", 0.0) + fade_dur)
+                            # Queue for the next real clip's head (fade-in /
+                            # crossfade incoming side).
+                            pending_fade_in = fade_dur
                         timeline_pos += comp_len
                         continue
 
@@ -844,13 +981,17 @@ def parse_aaf_session(aaf_path):
                     src_out_secs = src_in_secs + dur_secs
 
                     track_clips.append({
-                        "clip_name":    clip_name,
-                        "start_secs":   start_secs,
-                        "end_secs":     end_secs,
-                        "src_in_secs":  src_in_secs,
-                        "src_out_secs": src_out_secs,
-                        "state":        "Unmuted",
+                        "clip_name":     clip_name,
+                        "start_secs":    start_secs,
+                        "end_secs":      end_secs,
+                        "src_in_secs":   src_in_secs,
+                        "src_out_secs":  src_out_secs,
+                        "state":         "Unmuted",
+                        "source_file":   source_file,
+                        "fade_in_secs":  pending_fade_in,
+                        "fade_out_secs": 0.0,
                     })
+                    pending_fade_in = 0.0
 
                 timeline_pos += comp_len
 

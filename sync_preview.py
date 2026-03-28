@@ -72,8 +72,12 @@ class SyncPreviewDialog:
         self._on_accept = on_accept
         self._sr = _SR
 
-        # Offset state (in samples at _SR)
-        self._offset_samples = int(round(initial_offset * _SR))
+        # Offset state (in samples at _SR).
+        # Internally stored negated relative to the semantic v_offset so that
+        # the display formula  vid_vs = vs - _offset_samples  shows the correct
+        # visual alignment: positive v_offset (camera ahead of DAW) → video
+        # waveform shifted left (earlier video content on screen).
+        self._offset_samples = -int(round(initial_offset * _SR))
 
         # Waveform data (populated by background thread)
         self._vid_samples = None
@@ -148,8 +152,7 @@ class SyncPreviewDialog:
         self._cv.bind("<ButtonPress-1>", self._on_drag_start)
         self._cv.bind("<B1-Motion>", self._on_drag_motion)
         self._cv.bind("<ButtonRelease-1>", self._on_drag_end)
-        self._cv.bind("<MouseWheel>", self._on_zoom)
-        self._cv.bind("<Shift-MouseWheel>", self._on_pan)
+        self._cv.bind("<MouseWheel>", self._on_scroll)
         self._cv.bind("<Configure>", self._on_canvas_resize)
 
         # Zoom + offset row
@@ -157,18 +160,17 @@ class SyncPreviewDialog:
         ctrl.pack(fill="x", padx=12, pady=(6, 2))
 
         tk.Label(ctrl, text="Zoom:", fg=SUB, bg=BG, font=FB).pack(side="left")
-        for label, secs in [("Full", None), ("10s", 10), ("2s", 2)]:
-            b = tk.Label(ctrl, text=label, font=FB, bg=SURF3, fg=TEXT,
-                         cursor="hand2", padx=8, pady=2, bd=0,
+        for sym, fn in [("−", self._zoom_out), ("+", self._zoom_in)]:
+            b = tk.Label(ctrl, text=sym, font=FBT, bg=SURF3, fg=TEXT,
+                         cursor="hand2", padx=10, pady=2, bd=0,
                          highlightbackground=BORDER, highlightthickness=1)
             b.pack(side="left", padx=(4, 0))
             b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT))
             b.bind("<Leave>", lambda e, w=b: w.config(bg=SURF3))
-            b.bind("<ButtonRelease-1>",
-                   lambda e, s=secs: self._zoom_preset(s))
+            b.bind("<ButtonRelease-1>", lambda e, f=fn: f())
 
         # Spacer
-        tk.Frame(ctrl, bg=BG, width=30).pack(side="left")
+        tk.Frame(ctrl, bg=BG, width=20).pack(side="left")
 
         tk.Label(ctrl, text="Offset:", fg=SUB, bg=BG, font=FB).pack(side="left")
         self._offset_var = tk.StringVar(value=self._fmt_offset())
@@ -252,51 +254,91 @@ class SyncPreviewDialog:
         return vid, ref
 
     def _extraction_done(self, fut):
+        # Guard against callbacks firing after the window was closed
+        try:
+            if not self._win.winfo_exists():
+                return
+        except Exception:
+            return
+
         try:
             vid, ref = fut.result()
         except Exception as exc:
             def _err():
-                self._loading_lbl.config(
-                    text="Extraction failed: {}".format(exc))
+                try:
+                    self._loading_lbl.config(
+                        text="Extraction failed: {}".format(exc))
+                except Exception:
+                    pass
             self._win.after(0, _err)
             return
 
         def _ready():
-            self._vid_samples = vid
-            self._ref_samples = ref
-            self._loading_lbl.destroy()
-            # Initial zoom: show the full reference file
-            self._canvas_w = max(100, self._cv.winfo_width())
-            self._canvas_h = max(50, self._cv.winfo_height())
-            n_ref = len(ref)
-            self._samples_per_px = max(1, n_ref // self._canvas_w)
-            self._view_start = 0
-            self._draw()
+            try:
+                if not self._win.winfo_exists():
+                    return
+                self._vid_samples = vid
+                self._ref_samples = ref
+                self._loading_lbl.destroy()
+                # Initial zoom: show the full reference file
+                self._canvas_w = max(100, self._cv.winfo_width())
+                self._canvas_h = max(50, self._cv.winfo_height())
+                n_ref = len(ref)
+                self._samples_per_px = max(1, n_ref // self._canvas_w)
+                self._view_start = 0
+                self._draw()
+            except Exception:
+                pass
         self._win.after(0, _ready)
 
     # ── Waveform Rendering ────────────────────────────────────────────────
 
     @staticmethod
     def _compute_bins(samples, width, view_start, view_end):
-        """Downsample *samples[view_start:view_end]* to *width* min/max bins."""
+        """Downsample samples[view_start:view_end] to *width* min/max bins.
+
+        view_start / view_end may extend outside [0, len(samples)].
+        Out-of-bounds regions are zero-padded so the waveform holds its
+        shape and position rather than stretching to fill the canvas.
+        """
         import numpy as _np
-        view_start = max(0, int(view_start))
-        view_end = min(len(samples), int(view_end))
-        chunk = samples[view_start:view_end]
-        n = len(chunk)
-        if n == 0 or width <= 0:
+        view_start = int(view_start)
+        view_end   = int(view_end)
+        total      = view_end - view_start
+        if total <= 0 or width <= 0:
             return _np.zeros(width), _np.zeros(width)
-        if n < width:
-            # Fewer samples than pixels — pad
-            mins = _np.zeros(width)
-            maxs = _np.zeros(width)
-            mins[:n] = chunk
-            maxs[:n] = chunk
+
+        clamp_s = max(0, view_start)
+        clamp_e = min(len(samples), view_end)
+
+        mins = _np.zeros(width)
+        maxs = _np.zeros(width)
+
+        if clamp_s >= clamp_e:          # entirely out of range
             return mins, maxs
-        bin_size = n // width
-        trim = bin_size * width
-        reshaped = chunk[:trim].reshape(width, bin_size)
-        return reshaped.min(axis=1), reshaped.max(axis=1)
+
+        # Pixel positions of the valid sample region within the output array
+        px_start = int(round((clamp_s - view_start) / total * width))
+        px_end   = min(width, int(round((clamp_e - view_start) / total * width)))
+        px_w     = px_end - px_start
+        if px_w <= 0:
+            return mins, maxs
+
+        chunk = samples[clamp_s:clamp_e]
+        n = len(chunk)
+        if n == 0:
+            return mins, maxs
+        if n <= px_w:
+            mins[px_start:px_start + n] = chunk
+            maxs[px_start:px_start + n] = chunk
+        else:
+            bin_size = n // px_w
+            trim     = bin_size * px_w
+            reshaped = chunk[:trim].reshape(px_w, bin_size)
+            mins[px_start:px_end] = reshaped.min(axis=1)
+            maxs[px_start:px_end] = reshaped.max(axis=1)
+
+        return mins, maxs
 
     def _draw(self):
         if self._ref_samples is None:
@@ -392,24 +434,13 @@ class SyncPreviewDialog:
     def _on_drag_end(self, event):
         self._drag_x0 = None
 
-    def _on_zoom(self, event):
-        if self._ref_samples is None:
-            return
-        factor = 1.0 / 1.5 if event.delta > 0 else 1.5
-        old_spp = self._samples_per_px
-        new_spp = max(1, int(old_spp * factor))
-        # Clamp: minimum = ~0.5s across canvas, maximum = full file
-        n_ref = len(self._ref_samples)
-        max_spp = max(1, n_ref // max(1, self._canvas_w))
-        min_spp = max(1, int(0.5 * self._sr / max(1, self._canvas_w)))
-        new_spp = max(min_spp, min(max_spp, new_spp))
-        if new_spp == old_spp:
-            return
-        # Keep the point under the cursor in place
-        cursor_sample = self._view_start + event.x * old_spp
-        self._samples_per_px = new_spp
-        self._view_start = max(0, int(cursor_sample - event.x * new_spp))
-        self._draw()
+    def _on_scroll(self, event):
+        """MouseWheel — pan normally; hold Ctrl to zoom centred on cursor."""
+        if event.state & 0x4:          # Ctrl held → zoom
+            self._zoom_by(1.0 / 1.5 if event.delta > 0 else 1.5,
+                          mouse_x=event.x)
+        else:
+            self._on_pan(event)
 
     def _on_pan(self, event):
         if self._ref_samples is None:
@@ -420,20 +451,35 @@ class SyncPreviewDialog:
         self._view_start = max(0, min(max_start, self._view_start + delta))
         self._draw()
 
-    def _zoom_preset(self, seconds):
-        """Zoom to show *seconds* of audio, or the full file if None."""
+    def _zoom_in(self):
+        """Zoom in by 2×, keeping the view centred."""
+        self._zoom_by(0.5)
+
+    def _zoom_out(self):
+        """Zoom out by 2×, keeping the view centred."""
+        self._zoom_by(2.0)
+
+    def _zoom_by(self, factor, mouse_x=None):
         if self._ref_samples is None:
             return
-        n_ref = len(self._ref_samples)
-        w = max(1, self._canvas_w)
-        if seconds is None:
-            self._samples_per_px = max(1, n_ref // w)
-            self._view_start = 0
+        n_ref  = len(self._ref_samples)
+        w      = max(1, self._canvas_w)
+        old    = self._samples_per_px
+        new    = max(1, int(old * factor))
+        max_sp = max(1, n_ref // w)
+        min_sp = max(1, int(self._sr // w))    # ~1 s minimum span
+        new    = max(min_sp, min(max_sp, new))
+        if new == old:
+            return
+        if mouse_x is not None:
+            # Keep the sample under the mouse cursor fixed in place
+            anchor_samp = self._view_start + mouse_x * old
+            self._view_start = max(0, int(anchor_samp - mouse_x * new))
         else:
-            self._samples_per_px = max(1, int(seconds * self._sr / w))
-            # Centre on current view centre
-            centre = self._view_start + (w * self._samples_per_px) // 2
-            self._view_start = max(0, centre - (w * self._samples_per_px) // 2)
+            # Keep view centre fixed (used by +/- buttons)
+            centre           = self._view_start + (w * old) // 2
+            self._view_start = max(0, centre - (w * new) // 2)
+        self._samples_per_px = new
         self._draw()
 
     def _nudge(self, frames):
@@ -555,8 +601,12 @@ class SyncPreviewDialog:
 
     # ── Accept / Cancel ───────────────────────────────────────────────────
 
+    def close(self):
+        """Close this dialog programmatically (e.g. when the user re-syncs)."""
+        self._cleanup()
+
     def _on_accept_click(self):
-        offset_s = self._offset_samples / self._sr
+        offset_s = -self._offset_samples / self._sr
         self._cleanup()
         if self._on_accept:
             self._on_accept(offset_s)
@@ -580,5 +630,5 @@ class SyncPreviewDialog:
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _fmt_offset(self):
-        s = self._offset_samples / self._sr
+        s = -self._offset_samples / self._sr
         return "{:+.3f}s".format(s)
