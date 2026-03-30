@@ -33,7 +33,7 @@ from engines import extract_mono_pcm, extract_audio_segment
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SR           = 8000       # extraction sample rate for waveform display
-_PLAYBACK_SR  = 16000      # extraction sample rate for playback clips
+_PLAYBACK_SR  = 44100      # extraction sample rate for playback clips
 _PLAY_DUR     = 3.0        # playback clip duration (seconds)
 _FRAME_S      = 1.0 / 60   # one frame at 60 fps
 _NUDGE_SAMP   = int(_FRAME_S * _SR)  # samples per single-frame nudge
@@ -120,6 +120,9 @@ class SyncPreviewDialog:
         # Capture all input while the dialog is open so scroll events don't
         # bleed through to the underlying panel.
         self._win.grab_set()
+        # Block MouseWheel on the whole dialog window so that scrolling over
+        # non-canvas widgets (buttons, labels) doesn't reach the parent panel.
+        self._win.bind("<MouseWheel>", lambda e: "break")
         self._start_extraction()
 
     # ── UI Construction ───────────────────────────────────────────────────
@@ -446,6 +449,7 @@ class SyncPreviewDialog:
                           mouse_x=event.x)
         else:
             self._on_pan(event)
+        return "break"  # prevent propagation to parent window
 
     def _on_pan(self, event):
         if self._ref_samples is None:

@@ -28,7 +28,7 @@ from engines import extract_audio_segment
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SR          = 8000     # waveform display sample rate
-_PLAYBACK_SR = 16000    # playback sample rate
+_PLAYBACK_SR = 44100    # playback sample rate
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
 
@@ -114,6 +114,7 @@ class MatchReviewDialog:
 
         self._build_ui(quote_text)
         self._win.grab_set()
+        self._win.bind("<MouseWheel>", lambda e: "break")
         self._start_extraction()
 
     # ── UI ────────────────────────────────────────────────────────────────
@@ -470,6 +471,7 @@ class MatchReviewDialog:
             self._zoom_by(1.0 / 1.5 if event.delta > 0 else 1.5, event.x)
         else:
             self._pan(event)
+        return "break"
 
     def _pan(self, event):
         if self._samples is None:

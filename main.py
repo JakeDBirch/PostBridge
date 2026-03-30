@@ -37,7 +37,7 @@ from utils import basename, secs_tc, tc_secs, is_video, is_audio, is_media, MEDI
 from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
-                     detect_sync_offset)
+                     detect_sync_offset, verify_sync_at_offset)
 from gui_components import VoBin, MediaPool, _SlimScrollbar, _FlatDropdown, _FlatProgressBar
 import engines
 from sync_preview import SyncPreviewDialog
@@ -4064,18 +4064,49 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             "close"  if _correction_ms < 500 else
                             "wrong")
                 _entry = {
-                    "ts":           _dt.datetime.now().isoformat(timespec="seconds"),
-                    "source":       base,
-                    "auto_T":       round(offset, 4),
-                    "accepted_T":   round(accepted_offset, 4),
+                    "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
+                    "source":        base,
+                    "video":         os.path.basename(video_path),
+                    "audio":         os.path.basename(audio_path),
+                    "auto_T":        round(offset, 4),
+                    "accepted_T":    round(accepted_offset, 4),
                     "correction_ms": _correction_ms,
-                    "verdict":      _verdict,
+                    "verdict":       _verdict,
                 }
                 with open(_os.path.join(_cache_dir, "sync_corrections.jsonl"),
                           "a", encoding="utf-8") as _fh:
                     _fh.write(_json.dumps(_entry) + "\n")
             except Exception:
                 pass
+
+            # ── Background signal verification ────────────────────────────
+            # Run a Stage-3 xcorr at the accepted offset to confirm waveform
+            # agreement.  Appends a "verified" entry to sync_corrections.jsonl
+            # so future algorithm runs have signal-backed ground truth.
+            def _verify_bg(vp=video_path, ap=audio_path,
+                           acc=accepted_offset, src=base):
+                try:
+                    import json as _jv, datetime as _dv, os as _ov
+                    _v_T, _v_conf = verify_sync_at_offset(vp, ap, acc)
+                    _cache = _ov.path.join(
+                        _ov.path.dirname(_ov.path.abspath(__file__)), ".pb_cache")
+                    _ve = {
+                        "ts":            _dv.datetime.now().isoformat(timespec="seconds"),
+                        "source":        src,
+                        "video":         _ov.path.basename(vp),
+                        "audio":         _ov.path.basename(ap),
+                        "accepted_T":    round(acc, 4),
+                        "verified_T":    _v_T,
+                        "verified_conf": _v_conf,
+                        "verdict":       "verified",
+                    }
+                    with open(_ov.path.join(_cache, "sync_corrections.jsonl"),
+                              "a", encoding="utf-8") as _fv:
+                        _fv.write(_jv.dumps(_ve) + "\n")
+                except Exception:
+                    pass
+            import threading as _thr
+            _thr.Thread(target=_verify_bg, daemon=True).start()
             # ── Apply accepted offset to UI ────────────────────────────────
             self._aaf_push_undo(base)
             ov = self._aaf_source_offset_vars.get(base)
@@ -4323,12 +4354,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             import json as _json, datetime as _dt, os as _os
             _ov = self._aaf_source_offset_vars.get(base)
             _offset = float(_ov.get()) if _ov else 0.0
+            _vp = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
+            _ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
             _cache_dir = _os.path.join(
                 _os.path.dirname(_os.path.abspath(__file__)), ".pb_cache")
             _os.makedirs(_cache_dir, exist_ok=True)
             _entry = {
                 "ts":      _dt.datetime.now().isoformat(timespec="seconds"),
                 "source":  base,
+                "video":   _os.path.basename(_vp) if _vp else "",
+                "audio":   _os.path.basename(_ap) if _ap else "",
                 "auto_T":  round(_offset, 4),
                 "verdict": "accepted",   # user was happy with auto result
             }
