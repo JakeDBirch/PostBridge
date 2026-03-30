@@ -539,6 +539,72 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         conf        = min(1.0, z / 8.0)
         return lag, conf
 
+    def _xcorr_top_n(a_sig, b_sig, max_lag_samp, n_peaks=3, min_gap=5):
+        """
+        Like _xcorr_bounded but returns the top-N (lag, conf) pairs,
+        each at least min_gap lag-samples apart.  Peaks are found by
+        repeatedly zeroing out the neighbourhood around each winner and
+        scanning again; confidence is always relative to the same global
+        noise floor so values are comparable across calls.
+
+        Used for multi-candidate Stage 1: instead of committing to the
+        single strongest 1 Hz peak, we keep the top 3 and let Stage 2
+        arbitrate by running a separate ±20 s search from each.
+        """
+        na, nb = len(a_sig), len(b_sig)
+        n  = na + nb - 1
+        N  = 1 << int(_np.ceil(_np.log2(max(n, 1))))
+        C  = _np.fft.irfft(
+                 _np.fft.rfft(b_sig, N) * _np.conj(_np.fft.rfft(a_sig, N)),
+                 N)[:n]
+        C_abs = _np.abs(C)
+
+        ml      = min(max_lag_samp, n // 2 - 1)
+        pos_idx = _np.arange(0, ml + 1)
+        neg_idx = _np.arange(n - ml, n) if ml > 0 else _np.array([], dtype=int)
+        win_idx = _np.concatenate([pos_idx, neg_idx])
+
+        # Noise floor: fixed across all peak iterations so confidences
+        # are comparable (dividing by the same baseline each time).
+        vals       = C_abs[win_idx]
+        noise_mean = float(_np.mean(vals))
+        noise_std  = float(_np.std(vals))
+
+        C_work  = C_abs.copy()
+        results = []
+        win_lags = _np.where(win_idx <= n // 2,
+                             win_idx.astype(int),
+                             win_idx.astype(int) - n)   # signed lags for gap test
+
+        for _ in range(n_peaks):
+            remaining = C_work[win_idx]
+            if float(_np.max(remaining)) < 1e-12:
+                break
+
+            local_best = int(_np.argmax(remaining))
+            best_i     = int(win_idx[local_best])
+            lag_int    = best_i if best_i <= n // 2 else best_i - n
+
+            lag = float(lag_int)
+            if 0 < best_i < n - 1:
+                y0 = float(C_abs[best_i - 1])
+                y1 = float(C_abs[best_i])
+                y2 = float(C_abs[best_i + 1])
+                denom = y0 - 2.0 * y1 + y2
+                if abs(denom) > 1e-12:
+                    lag += max(-0.5, min(0.5, 0.5 * (y0 - y2) / denom))
+
+            z    = (float(C_abs[best_i]) - noise_mean) / max(noise_std, 1e-9)
+            conf = min(1.0, z / 8.0)
+            results.append((lag, conf))
+
+            # Null out ±min_gap around this peak in lag-space so the next
+            # iteration cannot re-select it or an immediate neighbour.
+            mask = _np.abs(win_lags - lag_int) < min_gap
+            C_work[win_idx[mask]] = 0.0
+
+        return results if results else [(0.0, 0.0)]
+
     # ── Stage 1: 1 Hz RMS envelope, full probe window ─────────────────────
     # One RMS sample per second.  Handles offsets up to ±probe_duration/2 s.
     # Accuracy: ±0.5 s.
@@ -561,34 +627,49 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     # audio first, video second — C[L] = sum_t AUDIO[t] * VIDEO[t+L]
     # Peak at L=+10 means VIDEO leads AUDIO by 10s (camera started 10s early) → T1=+10
     # Consistent with Stage 2 and Stage 3 argument order.
-    lag1, conf1 = _xcorr_bounded(env_b1, env_a1, len(env_b1) // 2)
+    # Return top-3 candidates separated by ≥5 s so Stage 2 can arbitrate.
+    _s1_peaks = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
+                              n_peaks=3, min_gap=5)
+    lag1, conf1 = _s1_peaks[0]
     # Both extractions started at start_offset; v_start = a_start, so:
     T1 = float(lag1) / SR1   # seconds; positive = camera started before DAW
 
-    # ── Stage 2: 50 Hz RMS envelope, ±10 s search around T1 ──────────────
-    # Accuracy: ±10 ms.
+    # ── Stage 2: 50 Hz RMS envelope, ±20 s search on each S1 candidate ───
+    # Run once per Stage-1 candidate; pick whichever gives the highest Stage-2
+    # confidence.  This lets Stage 2 escape a false Stage-1 peak without an
+    # expensive full-range sweep.  Early-stop when conf ≥ 0.80 (clean match).
     SR2      = 8000
     WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
     PROBE2   = 60.0            # seconds to extract
-    SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
+    SEARCH2  = 20.0            # ±20 s search
 
     a_start2 = start_offset
-    # Centre the video extraction on the Stage-1 estimate.
-    # v_start2 - a_start2 encodes the expected offset so the lag is small.
-    v_start2 = max(0.0, start_offset + T1)
-
-    raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
-    raw_v2 = _extract(video_path,  v_start2, PROBE2, SR2)
+    raw_a2   = _extract(audio_path, a_start2, PROBE2, SR2)
 
     T2, conf2 = T1, conf1   # fallback
-    if raw_a2 is not None and raw_v2 is not None:
+    T1_best   = T1          # Stage-1 candidate whose Stage-2 result won
+    if raw_a2 is not None:
         env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
-        env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
-        if env_a2 is not None and env_v2 is not None:
-            sr2_eff  = SR2 // WIN2                       # 50 Hz effective
+        if env_a2 is not None:
+            sr2_eff  = SR2 // WIN2
             max_lag2 = int(SEARCH2 * sr2_eff)
-            lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
-            T2 = (v_start2 - a_start2) + float(lag2) / sr2_eff
+            _best_c2 = -1.0
+            for _s1_lag_c, _s1_c_c in _s1_peaks:
+                _T1c     = float(_s1_lag_c) / SR1
+                _v_s2c   = max(0.0, start_offset + _T1c)
+                _raw_v2c = _extract(video_path, _v_s2c, PROBE2, SR2)
+                if _raw_v2c is not None:
+                    _env_v2c = _peak_env(_raw_v2c, WIN2, top_pct=25)
+                    if _env_v2c is not None:
+                        _l2c, _c2c = _xcorr_bounded(env_a2, _env_v2c, max_lag2)
+                        _T2c = (_v_s2c - a_start2) + float(_l2c) / sr2_eff
+                        if _c2c > _best_c2:
+                            _best_c2 = _c2c
+                            T2       = _T2c
+                            conf2    = _c2c
+                            T1_best  = _T1c
+                if _best_c2 >= 0.80:   # clean match — no need to try others
+                    break
 
     # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
     # Accuracy: ±1 ms (sub-frame).
@@ -616,22 +697,22 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             T3         = (v_start3 - a_start3) + float(lag3) / sr3_eff
             stage3_ran = True
 
-    # ── Stage 3R: Rescue – Stage-3 anchored at T1 ─────────────────────────
-    # When T1 and T2 disagree by ≥ 3 s Stage 2 likely latched onto a false
-    # cross-correlation peak.  Independently verify T1 by running a Stage-3
-    # precision search centred on T1 rather than T2.  Whichever anchor yields
-    # higher correlation confidence becomes the final answer.
-    _t12_spread_pre = abs(T2 - T1)
+    # ── Stage 3R: Rescue – Stage-3 anchored at T1_best ────────────────────
+    # When the winning Stage-2 result still disagrees with its own Stage-1
+    # seed by ≥ 3 s, Stage 2 likely latched onto a false peak inside its
+    # ±20 s search window.  Run a fine Stage-3 check anchored at T1_best;
+    # if that yields higher confidence than the current best, use it instead.
+    _t12_spread_pre = abs(T2 - T1_best)
     rescue_ran  = False
-    T3R         = T2        # fallback if rescue does not run or is worse
+    T3R         = T2
     conf3R_raw  = 0.0
 
     if _t12_spread_pre >= 3.0:
-        _sr3r_eff  = SR3 // WIN3               # 500 Hz
+        _sr3r_eff  = SR3 // WIN3
         _max_lag3r = int(SEARCH3 * _sr3r_eff)
-        # Anchor audio at same 30 % point used by Stage 3; anchor video on T1.
+        # Anchor audio at the same 30 % point Stage 3 uses; anchor video on T1_best.
         _a_start3r = a_start2 + PROBE2 * 0.3
-        _v_start3r = max(0.0, _a_start3r + T1)
+        _v_start3r = max(0.0, _a_start3r + T1_best)
         _raw_a3r   = _extract(audio_path, _a_start3r, PROBE3, SR3)
         _raw_v3r   = _extract(video_path,  _v_start3r, PROBE3, SR3)
         if _raw_a3r is not None and _raw_v3r is not None:
@@ -642,37 +723,6 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
                 T3R        = (_v_start3r - _a_start3r) + float(_lag3r) / _sr3r_eff
                 conf3R_raw = _conf3r
                 rescue_ran = True
-
-    # ── Stage 2P: Prior-seeded Stage-3 when confidence is low ─────────────
-    # If a previous run was manually corrected for the same video/audio pair,
-    # load the accepted offset and verify it via a Stage-3 xcorr.  Only used
-    # when the algorithm's own confidence is below 0.30.
-    _prior_T     = None
-    _prior_conf3 = 0.0
-    _T3P         = None
-    _used_prior  = False
-    try:
-        import json as _json_p
-        _corr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   ".pb_cache", "sync_corrections.jsonl")
-        if os.path.exists(_corr_path):
-            _vbase = os.path.basename(video_path)
-            _abase = os.path.basename(audio_path)
-            with open(_corr_path, "r", encoding="utf-8") as _cf:
-                for _cl in _cf:
-                    _cl = _cl.strip()
-                    if not _cl:
-                        continue
-                    try:
-                        _ce = _json_p.loads(_cl)
-                        if (_ce.get("video") == _vbase
-                                and _ce.get("audio") == _abase
-                                and _ce.get("accepted_T") is not None):
-                            _prior_T = float(_ce["accepted_T"])
-                    except Exception:
-                        pass
-    except Exception:
-        pass
 
     # ── Return finest reliable result ──────────────────────────────────────
     # Two independent confidence signals are combined:
@@ -698,7 +748,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     #    so even a fully-penalised result stays above 0 (avoids hiding
     #    detections that are still worth user inspection).
 
-    t12_spread = abs(T2 - T1)
+    t12_spread = abs(T2 - T1_best)
     if t12_spread < 1.0:
         t12_factor = 1.0
     elif t12_spread < 5.0:
@@ -734,35 +784,6 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         final_conf   = round(min(1.0, conf3R_raw), 4)
         _used_rescue = True
 
-    # ── Apply prior accepted offset if algorithm confidence is still low ───
-    # Requires corrections.jsonl entries that include "video" / "audio" fields
-    # (logged from main.py ≥ this version).  Runs a Stage-3 precision check
-    # centred on the prior accepted offset; uses the result only if its
-    # confidence beats the algorithm's current best.
-    if _prior_T is not None and final_conf < 0.30:
-        _sr3p_eff  = SR3 // WIN3
-        _max_lag3p = int(SEARCH3 * _sr3p_eff)
-        # Compensate for prior_T so both extractions are time-aligned
-        if _prior_T >= 0:
-            _a_s3p = start_offset
-            _v_s3p = max(0.0, start_offset + _prior_T)
-        else:
-            _a_s3p = max(0.0, start_offset - _prior_T)
-            _v_s3p = start_offset
-        _raw_a3p = _extract(audio_path, _a_s3p, PROBE3, SR3)
-        _raw_v3p = _extract(video_path,  _v_s3p, PROBE3, SR3)
-        if _raw_a3p is not None and _raw_v3p is not None:
-            _env_a3p = _peak_env(_raw_a3p, WIN3, top_pct=35)
-            _env_v3p = _peak_env(_raw_v3p, WIN3, top_pct=35)
-            if _env_a3p is not None and _env_v3p is not None:
-                _lagp, _confp = _xcorr_bounded(_env_a3p, _env_v3p, _max_lag3p)
-                _T3P    = (_v_s3p - _a_s3p) + float(_lagp) / _sr3p_eff
-                _prior_conf3 = _confp
-                if _confp > final_conf:
-                    final_T     = round(_T3P, 6)
-                    final_conf  = round(min(1.0, _confp), 4)
-                    _used_prior = True
-
     # ── Write feedback log ─────────────────────────────────────────────────
     # .pb_cache/sync_runs.jsonl accumulates one entry per detection run.
     # At session start these can be read to understand algorithm behaviour.
@@ -776,19 +797,18 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
             "video":         os.path.basename(video_path),
             "audio":         os.path.basename(audio_path),
-            "T1":            round(T1, 4),    "conf1": round(conf1, 4),
-            "T2":            round(T2, 4),    "conf2": round(conf2, 4),
-            "T3":            round(T3, 6) if stage3_ran else None,
-            "conf3":         round(conf3, 4) if stage3_ran else None,
+            "T1":            round(T1, 4),       "conf1":  round(conf1, 4),
+            "T1_best":       round(T1_best, 4),
+            "T2":            round(T2, 4),       "conf2":  round(conf2, 4),
+            "T3":            round(T3, 6)        if stage3_ran else None,
+            "conf3":         round(conf3, 4)     if stage3_ran else None,
             "t12_spread_ms": round(t12_spread * 1000, 1),
             "t12_factor":    round(t12_factor, 3),
             "spread_ms":     round(spread * 1000, 1) if spread is not None else None,
             "stage3_ran":    stage3_ran,
-            "rescue_T3R":    round(T3R, 6)    if rescue_ran  else None,
-            "rescue_conf":   round(conf3R_raw, 4) if rescue_ran  else None,
+            "rescue_T3R":    round(T3R, 6)       if rescue_ran else None,
+            "rescue_conf":   round(conf3R_raw, 4) if rescue_ran else None,
             "used_rescue":   _used_rescue,
-            "prior_seed_T":  round(_prior_T, 4) if _prior_T is not None else None,
-            "used_prior":    _used_prior,
             "final_T":       final_T,
             "final_conf":    final_conf,
         }
