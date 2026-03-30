@@ -680,6 +680,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
     orig_in  = pull["in_seconds"]
     orig_out = pull["out_seconds"]
     result   = _base_result(pull)
+    result["source_audio"] = transcript_file or ""
 
     if not transcript_file:
         return result
@@ -1282,6 +1283,7 @@ def reconcile_vo_part(vo_blocks, takes):
         abs_out = best_segs[-1][1]
         conf    = round(best_match["confidence"], 3)
 
+        best_apath = unpacked[best_take_index][3] if best_take_index < len(unpacked) else ""
         base.update({
             "takes_data":      takes_data_clean,
             "best_take_index": best_take_index,
@@ -1297,6 +1299,7 @@ def reconcile_vo_part(vo_blocks, takes):
             "n_internal_cuts": best_match["n_internal_cuts"],
             "n_gap_cuts":      best_match["n_gap_cuts"],
             "status":          "ok" if conf >= MATCH_THRESH else "low_confidence",
+            "source_audio":    best_apath,
         })
         results.append(base)
 
@@ -1359,7 +1362,8 @@ def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
-            data = np.frombuffer(open(tmp, 'rb').read(), dtype=np.float32)
+            with open(tmp, 'rb') as _f:
+                data = np.frombuffer(_f.read(), dtype=np.float32)
             rms = np.sqrt(np.mean(data ** 2))
             if rms > 0:
                 data = data / rms
@@ -1413,7 +1417,8 @@ def _extract_mono(src_path, duration, out_sr):
                            encoding='utf-8', errors='replace')
         if r.returncode != 0:
             return None
-        data = np.frombuffer(open(tmp, 'rb').read(), dtype=np.float32)
+        with open(tmp, 'rb') as _f:
+            data = np.frombuffer(_f.read(), dtype=np.float32)
         rms = np.sqrt(np.mean(data ** 2))
         if rms > 0:
             data = data / rms

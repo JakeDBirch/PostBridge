@@ -117,6 +117,9 @@ class SyncPreviewDialog:
         self._win.geometry("{}x{}+{}+{}".format(w, h, max(0, x), max(0, y)))
 
         self._build_ui()
+        # Capture all input while the dialog is open so scroll events don't
+        # bleed through to the underlying panel.
+        self._win.grab_set()
         self._start_extraction()
 
     # ── UI Construction ───────────────────────────────────────────────────
@@ -244,13 +247,15 @@ class SyncPreviewDialog:
         vid = extract_mono_pcm(self._vp, sample_rate=_SR)
         ref = extract_mono_pcm(self._ap, sample_rate=_SR)
         _log.info("extracted  vid=%d samples  ref=%d samples", len(vid), len(ref))
-        # RMS-normalise for gain matching
-        rms_v = _np.sqrt(_np.mean(vid ** 2))
-        rms_r = _np.sqrt(_np.mean(ref ** 2))
-        if rms_v > 1e-6:
-            vid = vid / rms_v * 0.25
-        if rms_r > 1e-6:
-            ref = ref / rms_r * 0.25
+        # Peak-normalise each waveform independently so neither clips visually.
+        # (RMS normalisation with speech crest factors of 10-15 dB causes the
+        # peaks to shoot well past the canvas height.)
+        peak_v = float(_np.max(_np.abs(vid))) if len(vid) else 0.0
+        peak_r = float(_np.max(_np.abs(ref))) if len(ref) else 0.0
+        if peak_v > 1e-6:
+            vid = vid / peak_v * 0.85
+        if peak_r > 1e-6:
+            ref = ref / peak_r * 0.85
         return vid, ref
 
     def _extraction_done(self, fut):
@@ -538,9 +543,20 @@ class SyncPreviewDialog:
                         data = w.readframes(w.getnframes())
                     return _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
 
+                def _norm(arr, target_peak=0.72):
+                    """Peak-normalise to a consistent listening level.
+                    Peak normalisation never clips regardless of crest factor,
+                    which eliminates distortion on high-dynamic speech.
+                    RMS normalisation caused clipping when speech peaks were
+                    4-6× the RMS (typical crest factor 12-15 dB)."""
+                    peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
+                    if peak < 1e-6:
+                        return arr
+                    return arr / peak * target_peak
+
                 if mix:
-                    a = _read(ref_wav)
-                    b = _read(vid_wav)
+                    a = _norm(_read(ref_wav))
+                    b = _norm(_read(vid_wav))
                     if len(a) < len(b):
                         a = _np.pad(a, (0, len(b) - len(a)))
                     elif len(b) < len(a):
@@ -548,9 +564,9 @@ class SyncPreviewDialog:
                     mixed = _np.clip(a * 0.5 + b * 0.5, -1.0, 1.0)
                     pcm = (mixed * 32767).astype(_np.int16)
                 elif ref_only:
-                    pcm = (_read(ref_wav) * 32767).astype(_np.int16)
+                    pcm = (_norm(_read(ref_wav)) * 32767).astype(_np.int16)
                 else:
-                    pcm = (_read(vid_wav) * 32767).astype(_np.int16)
+                    pcm = (_norm(_read(vid_wav)) * 32767).astype(_np.int16)
 
                 with _wave.open(out_wav, "wb") as w:
                     w.setnchannels(1)

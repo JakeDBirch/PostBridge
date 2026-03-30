@@ -14,7 +14,7 @@ def parse_script(text):
       warnings : [str]
     """
     tokens, parts, pulls, vo_blocks, warnings = [], [], [], [], []
-    doc_title = "Blood Trails Episode"
+    doc_title = "PostBridge Episode"
 
     for mk in ["--- INTERVIEW SESSIONS START ---", "--- EPISODE ASSETS START ---"]:
         idx = text.find(mk)
@@ -536,7 +536,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         noise_mean  = float(_np.mean(vals))
         noise_std   = float(_np.std(vals))
         z           = (float(C_abs[best_i]) - noise_mean) / max(noise_std, 1e-9)
-        conf        = min(1.0, z / 20.0)
+        conf        = min(1.0, z / 8.0)
         return lag, conf
 
     # ── Stage 1: 1 Hz RMS envelope, full probe window ─────────────────────
@@ -570,7 +570,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     SR2      = 8000
     WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
     PROBE2   = 60.0            # seconds to extract
-    SEARCH2  = 10.0            # ±10 s search
+    SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
 
     a_start2 = start_offset
     # Centre the video extraction on the Stage-1 estimate.
@@ -604,26 +604,102 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     raw_a3 = _extract(audio_path, a_start3, PROBE3, SR3)
     raw_v3 = _extract(video_path,  v_start3, PROBE3, SR3)
 
-    T3, conf3 = T2, conf2   # fallback
+    stage3_ran = False
+    T3, conf3  = T2, conf2   # fallback
     if raw_a3 is not None and raw_v3 is not None:
         env_a3 = _peak_env(raw_a3, WIN3, top_pct=35)
         env_v3 = _peak_env(raw_v3, WIN3, top_pct=35)
         if env_a3 is not None and env_v3 is not None:
-            sr3_eff  = SR3 // WIN3                       # 500 Hz effective
-            max_lag3 = int(SEARCH3 * sr3_eff)
+            sr3_eff   = SR3 // WIN3                      # 500 Hz effective
+            max_lag3  = int(SEARCH3 * sr3_eff)
             lag3, conf3 = _xcorr_bounded(env_a3, env_v3, max_lag3)
-            T3 = (v_start3 - a_start3) + float(lag3) / sr3_eff
+            T3         = (v_start3 - a_start3) + float(lag3) / sr3_eff
+            stage3_ran = True
 
     # ── Return finest reliable result ──────────────────────────────────────
-    # Stage 3 searches ±0.5 s around Stage 2's estimate, which itself searched
-    # ±10 s around Stage 1.  If Stage 3 ran at all, it is always at least as
-    # accurate as Stage 2 — prefer it whenever it has any meaningful signal.
-    # Use very permissive thresholds to avoid falling back to coarser stages.
-    if conf3 >= 0.05:
-        return round(T3, 6), round(conf3, 4)
-    if conf2 >= 0.05:
-        return round(T2, 6), round(conf2, 4)
-    return round(T1, 4), round(conf1, 4)
+    # Two independent confidence signals are combined:
+    #
+    # 1. T2/T3 SPREAD (cross-stage agreement within Stage 2's region)
+    #    Stage 3 is anchored at T2 and searches ±0.5 s.  If it lands
+    #    somewhere different, Stage 2's peak was ambiguous.
+    #      spread < 50 ms  → agree = 1.0
+    #      spread < 500 ms → linear 1.0 → 0.0
+    #      spread ≥ 500 ms → agree = 0.0
+    #
+    # 2. T1/T2 SPREAD (cross-stage agreement between coarse and fine)
+    #    Stage 1 (1 Hz, full probe) and Stage 2 (50 Hz, ±20 s window) are
+    #    fully independent.  When they disagree by more than 1 s, at least
+    #    one found a false peak — and T3 cannot arbitrate because it is
+    #    anchored at T2.  Empirical data confirms: every wrong detection had
+    #    |T1-T2| > 2 s; every clean detection had |T1-T2| < 1 s.
+    #      |T1-T2| < 1 s → t12_factor = 1.0   (no penalty)
+    #      |T1-T2| < 5 s → linear 1.0 → 0.0
+    #      |T1-T2| ≥ 5 s → t12_factor = 0.0   (maximum penalty)
+    #
+    #    The t12_factor scales the base confidence: multiplier = 0.35 + 0.65×f
+    #    so even a fully-penalised result stays above 0 (avoids hiding
+    #    detections that are still worth user inspection).
+
+    t12_spread = abs(T2 - T1)
+    if t12_spread < 1.0:
+        t12_factor = 1.0
+    elif t12_spread < 5.0:
+        t12_factor = 1.0 - (t12_spread - 1.0) / 4.0
+    else:
+        t12_factor = 0.0
+    t12_mult = 0.35 + 0.65 * t12_factor   # range [0.35, 1.0]
+
+    if stage3_ran and conf3 >= 0.05:
+        spread = abs(T3 - T2)
+        if spread < 0.05:
+            agree = 1.0
+        elif spread < 0.5:
+            agree = 1.0 - (spread - 0.05) / 0.45
+        else:
+            agree = 0.0
+        base_conf  = agree * 0.70 + conf3 * 0.30
+        final_T    = round(T3, 6)
+        final_conf = round(min(1.0, base_conf * t12_mult), 4)
+    elif conf2 >= 0.05:
+        spread     = abs(T3 - T2) if stage3_ran else None
+        final_T    = round(T2, 6)
+        final_conf = round(min(1.0, conf2 * t12_mult), 4)
+    else:
+        spread     = None
+        final_T    = round(T1, 4)
+        final_conf = round(conf1, 4)
+
+    # ── Write feedback log ─────────────────────────────────────────────────
+    # .pb_cache/sync_runs.jsonl accumulates one entry per detection run.
+    # At session start these can be read to understand algorithm behaviour.
+    try:
+        import json as _json
+        import datetime as _dt
+        _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   ".pb_cache")
+        os.makedirs(_cache_dir, exist_ok=True)
+        _entry = {
+            "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
+            "video":         os.path.basename(video_path),
+            "audio":         os.path.basename(audio_path),
+            "T1":            round(T1, 4),    "conf1": round(conf1, 4),
+            "T2":            round(T2, 4),    "conf2": round(conf2, 4),
+            "T3":            round(T3, 6) if stage3_ran else None,
+            "conf3":         round(conf3, 4) if stage3_ran else None,
+            "t12_spread_ms": round(t12_spread * 1000, 1),
+            "t12_factor":    round(t12_factor, 3),
+            "spread_ms":     round(spread * 1000, 1) if spread is not None else None,
+            "stage3_ran":    stage3_ran,
+            "final_T":       final_T,
+            "final_conf":    final_conf,
+        }
+        with open(os.path.join(_cache_dir, "sync_runs.jsonl"),
+                  "a", encoding="utf-8") as _fh:
+            _fh.write(_json.dumps(_entry) + "\n")
+    except Exception:
+        pass
+
+    return final_T, final_conf
 
 
 def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=8000):
