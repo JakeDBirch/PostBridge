@@ -627,49 +627,36 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     # audio first, video second — C[L] = sum_t AUDIO[t] * VIDEO[t+L]
     # Peak at L=+10 means VIDEO leads AUDIO by 10s (camera started 10s early) → T1=+10
     # Consistent with Stage 2 and Stage 3 argument order.
-    # Return top-3 candidates separated by ≥5 s so Stage 2 can arbitrate.
-    _s1_peaks = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
-                              n_peaks=3, min_gap=5)
-    lag1, conf1 = _s1_peaks[0]
+    lag1, conf1 = _xcorr_bounded(env_b1, env_a1, len(env_b1) // 2)
     # Both extractions started at start_offset; v_start = a_start, so:
     T1 = float(lag1) / SR1   # seconds; positive = camera started before DAW
 
-    # ── Stage 2: 50 Hz RMS envelope, ±20 s search on each S1 candidate ───
-    # Run once per Stage-1 candidate; pick whichever gives the highest Stage-2
-    # confidence.  This lets Stage 2 escape a false Stage-1 peak without an
-    # expensive full-range sweep.  Early-stop when conf ≥ 0.80 (clean match).
+    # ── Stage 2: 50 Hz RMS envelope, ±20 s search around T1 ──────────────
+    # Accuracy: ±10 ms.
     SR2      = 8000
     WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
     PROBE2   = 60.0            # seconds to extract
-    SEARCH2  = 20.0            # ±20 s search
+    SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
 
     a_start2 = start_offset
-    raw_a2   = _extract(audio_path, a_start2, PROBE2, SR2)
+    # Centre the video extraction on the Stage-1 estimate.
+    # v_start2 - a_start2 encodes the expected offset so the lag is small.
+    v_start2 = max(0.0, start_offset + T1)
+
+    raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
+    raw_v2 = _extract(video_path,  v_start2, PROBE2, SR2)
 
     T2, conf2 = T1, conf1   # fallback
-    T1_best   = T1          # Stage-1 candidate whose Stage-2 result won
-    if raw_a2 is not None:
+    T1_best   = T1
+    if raw_a2 is not None and raw_v2 is not None:
         env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
-        if env_a2 is not None:
-            sr2_eff  = SR2 // WIN2
+        env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
+        if env_a2 is not None and env_v2 is not None:
+            sr2_eff  = SR2 // WIN2                       # 50 Hz effective
             max_lag2 = int(SEARCH2 * sr2_eff)
-            _best_c2 = -1.0
-            for _s1_lag_c, _s1_c_c in _s1_peaks:
-                _T1c     = float(_s1_lag_c) / SR1
-                _v_s2c   = max(0.0, start_offset + _T1c)
-                _raw_v2c = _extract(video_path, _v_s2c, PROBE2, SR2)
-                if _raw_v2c is not None:
-                    _env_v2c = _peak_env(_raw_v2c, WIN2, top_pct=25)
-                    if _env_v2c is not None:
-                        _l2c, _c2c = _xcorr_bounded(env_a2, _env_v2c, max_lag2)
-                        _T2c = (_v_s2c - a_start2) + float(_l2c) / sr2_eff
-                        if _c2c > _best_c2:
-                            _best_c2 = _c2c
-                            T2       = _T2c
-                            conf2    = _c2c
-                            T1_best  = _T1c
-                if _best_c2 >= 0.80:   # clean match — no need to try others
-                    break
+            lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
+            T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
+            T1_best = T1
 
     # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
     # Accuracy: ±1 ms (sub-frame).
