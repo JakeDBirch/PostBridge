@@ -77,7 +77,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._init_styles()
 
         # State
-        self.workflow   = None   
+        self.workflow              = None
+        self._export_fmt           = None   # "aaf" or "xml", chosen at Step 5 for script_session
+        self._current_session_file = None   # path of the last Save / Save As target
+        self._restore_s4           = False  # True only when explicitly opened via OPEN
         self.tokens     = []
         self.parts      = []
         self.pulls      = []
@@ -96,7 +99,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._header()
         self.body = tk.Frame(self, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=44, pady=(0,32))
+        self.body.pack(fill="both", expand=True, padx=44, pady=(0,4))
+
+        # Persistent footer: SAVE / SAVE AS / OPEN — lives on every screen
+        self._footer = tk.Frame(self, bg=BG)
+        self._footer.pack(fill="x", padx=44, pady=(2, 14))
+        tk.Frame(self._footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
+        _ftr_row = tk.Frame(self._footer, bg=BG)
+        _ftr_row.pack(fill="x")
+        self._footer_save_btn = [None]
+        def _ftr_save():
+            self._quick_save(self._footer_save_btn)
+        _fsb = self._btn(_ftr_row, "SAVE", _ftr_save, small=True)
+        _fsb.pack(side="left", padx=(0, 4))
+        self._footer_save_btn[0] = _fsb
+        self._btn(_ftr_row, "SAVE AS", self._save_as, small=True).pack(side="left", padx=(0, 4))
+        self._btn(_ftr_row, "OPEN",    self._open_session, small=True).pack(side="left")
+        self._btn(_ftr_row, "⌂ HOME",  self._home, small=True).pack(side="right")
+
+        # Global keyboard shortcuts — active on every screen
+        self.bind_all("<Control-s>",       lambda e: self._quick_save(self._footer_save_btn))
+        self.bind_all("<Control-S>",       lambda e: self._save_as())
+        self.bind_all("<Control-o>",       lambda e: self._open_session())
+
         self._home()
 
     def _center(self, w, h):
@@ -198,9 +223,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _clear(self):
         self.unbind_all("<MouseWheel>")
+        for key in ("<Control-z>", "<Control-Z>",
+                    "<Control-Shift-z>", "<Control-Shift-Z>"):
+            try:
+                self.unbind_all(key)
+            except Exception:
+                pass
         for w in self.body.winfo_children(): w.destroy()
 
     def _home(self):
+        # Reset session-specific state so a new workflow starts clean
+        self._current_session_file = None
+        self._export_fmt           = None
+        self._restore_s4           = False
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
@@ -210,14 +245,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         cards_frame = tk.Frame(self.body, bg=BG)
         cards_frame.pack(fill="x", padx=20)
 
+        _TITLE_FONT = (_SANS, 15, "bold")
+        _DESC_FONT  = (_SANS, 11)
+        _ARR_FONT   = (_SANS, 20, "bold")
+        hover_bg    = "#303030"
+
         workflows = [
-            ("Script \u2192 AAF",
-             "script_aaf",
-             "Whisper-reconcile a script and export an AAF.",
-             HAS_WHISPER and HAS_AAF),
-            ("Script \u2192 XML",
-             "script_xml",
-             "Whisper-reconcile a script and export XML.",
+            ("Script Formatter",
+             "script_formatter",
+             "Build @PART, @VO, and @PULL blocks and copy them into your script.",
+             True),
+            ("Script \u2192 Session",
+             "script_session",
+             "Whisper-reconcile a script and export as AAF or XML \u2014 "
+             "format is chosen at the export step.",
              HAS_WHISPER),
             ("AAF \u2192 XML",
              "pt_xml",
@@ -225,11 +266,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
              "and generate XML.",
              HAS_AAF),
         ]
-
-        _TITLE_FONT = (_SANS, 15, "bold")
-        _DESC_FONT  = (_SANS, 11)
-        _ARR_FONT   = (_SANS, 20, "bold")
-        hover_bg    = "#303030"
 
         for title, wf_key, desc, available in workflows:
             card = tk.Frame(cards_frame, bg=SURF,
@@ -286,44 +322,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     w.bind("<Leave>", _leave)
                     w.bind("<Button-1>", _click)
 
-        # ── Script format reference ───────────────────────────────────────────
-        tk.Frame(self.body, bg=BG, height=8).pack()
-        ref_card = tk.Frame(self.body, bg=SURF,
-                            highlightbackground=BORDER, highlightthickness=1)
-        ref_card.pack(fill="x", padx=20, pady=(0, 20))
-        tk.Frame(ref_card, bg=BORDER, width=4).pack(side="left", fill="y")
-        ref_inner = tk.Frame(ref_card, bg=SURF)
-        ref_inner.pack(fill="x", padx=24, pady=14)
+        # Script Format Reference has moved to the Script Formatter workflow
 
-        ref_hdr = tk.Frame(ref_inner, bg=SURF)
-        ref_hdr.pack(fill="x")
-        tk.Label(ref_hdr, text="Script Format Reference", font=FL,
-                 bg=SURF, fg=TEXT, anchor="w").pack(side="left")
-        self._btn(ref_hdr, "Copy AI Prompt",
-                  self._home_copy_ai_prompt, small=True).pack(side="right")
-
-        tk.Label(ref_inner,
-                 text=("PostBridge reads scripts marked up with special directives. "
-                       "If your script isn't already in this format, use the AI prompt "
-                       "to reformat it: click \u201cCopy AI Prompt,\u201d paste it into any AI "
-                       "assistant (ChatGPT, Claude, etc.), then paste your script after it. "
-                       "The AI will reformat it correctly."),
-                 font=FB, bg=SURF, fg=SUB,
-                 justify="left", wraplength=900, anchor="w").pack(anchor="w", pady=(8, 2))
-
-        tk.Label(ref_inner,
-                 text=("--- INTERVIEW SESSIONS START ---    @PART  Part Name\n"
-                       "[TOKEN_NAME]                        @PULL  TOKEN [HH:MM:SS-HH:MM:SS]\n"
-                       "--- INTERVIEW SESSIONS END ---        Quote text \u2014 no blank lines inside\n"
-                       "                                    @VO  PART_N_LABEL\n"
-                       "--- EPISODE ASSETS START ---          VO text \u2014 ends at next @, //, or blank line\n"
-                       "[PART_0_NARRATOR]                   // comment\n"
-                       "--- EPISODE ASSETS END ---"),
-                 font=("Courier New", 10), bg=SURF, fg=SUB,
-                 justify="left", anchor="w").pack(anchor="w", pady=(4, 0))
-
-    def _home_copy_ai_prompt(self):
-        prompt = (
+    def _ai_prompt_text(self):
+        """Return the AI reformatting prompt as a string (used by Script Formatter)."""
+        return (
             "Reformat the following script for PostBridge. Follow these rules exactly.\n\n"
             "TOKEN DECLARATION BLOCKS — place at the top of the file:\n\n"
             "--- INTERVIEW SESSIONS START ---\n"
@@ -332,33 +335,45 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "--- EPISODE ASSETS START ---\n"
             "[PART_0_NARRATOR]\n"
             "--- EPISODE ASSETS END ---\n\n"
-            "  • Token names: UPPERCASE letters, digits, and underscores only (e.g. JOHN_SMITH)\n"
-            "  • One token per interview speaker\n"
-            "  • PART_N_NARRATOR tokens for narrator VO tracks (PART_0_NARRATOR, PART_1_NARRATOR, etc.)\n\n"
+            "  \u2022 Token names: UPPERCASE letters, digits, and underscores only (e.g. JOHN_SMITH)\n"
+            "  \u2022 One token per interview speaker\n"
+            "  \u2022 PART_N_NARRATOR tokens for narrator VO tracks (PART_0_NARRATOR, PART_1_NARRATOR, etc.)\n\n"
             "BODY DIRECTIVES (in document order):\n\n"
             "@PART  Part Name\n"
-            "  — marks a new section/segment\n\n"
+            "  \u2014 marks a new section/segment\n\n"
             "@PULL  TOKEN_NAME [HH:MM:SS-HH:MM:SS]\n"
             "Quote text goes here.\n"
-            "No blank lines within the quote — a blank line ends the quote.\n\n"
+            "No blank lines within the quote \u2014 a blank line ends the quote.\n\n"
             "@VO  PART_N_LABEL\n"
             "Narrator voice-over text here.\n"
             "Ends at the next @, //, or blank line.\n\n"
-            "// This is a comment — ignored by the parser.\n\n"
+            "// This is a comment \u2014 ignored by the parser.\n\n"
             "RULES:\n"
-            "  • Timecodes must be HH:MM:SS (zero-padded). Prepend 00: to any MM:SS timecodes.\n"
-            "  • No blank lines inside @PULL quote text.\n"
-            "  • Multiple @VO blocks with the same ID are fine — collected in order.\n"
-            "  • Plain text not inside an @VO or @PULL block is ignored.\n\n"
+            "  \u2022 Each token in the declaration block MUST be wrapped in square brackets: [TOKEN_NAME]\n"
+            "  \u2022 Timecodes must be HH:MM:SS (zero-padded). Prepend 00: to any MM:SS timecodes.\n"
+            "  \u2022 No blank lines inside @PULL quote text.\n"
+            "  \u2022 Multiple @VO blocks with the same ID are fine \u2014 collected in order.\n"
+            "  \u2022 Plain text not inside an @VO or @PULL block is ignored.\n\n"
             "Please reformat the following script:\n\n"
             "[PASTE YOUR SCRIPT HERE]"
         )
+
+    def _home_copy_ai_prompt(self):
         self.clipboard_clear()
-        self.clipboard_append(prompt)
+        self.clipboard_append(self._ai_prompt_text())
+
+    def _is_aaf_mode(self):
+        """Return True when the current workflow/format requires AAF output."""
+        if self.workflow == "script_aaf":
+            return True
+        if self.workflow == "script_session":
+            return self._export_fmt == "aaf"
+        return False
 
     def _select_workflow(self, key):
         self.workflow = key
-        if key in ("script_aaf", "script_xml"):
+        self._export_fmt = None   # reset any previous format choice
+        if key in ("script_aaf", "script_xml", "script_session"):
             path = filedialog.askopenfilename(
                 title="Open Script",
                 filetypes=[("Text", "*.txt"), ("All", "*.*")])
@@ -374,6 +389,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self.workflow = None   # user cancelled — stay on home
                 return
             self._aaf_load(path)
+        elif key == "script_formatter":
+            self._script_formatter()
 
     def _tooltip(self, widget, text):
         """Attach a hover tooltip showing full text to any widget."""
@@ -435,6 +452,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        # Store so callers can access for programmatic scroll
+        self._last_scroll_canvas = canvas
 
         def _on_wheel(e):
             # Don't scroll when focus is in a popup (e.g. combobox dropdown)
@@ -584,7 +603,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _step1(self):
         self._clear()
         self._step1_next_added   = False
-        wf_label = "AAF" if self.workflow == "script_aaf" else "XML"
+        wf_label = ("Session" if self.workflow == "script_session"
+                    else ("AAF" if self.workflow == "script_aaf" else "XML"))
         self._section("STEP 1 — LOAD SCRIPT  (Script → {})".format(wf_label))
 
         # ── Nav pinned to bottom first so it's always visible ─────────────────
@@ -686,9 +706,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← HOME",          self._home).pack(side="left")
-        self._btn(nav, "SAVE SETUP",     self._save_setup).pack(side="left", padx=(8,0))
-        self._btn(nav, "LOAD SETUP",     self._load_setup).pack(side="left", padx=(4,0))
-        self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(4,0))
+        self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(8,0))
         self._btn(nav, "RECONCILE  →",   self._start_reconcile,
                   color=ACCENT).pack(side="right")
 
@@ -696,7 +714,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         sf = self._scroll_frame(self.body)
 
         self._pool = MediaPool(sf, self.tokens, self.parts,
-                              aaf_mode=(self.workflow == "script_aaf"))
+                              aaf_mode=(self.workflow in ("script_aaf", "script_session")))
         self._pool.pack(fill="x", pady=(0,10), padx=2)
 
         # Pre-load any files dropped at Step 1
@@ -717,38 +735,289 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._pool._refresh_count()
             del self._redo_setup
 
+        # Apply pending setup from _open_session (home page "Open Session" card)
+        if getattr(self, "_pending_setup", None):
+            self._apply_setup_data(self._pending_setup)
+            del self._pending_setup
+
+        # If results were saved and loaded, skip straight to Step 4
+        if getattr(self, "_pending_results", None) is not None:
+            self.results = self._pending_results
+            del self._pending_results
+            self.after(50, self._step4)
+
     def _setup_sidecar_path(self):
         if not hasattr(self, '_script_path') or not self._script_path:
             return None
         base = os.path.splitext(self._script_path)[0]
         return base + "_setup.json"
 
-    def _save_setup(self):
+    def _step4_state_path(self):
+        if not hasattr(self, '_script_path') or not self._script_path:
+            return None
+        base = os.path.splitext(self._script_path)[0]
+        return base + "_step4state.json"
+
+    def _results_sidecar_path(self):
+        if not hasattr(self, '_script_path') or not self._script_path:
+            return None
+        base = os.path.splitext(self._script_path)[0]
+        return base + "_results.json"
+
+    def _save_results(self):
+        """Persist self.results to a sidecar JSON so open can restore to Step 4."""
+        path = self._results_sidecar_path()
+        if not path or not getattr(self, 'results', None):
+            return
+        try:
+            import json as _json
+            class _Enc(_json.JSONEncoder):
+                def default(self, obj):
+                    try:
+                        import numpy as _np
+                        if isinstance(obj, _np.integer):  return int(obj)
+                        if isinstance(obj, _np.floating): return float(obj)
+                        if isinstance(obj, _np.ndarray):  return obj.tolist()
+                    except ImportError:
+                        pass
+                    return super().default(obj)
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(self.results, f, cls=_Enc, indent=2)
+        except Exception:
+            pass
+
+    def _s4_snapshot(self):
+        """Return a serialisable snapshot of the current Step 4 card states."""
+        snap = {}
+        for e in getattr(self, "_rv", []):
+            order = e["res"]["order"]
+            r = e["res"]
+            entry = {
+                "segments":   r.get("segments", []),
+                "rec_in_tc":  r.get("rec_in_tc",  ""),
+                "rec_out_tc": r.get("rec_out_tc", ""),
+                "rec_in_s":   r.get("rec_in_s",   0.0),
+                "rec_out_s":  r.get("rec_out_s",  0.0),
+                "status":     r.get("status", ""),
+                "ignored":    e["skip_var"].get(),
+                "accepted":   e.get("accepted_flag", [False])[0],
+            }
+            if "gap_after_s" in r:
+                entry["gap_after_s"] = r["gap_after_s"]
+            # Persist VO takes_data so edited segments survive save/load cycles
+            if r.get("is_vo") and r.get("takes_data"):
+                entry["takes_data"] = r["takes_data"]
+            snap[str(order)] = entry
+        return snap
+
+    def _s4_save(self):
+        """Persist the current Step 4 state to a sidecar JSON file."""
+        path = self._step4_state_path()
+        if not path:
+            return
+        try:
+            import json as _json
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(self._s4_snapshot(), f, indent=2)
+        except Exception:
+            pass
+
+    def _s4_load(self):
+        """Return saved Step 4 state dict, or {} if none exists."""
+        path = self._step4_state_path()
+        if not path or not os.path.isfile(path):
+            return {}
+        try:
+            import json as _json
+            with open(path, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+
+    def _s4_apply_state(self, snap):
+        """Apply a snapshot dict to the live _rv card list."""
+        inc = getattr(self, "_s4_increment_confirmed", lambda s="": None)
+        dec = getattr(self, "_s4_decrement_confirmed", lambda s="": None)
+        for e in getattr(self, "_rv", []):
+            order = str(e["res"]["order"])
+            if order not in snap:
+                continue
+            entry = snap[order]
+            r = e["res"]
+
+            # Restore segment data directly into the result dict
+            if "segments" in entry:
+                r["segments"]  = entry["segments"]
+            if "rec_in_tc"  in entry:
+                r["rec_in_tc"]  = entry["rec_in_tc"]
+            if "rec_out_tc" in entry:
+                r["rec_out_tc"] = entry["rec_out_tc"]
+            if "rec_in_s"  in entry:
+                r["rec_in_s"]  = entry["rec_in_s"]
+            if "rec_out_s" in entry:
+                r["rec_out_s"] = entry["rec_out_s"]
+            if "status" in entry:
+                r["status"] = entry["status"]
+            if "gap_after_s" in entry:
+                r["gap_after_s"] = entry["gap_after_s"]
+            elif "gap_after_s" in r:
+                del r["gap_after_s"]   # restore to "use global default"
+            # Restore VO takes_data (keeps edited per-take segments in sync)
+            if "takes_data" in entry and r.get("is_vo"):
+                r["takes_data"] = entry["takes_data"]
+
+            was_ignored  = e["skip_var"].get()
+            was_accepted = e.get("accepted_flag", [False])[0]
+            snap_ignored  = entry.get("ignored",  False)
+            snap_accepted = entry.get("accepted", False)
+
+            # Apply ignore state (toggle_ignore_fn toggles, so only call when mismatch)
+            if snap_ignored != was_ignored:
+                e.get("toggle_ignore_fn", lambda **kw: None)(from_restore=True)
+
+            # Apply accepted state and update tally counters
+            if snap_accepted and not was_accepted:
+                e["accepted_flag"][0] = True
+                e.get("set_accepted_fn", lambda: None)()
+                inc(r.get("status", ""))
+            elif not snap_accepted and was_accepted:
+                e["accepted_flag"][0] = False
+                e.get("set_normal_fn", lambda: None)()
+                dec(r.get("status", ""))
+
+    def _s4_push_undo(self):
+        """Save current state onto the undo stack before a mutation."""
+        stack = getattr(self, "_s4_undo_stack", None)
+        if stack is None:
+            self._s4_undo_stack = []
+            self._s4_redo_stack = []
+            stack = self._s4_undo_stack
+        stack.append(self._s4_snapshot())
+        self._s4_redo_stack.clear()
+        # Keep undo history bounded
+        if len(stack) > 80:
+            stack.pop(0)
+
+    def _s4_undo(self, event=None):
+        stack = getattr(self, "_s4_undo_stack", [])
+        if not stack:
+            return
+        self._s4_redo_stack.append(self._s4_snapshot())
+        self._s4_apply_state(stack.pop())
+        self._s4_save()
+
+    def _s4_redo(self, event=None):
+        stack = getattr(self, "_s4_redo_stack", [])
+        if not stack:
+            return
+        self._s4_undo_stack.append(self._s4_snapshot())
+        self._s4_apply_state(stack.pop())
+        self._s4_save()
+
+    def _build_setup_data(self):
+        """Return a serialisable setup dict for the current state."""
         src_data = {}
         for tok in self.tokens:
             sp = self._pool.get_transcript_source(tok) if self._pool else None
             if sp: src_data[tok] = sp
-
-        data = {
+        d = {
             "version":   1,
+            "workflow":  getattr(self, "workflow", "script_xml"),
             "script":    getattr(self, "_script_path", ""),
             "assignments": {r["path"]: r["var"].get()
                             for r in self._pool._rows} if self._pool else {},
             "transcript_sources": src_data,
         }
-        sidecar = self._setup_sidecar_path()
-        init_dir  = os.path.dirname(sidecar) if sidecar else ""
-        init_file = os.path.basename(sidecar) if sidecar else "setup.json"
+        # Embed match results so the file is self-contained and restores to Step 4
+        if getattr(self, "results", None):
+            d["results"] = self.results
+        return d
+
+    def _numpy_safe_encoder(self):
+        """Return a JSONEncoder subclass that converts numpy scalars/arrays."""
+        class _Enc(json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    import numpy as _np
+                    if isinstance(obj, _np.integer):  return int(obj)
+                    if isinstance(obj, _np.floating): return float(obj)
+                    if isinstance(obj, _np.ndarray):  return obj.tolist()
+                except ImportError:
+                    pass
+                return super().default(obj)
+        return _Enc
+
+    def _save_setup(self):
+        """Save setup to the default sidecar location (no dialog)."""
+        if not getattr(self, '_script_path', None) or not getattr(self, '_pool', None):
+            return
+        path = self._setup_sidecar_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._build_setup_data(), f, cls=self._numpy_safe_encoder(), indent=2)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _build_full_session_data(self):
+        """Return a complete session dict: setup + results + Step 4 state."""
+        data = self._build_setup_data() if getattr(self, '_pool', None) else {}
+        data["script"]   = getattr(self, "_script_path", "")
+        data["workflow"] = getattr(self, "workflow", "script_xml")
+        if getattr(self, '_rv', None):
+            data["step4_state"] = self._s4_snapshot()
+        return data
+
+    def _save_as(self):
+        """Prompt for a file path, write a complete session JSON, and remember the path."""
+        if not getattr(self, '_script_path', None):
+            messagebox.showinfo("Nothing to save", "No session is open yet.")
+            return
+        init_dir  = (os.path.dirname(self._current_session_file)
+                     if self._current_session_file else
+                     os.path.dirname(getattr(self, "_script_path", "") or ""))
+        init_file = (os.path.basename(self._current_session_file)
+                     if self._current_session_file else "session.json")
         path = filedialog.asksaveasfilename(
-            title="Save setup",
+            title="Save Session As",
             defaultextension=".json",
-            filetypes=[("JSON","*.json")],
+            filetypes=[("JSON", "*.json")],
             initialdir=init_dir,
             initialfile=init_file)
-        if not path: return
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        messagebox.showinfo("Saved", "Setup saved to:\n{}".format(path))
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._build_full_session_data(), f,
+                          cls=self._numpy_safe_encoder(), indent=2)
+            self._current_session_file = path
+            messagebox.showinfo("Saved", "Session saved to:\n{}".format(path))
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _quick_save(self, btn_ref=None):
+        """Save to the current session file; prompt for a path on the first save."""
+        if not getattr(self, '_script_path', None):
+            messagebox.showinfo("Nothing to save", "No session is open yet.")
+            return
+        # First save of this session — behave like Save As
+        if not self._current_session_file:
+            self._save_as()
+            return
+        try:
+            with open(self._current_session_file, "w", encoding="utf-8") as f:
+                json.dump(self._build_full_session_data(), f,
+                          cls=self._numpy_safe_encoder(), indent=2)
+            b = btn_ref[0] if btn_ref else None
+            if b:
+                try:
+                    b.config(text="SAVED \u2713")
+                    self.after(1800, lambda: b.config(text="SAVE"))
+                except Exception:
+                    pass
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
 
     def _load_setup(self):
         path = filedialog.askopenfilename(
@@ -785,6 +1054,109 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showwarning("Missing files",
                 "{} file(s) from the saved setup were not found:\n{}".format(
                     len(missing), "\n".join(basename(p) for p in missing[:5])))
+
+    def _scroll_card_to_top(self, card):
+        """After a card expands, scroll so its top is at the top of the Step 4 list."""
+        cv = getattr(self, "_s4_scroll_canvas", None)
+        if not cv:
+            return
+        def _do(c=card, canvas=cv):
+            try:
+                c.update_idletasks()
+                bbox = canvas.bbox("all")
+                if not bbox or bbox[3] <= 0:
+                    return
+                # Scroll so that ~2 collapsed cards remain visible above the
+                # expanded card for context (each ~44 px when collapsed).
+                y = c.winfo_y()
+                scroll_y = max(0, y - 88)
+                canvas.yview_moveto(scroll_y / bbox[3])
+            except Exception:
+                pass
+        self.after(20, _do)
+
+    def _apply_setup_data(self, data):
+        """Apply a setup dict (from _save_setup) to the current pool. Called from _step2."""
+        assignments = data.get("assignments", {})
+        missing = []
+        for fpath, token in assignments.items():
+            if os.path.exists(fpath):
+                self._pool._add(fpath)
+            else:
+                missing.append(fpath)
+        for r in self._pool._rows:
+            saved_tok = assignments.get(r["path"])
+            if saved_tok:
+                r["var"].set(saved_tok)
+        src_data = data.get("transcript_sources", {})
+        for tok, sp in src_data.items():
+            if tok in self._pool._src_vars and basename(sp) in [
+                basename(p) for p in self._pool.get_interview_assets().get(tok, [])
+                if not is_video(p)
+            ]:
+                self._pool._src_vars[tok].set(basename(sp))
+        self._pool._rebuild_src_dropdowns()
+        self._pool._refresh_count()
+        if missing:
+            messagebox.showwarning("Missing files",
+                "{} file(s) from the saved session were not found:\n{}".format(
+                    len(missing), "\n".join(basename(p) for p in missing[:5])))
+
+    def _open_session(self):
+        """Open a saved *_setup.json and jump straight to Step 2 with everything restored."""
+        path = filedialog.askopenfilename(
+            title="Open Session",
+            filetypes=[("JSON files", "*.json"),
+                       ("All files", "*.*")])
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+
+        script_path = data.get("script", "")
+        if not script_path or not os.path.isfile(script_path):
+            messagebox.showerror("Script not found",
+                "The script file referenced by this session could not be found:\n\n"
+                "{}".format(script_path or "(none)"))
+            return
+
+        # Migrate legacy workflow keys to the unified script_session workflow.
+        # Preserve the old format preference so it pre-selects at Step 5.
+        _raw_wf = data.get("workflow", "script_xml")
+        if _raw_wf in ("script_aaf", "script_xml"):
+            self.workflow    = "script_session"
+            self._export_fmt = "aaf" if _raw_wf == "script_aaf" else "xml"
+        else:
+            self.workflow    = _raw_wf
+            self._export_fmt = None
+        self._current_session_file = path   # future saves go back to this file
+        self._restore_s4           = True   # signal _step4 to restore saved state
+
+        # Stash setup data — _step2 will pick it up after the pool is built
+        self._pending_setup = data
+
+        # Stash Step 4 state if embedded in the session file
+        self._pending_s4_state = data.get("step4_state") or None
+
+        # Results may be embedded directly in the setup JSON (preferred) or in a sidecar
+        if data.get("results"):
+            self._pending_results = data["results"]
+        else:
+            results_path = os.path.splitext(script_path)[0] + "_results.json"
+            if os.path.isfile(results_path):
+                try:
+                    with open(results_path, encoding="utf-8") as f:
+                        self._pending_results = json.load(f)
+                except Exception:
+                    self._pending_results = None
+            else:
+                self._pending_results = None
+
+        self._load_script(script_path)
 
     def _clear_cache(self, kind="all"):
         """Delete cached files from the .pb_cache directory next to the script.
@@ -882,7 +1254,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── 3. For AAF, prune video rows that now have audio counterparts ────
         pruned = 0
-        if self.workflow == "script_aaf":
+        if self.workflow in ("script_aaf", "script_session"):
             pruned = self._pool.prune_redundant_videos()
 
         # ── 4. Report ─────────────────────────────────────────────────────
@@ -1107,7 +1479,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # VO part that already has a matching audio file.  Fall back to video
         # only when there is no audio at all (so we can still extract audio
         # from a video-only source).
-        if self.workflow == "script_aaf":
+        if self.workflow in ("script_aaf", "script_session"):
             int_assets = {
                 tok: ([p for p in paths if not is_video(p)]
                       or [p for p in paths if is_video(p)])
@@ -1154,9 +1526,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._section("STEP 3 — RECONCILING")
 
         tk.Label(self.body,
-                 text="Extracting clip windows and transcribing.  "
-                      "Each pull takes a few seconds.",
-                 font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(0,10))
+                 text="Processing audio clips and matching to your script.  "
+                      "Each clip is extracted and transcribed — this step can take "
+                      "several minutes for longer episodes.  The progress bar updates "
+                      "as each clip finishes.",
+                 font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
         prog_outer = tk.Frame(self.body, bg=SURF,
                               highlightbackground=BORDER, highlightthickness=1)
@@ -1178,6 +1552,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._tx_lbl.pack(side="left")
         self._tx_bar = _FlatProgressBar(tx_row, height=4)
         self._tx_bar.pack(side="left", fill="x", expand=True)
+
+        # Animated liveness dots — cycles independently of clip-level progress
+        self._dot_lbl = tk.Label(prog_outer, text="", font=FL, bg=SURF, fg=ACCENT,
+                                 anchor="w", padx=12, pady=(0))
+        self._dot_lbl.pack(anchor="w", pady=(0, 4))
+        self._dot_running = True
+
+        def _pulse_dots(step=0):
+            if not self._dot_running:
+                return
+            dots = ["·  ", "·· ", "···", " ··", "  ·", "   "]
+            try:
+                self._dot_lbl.config(text=dots[step % len(dots)])
+            except Exception:
+                return
+            self.after(300, _pulse_dots, step + 1)
+
+        self.after(0, _pulse_dots)
 
         log_frame = tk.Frame(self.body, bg=SURF3,
                              highlightbackground=BORDER, highlightthickness=1)
@@ -1432,7 +1824,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if self._cancel.is_set():
                 r = engines._base_result(pull); r["status"] = "cancelled"; return r
             tsrc = transcript_sources.get(pull["token"])
-            return [engines.reconcile_interview_pull(pull, tsrc, pad=self.pad_var.get())]
+            results = [engines.reconcile_interview_pull(pull, tsrc, pad=self.pad_var.get())]
+            # For video-sourced clips (no audio transcript), attach the video path
+            # so the waveform editor can still open for manual IN/OUT adjustment.
+            if not tsrc:
+                vid = next((p for p in int_assets.get(pull["token"], [])
+                            if is_video(p)), None)
+                if vid:
+                    for r in results:
+                        if not r.get("source_audio"):
+                            r["source_video"] = vid
+            return results
 
         def process_vo_part(part_index, blocks):
             if self._cancel.is_set():
@@ -1788,6 +2190,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Called on the main thread after _run_reconcile completes.
         Appends the pre-computed summary lines to the log widget then
         transitions to Step 4.  All Tk operations happen here, safely."""
+        self._dot_running = False   # stop the animated dots
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
@@ -1795,6 +2198,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _cancel_reconcile(self):
         self._cancel.set()
+        self._dot_running = False
         self._log_line("Cancel requested — stopping after current items finish…", WARN)
         # Disable the cancel button immediately so the user knows the click landed
         for w in self.body.winfo_children():
@@ -1818,6 +2222,100 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             self._reconcile_log_text = getattr(self, "_reconcile_log_text", "")
 
+        # Always restore saved Step 4 edits for this script so that accepted
+        # changes survive fresh reconciliation runs.  When a session file was
+        # explicitly opened via OPEN, prefer the session-embedded state over
+        # the sidecar (the session file may carry newer edits than the sidecar).
+        _restore_requested = getattr(self, "_restore_s4", False)
+        self._restore_s4   = False   # consume the flag
+        if _restore_requested:
+            _pending_s4_was_set = getattr(self, "_pending_s4_state", None) is not None
+            _saved_s4 = (getattr(self, "_pending_s4_state", None)
+                         or self._s4_load())
+            _restore_source_dbg = "session_json_embedded" if _pending_s4_was_set else "sidecar_fallback"
+            self._pending_s4_state = None
+        else:
+            # Fresh reconciliation run — still load the sidecar so the user's
+            # previously saved Step 4 edits are not silently discarded.
+            _saved_s4 = self._s4_load()
+            _restore_source_dbg = "sidecar" if _saved_s4 else "none"
+        if _saved_s4:
+            for r in self.results:
+                entry = _saved_s4.get(str(r["order"]))
+                if not entry:
+                    continue
+                # New format stores float segments directly
+                if entry.get("segments"):
+                    segs = entry["segments"]
+                    r["segments"]  = segs
+                    r["rec_in_s"]  = segs[0][0]
+                    r["rec_out_s"] = segs[-1][1]
+                    r["rec_in_tc"]  = entry.get("rec_in_tc",  secs_tc(segs[0][0]))
+                    r["rec_out_tc"] = entry.get("rec_out_tc", secs_tc(segs[-1][1]))
+                elif entry.get("segs"):
+                    # Legacy format: list of (in_tc_str, out_tc_str)
+                    segs_tc = entry["segs"]
+                    r["rec_in_tc"]  = segs_tc[0][0]
+                    r["rec_out_tc"] = segs_tc[-1][1]
+                    try:
+                        r["rec_in_s"]  = tc_secs(segs_tc[0][0])
+                        r["rec_out_s"] = tc_secs(segs_tc[-1][1])
+                        r["segments"]  = [(tc_secs(i), tc_secs(o))
+                                          for i, o in segs_tc]
+                    except Exception:
+                        pass
+                if entry.get("status"):
+                    r["status"] = entry["status"]
+                r["_s4_ignored"]  = entry.get("ignored",  False)
+                r["_s4_accepted"] = entry.get("accepted", False)
+                if "gap_after_s" in entry:
+                    r["gap_after_s"] = entry["gap_after_s"]
+                # Restore VO takes_data (keeps edited per-take segments in sync)
+                if "takes_data" in entry and r.get("is_vo"):
+                    r["takes_data"] = entry["takes_data"]
+
+        # ── Diagnostic: write a restore-trace so we can see what was applied ──
+        # Written as <script>_step4restore.json next to the script file.
+        # Shows source (session/sidecar/none), sidecar keys, and a per-clip
+        # diff of what the sidecar had vs what self.results had before the apply.
+        try:
+            _diag_path = self._step4_state_path()
+            if _diag_path:
+                _diag_path = _diag_path.replace("_step4state.json", "_step4restore.json")
+                _diag = {
+                    "restore_source": _restore_source_dbg,
+                    "restore_requested": _restore_requested,
+                    "saved_s4_keys": sorted(_saved_s4.keys()) if _saved_s4 else [],
+                    "results_count": len(self.results),
+                    "clips": []
+                }
+                for _r in self.results:
+                    _ord = str(_r.get("order", "?"))
+                    _entry = _saved_s4.get(_ord) if _saved_s4 else None
+                    _diag["clips"].append({
+                        "order":            _r.get("order"),
+                        "token":            _r.get("token"),
+                        "is_vo":            _r.get("is_vo", False),
+                        "result_segs":      [list(s) for s in (_r.get("segments") or [])],
+                        "result_status":    _r.get("status"),
+                        "sidecar_segs":     [list(s) for s in (_entry.get("segments") or [])] if _entry else None,
+                        "sidecar_status":   _entry.get("status") if _entry else None,
+                        "sidecar_accepted": _entry.get("accepted") if _entry else None,
+                        "sidecar_entry_found": _entry is not None,
+                        "segs_match":       (
+                            [list(s) for s in (_r.get("segments") or [])]
+                            == [list(s) for s in (_entry.get("segments") or [])]
+                        ) if _entry else None,
+                    })
+                with open(_diag_path, "w", encoding="utf-8") as _df:
+                    json.dump(_diag, _df, indent=2)
+        except Exception:
+            pass
+
+        # Reset undo/redo stacks for this Step 4 session
+        self._s4_undo_stack = []
+        self._s4_redo_stack = []
+
         self._clear()
         self._section("STEP 4 — REVIEW")
         tk.Label(self.body,
@@ -1829,69 +2327,275 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _CLEAN = ("ok", "direct", "no_quote", "cancelled")
         _ATTN  = ("no_match", "error", "low_confidence", "no_file", "not_run")
 
-        ok    = sum(1 for r in self.results if r["status"] in ("ok", "direct"))
-        flags = sum(1 for r in self.results if r["status"] in _ATTN)
-        skips = sum(1 for r in self.results if r["status"] in ("no_file", "cancelled"))
+        ok     = sum(1 for r in self.results if r["status"] in ("ok", "direct"))
+        review = sum(1 for r in self.results if r["status"] in
+                     ("no_match", "error", "low_confidence", "not_run"))
+        skips  = sum(1 for r in self.results if r["status"] in ("no_file", "cancelled"))
+        flags  = review + skips   # total items needing attention (used by filter tabs)
+
+        # Live counters — each category decrements as items are confirmed
+        _ok_count        = [ok]
+        _review_count    = [review]
+        _confirmed_count = [0]
+        _ignored_count   = [0]
+        _ok_var          = tk.StringVar(value=str(ok))
+        _review_var      = tk.StringVar(value=str(review))
+        _confirmed_var   = tk.StringVar(value="0")
+        _ignored_var     = tk.StringVar(value="0")
+        _runtime_var     = tk.StringVar(value="--:--:--")
+        _unconfirmed_count = [0]   # mutable; set accurately after card-restore loop
+
+        def _sync_unconfirmed_btn():
+            try:
+                _fbtns["unconfirmed"].config(
+                    text="UNCONFIRMED  {}".format(_unconfirmed_count[0]))
+                if _fstate["mode"] == "unconfirmed":
+                    _apply_filter()
+            except Exception:
+                pass
+
+        def _increment_confirmed(status=""):
+            """Move an item from its source bucket into confirmed."""
+            _confirmed_count[0] += 1
+            _confirmed_var.set(str(_confirmed_count[0]))
+            _confirmed_num_lbl.config(fg=SUCCESS)
+            if status in ("ok", "direct"):
+                _ok_count[0] = max(0, _ok_count[0] - 1)
+                _ok_var.set(str(_ok_count[0]))
+                _ok_num_lbl.config(fg=SUCCESS if _ok_count[0] > 0 else SUB)
+            elif status in ("no_match", "error", "low_confidence", "not_run"):
+                _review_count[0] = max(0, _review_count[0] - 1)
+                _review_var.set(str(_review_count[0]))
+                _review_num_lbl.config(fg=WARN if _review_count[0] > 0 else SUB)
+                try:
+                    _fbtns["attention"].config(
+                        text="NEEDS ATTENTION  {}".format(_review_count[0]))
+                except Exception:
+                    pass
+            _unconfirmed_count[0] = max(0, _unconfirmed_count[0] - 1)
+            _sync_unconfirmed_btn()
+
+        def _decrement_confirmed(status=""):
+            """Return an item from confirmed back to its source bucket (un-accept)."""
+            _confirmed_count[0] = max(0, _confirmed_count[0] - 1)
+            _confirmed_var.set(str(_confirmed_count[0]))
+            _confirmed_num_lbl.config(fg=SUCCESS if _confirmed_count[0] > 0 else SUB)
+            if status in ("ok", "direct", "manual"):
+                _ok_count[0] += 1
+                _ok_var.set(str(_ok_count[0]))
+                _ok_num_lbl.config(fg=SUCCESS)
+            elif status in ("no_match", "error", "low_confidence", "not_run"):
+                _review_count[0] += 1
+                _review_var.set(str(_review_count[0]))
+                _review_num_lbl.config(fg=WARN)
+                try:
+                    _fbtns["attention"].config(
+                        text="NEEDS ATTENTION  {}".format(_review_count[0]))
+                except Exception:
+                    pass
+            _unconfirmed_count[0] += 1
+            _sync_unconfirmed_btn()
+
+        def _increment_ignored():
+            _ignored_count[0] += 1
+            _ignored_var.set(str(_ignored_count[0]))
+            try: _ign_num_lbl.config(fg=ERR)
+            except Exception: pass
+            _unconfirmed_count[0] = max(0, _unconfirmed_count[0] - 1)
+            _sync_unconfirmed_btn()
+
+        def _decrement_ignored():
+            _ignored_count[0] = max(0, _ignored_count[0] - 1)
+            _ignored_var.set(str(_ignored_count[0]))
+            try: _ign_num_lbl.config(fg=ERR if _ignored_count[0] > 0 else SUB)
+            except Exception: pass
+            _unconfirmed_count[0] += 1
+            _sync_unconfirmed_btn()
 
         srow = tk.Frame(self.body, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
         srow.pack(fill="x", pady=(0,8))
-        for lbl, val, col in [
-            ("matched",     str(ok),    SUCCESS),
-            ("need review", str(flags), WARN if flags else SUB),
-            ("no file",     str(skips), ERR  if skips else SUB),
-        ]:
-            c = tk.Frame(srow, bg=SURF); c.pack(side="left", padx=20, pady=6)
-            tk.Label(c, text=val,  font=("Courier New",18,"bold"),
-                     bg=SURF, fg=col).pack()
-            tk.Label(c, text=lbl, font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: matched ─────────────────────────────────────────────
+        _ok_cell = tk.Frame(srow, bg=SURF)
+        _ok_cell.pack(side="left", padx=20, pady=6)
+        _ok_num_lbl = tk.Label(_ok_cell, textvariable=_ok_var,
+                               font=("Courier New",18,"bold"), bg=SURF,
+                               fg=SUCCESS if ok > 0 else SUB)
+        _ok_num_lbl.pack()
+        tk.Label(_ok_cell, text="matched", font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: need review ─────────────────────────────────────────
+        _review_cell = tk.Frame(srow, bg=SURF)
+        _review_cell.pack(side="left", padx=20, pady=6)
+        _review_num_lbl = tk.Label(_review_cell, textvariable=_review_var,
+                                   font=("Courier New",18,"bold"), bg=SURF,
+                                   fg=WARN if review > 0 else SUB)
+        _review_num_lbl.pack()
+        tk.Label(_review_cell, text="need review", font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: no file (static) ────────────────────────────────────
+        _nf_cell = tk.Frame(srow, bg=SURF)
+        _nf_cell.pack(side="left", padx=20, pady=6)
+        tk.Label(_nf_cell, text=str(skips),
+                 font=("Courier New",18,"bold"), bg=SURF,
+                 fg=ERR if skips else SUB).pack()
+        tk.Label(_nf_cell, text="no file", font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: confirmed (live) ────────────────────────────────────
+        _conf_cell = tk.Frame(srow, bg=SURF)
+        _conf_cell.pack(side="left", padx=20, pady=6)
+        _confirmed_num_lbl = tk.Label(_conf_cell, textvariable=_confirmed_var,
+                                      font=("Courier New",18,"bold"), bg=SURF, fg=SUB)
+        _confirmed_num_lbl.pack()
+        tk.Label(_conf_cell, text="confirmed", font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: ignored (live) ──────────────────────────────────────
+        _ign_cell = tk.Frame(srow, bg=SURF)
+        _ign_cell.pack(side="left", padx=20, pady=6)
+        _ign_num_lbl = tk.Label(_ign_cell, textvariable=_ignored_var,
+                                font=("Courier New",18,"bold"), bg=SURF, fg=SUB)
+        _ign_num_lbl.pack()
+        tk.Label(_ign_cell, text="ignored", font=FB, bg=SURF, fg=SUB).pack()
+
+        # ── Stat cell: runtime (live) ──────────────────────────────────────
+        _rt_cell = tk.Frame(srow, bg=SURF)
+        _rt_cell.pack(side="left", padx=20, pady=6)
+        tk.Label(_rt_cell, textvariable=_runtime_var,
+                 font=("Courier New", 18, "bold"), bg=SURF, fg=TEXT).pack()
+        tk.Label(_rt_cell, text="runtime", font=FB, bg=SURF, fg=SUB).pack()
+
+        def _update_runtime():
+            _matched = ("ok", "direct", "manual", "snapped", "low_confidence")
+            total = 0.0
+            for r in self.results:
+                if r.get("status") in _matched:
+                    segs = r.get("segments")
+                    if segs:
+                        for s_in, s_out in segs:
+                            total += max(0.0, s_out - s_in)
+                    else:
+                        total += max(0.0,
+                                     r.get("rec_out_s", 0) - r.get("rec_in_s", 0))
+            h = int(total) // 3600
+            m = (int(total) % 3600) // 60
+            s = total % 60
+            _runtime_var.set("{:02d}:{:02d}:{:05.2f}".format(h, m, s))
+
+        self._s4_update_runtime = _update_runtime
 
         # ── Filter tabs ───────────────────────────────────────────────────────
-        _fstate = {"mode": "attention"}
+        _fstate = {"mode": "all", "sort": "script"}
         _fbtns  = {}
+        _sbtns  = {}
 
-        def _apply_filter(mode):
-            _fstate["mode"] = mode
+        _part_dividers = {}   # part_index → divider Frame (filled during card loop)
+
+        def _apply_filter(mode=None, sort=None):
+            if mode is not None:
+                _fstate["mode"] = mode
+            if sort is not None:
+                _fstate["sort"] = sort
+            cur_mode = _fstate["mode"]
+            cur_sort = _fstate["sort"]
+
             for m, b in _fbtns.items():
-                active = (m == mode)
+                active = (m == cur_mode)
                 b.config(bg=ACCENT if active else SURF2,
                          fg=BG    if active else TEXT)
-            # Unpack all then repack matching cards — preserves original order
+            for s, b in _sbtns.items():
+                active = (s == cur_sort)
+                b.config(bg=ACCENT if active else SURF2,
+                         fg=BG    if active else TEXT)
+
+            # Unpack everything
             for e in self._rv:
                 e["card"].pack_forget()
+            for div in _part_dividers.values():
+                div.pack_forget()
+
+            # Determine visible entries
+            visible = []
             for e in self._rv:
                 st = e["res"].get("status", "")
-                if mode == "all":
-                    show = True
-                elif mode == "attention":
-                    show = st in _ATTN
-                else:                       # "matched"
-                    show = st in ("ok", "direct")
+                show = (cur_mode == "all" or
+                        (cur_mode == "attention"   and st in _ATTN) or
+                        (cur_mode == "matched"     and st in ("ok", "direct")) or
+                        (cur_mode == "unconfirmed" and
+                         not e["accepted_flag"][0] and not e["skip_var"].get()))
                 if show:
-                    e["card"].pack(fill="x", pady=(0, 4), padx=2)
+                    visible.append(e)
+
+            # Apply sort
+            if cur_sort == "confidence":
+                def _conf_key(e):
+                    c = e["res"].get("confidence", 0) or 0
+                    # Items with no confidence (adjusted/manual) sink to the bottom
+                    return (1, 0) if c == 0 else (0, c)
+                visible.sort(key=_conf_key)
+            elif cur_sort == "subclips":
+                visible.sort(
+                    key=lambda e: len(e["res"].get("segments") or []),
+                    reverse=True)
+            # "script" order → no sort (already in script order)
+
+            # Repack — only show part dividers in script order
+            use_dividers = (cur_sort == "script")
+            cur_pi = object()  # sentinel
+            for e in visible:
+                if use_dividers:
+                    pi = e["res"].get("part_index", 0)
+                    if pi != cur_pi and pi in _part_dividers:
+                        _part_dividers[pi].pack(fill="x", pady=(10, 2), padx=2)
+                        cur_pi = pi
+                e["card"].pack(fill="x", pady=(0, 4), padx=2)
 
         frow = tk.Frame(self.body, bg=BG)
-        frow.pack(fill="x", pady=(0, 8))
+        frow.pack(fill="x", pady=(0, 4))
+        _unc_initial = sum(
+            1 for r in self.results
+            if not r.get("_s4_accepted") and not r.get("_s4_ignored")
+        )
         for _fm, _fl, _fc in [
-            ("attention", "NEEDS ATTENTION", flags),
-            ("matched",   "MATCHED",         ok),
-            ("all",       "ALL",             len(self.results)),
+            ("all",          "ALL",              len(self.results)),
+            ("matched",      "MATCHED",          ok),
+            ("attention",    "NEEDS ATTENTION",  flags),
+            ("unconfirmed",  "UNCONFIRMED",      _unc_initial),
         ]:
             b = tk.Label(frow, text="{}  {}".format(_fl, _fc), font=FB,
                          bg=SURF2, fg=TEXT, cursor="hand2",
                          padx=14, pady=6, bd=0,
                          highlightbackground=BORDER, highlightthickness=1)
             b.pack(side="left", padx=(0, 4))
-            b.bind("<Button-1>", lambda e, m=_fm: _apply_filter(m))
+            b.bind("<Button-1>", lambda e, m=_fm: _apply_filter(mode=m))
             _fbtns[_fm] = b
 
+        # ── Sort controls ──────────────────────────────────────────────────────
+        srow = tk.Frame(self.body, bg=BG)
+        srow.pack(fill="x", pady=(0, 8))
+        tk.Label(srow, text="SORT:", font=FB, bg=BG, fg=SUB).pack(side="left")
+        for _sk, _sl in [
+            ("script",     "Script Order"),
+            ("confidence", "Confidence"),
+            ("subclips",   "Sub-clips"),
+        ]:
+            b = tk.Label(srow, text=_sl, font=FB,
+                         bg=SURF2, fg=TEXT, cursor="hand2",
+                         padx=10, pady=4, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            b.pack(side="left", padx=(4, 0))
+            b.bind("<Button-1>", lambda e, s=_sk: _apply_filter(sort=s))
+            _sbtns[_sk] = b
+
         sf = self._scroll_frame(self.body, height=380)
+        self._s4_scroll_canvas = self._last_scroll_canvas
         self._rv   = []
         self._skip = []
 
         STATUS_COLOR = {
             "ok":             SUCCESS,
             "direct":         SUCCESS,
+            "manual":         SUCCESS,
             "low_confidence": WARN,
             "no_match":       ERR,
             "no_quote":       SUB,
@@ -1901,195 +2605,443 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "cancelled":      SUB,
         }
         STATUS_LABEL = {
-            "ok":             "✓  matched",
-            "direct":         "✓  matched",
-            "low_confidence": "⚠  low confidence",
-            "no_match":       "✗  no match",
-            "no_quote":       "–  no quote text",
-            "error":          "✗  error",
-            "no_file":        "✗  no file assigned",
-            "not_run":        "–  not run",
-            "cancelled":      "–  cancelled",
+            "ok":             "\u2713  matched",
+            "direct":         "\u2713  matched",
+            "manual":         "\u2713  adjusted",
+            "low_confidence": "\u26a0  low confidence",
+            "no_match":       "\u2717  no match",
+            "no_quote":       "\u2013  no quote text",
+            "error":          "\u2717  error",
+            "no_file":        "\u2717  no file assigned",
+            "not_run":        "\u2013  not run",
+            "cancelled":      "\u2013  cancelled",
         }
 
-        for res in self.results:
-            st   = res.get("status","")
-            sc   = STATUS_COLOR.get(st,  SUB)
-            sl   = STATUS_LABEL.get(st,  st)
+        # Accordion: only one card body open at a time.
+        _open_card   = [None]
+        _cur_part_idx = object()   # sentinel — won't match any real part_index
 
+        # Visual stripe colors by card state
+        _STRIPE_DEF = BORDER
+        _STRIPE_ACC = SUCCESS
+        _STRIPE_IGN = ERR
+
+        for res in self.results:
+            st  = res.get("status", "")
+            sc  = STATUS_COLOR.get(st, SUB)
+            sl  = STATUS_LABEL.get(st, st)
+            pi  = res.get("part_index", 0)
+
+            # ── Part divider ───────────────────────────────────────────────────
+            if pi != _cur_part_idx:
+                _cur_part_idx = pi
+                part_name = next((p["name"] for p in self.parts
+                                  if p["index"] == pi), "Part {}".format(pi))
+                _div = tk.Frame(sf, bg=BG)
+                _div.pack(fill="x", pady=(10, 2), padx=2)
+                tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
+                tk.Label(_div, text="  \u25c6  {}".format(part_name.upper()),
+                         font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(2, 0))
+                _part_dividers[pi] = _div
+
+            # ── Card shell ─────────────────────────────────────────────────────
             card = tk.Frame(sf, bg=SURF,
                             highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=(0,4), padx=2)
+            card.pack(fill="x", pady=(0, 4), padx=2)
 
-            hdr = tk.Frame(card, bg=SURF); hdr.pack(fill="x", padx=10, pady=(6,2))
-            tk.Label(hdr, text="#{:03d}".format(res["order"]),
-                     font=FL, bg=SURF, fg=SUB, width=5, anchor="w").pack(side="left")
-            tk.Label(hdr, text=res["token"],
-                     font=FL, bg=SURF, fg=ACCENT, width=14, anchor="w").pack(side="left")
-            tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc).pack(side="left", padx=8)
+            # Left color stripe — 4px, reflects accept/ignore/normal state
+            _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
+            _stripe.pack(side="left", fill="y")
+
+            _inner = tk.Frame(card, bg=SURF)
+            _inner.pack(side="left", fill="both", expand=True)
+
+            hdr = tk.Frame(_inner, bg=SURF, cursor="hand2")
+            hdr.pack(fill="x", padx=(4, 10), pady=(6, 6))
+
+            _accepted_flag = [False]
+
+            # ── Header left ────────────────────────────────────────────────────
+            ord_lbl  = tk.Label(hdr, text="#{:03d}".format(res["order"]),
+                                font=FL, bg=SURF, fg=SUB,
+                                width=5, anchor="w", cursor="hand2")
+            ord_lbl.pack(side="left")
+            tok_lbl  = tk.Label(hdr, text=res["token"],
+                                font=FL, bg=SURF, fg=ACCENT,
+                                width=14, anchor="w", cursor="hand2")
+            tok_lbl.pack(side="left")
+            stat_lbl = tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc,
+                                cursor="hand2")
+            stat_lbl.pack(side="left", padx=8)
+
+            conf_hdr = res.get("confidence", 0)
+            if conf_hdr:
+                tk.Label(hdr, text="{:.0%}".format(conf_hdr),
+                         font=FS, bg=SURF, fg=sc, cursor="hand2").pack(
+                             side="left", padx=(0, 6))
+
+
+            # Sub-clip count (number of segments) — always created, shown when > 1
+            _clips_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=WARN,
+                                  cursor="hand2")
+
+            def _refresh_clips_lbl(cl=_clips_lbl, r=res):
+                n = len(r.get("segments") or [(0, 0)])
+                if n > 1:
+                    cl.config(text="{} clips".format(n))
+                    cl.pack(side="left", padx=(0, 6))
+                else:
+                    cl.pack_forget()
+
+            _refresh_clips_lbl()
+
+            # Timecode label — shown right after the status text when accepted
+            _tc_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB)
+            # initially not packed
 
             d_in  = res.get("delta_in",  0)
             d_out = res.get("delta_out", 0)
+            delta_lbl = None
             if st == "ok" and (abs(d_in) > 0.5 or abs(d_out) > 0.5):
-                tk.Label(hdr,
-                         text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
-                         font=FB, bg=SURF, fg=INFO).pack(side="left", padx=4)
+                delta_lbl = tk.Label(hdr,
+                            text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
+                            font=FB, bg=SURF, fg=INFO, cursor="hand2")
+                delta_lbl.pack(side="left", padx=4)
+                self._tooltip(delta_lbl,
+                    "Δin = matched IN point differs from script timecode by this amount\n"
+                    "Δout = matched OUT point differs from script timecode by this amount\n"
+                    "Positive = later in file  ·  Negative = earlier in file")
 
             skip_var = tk.BooleanVar(value=False)
 
-            # IGNORE toggle – right side of every card header
-            ignore_lbl = tk.Label(hdr, text="IGNORE", font=FS,
+            # ── Header right — state container ─────────────────────────────────
+            # Normal: [ADJUST] [IGNORE]  |  Accepted: [✓ ACCEPTED]  |  Ignored: [⊘ IGNORED]
+            _hdr_right = tk.Frame(hdr, bg=SURF)
+            _hdr_right.pack(side="right")
+
+            _norm_frame    = tk.Frame(_hdr_right, bg=SURF)
+            _norm_frame.pack(side="left")
+
+            _acc_state_lbl = tk.Label(_hdr_right, text="\u2713 ACCEPTED",
+                                      font=FS, bg=SURF, fg=SUCCESS, cursor="hand2")
+            # initially not packed
+
+            _ign_state_lbl = tk.Label(_hdr_right, text="\u2298 IGNORED",
+                                      font=FS, bg=SURF, fg=ERR, cursor="hand2")
+            # initially not packed
+
+            # source_audio: prefer explicit audio path, fall back to video path
+            # so that clips sourced from video assets can still be reviewed.
+            _src_audio = (res.get("source_audio", "") or
+                          res.get("source_video", "") or "")
+
+            # IGNORE button (only interactive control besides clicking to review)
+            ignore_lbl = tk.Label(_norm_frame, text="IGNORE", font=FS,
                                   bg=SURF, fg=SUB, cursor="hand2")
-            ignore_lbl.pack(side="right", padx=(0, 2))
+            ignore_lbl.pack(side="right", padx=(4, 0))
+            ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
+            ignore_lbl.bind("<Leave>", lambda e, w=ignore_lbl: w.config(fg=SUB))
 
-            # REVIEW button — opens waveform dialog if source audio is known.
-            # _rv_seg_vars is a mutable list populated below once seg_vars
-            # is built, so the accept callback can update card entries live.
-            _src_audio  = res.get("source_audio", "")
-            _segs       = res.get("segments") or []
-            _rv_seg_vars = []   # filled in after seg_vars is populated below
-            if _src_audio and os.path.isfile(_src_audio) and _segs:
-                rev_lbl = tk.Label(hdr, text="REVIEW", font=FS,
-                                   bg=SURF, fg=ACCENT, cursor="hand2")
-                rev_lbl.pack(side="right", padx=(0, 8))
-                rev_lbl.bind("<Enter>",
-                             lambda e, w=rev_lbl: w.config(bg=ACCENT, fg=BG))
-                rev_lbl.bind("<Leave>",
-                             lambda e, w=rev_lbl: w.config(bg=SURF, fg=ACCENT))
+            # ── State management helpers ────────────────────────────────────────
+            def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
+                            il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
+                al.pack_forget(); il.pack_forget(); tl.pack_forget()
+                nf.pack(side="left")
+                sw.config(bg=_STRIPE_DEF)
+                c.config(highlightbackground=BORDER, highlightthickness=1)
 
-                def _open_review(event, r=res, svref=_rv_seg_vars):
-                    sa   = r.get("source_audio", "")
-                    segs = r.get("segments") or []
-                    if not sa or not segs:
-                        return
-                    token = r.get("token", "")
-                    qt    = r.get("quote_text", "")
-                    fps   = getattr(self, "_seq_fps", 24.0)
+            def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
+                              il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
+                              c=card, r=res):
+                nf.pack_forget(); il.pack_forget()
+                al.pack(side="left")
+                in_tc  = r.get("rec_in_tc",  r.get("in_tc",  ""))
+                out_tc = r.get("rec_out_tc", r.get("out_tc", ""))
+                if in_tc and out_tc:
+                    tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
+                    tl.pack(side="left", padx=(4, 0))
+                sw.config(bg=_STRIPE_ACC)
+                c.config(highlightbackground=SUCCESS, highlightthickness=2)
 
-                    def _accept(new_segs, r=r, svref=svref):
-                        # Update result dict so export sees adjusted values
-                        r["segments"]   = new_segs
-                        r["rec_in_s"]   = new_segs[0][0]
-                        r["rec_out_s"]  = new_segs[-1][1]
-                        r["rec_in_tc"]  = secs_tc(new_segs[0][0])
-                        r["rec_out_tc"] = secs_tc(new_segs[-1][1])
-                        # Refresh card entry fields live
-                        for i, (iv, ov) in enumerate(svref):
-                            if i < len(new_segs):
-                                iv.set(secs_tc(new_segs[i][0]))
-                                ov.set(secs_tc(new_segs[i][1]))
+            def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
+                             il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
+                nf.pack_forget(); al.pack_forget(); tl.pack_forget()
+                il.pack(side="left")
+                sw.config(bg=_STRIPE_IGN)
+                c.config(highlightbackground=ERR, highlightthickness=2)
 
-                    MatchReviewDialog(self, sa, segs, title=token,
-                                      quote_text=qt, on_accept=_accept, fps=fps)
+            def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
+                self._s4_push_undo()
+                af[0] = False
+                r["_s4_accepted"] = False   # clear persisted accepted flag
+                ss_n()
+                # Use _original_status so we return the item to the right bucket
+                eff_status = r.get("_original_status") or r.get("status", "")
+                _decrement_confirmed(eff_status)
+                self._s4_save()
 
-                rev_lbl.bind("<ButtonRelease-1>", _open_review)
-
-            def _toggle_ignore(sv=skip_var, c=card, lbl=ignore_lbl):
+            def _toggle_ignore(sv=skip_var, ss_n=_set_normal, ss_i=_set_ignored,
+                               from_restore=False):
+                if not from_restore:
+                    self._s4_push_undo()
                 sv.set(not sv.get())
                 if sv.get():
-                    lbl.config(text="⊘ IGNORED", fg=ERR)
-                    c.config(highlightbackground=SURF3)
+                    ss_i()
+                    _increment_ignored()
                 else:
-                    lbl.config(text="IGNORE", fg=SUB)
-                    c.config(highlightbackground=BORDER)
+                    ss_n()
+                    _decrement_ignored()
+                if not from_restore:
+                    self._s4_save()
 
-            ignore_lbl.bind("<Button-1>", lambda e, f=_toggle_ignore: f())
+            # ── Open waveform editor — primary card action ──────────────────────
+            def _open_review(event=None, r=res, af=_accepted_flag,
+                             ss=_set_accepted, sl=stat_lbl,
+                             rcl=_refresh_clips_lbl):
+                # Compute sa dynamically so session-restored results without
+                # source_video still get a second chance via the pool.
+                sa = r.get("source_audio") or r.get("source_video") or ""
+                if not sa or not os.path.isfile(sa):
+                    # Fallback: look for a video file in current pool assets
+                    tok    = r.get("token", "")
+                    assets = (getattr(self, "_pool", None) and
+                              self._pool.get_interview_assets().get(tok, []))
+                    vid = next((p for p in (assets or [])
+                                if is_video(p) and os.path.isfile(p)), None)
+                    if vid:
+                        sa = vid
+                        r["source_video"] = vid   # cache for future opens
+                if not sa or not os.path.isfile(sa):
+                    return
+                segs_r = r.get("segments") or [(0.0, 30.0)]
+                fps    = getattr(self, "_seq_fps", 24.0)
 
-            q = (res.get("quote_text","") or "")[:80]
-            if len(res.get("quote_text","")) > 80: q += "…"
-            tk.Label(card, text="Script:  " + q,
-                     font=FB, bg=SURF, fg=SUB, anchor="w",
-                     wraplength=820).pack(anchor="w", padx=10, pady=(0,2))
+                def _accept(new_segs, r=r, af=af, ss=ss, sl=sl, rcl=rcl):
+                    self._s4_push_undo()
+                    old_status = r.get("status", "")
+                    r["segments"]   = new_segs
+                    r["rec_in_s"]   = new_segs[0][0]
+                    r["rec_out_s"]  = new_segs[-1][1]
+                    r["rec_in_tc"]  = secs_tc(new_segs[0][0])
+                    r["rec_out_tc"] = secs_tc(new_segs[-1][1])
+                    r["_s4_accepted"] = True   # persist across Step 4 re-entries
+                    # For VO clips, build_aaf reads takes_data[best_i]["segments"],
+                    # not the top-level segments, so keep them in sync.
+                    if r.get("is_vo"):
+                        _best_i = r.get("best_take_index", 0)
+                        _td = r.get("takes_data") or []
+                        if _td and _best_i < len(_td) and isinstance(_td[_best_i], dict):
+                            # Matched VO: update the winning take's segments in-place.
+                            _td[_best_i] = dict(_td[_best_i], segments=list(new_segs))
+                        elif not _td:
+                            # No-match VO: takes_data was empty so build_aaf would
+                            # skip this clip entirely.  Synthesise a minimal entry
+                            # from the audio file the waveform editor just used.
+                            r["takes_data"]      = [{"apath": sa, "segments": list(new_segs)}]
+                            r["best_take_index"] = 0
+                    if old_status not in ("ok", "direct", "manual"):
+                        # Remember the original status so restore/un-accept
+                        # can decrement the correct tally bucket.
+                        r["_original_status"] = old_status
+                        r["status"] = "manual"
+                        sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
+                                  fg=STATUS_COLOR.get("manual", SUCCESS))
+                    af[0] = True
+                    ss()
+                    rcl()   # refresh sub-clip count badge
+                    _increment_confirmed(old_status)
+                    self._s4_save()
+                    getattr(self, "_s4_update_runtime", lambda: None)()
 
-            if res.get("matched_text"):
-                m = res["matched_text"][:80]
-                if len(res["matched_text"]) > 80: m += "…"
-                tk.Label(card, text="Found:   " + m,
-                         font=FB, bg=SURF,
-                         fg=TEXT if st=="ok" else WARN,
-                         anchor="w", wraplength=820).pack(anchor="w", padx=10)
+                # Gather neighbouring quote text for script context
+                _ctx_before = _ctx_after = ""
+                _this_order = r.get("order", -1)
+                for _ri, _rr in enumerate(self.results):
+                    if _rr.get("order") == _this_order:
+                        if _ri > 0:
+                            _ctx_before = (self.results[_ri - 1]
+                                           .get("quote_text", "") or "")
+                        if _ri < len(self.results) - 1:
+                            _ctx_after  = (self.results[_ri + 1]
+                                           .get("quote_text", "") or "")
+                        break
 
-            segs     = res.get("segments") or []
-            seg_vars = []   
+                # Words: prefer per-result transcription (interview pulls store
+                # their windowed words there); fall back to full-file cache
+                # (VO takes are cached against the take file path).
+                _words = (r.get("words")
+                          or engines.cache_load(sa)
+                          or [])
 
-            n_ic = res.get("n_internal_cuts", 0)
-            n_gc = res.get("n_gap_cuts",      0)
-            conf = res.get("confidence", 0)
+                # Format scripted timecode range for display in the editor
+                _stc_in  = r.get("in_tc",  "")
+                _stc_out = r.get("out_tc", "")
+                _scripted_tc = (
+                    "{}  \u2192  {}".format(_stc_in, _stc_out)
+                    if _stc_in and _stc_out else ""
+                )
 
-            if n_ic or n_gc:
-                cinfo = tk.Frame(card, bg=SURF); cinfo.pack(anchor="w", padx=10)
-                parts_lbl = []
-                if n_ic: parts_lbl.append("{} ellipsis cut{}".format(n_ic,"s" if n_ic>1 else ""))
-                if n_gc: parts_lbl.append("{} silence cut{}".format(n_gc,"s" if n_gc>1 else ""))
-                tk.Label(cinfo,
-                         text="  {}  →  {} sub-clip{}".format(
-                             "  +  ".join(parts_lbl),
-                             len(segs), "s" if len(segs)>1 else ""),
-                         font=FB, bg=SURF, fg=INFO).pack(side="left")
+                MatchReviewDialog(self, sa, segs_r,
+                                  title=r.get("token", ""),
+                                  quote_text=r.get("quote_text", ""),
+                                  matched_text=r.get("matched_text", ""),
+                                  context_before=_ctx_before,
+                                  context_after=_ctx_after,
+                                  scripted_tc=_scripted_tc,
+                                  words=_words,
+                                  on_accept=_accept, fps=fps)
 
-            if segs:
-                for si, (seg_in_s, seg_out_s) in enumerate(segs):
-                    srow = tk.Frame(card, bg=SURF2 if si%2==0 else SURF3)
-                    srow.pack(fill="x", padx=10, pady=1)
-                    tk.Label(srow,
-                             text="SEG {:d}".format(si+1),
-                             font=("Courier New",8,"bold"),
-                             bg=srow["bg"], fg=SUB,
-                             width=6, anchor="w").pack(side="left", padx=(6,0), pady=3)
-                    iv = tk.StringVar(value=secs_tc(seg_in_s))
-                    ov = tk.StringVar(value=secs_tc(seg_out_s))
-                    for lbl2, v2 in [("IN  ", iv), ("OUT ", ov)]:
-                        tk.Label(srow, text=lbl2, font=FB,
-                                 bg=srow["bg"], fg=SUB,
-                                 width=4, anchor="w").pack(side="left")
-                        tk.Entry(srow, textvariable=v2, font=FB,
-                                 bg=SURF, fg=TEXT, insertbackground=TEXT,
-                                 relief="flat", bd=3, width=10).pack(side="left", padx=(0,12))
-                    dur = seg_out_s - seg_in_s
-                    tk.Label(srow,
-                             text="{:.1f}s".format(dur),
-                             font=FB, bg=srow["bg"], fg=SUB).pack(side="left")
-                    seg_vars.append((iv, ov))
-            else:
-                # No Whisper match — allow fully manual in/out placement.
-                trow = tk.Frame(card, bg=SURF)
-                trow.pack(anchor="w", padx=10, pady=(4, 2))
-                iv = tk.StringVar(value=res.get("rec_in_tc",  res.get("in_tc",  "")))
-                ov = tk.StringVar(value=res.get("rec_out_tc", res.get("out_tc", "")))
-                for lbl, var in [("IN  ", iv), ("OUT ", ov)]:
-                    tk.Label(trow, text=lbl, font=FB, bg=SURF,
-                             fg=SUB, width=5, anchor="w").pack(side="left")
-                    tk.Entry(trow, textvariable=var, font=FB,
-                             bg=SURF2, fg=TEXT, insertbackground=TEXT,
-                             relief="flat", bd=4, width=10).pack(side="left", padx=(0,16))
-                tk.Label(trow,
-                         text="edit to place this clip manually",
-                         font=FS, bg=SURF, fg=SUB).pack(side="left")
-                seg_vars.append((iv, ov))
+            # ── Bind labels ────────────────────────────────────────────────────
+            ignore_lbl.bind("<Button-1>",
+                            lambda e, f=_toggle_ignore: f())
+            _acc_state_lbl.bind("<Button-1>",
+                                lambda e, f=_un_accept: f())
+            _ign_state_lbl.bind("<Button-1>",
+                                lambda e, f=_toggle_ignore: f())
 
-            if conf:
-                crow = tk.Frame(card, bg=SURF); crow.pack(anchor="w", padx=10, pady=(2,6))
-                tk.Label(crow, text="conf {:.0%}".format(conf),
-                         font=FB, bg=SURF, fg=sc).pack(side="left")
+            # ── Card click → open waveform editor ──────────────────────────────
+            def _hdr_click(event=None, sv=skip_var, fn=_open_review):
+                if not sv.get():   # ignored cards do nothing on click
+                    fn()
 
-            tk.Frame(card, bg=BORDER, height=1).pack(fill="x")
+            for _w in [hdr, card, _inner, ord_lbl, tok_lbl, stat_lbl]:
+                _w.bind("<Button-1>", _hdr_click)
+            if delta_lbl:
+                delta_lbl.bind("<Button-1>", _hdr_click)
 
-            # Wire seg_vars into the REVIEW button's accept callback ref
-            _rv_seg_vars.extend(seg_vars)
+            self._rv.append({
+                "skip_var": skip_var, "res": res, "card": card,
+                "ignore_lbl": ignore_lbl,
+                "accepted_flag": _accepted_flag,
+                "toggle_ignore_fn": _toggle_ignore,
+                "set_accepted_fn": _set_accepted,
+                "set_normal_fn":   _set_normal,
+            })
 
-            self._rv.append({"seg_vars": seg_vars,
-                             "skip_var": skip_var, "res": res, "card": card})
+            # ── Restore saved state ────────────────────────────────────────────
+            if res.get("_s4_ignored") and not skip_var.get():
+                _toggle_ignore(from_restore=True)
+            elif res.get("_s4_accepted"):
+                _accepted_flag[0] = True
+                _set_accepted()
+                # Use _original_status if available so we decrement the right bucket
+                # (items that were low_confidence/no_match get status="manual" after
+                # accept; without _original_status they would never clear _review_count)
+                eff = res.get("_original_status") or res.get("status", "")
+                _increment_confirmed(eff)
+
+        # Store tally callbacks on self so _s4_apply_state can reach them
+        self._s4_increment_confirmed = _increment_confirmed
+        self._s4_decrement_confirmed = _decrement_confirmed
+
+        # Recompute the UNCONFIRMED count from the live _rv state now that
+        # card restoration has run (accepted_flag / skip_var are authoritative).
+        _unc = sum(1 for e in self._rv
+                   if not e["accepted_flag"][0] and not e["skip_var"].get())
+        _unconfirmed_count[0] = _unc
+        if "unconfirmed" in _fbtns:
+            _fbtns["unconfirmed"].config(text="UNCONFIRMED  {}".format(_unc))
 
         # Apply default filter and highlight its tab
-        _apply_filter("attention")
+        _apply_filter(mode="all")
+
+        _update_runtime()
+
+        # Flush the current (fully-restored) state to the sidecar so that if
+        # the user clicks ← REDO and re-runs reconciliation, the next Step 4
+        # entry can reload the correct positions from the sidecar rather than
+        # showing stale cache-reconciliation results.
+        self._s4_save()
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "← REDO", self._step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
-        fmt = "AAF" if self.workflow == "script_aaf" else "XML"
-        self._btn(nav, "EXPORT {}  →".format(fmt), self._step5,
+
+        # Undo / Redo buttons
+        _undo_btn = self._btn(nav, "↩ UNDO", self._s4_undo, small=True)
+        _undo_btn.pack(side="left", padx=(4,0))
+        _redo_btn = self._btn(nav, "↪ REDO", self._s4_redo, small=True)
+        _redo_btn.pack(side="left", padx=(2,0))
+
+        self._btn(nav, "EXPORT  →", self._step5,
                   color=ACCENT).pack(side="right")
+
+        # Keyboard shortcuts for undo/redo
+        self.bind_all("<Control-z>",       self._s4_undo)
+        self.bind_all("<Control-Z>",       self._s4_undo)
+        self.bind_all("<Control-Shift-z>", self._s4_redo)
+        self.bind_all("<Control-Shift-Z>", self._s4_redo)
+
+    # ── Inline card-level audio playback ──────────────────────────────────────
+
+    def _stop_playback(self):
+        """Stop any currently playing audio (Windows winsound)."""
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+    def _play_segment(self, audio_path, start_s, duration_s, status_var=None):
+        """
+        Asynchronously extract and play a short segment.
+        status_var: an optional tk.StringVar to show state ("playing…" / "").
+        """
+        if not audio_path or not os.path.isfile(audio_path):
+            return
+        self._stop_playback()
+        import tempfile, wave as _wave
+        import numpy as _np
+        from concurrent.futures import ThreadPoolExecutor
+        from engines import extract_audio_segment
+
+        tmp_dir  = getattr(self, "_card_play_tmpdir", None)
+        if tmp_dir is None or not os.path.isdir(tmp_dir):
+            tmp_dir = tempfile.mkdtemp(prefix="pb_card_")
+            self._card_play_tmpdir = tmp_dir
+        out_wav = os.path.join(tmp_dir, "_card_play.wav")
+
+        if status_var is not None:
+            status_var.set("▶ …")
+
+        def _do():
+            extract_audio_segment(audio_path, max(0.0, start_s),
+                                  max(0.1, duration_s), out_wav, sample_rate=44100)
+            with _wave.open(out_wav, "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            arr  = _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
+            peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
+            if peak > 1e-6:
+                arr = arr / peak * 0.72
+            pcm = (arr * 32767).astype(_np.int16)
+            with _wave.open(out_wav, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2)
+                wf.setframerate(44100)
+                wf.writeframes(pcm.tobytes())
+            return out_wav
+
+        def _done(fut):
+            try:
+                path = fut.result()
+            except Exception:
+                if status_var is not None:
+                    self.after(0, lambda: status_var.set(""))
+                return
+            def _play():
+                try:
+                    import winsound
+                    winsound.PlaySound(path,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC)
+                except Exception:
+                    pass
+                if status_var is not None:
+                    status_var.set("")
+            self.after(0, _play)
+
+        ex = ThreadPoolExecutor(max_workers=1)
+        ex.submit(_do).add_done_callback(_done)
+        ex.shutdown(wait=False)
 
     def _show_reconcile_log(self):
         """Open a window showing the saved Step 3 reconcile log (for debugging)."""
@@ -2138,9 +3090,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _step5(self):
         self._clear()
-        is_aaf = self.workflow == "script_aaf"
+        is_session = (self.workflow == "script_session")
+
+        # Default to AAF for the unified Script → Session workflow
+        if is_session and not self._export_fmt:
+            self._export_fmt = "aaf"
+
+        is_aaf = self._is_aaf_mode()
         fmt    = "AAF" if is_aaf else "XML"
         self._section("STEP 5 — EXPORT {}".format(fmt))
+
+        # Format switcher row (only shown for script_session — lets user change their mind)
+        if is_session:
+            _sw_row = tk.Frame(self.body, bg=BG); _sw_row.pack(fill="x", pady=(0, 12))
+            tk.Label(_sw_row, text="FORMAT", font=FL, bg=BG, fg=SUB,
+                     width=26, anchor="w").pack(side="left")
+            def _reswitch(f):
+                self._export_fmt = f
+                self.out_path.set("")
+                self._step5()
+            self._btn(_sw_row, "AAF", lambda: _reswitch("aaf"), small=True,
+                      color=ACCENT if is_aaf else None).pack(side="left", padx=(0, 4))
+            self._btn(_sw_row, "XML", lambda: _reswitch("xml"), small=True,
+                      color=ACCENT if not is_aaf else None).pack(side="left")
 
         for lbl, var, wfn in [
             ("SEQUENCE NAME",
@@ -2171,6 +3143,77 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Entry(row3, textvariable=self.out_path, font=FB,
                  bg=SURF2, fg=TEXT, insertbackground=TEXT,
                  relief="flat", bd=6).pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        # ── Clip-review panel: shows what will actually be exported ──────────
+        # Segments are read live from self.results so any Step 4 edits
+        # (via MatchReviewDialog) are reflected here before the build starts.
+        _EXPORTABLE = ("ok", "direct", "manual", "low_confidence", "snapped")
+        _clip_rows = []
+        for _r in getattr(self, "results", []):
+            if _r.get("is_vo"):
+                continue
+            _st = _r.get("status", "")
+            if _st not in _EXPORTABLE:
+                continue
+            _segs = _r.get("segments") or []
+            if not _segs:
+                continue
+            # Check skip flag via _rv
+            _rv_e = next((e for e in getattr(self, "_rv", [])
+                          if e["res"] is _r), None)
+            if _rv_e and _rv_e["skip_var"].get():
+                continue
+            _clip_rows.append(_r)
+
+        if _clip_rows:
+            _cr_hdr = tk.Frame(self.body, bg=BG)
+            _cr_hdr.pack(fill="x", pady=(0, 2))
+            tk.Label(_cr_hdr, text="CLIP REVIEW  —  verify edits before building",
+                     font=FL, bg=BG, fg=SUB).pack(side="left")
+            tk.Label(_cr_hdr, text="{} interview clips".format(len(_clip_rows)),
+                     font=FS, bg=BG, fg=SUB).pack(side="right")
+
+            _cr_frame = tk.Frame(self.body, bg=SURF,
+                                 highlightbackground=BORDER, highlightthickness=1)
+            _cr_frame.pack(fill="x", pady=(0, 12))
+
+            _cr_canvas = tk.Canvas(_cr_frame, bg=SURF, height=min(160, len(_clip_rows) * 22 + 8),
+                                   highlightthickness=0)
+            _cr_sb = _SlimScrollbar(_cr_frame, command=_cr_canvas.yview)
+            _cr_inner = tk.Frame(_cr_canvas, bg=SURF)
+            _cr_canvas.create_window((0, 0), window=_cr_inner, anchor="nw")
+            _cr_canvas.configure(yscrollcommand=_cr_sb.set)
+
+            def _cr_resize(e, cv=_cr_canvas, fr=_cr_inner):
+                cv.configure(scrollregion=cv.bbox("all"))
+            _cr_inner.bind("<Configure>", _cr_resize)
+            _cr_canvas.pack(side="left", fill="both", expand=True)
+            _cr_sb.pack(side="right", fill="y")
+
+            for _row_i, _r in enumerate(_clip_rows):
+                _bg = SURF if _row_i % 2 == 0 else SURF3
+                _segs = _r.get("segments") or []
+                _in_s  = _segs[0][0]  if _segs else _r.get("rec_in_s",  0)
+                _out_s = _segs[-1][1] if _segs else _r.get("rec_out_s", 0)
+                _acc   = _r.get("_s4_accepted", False)
+                _acc_col = SUCCESS if _acc else SUB
+                _acc_txt = "\u2713" if _acc else "\u25cb"
+
+                _rrow = tk.Frame(_cr_inner, bg=_bg)
+                _rrow.pack(fill="x")
+                tk.Label(_rrow, text="#{:03d}".format(_r.get("order", 0)),
+                         font=FS, bg=_bg, fg=SUB, width=5, anchor="w").pack(side="left", padx=(6,0))
+                tk.Label(_rrow, text=_r.get("token", "?"),
+                         font=FL, bg=_bg, fg=ACCENT, width=14, anchor="w").pack(side="left")
+                tk.Label(_rrow, text=_acc_txt,
+                         font=FS, bg=_bg, fg=_acc_col, width=2).pack(side="left")
+                tk.Label(_rrow, text="in: {:10.4f}s".format(_in_s),
+                         font=("Courier New", 10), bg=_bg, fg=TEXT, anchor="w").pack(side="left", padx=(4,0))
+                tk.Label(_rrow, text="out: {:10.4f}s".format(_out_s),
+                         font=("Courier New", 10), bg=_bg, fg=TEXT, anchor="w").pack(side="left", padx=(4,0))
+                if len(_segs) > 1:
+                    tk.Label(_rrow, text="({} segs)".format(len(_segs)),
+                             font=FS, bg=_bg, fg=WARN, anchor="w").pack(side="left", padx=(4,0))
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._step4).pack(side="left")
@@ -2275,7 +3318,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         seq_name = self.seq_name.get()
         gap_secs = self.gap_var.get()
         out_path = self.out_path.get()
-        is_aaf   = (self.workflow == "script_aaf")
+        is_aaf   = self._is_aaf_mode()
         fmt      = "AAF" if is_aaf else "XML"
         parts    = list(self.parts)
         vo_takes = dict(getattr(self, "_vo_takes_by_part", {}))
@@ -2315,7 +3358,43 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try:
                 _t_build_start = time.perf_counter()
 
-                _set_status("Probing media settings…")
+                # ── Write a pre-build diagnostic snapshot ────────────────────
+                # Shows exactly what segments will be sent to build_aaf/build_xml.
+                # Saved next to the output file as <name>_build_debug.json.
+                _debug_path = os.path.splitext(out_path)[0] + "_build_debug.json"
+                try:
+                    _debug_clips = []
+                    for _r in edited:
+                        _td_dbg = None
+                        if _r.get("is_vo"):
+                            _td_raw = _r.get("takes_data") or []
+                            _bi     = _r.get("best_take_index", 0)
+                            _td_dbg = {
+                                "n_takes":   len(_td_raw),
+                                "best_i":    _bi,
+                                "best_apath": (_td_raw[_bi].get("apath") if _bi < len(_td_raw) else None),
+                                "best_segs":  ([list(s) for s in (_td_raw[_bi].get("segments") or [])]
+                                               if _bi < len(_td_raw) else None),
+                            }
+                        _debug_clips.append({
+                            "order":    _r.get("order"),
+                            "token":    _r.get("token"),
+                            "status":   _r.get("status"),
+                            "is_vo":    _r.get("is_vo", False),
+                            "rec_in_s": _r.get("rec_in_s"),
+                            "rec_out_s":_r.get("rec_out_s"),
+                            "segments": [list(s) for s in (_r.get("segments") or [])],
+                            "n_segs":   len(_r.get("segments") or []),
+                            "takes_data_dbg": _td_dbg,
+                        })
+                    with open(_debug_path, "w", encoding="utf-8") as _df:
+                        json.dump(_debug_clips, _df, indent=2)
+                except Exception:
+                    pass
+
+                _set_status("Probing media settings… ({} clips, {} with edits)".format(
+                    len(edited),
+                    sum(1 for _r in edited if _r.get("status") in ("manual", "ok", "direct"))))
                 seq_w, seq_h, seq_fps, seq_sr = engines.probe_media_settings(
                     [p for p in all_paths if p])
 
@@ -2378,7 +3457,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _done(self, included, skipped, report_path=None):
         self._clear()
-        fmt = "AAF" if self.workflow == "script_aaf" else "XML"
+        fmt = "AAF" if self._is_aaf_mode() else "XML"
         tk.Frame(self.body, bg=BG, height=40).pack()
         tk.Label(self.body, text="✓",
                  font=("Courier New",52,"bold"), bg=BG, fg=SUCCESS).pack()
@@ -4342,6 +5421,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         state = self._aaf_sync_state_vars.get(base, tk.StringVar()).get()
         if not state:
             return   # nothing to confirm
+        self._aaf_qa_stop()
         self._aaf_push_undo(base)
         sv = self._aaf_source_sync_vars.get(base)
         if sv:
@@ -5247,6 +6327,384 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 line = "  {:<50s}  →  {}\n".format(clip_name[:50], vid_label)
                 log.insert("end", line, tag)
             log.configure(state="disabled")
+
+    # ── Script Formatter workflow ─────────────────────────────────────────────
+
+    def _script_formatter(self):
+        """Standalone script builder: token chips, @PART/@VO/@PULL block copiers,
+        format reference cheat sheet, and AI prompt copier."""
+        self._clear()
+        self._sf_tokens = []
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr_row = tk.Frame(self.body, bg=BG)
+        hdr_row.pack(fill="x", pady=(16, 4))
+        self._btn(hdr_row, "\u2190 Back", self._home, small=True).pack(side="left")
+        tk.Label(hdr_row, text="Script Formatter", font=FBT,
+                 bg=BG, fg=TEXT).pack(side="left", padx=20)
+
+        sf = self._scroll_frame(self.body)
+
+        # ── Card helper ───────────────────────────────────────────────────────
+        def _card(title):
+            outer = tk.Frame(sf, bg=SURF,
+                             highlightbackground=BORDER, highlightthickness=1)
+            outer.pack(fill="x", pady=(0, 14))
+            tk.Frame(outer, bg=ACCENT, width=4).pack(side="left", fill="y")
+            inner = tk.Frame(outer, bg=SURF)
+            inner.pack(fill="x", padx=20, pady=16, side="left", expand=True)
+            tk.Label(inner, text=title.upper(),
+                     font=("Courier New", 9, "bold"),
+                     bg=SURF, fg=SUB).pack(anchor="w", pady=(0, 10))
+            return inner
+
+        # ── Copy-with-feedback row helper ──────────────────────────────────
+        def _copy_row(parent, label, get_text):
+            row = tk.Frame(parent, bg=SURF)
+            row.pack(fill="x", pady=(10, 0))
+            fb = tk.Label(row, text="", font=FB, bg=SURF, fg=SUCCESS)
+            fb.pack(side="right", padx=4)
+            def _do():
+                t = get_text()
+                if not t:
+                    return
+                self.clipboard_clear()
+                self.clipboard_append(t)
+                fb.config(text="\u2713 Copied!")
+                fb.after(2000, lambda: fb.config(text=""))
+            self._btn(row, label, _do, small=True).pack(side="left")
+
+        # Shared @PULL state
+        _pull_text    = [""]
+        _pull_tok_var = tk.StringVar()
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SECTION 0 — Format Reference + AI Prompt
+        # ═════════════════════════════════════════════════════════════════════
+        ref_inner = _card("Script Format Reference")
+
+        tk.Label(ref_inner,
+                 text=("PostBridge reads scripts marked up with special directives. "
+                       "If your script isn\u2019t already in this format, use the AI prompt "
+                       "to reformat it: click \u201cCopy AI Prompt,\u201d paste it into ChatGPT, "
+                       "Claude, or another assistant, then paste your script after it."),
+                 font=FB, bg=SURF, fg=SUB,
+                 justify="left", wraplength=900, anchor="w").pack(anchor="w",
+                                                                  pady=(0, 8))
+
+        tk.Label(ref_inner,
+                 text=("--- INTERVIEW SESSIONS START ---    @PART  Part Name\n"
+                       "[TOKEN_NAME]                        @PULL  TOKEN [HH:MM:SS-HH:MM:SS]\n"
+                       "--- INTERVIEW SESSIONS END ---        Quote text \u2014 no blank lines inside\n"
+                       "                                    @VO  PART_N_LABEL\n"
+                       "--- EPISODE ASSETS START ---          VO text \u2014 ends at next @, //, or blank\n"
+                       "[PART_0_NARRATOR]                   // comment\n"
+                       "--- EPISODE ASSETS END ---"),
+                 font=("Courier New", 10), bg=SURF, fg=SUB,
+                 justify="left", anchor="w").pack(anchor="w", pady=(0, 8))
+
+        _copy_row(ref_inner, "Copy AI Prompt", self._ai_prompt_text)
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SECTION 1 — Episode Tokens
+        # ═════════════════════════════════════════════════════════════════════
+        tok_inner = _card("Episode Tokens")
+
+        tk.Label(tok_inner,
+                 text="Token names \u2014 one per line  (e.g. INTERVIEW_A)",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+        tok_text = tk.Text(tok_inner, height=4,
+                           font=("Courier New", 11),
+                           bg=SURF2, fg=TEXT, bd=0, relief="flat",
+                           highlightbackground=BORDER, highlightthickness=1,
+                           insertbackground=TEXT, padx=8, pady=6)
+        tok_text.pack(fill="x", pady=(4, 10))
+
+        chip_row = tk.Frame(tok_inner, bg=SURF)
+        chip_row.pack(fill="x", pady=(0, 10))
+        tk.Label(chip_row, text="No tokens yet",
+                 font=(_SANS, 10, "italic"),
+                 bg=SURF, fg=SUB).pack(side="left")
+
+        tk.Label(tok_inner, text="Asset block for document header",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+        asset_var = tk.StringVar(value="Enter tokens above")
+        asset_lbl = tk.Label(tok_inner, textvariable=asset_var,
+                             font=("Courier New", 11),
+                             bg=SURF2, fg=SUB, justify="left", anchor="nw",
+                             padx=10, pady=8)
+        asset_lbl.pack(fill="x", pady=(4, 0))
+
+        _copy_row(tok_inner, "Copy Asset Block",
+                  lambda: asset_var.get() if self._sf_tokens else "")
+        tk.Label(tok_inner,
+                 text="Paste this block into the doc once, near the top, "
+                      "before any @PART lines.",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w", pady=(6, 0))
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SECTION 2 — @PART
+        # ═════════════════════════════════════════════════════════════════════
+        part_inner = _card("@PART \u2014 Insert a Part Marker")
+
+        tk.Label(part_inner, text="Part title",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+        part_var = tk.StringVar()
+        tk.Entry(part_inner, textvariable=part_var,
+                 font=(_SANS, 13),
+                 bg=SURF2, fg=TEXT, bd=0, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1,
+                 insertbackground=TEXT).pack(fill="x", pady=(4, 8))
+
+        part_preview = tk.Label(part_inner, text="\u2014",
+                                font=("Courier New", 12),
+                                bg=SURF2, fg=SUB, anchor="w", padx=10, pady=8)
+        part_preview.pack(fill="x")
+
+        def _update_part(*_):
+            t = part_var.get().strip()
+            part_preview.config(
+                text="@PART " + t if t else "\u2014",
+                fg=TEXT if t else SUB)
+
+        part_var.trace_add("write", _update_part)
+        _copy_row(part_inner, "Copy @PART",
+                  lambda: ("@PART " + part_var.get().strip())
+                  if part_var.get().strip() else "")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SECTION 3 — @VO
+        # ═════════════════════════════════════════════════════════════════════
+        vo_inner = _card("@VO \u2014 Insert a Voice-Over Marker")
+
+        tk.Label(vo_inner,
+                 text=("Copies @VO to your clipboard \u2014 paste it into the doc, "
+                       "then type your VO copy on the line below it."),
+                 font=FB, bg=SURF, fg=SUB, justify="left").pack(anchor="w",
+                                                                pady=(0, 6))
+        _copy_row(vo_inner, "Copy @VO", lambda: "@VO")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SECTION 4 — @PULL
+        # ═════════════════════════════════════════════════════════════════════
+        pull_inner = _card("@PULL \u2014 Insert a Pull Marker")
+
+        tk.Label(pull_inner, text="Token",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+        pull_cb = ttk.Combobox(pull_inner, textvariable=_pull_tok_var,
+                               values=["\u2014 select token \u2014"],
+                               state="readonly", font=(_SANS, 12))
+        pull_cb.set("\u2014 select token \u2014")
+        pull_cb.pack(fill="x", pady=(4, 14))
+
+        tc_row = tk.Frame(pull_inner, bg=SURF)
+        tc_row.pack(fill="x", pady=(0, 4))
+
+        def _make_tc_group(parent, label_text):
+            col = tk.Frame(parent, bg=SURF)
+            col.pack(side="left", expand=True, fill="x", padx=(0, 16))
+            tk.Label(col, text=label_text, font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+            grp = tk.Frame(col, bg=SURF2,
+                           highlightbackground=BORDER, highlightthickness=1)
+            grp.pack(fill="x", pady=(4, 0))
+
+            def _only_digits(P):
+                return P == "" or (P.isdigit() and len(P) <= 2)
+
+            vcmd = (grp.register(_only_digits), "%P")
+            entries = []
+            for i in range(3):
+                if i > 0:
+                    tk.Label(grp, text=":", font=("Courier New", 13),
+                             bg=SURF2, fg=SUB).pack(side="left")
+                e = tk.Entry(grp, width=3, font=("Courier New", 13),
+                             bg=SURF2, fg=TEXT, bd=0, relief="flat",
+                             insertbackground=TEXT, justify="center",
+                             validate="key", validatecommand=vcmd)
+                e.pack(side="left",
+                       padx=(8 if i == 0 else 0, 8 if i == 2 else 0),
+                       pady=7)
+                entries.append(e)
+
+            for i, e in enumerate(entries):
+                def _on_key(ev, idx=i, en=e):
+                    if len(en.get()) == 2 and idx < 2:
+                        entries[idx + 1].focus_set()
+                        entries[idx + 1].select_range(0, "end")
+                    _build_pull()
+
+                def _on_bs(ev, idx=i, en=e):
+                    if idx > 0 and not en.get():
+                        entries[idx - 1].focus_set()
+                        entries[idx - 1].icursor("end")
+
+                e.bind("<KeyRelease>", _on_key)
+                e.bind("<BackSpace>", _on_bs)
+                e.bind("<FocusIn>", lambda ev, en=e: en.select_range(0, "end"))
+
+            def get_val():
+                vals = [en.get() for en in entries]
+                if not any(vals):
+                    return ""
+                return ":".join(v.zfill(2) for v in vals)
+
+            def is_done():
+                return all(len(en.get()) == 2 for en in entries)
+
+            def clear_all():
+                for en in entries:
+                    en.delete(0, "end")
+
+            return get_val, is_done, clear_all
+
+        get_in_tc,  in_done,  clear_in  = _make_tc_group(tc_row, "IN timecode")
+        get_out_tc, out_done, clear_out = _make_tc_group(tc_row, "OUT timecode")
+
+        pull_msg = tk.Label(pull_inner, text="", font=FB,
+                            bg=SURF, fg=ERR, anchor="w", justify="left")
+        pull_msg.pack(anchor="w", pady=(4, 0))
+
+        pull_preview = tk.Label(pull_inner, text="\u2014",
+                                font=("Courier New", 12),
+                                bg=SURF2, fg=SUB, anchor="w", padx=10, pady=8)
+        pull_preview.pack(fill="x", pady=(4, 0))
+
+        def _build_pull(*_):
+            tok    = _pull_tok_var.get()
+            i_ok   = in_done()
+            o_ok   = out_done()
+            in_tc  = get_in_tc()  if i_ok else ""
+            out_tc = get_out_tc() if o_ok else ""
+
+            pull_msg.config(text="", fg=ERR)
+            pull_preview.config(text="\u2014", fg=SUB)
+            _pull_text[0] = ""
+
+            if not tok or tok == "\u2014 select token \u2014" \
+                    or not i_ok or not o_ok:
+                return
+
+            def _valid(tc):
+                if len(tc) != 8:
+                    return False
+                try:
+                    parts = tc.split(":")
+                    return int(parts[1]) < 60 and int(parts[2]) < 60
+                except (ValueError, IndexError):
+                    return False
+
+            def _secs(tc):
+                h, m, s = (int(x) for x in tc.split(":"))
+                return h * 3600 + m * 60 + s
+
+            errs = []
+            if not _valid(in_tc):
+                errs.append("IN timecode invalid (MM/SS must be < 60)")
+            if not _valid(out_tc):
+                errs.append("OUT timecode invalid (MM/SS must be < 60)")
+            if not errs and _secs(out_tc) <= _secs(in_tc):
+                errs.append("OUT must be after IN")
+
+            if errs:
+                pull_msg.config(text=";  ".join(errs), fg=ERR)
+                return
+
+            line = "@PULL {} [{}-{}]".format(tok, in_tc, out_tc)
+            pull_preview.config(text=line, fg=TEXT)
+            _pull_text[0] = line
+
+            dur = _secs(out_tc) - _secs(in_tc)
+            if dur > 300:
+                m_ = dur // 60
+                s_ = dur % 60
+                dur_s = "{}m {}s".format(m_, s_) if s_ else "{}m".format(m_)
+                pull_msg.config(
+                    text="\u26a0  Duration is {} \u2014 confirm timing is correct".format(dur_s),
+                    fg=WARN)
+            else:
+                pull_msg.config(text="\u2713 Looks good", fg=SUCCESS)
+
+        _pull_tok_var.trace_add("write", _build_pull)
+
+        pull_btn_row = tk.Frame(pull_inner, bg=SURF)
+        pull_btn_row.pack(fill="x", pady=(10, 0))
+        pull_fb = tk.Label(pull_btn_row, text="", font=FB, bg=SURF, fg=SUCCESS)
+        pull_fb.pack(side="right", padx=4)
+
+        def _copy_pull():
+            t = _pull_text[0]
+            if not t:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(t)
+            pull_fb.config(text="\u2713 Copied!")
+            pull_fb.after(2000, lambda: pull_fb.config(text=""))
+
+        def _clear_pull():
+            clear_in()
+            clear_out()
+            pull_cb.set("\u2014 select token \u2014")
+            _build_pull()
+
+        self._btn(pull_btn_row, "Copy @PULL", _copy_pull, small=True).pack(side="left")
+        tk.Frame(pull_btn_row, bg=SURF, width=8).pack(side="left")
+        self._btn(pull_btn_row, "Clear", _clear_pull, small=True).pack(side="left")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Token rebuild — defined after all widgets exist so closures resolve
+        # ═════════════════════════════════════════════════════════════════════
+        def _refresh_pull_tokens():
+            opts = ["\u2014 select token \u2014"] + self._sf_tokens
+            pull_cb["values"] = opts
+            if _pull_tok_var.get() not in self._sf_tokens:
+                pull_cb.set("\u2014 select token \u2014")
+            _build_pull()
+
+        def _rebuild_tokens(*_):
+            raw = tok_text.get("1.0", "end")
+            seen = set()
+            toks = []
+            for line in raw.splitlines():
+                t = "".join(
+                    c for c in line.strip().upper()
+                    if c.isalnum() or c == "_")
+                if t and t not in seen:
+                    seen.add(t)
+                    toks.append(t)
+            self._sf_tokens = toks
+
+            # Rebuild chips
+            for w in chip_row.winfo_children():
+                w.destroy()
+            if not toks:
+                tk.Label(chip_row, text="No tokens yet",
+                         font=(_SANS, 10, "italic"),
+                         bg=SURF, fg=SUB).pack(side="left")
+            else:
+                for t in toks:
+                    tk.Label(chip_row, text=t,
+                             font=("Courier New", 10),
+                             bg="#1e2636", fg="#5a9fd4",
+                             padx=8, pady=2,
+                             highlightbackground="#3a6090",
+                             highlightthickness=1).pack(side="left", padx=(0, 5))
+
+            # Rebuild asset block
+            if toks:
+                block = ("--- EPISODE ASSETS START ---\n"
+                         + "\n".join("[{}]".format(t) for t in toks)
+                         + "\n--- EPISODE ASSETS END ---")
+                asset_var.set(block)
+                asset_lbl.config(fg=TEXT)
+            else:
+                asset_var.set("Enter tokens above")
+                asset_lbl.config(fg=SUB)
+
+            _refresh_pull_tokens()
+
+        tok_text.bind("<KeyRelease>", _rebuild_tokens)
+        tok_text.bind("<<Paste>>",
+                      lambda e: tok_text.after(10, _rebuild_tokens))
 
     def _reset(self):
         self.workflow=None; self.tokens=[]; self.parts=[]; self.pulls=[]

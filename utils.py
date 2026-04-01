@@ -16,14 +16,18 @@ def pathurl(p):
         return "file://localhost" + urllib.parse.quote(p)
 
 def tc_secs(tc):
-    p = [int(x) for x in tc.split(":")]
-    return p[0]*3600 + p[1]*60 + p[2]
+    """Parse HH:MM:SS or HH:MM:SS.mmm → float seconds."""
+    p = tc.strip().split(":")
+    return int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
 
 def secs_tc(s):
-    s = max(0, round(s))
-    h, r = divmod(s, 3600)
-    m, s = divmod(r, 60)
-    return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+    """Convert float seconds → HH:MM:SS.mmm string (sub-second precision)."""
+    s = max(0.0, float(s))
+    h = int(s // 3600)
+    r = s - h * 3600
+    m = int(r // 60)
+    sec = r - m * 60
+    return "{:02d}:{:02d}:{:06.3f}".format(h, m, sec)
 
 VIDEO_EXTS = {
     ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v",

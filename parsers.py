@@ -32,7 +32,8 @@ def parse_script(text):
         if m:
             for ln in m.group(1).split("\n"):
                 clean = re.sub(r'//.*$', '', ln).strip()
-                tm = re.match(r'^\[([A-Z0-9_]+)\]$', clean)
+                # Accept both [TOKEN] and bare TOKEN (no brackets)
+                tm = re.match(r'^\[?([A-Z0-9_]+)\]?$', clean)
                 if tm and tm.group(1) not in tokens:
                     tokens.append(tm.group(1))
             break
@@ -490,7 +491,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             return None
         return env / std
 
-    def _xcorr_bounded(a_sig, b_sig, max_lag_samp):
+    def _xcorr_bounded(a_sig, b_sig, max_lag_samp, phat=False):
         """
         Cross-correlate a_sig and b_sig.
         C[L] = sum_t  a_sig[t] * b_sig[t + L]
@@ -499,13 +500,22 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         Search restricted to |L| ≤ max_lag_samp to avoid false peaks.
         Returns (signed_lag_samples_float, confidence_0_to_1).
         Lag is a float thanks to parabolic sub-sample interpolation.
+
+        phat=True applies GCC-PHAT weighting: the cross-spectrum is divided by
+        its magnitude before the IFFT.  This whitens the frequency content so
+        that dominant periodic components (e.g. speech rhythm harmonics) no
+        longer bias the xcorr peak, yielding a sharper, less ambiguous result
+        for signals that would otherwise produce multiple competing peaks.
         """
         na, nb = len(a_sig), len(b_sig)
         n   = na + nb - 1
         N   = 1 << int(_np.ceil(_np.log2(max(n, 1))))
-        C   = _np.fft.irfft(
-                  _np.fft.rfft(b_sig, N) * _np.conj(_np.fft.rfft(a_sig, N)),
-                  N)[:n]
+        cross = _np.fft.rfft(b_sig, N) * _np.conj(_np.fft.rfft(a_sig, N))
+        if phat:
+            mag = _np.abs(cross)
+            mag[mag < 1e-10] = 1e-10
+            cross = cross / mag
+        C   = _np.fft.irfft(cross, N)[:n]
         C_abs = _np.abs(C)
 
         # Restrict to ±max_lag in the circular-index layout:
@@ -605,20 +615,24 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
 
         return results if results else [(0.0, 0.0)]
 
-    # ── Stage 1: 1 Hz RMS envelope, full probe window ─────────────────────
-    # One RMS sample per second.  Handles offsets up to ±probe_duration/2 s.
-    # Accuracy: ±0.5 s.
-    SR1   = 1          # 1 Hz
-    DUR1  = min(probe_duration, 600.0)
-    WIN1  = 8000       # ffmpeg extract SR before computing 1-sample/s envelope
+    # ── Stage 1: 5 Hz RMS envelope, full probe window ─────────────────────
+    # Five RMS samples per second (200 ms windows).
+    # Handles offsets up to ±probe_duration/2 s.  Accuracy: ±100 ms.
+    # Extraction stays at 8 kHz (same ffmpeg cost as before); the finer
+    # 200 ms window captures sentence-level amplitude rhythm and reduces
+    # false-peak susceptibility compared to the old 1 Hz / 1 s windows.
+    SR1        = 5          # 5 Hz effective envelope rate
+    DUR1       = min(probe_duration, 600.0)
+    _SR1_EXTR  = 8000       # ffmpeg extraction sample rate (unchanged)
+    WIN1       = _SR1_EXTR // SR1   # 1600 samples = 200 ms per envelope window
 
-    raw_a1 = _extract(video_path, start_offset, DUR1, WIN1)
-    raw_b1 = _extract(audio_path, start_offset, DUR1, WIN1)
+    raw_a1 = _extract(video_path, start_offset, DUR1, _SR1_EXTR)
+    raw_b1 = _extract(audio_path, start_offset, DUR1, _SR1_EXTR)
 
     if raw_a1 is None or raw_b1 is None:
         return 0.0, 0.0
 
-    env_a1 = _peak_env(raw_a1, WIN1, top_pct=15)   # 1 sample per second, loudest 15 %
+    env_a1 = _peak_env(raw_a1, WIN1, top_pct=15)   # 5 samples/s, loudest 15 %
     env_b1 = _peak_env(raw_b1, WIN1, top_pct=15)
 
     if env_a1 is None or env_b1 is None or len(env_a1) < 4 or len(env_b1) < 4:
@@ -639,24 +653,24 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
 
     a_start2 = start_offset
-    # Centre the video extraction on the Stage-1 estimate.
-    # v_start2 - a_start2 encodes the expected offset so the lag is small.
-    v_start2 = max(0.0, start_offset + T1)
+    sr2_eff  = SR2 // WIN2                       # 50 Hz effective
+    max_lag2 = int(SEARCH2 * sr2_eff)
 
     raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
-    raw_v2 = _extract(video_path,  v_start2, PROBE2, SR2)
 
-    T2, conf2 = T1, conf1   # fallback
+    T2, conf2 = T1, conf1   # fallback if extraction fails entirely
     T1_best   = T1
-    if raw_a2 is not None and raw_v2 is not None:
+    if raw_a2 is not None:
         env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
-        env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
-        if env_a2 is not None and env_v2 is not None:
-            sr2_eff  = SR2 // WIN2                       # 50 Hz effective
-            max_lag2 = int(SEARCH2 * sr2_eff)
-            lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
-            T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
-            T1_best = T1
+        if env_a2 is not None:
+            v_start2 = max(0.0, start_offset + T1)
+            raw_v2   = _extract(video_path, v_start2, PROBE2, SR2)
+            if raw_v2 is not None:
+                env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
+                if env_v2 is not None:
+                    lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
+                    T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
+                    T1_best = T1
 
     # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
     # Accuracy: ±1 ms (sub-frame).
@@ -665,7 +679,11 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     PROBE3   = 10.0            # seconds to extract
     SEARCH3  = 0.5             # ±0.5 s search
 
-    # Anchor at 30 % into probe2 to use a different region than stage 2
+    # Anchor at 30 % into probe2 — settled speech, away from mic-handling noise
+    # and setup chaos at the very start of the recording.  The beginning of the
+    # file is the worst region for clean correlation: camera operators are still
+    # getting rolling, talent is adjusting mics, and transients there are random
+    # rather than matched between camera and VO recordings.
     a_start3 = a_start2 + PROBE2 * 0.3
     v_start3 = max(0.0, a_start3 + T2)
 
@@ -722,7 +740,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     #      spread ≥ 500 ms → agree = 0.0
     #
     # 2. T1/T2 SPREAD (cross-stage agreement between coarse and fine)
-    #    Stage 1 (1 Hz, full probe) and Stage 2 (50 Hz, ±20 s window) are
+    #    Stage 1 (5 Hz, full probe) and Stage 2 (50 Hz, ±20 s window) are
     #    fully independent.  When they disagree by more than 1 s, at least
     #    one found a false peak — and T3 cannot arbitrate because it is
     #    anchored at T2.  Empirical data confirms: every wrong detection had
@@ -753,8 +771,18 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         else:
             agree = 0.0
         base_conf  = agree * 0.70 + conf3 * 0.30
-        final_T    = round(T3, 6)
-        final_conf = round(min(1.0, base_conf * t12_mult), 4)
+        t3_conf    = round(min(1.0, base_conf * t12_mult), 4)
+        # Only accept Stage 3 result if it actually improves on Stage 2.
+        # When Stage 3 drifts far from T2 with low conf3, T2 (which has
+        # conf2 * t12_mult applied) can be a more reliable answer.
+        t2_conf    = round(min(1.0, conf2 * t12_mult), 4)
+        if t3_conf >= t2_conf:
+            final_T    = round(T3, 6)
+            final_conf = t3_conf
+        else:
+            spread     = abs(T3 - T2)   # keep for logging
+            final_T    = round(T2, 6)
+            final_conf = t2_conf
     elif conf2 >= 0.05:
         spread     = abs(T3 - T2) if stage3_ran else None
         final_T    = round(T2, 6)
@@ -771,6 +799,50 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         final_conf   = round(min(1.0, conf3R_raw), 4)
         _used_rescue = True
 
+    # ── Calibration offset ─────────────────────────────────────────────────
+    # Global fallback: +54.5 ms systematic positive bias measured across
+    # correctly-found files (deterministic, from peak-envelope window centroid
+    # assignment).  Per-file calibration below overrides this for known files
+    # using the accumulated corrections history.
+    _T_CAL_GLOBAL = -0.046       # seconds  (≈ -46 ms)
+    _T_CAL_S      = _T_CAL_GLOBAL
+
+    # Per-file learned calibration: look up the last non-wrong correction for
+    # this audio file in sync_corrections.jsonl.  The auto_T stored there had
+    # _T_CAL_GLOBAL applied, so the per-file calibration is:
+    #   _T_CAL_S = delta + _T_CAL_GLOBAL
+    # where delta = accepted_T - auto_T (0.0 when the user accepted unchanged).
+    # Group A files (delta≈0) get the same -46 ms as the global default.
+    # Group B files (delta≈+46 ms) end up with cal≈0, which is correct since
+    # the algorithm output for those files already lands on the true offset.
+    # "wrong" verdicts are skipped so a mis-found file never corrupts the cache.
+    try:
+        import json as _jcal
+        _cal_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  ".pb_cache")
+        _corr_path = os.path.join(_cal_cache, "sync_corrections.jsonl")
+        if os.path.exists(_corr_path):
+            _audio_name = os.path.basename(audio_path)
+            _last_good  = None
+            with open(_corr_path, "r", encoding="utf-8") as _fc:
+                for _line in _fc:
+                    try:
+                        _ce = _jcal.loads(_line)
+                        if (_ce.get("audio") == _audio_name and
+                                _ce.get("verdict") not in ("wrong", "verified")):
+                            _last_good = _ce
+                    except Exception:
+                        pass
+            if _last_good is not None:
+                _delta   = (0.0 if _last_good["verdict"] == "accepted"
+                            else (_last_good.get("accepted_T", 0.0)
+                                  - _last_good.get("auto_T",     0.0)))
+                _T_CAL_S = _delta + _T_CAL_GLOBAL
+    except Exception:
+        pass
+
+    final_T = round(final_T + _T_CAL_S, 6)
+
     # ── Write feedback log ─────────────────────────────────────────────────
     # .pb_cache/sync_runs.jsonl accumulates one entry per detection run.
     # At session start these can be read to understand algorithm behaviour.
@@ -784,6 +856,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
             "video":         os.path.basename(video_path),
             "audio":         os.path.basename(audio_path),
+            "s1_hz":         SR1,
             "T1":            round(T1, 4),       "conf1":  round(conf1, 4),
             "T1_best":       round(T1_best, 4),
             "T2":            round(T2, 4),       "conf2":  round(conf2, 4),

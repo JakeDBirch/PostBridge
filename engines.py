@@ -710,6 +710,15 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
         if not words:
             return result
 
+        # Offset word timestamps from clip-relative → absolute file time
+        # and store on the result so the waveform editor can display them.
+        abs_words = [
+            {**w, "start": round(w["start"] + clip_start, 4),
+                  "end":   round(w["end"]   + clip_start, 4)}
+            for w in words
+        ]
+        result["words"] = abs_words
+
         # ── Waveform blob detection for ms-level edge snapping ──────────────
         # Run on the same extracted clip window.  Blob timestamps come back
         # clip-relative (0 … clip_duration), so offset them into absolute
@@ -1223,6 +1232,7 @@ def reconcile_vo_part(vo_blocks, takes):
         best_segs       = None
         best_take_index = 0
         best_start_s    = -1.0
+        best_confidence = -1.0
         best_v_offset   = 0.0
         best_vpath      = None
         best_apath      = None
@@ -1249,7 +1259,8 @@ def reconcile_vo_part(vo_blocks, takes):
                 continue
 
             segs = refine_segment_endpoints(match["segments"], blobs)
-            seg_start = segs[0][0] if segs else 0.0
+            seg_start  = segs[0][0] if segs else 0.0
+            match_conf = match.get("confidence", 0.0)
 
             takes_data.append({
                 "segments": segs,
@@ -1258,9 +1269,19 @@ def reconcile_vo_part(vo_blocks, takes):
                 "v_offset": v_offset,
             })
 
-            # Prefer the match that starts latest — last iteration wins
-            if seg_start > best_start_s:
+            # Winner selection: confidence is the primary key so that a
+            # high-quality match in any take beats a spurious match in another
+            # file with a later timestamp.  When confidence is within 0.05 of
+            # the current best (same-quality, typical for multiple takes of the
+            # same content) fall back to latest-start so the final delivery wins.
+            is_better = (
+                match_conf > best_confidence + 0.05 or
+                (abs(match_conf - best_confidence) <= 0.05 and
+                 seg_start > best_start_s)
+            )
+            if is_better:
                 best_start_s    = seg_start
+                best_confidence = match_conf
                 best_match      = match
                 best_segs       = segs
                 best_take_index = ti
@@ -1273,8 +1294,35 @@ def reconcile_vo_part(vo_blocks, takes):
 
         if best_match is None or best_segs is None:
             base["status"] = "no_match"
+            # Attach the first available take's audio so the waveform editor
+            # can open and the user can set IN/OUT points manually.
+            if unpacked:
+                base["source_audio"] = unpacked[0][3]
+            # Diagnostic: record why the match failed for each take
+            diag_parts = []
+            for ti, (aw, _vo, _vp, ap, _bl) in enumerate(unpacked):
+                cursor_s     = cursors[ti]
+                window_start = max(0.0, cursor_s - _LOOKBACK_S)
+                in_window    = [w for w in (aw or []) if w.get("start", 0) >= window_start]
+                note = "take {}: cursor={:.1f}s  window_start={:.1f}s  words_in_window={}".format(
+                    ti, cursor_s, window_start, len(in_window))
+                if not aw:
+                    note += "  [NO TRANSCRIPTION]"
+                elif not in_window:
+                    note += "  [WINDOW EMPTY — cursor past end of audio]"
+                diag_parts.append(note)
+            base["diag"] = " | ".join(diag_parts)
             results.append(base)
             continue
+
+        # Merge any overlapping/duplicate segments (can arise from multi-chunk matches)
+        merged = []
+        for seg in sorted(best_segs, key=lambda s: s[0]):
+            if merged and seg[0] < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], seg[1])
+            else:
+                merged.append(list(seg))
+        best_segs = merged
 
         # Advance cursor for the winning take so the next block starts here
         cursors[best_take_index] = best_segs[-1][1]
@@ -1838,7 +1886,8 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
                     take_cursor = ef + (0 if not is_last else 0)
 
-            cursor += max_dur_fr + (gap_fr if res.get("gap_after", True) else 0)
+            _vo_gap_fr = round(res["gap_after_s"] * fps) if "gap_after_s" in res else gap_fr
+            cursor += max_dur_fr + (_vo_gap_fr if res.get("gap_after", True) else 0)
 
         else:
             tok    = res["token"]
@@ -1915,7 +1964,8 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                             SubElement(lk, "trackindex").text  = str(ref["track_idx"])
                             SubElement(lk, "clipindex").text   = str(ref["clip_pos"])
 
-                cursor = ef + (gap_fr if (is_last and res.get("gap_after", True)) else 0)
+                _int_gap_fr = round(res["gap_after_s"] * fps) if "gap_after_s" in res else gap_fr
+                cursor = ef + (_int_gap_fr if (is_last and res.get("gap_after", True)) else 0)
 
     total = cursor
 
@@ -2554,7 +2604,8 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     dur_sa = s2sa(seg_out_s - seg_in_s + VO_TAIL_SECS)
                     slots.append((ap, cursor, dur_sa, s2sa(seg_in_s), track))
                     cursor += dur_sa
-            cursor += (gap_sa if res.get("gap_after", True) else 0)
+            _vo_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
+            cursor += (_vo_gap if res.get("gap_after", True) else 0)
         else:
             tok    = res["token"]
             paths  = int_assets.get(tok, [])
@@ -2577,10 +2628,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 if seg_in_s >= seg_out_s: continue
                 dur_sa  = s2sa(seg_out_s - seg_in_s)
                 is_last = (si == len(segments) - 1)
-                # Shift the source read-start forward by CLIP_SRC_OFFSET so that
-                # script timecodes (which tend to be slightly early) land on the
-                # actual speech onset.  Duration is unchanged — the window moves.
-                src_in  = s2sa(seg_in_s + CLIP_SRC_OFFSET)
+                src_in  = s2sa(seg_in_s)
 
                 # Guest audio → token's own track
                 if guest_paths:
@@ -2590,7 +2638,8 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     slots.append((host_paths[0], cursor, dur_sa, src_in,
                                   HOST_NAME.upper()))
 
-                cursor += dur_sa + (gap_sa if (is_last and res.get("gap_after", True)) else 0)
+                _int_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
+                cursor += dur_sa + (_int_gap if (is_last and res.get("gap_after", True)) else 0)
 
     _prog("Analysing {} clips across {} tracks…".format(len(slots),
           len(set(s[4] for s in slots))))

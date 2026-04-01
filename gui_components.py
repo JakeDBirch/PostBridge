@@ -569,6 +569,17 @@ class MediaPool(tk.Frame):
                                  font=FB, bg=SURF3, fg=SUB, pady=14)
         self._dz_lbl.pack(fill="x")
 
+        # Column widths (pixels).  0 = not yet user-set; auto from content.
+        self._pool_name_col_w   = 0
+        self._pool_dd_col_w     = 0
+        self._pool_col_user_set = False   # True once the user has dragged the sash
+        self._pool_sash_drag    = {}      # transient drag state
+
+        # Column header row (rebuilt by _rebuild_col_hdr whenever widths change)
+        self._col_hdr = tk.Frame(self, bg=SURF)
+        self._col_hdr.pack(fill="x", padx=12, pady=(0, 0))
+        self._rebuild_col_hdr()
+
         self._table = tk.Frame(self, bg=SURF)
         self._table.pack(fill="x", padx=12)
 
@@ -707,27 +718,79 @@ class MediaPool(tk.Frame):
         tk.Label(row, text=kind, font=("Courier New",9,"bold"),
                  bg=kc[0], fg=kc[1], padx=5, pady=3).pack(side="left")
 
-        fn_lbl = tk.Label(row, text=fn, font=FB, bg=initial_bg, fg=TEXT,
+        # ── Filename column (fixed pixel width, auto-sized to content) ──────────
+        fn_w = self._pool_name_col_w if self._pool_name_col_w else 240
+        fn_frame = tk.Frame(row, bg=initial_bg, width=fn_w)
+        fn_frame.pack(side="left", fill="y")
+        fn_frame.pack_propagate(False)
+        tint_refs.append(fn_frame)
+
+        fn_lbl = tk.Label(fn_frame, text=fn, font=FB, bg=initial_bg, fg=TEXT,
                           padx=6, anchor="w")
-        fn_lbl.pack(side="left", fill="x", expand=True)
+        fn_lbl.pack(fill="both", expand=True)
         tint_refs.append(fn_lbl)
 
-        rm = tk.Label(row, text=" ✕ ", font=FB, bg=initial_bg, fg=SUB,
-                      cursor="hand2", padx=4)
-        rm.pack(side="right")
-        tint_refs.append(rm)
+        # ── Draggable column sash ─────────────────────────────────────────────
+        sash = tk.Frame(row, bg=SURF3, width=5, cursor="sb_h_double_arrow")
+        sash.pack(side="left", fill="y")
+        sash.pack_propagate(False)
+
+        def _sash_press(e, s=sash):
+            self._pool_sash_drag["x0"] = e.x_root
+            self._pool_sash_drag["w0"] = self._pool_name_col_w or fn_w
+            s.config(bg=ACCENT)
+
+        def _sash_motion(e):
+            if "x0" not in self._pool_sash_drag:
+                return
+            delta = e.x_root - self._pool_sash_drag["x0"]
+            new_w = max(80, self._pool_sash_drag["w0"] + delta)
+            self._pool_name_col_w   = new_w
+            self._pool_col_user_set = True
+            for r in self._rows:
+                ff = r.get("fn_frame")
+                if ff:
+                    try:
+                        ff.config(width=new_w)
+                    except Exception:
+                        pass
+            self._rebuild_col_hdr()
+
+        def _sash_release(e, s=sash):
+            self._pool_sash_drag.clear()
+            s.config(bg=SURF3)
+
+        sash.bind("<ButtonPress-1>",   _sash_press)
+        sash.bind("<B1-Motion>",       _sash_motion)
+        sash.bind("<ButtonRelease-1>", _sash_release)
+        sash.bind("<Enter>", lambda e, w=sash: w.config(bg=ACCENT))
+        sash.bind("<Leave>", lambda e, w=sash: (
+            w.config(bg=SURF3) if "x0" not in self._pool_sash_drag else None))
+
+        # ── Dropdown column (pixel-width frame so it never truncates) ─────────
+        dd_w = self._pool_dd_col_w if self._pool_dd_col_w else 200
+        dd_frame = tk.Frame(row, bg=initial_bg, width=dd_w)
+        dd_frame.pack(side="left", fill="y", padx=(0, 4))
+        dd_frame.pack_propagate(False)
+        tint_refs.append(dd_frame)
 
         om = _FlatDropdown(
-            row,
+            dd_frame,
             textvariable=var,
             values=options,
             state="readonly",
             font=FB,
-            width=28,
+            width=1,   # label expands to fill dd_frame; width=1 is just a minimum
         )
-        om.pack(side="right", padx=4)
+        om.pack(fill="both", expand=True)
 
-        rec = {"path": path, "var": var, "row": row}
+        rm = tk.Label(row, text="✕", font=FB, bg=initial_bg, fg=SUB,
+                      cursor="hand2", padx=6)
+        rm.pack(side="left")
+        tint_refs.append(rm)
+
+        rec = {"path": path, "var": var, "row": row, "fn_frame": fn_frame,
+               "fn_lbl": fn_lbl, "dd_frame": dd_frame, "sash": sash}
         self._rows.append(rec)
         rm.bind("<Button-1>", lambda e, r=rec: self._remove(r))
 
@@ -742,11 +805,100 @@ class MediaPool(tk.Frame):
             self.after(80, self._deferred_prune)
 
     def _sort_rows(self):
-        """Re-pack pool rows in alphabetical order by filename (case-insensitive)."""
+        """Re-pack pool rows alphabetically; auto-size columns unless user has
+        manually resized via the sash."""
         self._rows.sort(key=lambda r: os.path.basename(r["path"]).lower())
+
+        if self._rows:
+            try:
+                _dpi = self.winfo_fpixels('1i')
+            except Exception:
+                _dpi = 96.0
+            _ppc = max(9, int(9.0 * _dpi / 96.0 + 0.9))   # pixels per char
+
+            # Filename column: auto-size unless user has dragged the sash
+            if not self._pool_col_user_set:
+                _max_fn  = max(len(os.path.basename(r["path"])) for r in self._rows)
+                _name_w  = max(160, _max_fn * _ppc + 32)
+                self._pool_name_col_w = _name_w
+
+            # Dropdown column: always auto-size from longest option (never user-set)
+            if not self._pool_dd_col_w:
+                # Sample options from the first row's dropdown children if possible;
+                # otherwise derive from tokens + part names stored on the pool.
+                _toks  = list(self._tokens) + ["VO: {}".format(p["name"])
+                                               for p in self._parts]
+                _opts  = ["— unassigned —"] + sorted(_toks)
+                _max_o = max((len(o) for o in _opts), default=20)
+                self._pool_dd_col_w = max(180, _max_o * _ppc + 40)
+
+            # Apply widths to all rows
+            for r in self._rows:
+                ff = r.get("fn_frame")
+                if ff:
+                    try: ff.config(width=self._pool_name_col_w)
+                    except Exception: pass
+                df = r.get("dd_frame")
+                if df:
+                    try: df.config(width=self._pool_dd_col_w)
+                    except Exception: pass
+
+            self._rebuild_col_hdr()
+
         for r in self._rows:
             r["row"].pack_forget()
-            r["row"].pack(fill="x", pady=2)
+            r["row"].pack(fill="x", pady=1)
+
+    def _rebuild_col_hdr(self):
+        """Rebuild the column header labels to match current column widths."""
+        for w in self._col_hdr.winfo_children():
+            w.destroy()
+
+        if not self._rows:
+            # Hide the header frame itself when there are no rows
+            self._col_hdr.pack_forget()
+            # Show drop zone if hidden
+            try:
+                self.dz.pack(fill="x", padx=12, pady=(0, 6))
+            except Exception:
+                pass
+            return
+
+        # Hide drop zone while rows are present; show compact drop hint instead
+        try:
+            self.dz.pack_forget()
+        except Exception:
+            pass
+        self._col_hdr.pack(fill="x", padx=12, pady=(2, 0))
+
+        _HDR_H = 20   # explicit header row height in pixels
+
+        # Fixed prefix: strip (6px) + KIND badge.  Measure by asking tk for the
+        # badge width after rendering; fall back to a safe constant.
+        _PREFIX_W = 62   # 6px strip + ~56px "AUDIO"/"VIDEO" badge with padx=5
+
+        tk.Frame(self._col_hdr, bg=SURF,
+                 width=_PREFIX_W, height=_HDR_H).pack(side="left")
+
+        # FILE header — fixed pixel width + explicit height avoids collapse
+        name_w = self._pool_name_col_w or 240
+        nf = tk.Frame(self._col_hdr, bg=SURF, width=name_w, height=_HDR_H)
+        nf.pack_propagate(False)
+        nf.pack(side="left")
+        tk.Label(nf, text="FILE", font=("Courier New", 8, "bold"),
+                 bg=SURF, fg=SUB, anchor="w", padx=6).pack(fill="both", expand=True)
+
+        # Sash spacer (matches the 5px sash in every row)
+        tk.Frame(self._col_hdr, bg=SURF3,
+                 width=5, height=_HDR_H).pack(side="left")
+
+        # ASSIGNMENT header
+        dd_w = self._pool_dd_col_w or 200
+        df = tk.Frame(self._col_hdr, bg=SURF, width=dd_w, height=_HDR_H)
+        df.pack_propagate(False)
+        df.pack(side="left", padx=(0, 4))
+        tk.Label(df, text="ASSIGNMENT", font=("Courier New", 8, "bold"),
+                 bg=SURF, fg=SUB, anchor="w", padx=6).pack(fill="both", expand=True)
 
     def _deferred_prune(self):
         self._prune_scheduled = False
