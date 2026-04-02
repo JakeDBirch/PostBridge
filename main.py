@@ -804,6 +804,307 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception:
             pass
 
+    # ── Diagnostic ────────────────────────────────────────────────────────────
+
+    def _diagnostic_path(self):
+        cache = self._pb_cache_dir()
+        if not cache:
+            return None
+        stem = os.path.splitext(os.path.basename(self._script_path))[0]
+        return os.path.join(cache, stem + "_diagnostic.json")
+
+    def _build_diagnostic(self, results=None):
+        """Compute a diagnostic dict from the current (or supplied) results list.
+
+        Returns a dict with per-clip rows and aggregate summary statistics useful
+        for algorithm tuning — what the algo decided vs. what the user actually did.
+        """
+        import datetime
+        results = results or getattr(self, "results", None) or []
+
+        clips = []
+        for r in results:
+            algo_status  = r.get("_original_status") or r.get("status", "")
+            final_status = r.get("status", "")
+            accepted     = bool(r.get("_s4_accepted"))
+            ignored      = bool(r.get("_s4_ignored"))
+
+            if ignored:
+                user_action = "ignored"
+            elif accepted and final_status == "manual":
+                user_action = "adjusted"   # opened editor and changed IN/OUT
+            elif accepted:
+                user_action = "accepted"   # accepted algo result as-is
+            else:
+                user_action = "unreviewed"
+
+            clips.append({
+                "order":        r.get("order", 0),
+                "token":        r.get("token", ""),
+                "is_vo":        bool(r.get("is_vo")),
+                "algo_status":  algo_status,
+                "final_status": final_status,
+                "confidence":   round(float(r.get("confidence") or 0), 4),
+                "user_action":  user_action,
+                "delta_in_s":   round(float(r.get("delta_in")  or 0), 3),
+                "delta_out_s":  round(float(r.get("delta_out") or 0), 3),
+                "n_segments":   len(r.get("segments") or []),
+            })
+
+        # ── Cross-table: algo_status × user_action ────────────────────────────
+        ALGO_STATUSES = ["ok", "direct", "low_confidence", "no_match",
+                         "error", "no_file", "not_run", "cancelled"]
+        ACTIONS = ["accepted", "adjusted", "ignored", "unreviewed"]
+        cross = {}
+        for st in ALGO_STATUSES:
+            cross[st] = {a: 0 for a in ACTIONS}
+        cross["_other"] = {a: 0 for a in ACTIONS}
+        for c in clips:
+            bucket = c["algo_status"] if c["algo_status"] in ALGO_STATUSES else "_other"
+            cross[bucket][c["user_action"]] += 1
+
+        # ── Confidence calibration ────────────────────────────────────────────
+        buckets = [
+            ("90-100%", 0.90, 1.01),
+            ("70-89%",  0.70, 0.90),
+            ("50-69%",  0.50, 0.70),
+            ("<50%",    0.00, 0.50),
+        ]
+        conf_cal = {}
+        for label, lo, hi in buckets:
+            group = [c for c in clips if lo <= c["confidence"] < hi
+                     and c["algo_status"] not in ("no_file", "not_run", "cancelled")]
+            n = len(group)
+            used = sum(1 for c in group if c["user_action"] in ("accepted", "adjusted"))
+            conf_cal[label] = {
+                "n": n,
+                "used": used,
+                "rate": round(used / n, 3) if n else None,
+            }
+
+        # ── Position accuracy (clips where algo found a match) ────────────────
+        matched_clips = [c for c in clips
+                         if c["algo_status"] in ("ok", "direct", "low_confidence")
+                         and c["user_action"] in ("accepted", "adjusted")]
+        if matched_clips:
+            abs_di = [abs(c["delta_in_s"])  for c in matched_clips]
+            abs_do = [abs(c["delta_out_s"]) for c in matched_clips]
+            pos_acc = {
+                "n":                   len(matched_clips),
+                "mean_abs_delta_in_s": round(sum(abs_di) / len(abs_di), 3),
+                "mean_abs_delta_out_s":round(sum(abs_do) / len(abs_do), 3),
+                "clips_over_1s_off":   sum(1 for d in abs_di if d > 1.0),
+                "clips_over_2s_off":   sum(1 for d in abs_di if d > 2.0),
+            }
+        else:
+            pos_acc = {}
+
+        # ── Per-token breakdown ───────────────────────────────────────────────
+        by_tok = {}
+        for c in clips:
+            tok = c["token"] or "(unassigned)"
+            if tok not in by_tok:
+                by_tok[tok] = {"total": 0, "accepted": 0, "adjusted": 0,
+                               "ignored": 0, "unreviewed": 0,
+                               "algo_ok": 0, "algo_low": 0, "algo_miss": 0}
+            e = by_tok[tok]
+            e["total"]      += 1
+            e[c["user_action"]] += 1
+            if c["algo_status"] in ("ok", "direct"):   e["algo_ok"]  += 1
+            elif c["algo_status"] == "low_confidence": e["algo_low"] += 1
+            elif c["algo_status"] in ("no_match", "error"): e["algo_miss"] += 1
+
+        total  = len(clips)
+        n_acc  = sum(1 for c in clips if c["user_action"] == "accepted")
+        n_adj  = sum(1 for c in clips if c["user_action"] == "adjusted")
+        n_ign  = sum(1 for c in clips if c["user_action"] == "ignored")
+        n_unr  = sum(1 for c in clips if c["user_action"] == "unreviewed")
+
+        return {
+            "generated":  datetime.datetime.now().isoformat(timespec="seconds"),
+            "script":     getattr(self, "_script_path", ""),
+            "clips":      clips,
+            "summary": {
+                "total":          total,
+                "by_user_action": {
+                    "accepted":   n_acc,
+                    "adjusted":   n_adj,
+                    "ignored":    n_ign,
+                    "unreviewed": n_unr,
+                },
+                "automation_rate": round((n_acc + n_adj) / total, 3) if total else 0,
+                "cross_table":     cross,
+                "confidence_calibration": conf_cal,
+                "position_accuracy":      pos_acc,
+                "by_token":               by_tok,
+            },
+        }
+
+    def _write_diagnostic(self):
+        """Write diagnostic JSON to .pb_cache/. Called after export."""
+        path = self._diagnostic_path()
+        if not path:
+            return
+        try:
+            diag = self._build_diagnostic()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(diag, f, indent=2)
+        except Exception:
+            pass
+
+    def _show_diagnostic(self):
+        """Pop up a human-readable diagnostic summary for algorithm tuning."""
+        try:
+            diag = self._build_diagnostic()
+        except Exception as ex:
+            messagebox.showerror("Diagnostic error", str(ex))
+            return
+
+        s     = diag["summary"]
+        total = s["total"]
+        ba    = s["by_user_action"]
+        ct    = s["cross_table"]
+        cc    = s["confidence_calibration"]
+        pa    = s.get("position_accuracy", {})
+        bt    = s["by_token"]
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Session Diagnostic")
+        dlg.configure(bg=BG)
+        dlg.resizable(True, True)
+
+        # ── Scrollable body ───────────────────────────────────────────────────
+        outer = tk.Frame(dlg, bg=BG)
+        outer.pack(fill="both", expand=True, padx=16, pady=12)
+
+        def _section(txt):
+            tk.Frame(outer, bg=ACCENT, height=1).pack(fill="x", pady=(14, 4))
+            tk.Label(outer, text=txt, font=FL, bg=BG, fg=ACCENT).pack(anchor="w")
+
+        def _row(label, value, fg=TEXT):
+            f = tk.Frame(outer, bg=BG)
+            f.pack(fill="x", pady=1)
+            tk.Label(f, text=label, font=FB, bg=BG, fg=SUB,
+                     width=34, anchor="w").pack(side="left")
+            tk.Label(f, text=str(value), font=FB, bg=BG, fg=fg).pack(side="left")
+
+        def _table(headers, rows, col_widths):
+            f = tk.Frame(outer, bg=SURF,
+                         highlightbackground=BORDER, highlightthickness=1)
+            f.pack(fill="x", pady=(4, 0))
+            hf = tk.Frame(f, bg=SURF2)
+            hf.pack(fill="x")
+            for h, w in zip(headers, col_widths):
+                tk.Label(hf, text=h, font=FL, bg=SURF2, fg=ACCENT,
+                         width=w, anchor="w", padx=6).pack(side="left")
+            for ri, row_vals in enumerate(rows):
+                rf = tk.Frame(f, bg=SURF if ri % 2 == 0 else SURF2)
+                rf.pack(fill="x")
+                for val, w in zip(row_vals, col_widths):
+                    tk.Label(rf, text=str(val), font=FB, bg=rf["bg"], fg=TEXT,
+                             width=w, anchor="w", padx=6).pack(side="left")
+
+        # ── Overview ──────────────────────────────────────────────────────────
+        _section("OVERVIEW")
+        _row("Total clips:", total)
+        _row("Accepted as-is:",
+             "{} ({:.0%})".format(ba["accepted"], ba["accepted"]/total if total else 0),
+             SUCCESS)
+        _row("Accepted with edits:",
+             "{} ({:.0%})".format(ba["adjusted"], ba["adjusted"]/total if total else 0),
+             WARN)
+        _row("Ignored:",
+             "{} ({:.0%})".format(ba["ignored"],  ba["ignored"] /total if total else 0),
+             ERR)
+        _row("Unreviewed:",
+             "{} ({:.0%})".format(ba["unreviewed"], ba["unreviewed"]/total if total else 0),
+             SUB)
+        automation = s.get("automation_rate", 0)
+        _row("Automation rate (used without edits):",
+             "{:.0%}".format(ba["accepted"]/total if total else 0),
+             SUCCESS if ba["accepted"]/total >= 0.7 else WARN)
+
+        # ── Cross-table ───────────────────────────────────────────────────────
+        _section("ALGO VERDICT  →  USER ACTION")
+        DISPLAY_STATUSES = [
+            ("ok / direct",      ["ok", "direct"]),
+            ("low confidence",   ["low_confidence"]),
+            ("no match",         ["no_match"]),
+            ("error / no file",  ["error", "no_file", "not_run"]),
+        ]
+        ACTIONS = ["accepted", "adjusted", "ignored", "unreviewed"]
+        ct_rows = []
+        for label, statuses in DISPLAY_STATUSES:
+            acc = sum(ct.get(st, {}).get("accepted",   0) for st in statuses)
+            adj = sum(ct.get(st, {}).get("adjusted",   0) for st in statuses)
+            ign = sum(ct.get(st, {}).get("ignored",    0) for st in statuses)
+            unr = sum(ct.get(st, {}).get("unreviewed", 0) for st in statuses)
+            row_tot = acc + adj + ign + unr
+            ct_rows.append((label, row_tot, acc, adj, ign, unr))
+        _table(
+            ["ALGO VERDICT", "TOTAL", "ACCEPTED", "ADJUSTED", "IGNORED", "UNREVIEWED"],
+            ct_rows,
+            [18,  7,  10,  10,  9,  12],
+        )
+
+        # ── Confidence calibration ────────────────────────────────────────────
+        _section("CONFIDENCE CALIBRATION")
+        cc_rows = []
+        for label, data in cc.items():
+            n    = data["n"]
+            used = data["used"]
+            rate = data["rate"]
+            bar  = ("█" * int((rate or 0) * 10)).ljust(10)
+            cc_rows.append((label, n, used,
+                            "{:.0%}  {}".format(rate, bar) if rate is not None else "—"))
+        _table(
+            ["CONFIDENCE", "CLIPS", "USED", "USAGE RATE"],
+            cc_rows,
+            [12, 7, 6, 22],
+        )
+
+        # ── Position accuracy ─────────────────────────────────────────────────
+        if pa:
+            _section("POSITION ACCURACY  (algo vs script timecode, accepted clips)")
+            _row("Mean |Δ IN|:",  "{:.2f}s".format(pa["mean_abs_delta_in_s"]))
+            _row("Mean |Δ OUT|:", "{:.2f}s".format(pa["mean_abs_delta_out_s"]))
+            _row("Clips >1s off on IN:", str(pa["clips_over_1s_off"]))
+            _row("Clips >2s off on IN:", str(pa["clips_over_2s_off"]), ERR if pa["clips_over_2s_off"] > 0 else TEXT)
+
+        # ── Per-token ─────────────────────────────────────────────────────────
+        _section("PER TOKEN")
+        tok_rows = []
+        for tok, e in sorted(bt.items(), key=lambda x: -x[1]["total"]):
+            n   = e["total"]
+            ok  = e["accepted"] + e["adjusted"]
+            pct = "{:.0%}".format(ok/n) if n else "—"
+            tok_rows.append((
+                tok, n,
+                "{}/{}".format(e["algo_ok"], e["total"]),
+                e["accepted"], e["adjusted"], e["ignored"], pct,
+            ))
+        _table(
+            ["TOKEN", "CLIPS", "ALGO OK/TOTAL", "ACCEPTED", "ADJUSTED", "IGNORED", "USED%"],
+            tok_rows,
+            [16, 6, 14, 10, 10, 8, 7],
+        )
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        dp = self._diagnostic_path()
+        if dp:
+            tk.Frame(outer, bg=BORDER, height=1).pack(fill="x", pady=(14, 4))
+            tk.Label(outer, text="JSON: {}".format(dp),
+                     font=("Courier New", 8), bg=BG, fg=SUB,
+                     wraplength=700, justify="left").pack(anchor="w")
+
+        self._btn(outer, "CLOSE", dlg.destroy, small=True).pack(pady=(12, 0))
+
+        # ── Size and centre ───────────────────────────────────────────────────
+        dlg.update_idletasks()
+        w, h = max(680, dlg.winfo_reqwidth()), min(820, dlg.winfo_reqheight() + 20)
+        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+        dlg.geometry("{}x{}+{}+{}".format(w, h, (sw-w)//2, (sh-h)//2))
+
     def _s4_snapshot(self):
         """Return a serialisable snapshot of the current Step 4 card states."""
         snap = {}
@@ -2982,6 +3283,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "← REDO", self._step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
+        self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
+                  small=True).pack(side="left", padx=(4,0))
 
         # Undo / Redo buttons
         _undo_btn = self._btn(nav, "↩ UNDO", self._s4_undo, small=True)
@@ -3433,6 +3736,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                 n_inc  = len(edited)
                 n_skip = len(skipped)
+
+                # Write diagnostic snapshot alongside the export
+                try:
+                    dp = self._diagnostic_path()
+                    if dp:
+                        _diag = self._build_diagnostic()
+                        with open(dp, "w", encoding="utf-8") as _ddf:
+                            json.dump(_diag, _ddf, indent=2)
+                except Exception:
+                    pass
 
                 def _finish():
                     pbar.stop()
