@@ -2771,7 +2771,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _review_var      = tk.StringVar(value=str(review))
         _confirmed_var   = tk.StringVar(value="0")
         _ignored_var     = tk.StringVar(value="0")
-        _runtime_var     = tk.StringVar(value="--:--:--")
         _unconfirmed_count = [0]   # mutable; set accurately after card-restore loop
 
         def _sync_unconfirmed_btn():
@@ -2886,32 +2885,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 font=("Courier New",18,"bold"), bg=SURF, fg=SUB)
         _ign_num_lbl.pack()
         tk.Label(_ign_cell, text="ignored", font=FB, bg=SURF, fg=SUB).pack()
-
-        # ── Stat cell: runtime (live) ──────────────────────────────────────
-        _rt_cell = tk.Frame(srow, bg=SURF)
-        _rt_cell.pack(side="left", padx=20, pady=6)
-        tk.Label(_rt_cell, textvariable=_runtime_var,
-                 font=("Courier New", 18, "bold"), bg=SURF, fg=TEXT).pack()
-        tk.Label(_rt_cell, text="runtime", font=FB, bg=SURF, fg=SUB).pack()
-
-        def _update_runtime():
-            _matched = ("ok", "direct", "manual", "snapped", "low_confidence")
-            total = 0.0
-            for r in self.results:
-                if r.get("status") in _matched:
-                    segs = r.get("segments")
-                    if segs:
-                        for s_in, s_out in segs:
-                            total += max(0.0, s_out - s_in)
-                    else:
-                        total += max(0.0,
-                                     r.get("rec_out_s", 0) - r.get("rec_in_s", 0))
-            h = int(total) // 3600
-            m = (int(total) % 3600) // 60
-            s = total % 60
-            _runtime_var.set("{:02d}:{:02d}:{:05.2f}".format(h, m, s))
-
-        self._s4_update_runtime = _update_runtime
 
         # ── Filter tabs ───────────────────────────────────────────────────────
         _fstate = {"mode": "all", "sort": "script"}
@@ -3294,7 +3267,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     rcl()   # refresh sub-clip count badge
                     _increment_confirmed(old_status)
                     self._s4_save()
-                    getattr(self, "_s4_update_runtime", lambda: None)()
 
                 # Gather neighbouring quote text for script context
                 _ctx_before = _ctx_after = ""
@@ -3395,8 +3367,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Apply default filter and highlight its tab
         _apply_filter(mode="all")
-
-        _update_runtime()
 
         # Flush the current (fully-restored) state to the sidecar so that if
         # the user clicks ← REDO and re-runs reconciliation, the next Step 4
