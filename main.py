@@ -1383,6 +1383,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _save_as(self):
         """Prompt for a file path, write a complete session JSON, and remember the path."""
+        if getattr(self, 'workflow', None) == 'aaf_xml':
+            self._aaf_save_setup()
+            return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
             return
@@ -1410,6 +1413,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _quick_save(self, btn_ref=None):
         """Save to the current session file; prompt for a path on the first save."""
+        if getattr(self, 'workflow', None) == 'aaf_xml':
+            self._aaf_save_setup()
+            return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
             return
