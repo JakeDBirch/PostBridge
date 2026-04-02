@@ -1543,6 +1543,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return paths
 
     @staticmethod
+    def _is_foreign_platform_path(path):
+        """Return True if path looks like it was saved on a different OS platform.
+        Windows paths (C:\\, F:\\, etc.) look foreign on Mac/Linux, and vice-versa."""
+        import re
+        if not path:
+            return False
+        if sys.platform == "win32":
+            # On Windows, a Unix-style absolute path is foreign
+            return path.startswith("/")
+        else:
+            # On Mac/Linux, a Windows drive-letter path is foreign
+            return bool(re.match(r'^[A-Za-z]:[/\\]', path))
+
+    @staticmethod
     def _build_remap_index(folder):
         """Walk folder recursively and return {lowercase_filename: absolute_path}.
         Skips hidden directories (.pb_cache, .git, etc)."""
@@ -1609,10 +1623,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         script_path = data.get("script", "")
 
         # ── Cross-machine path remapping ──────────────────────────────────────
-        # If the script path doesn't exist, the session was probably saved on a
-        # different machine (or the files have moved).  Collect all unique paths,
-        # check how many are missing, and offer to remap by browsing to a folder.
+        # Only offer path remapping when the session was created on a different OS
+        # (i.e. the saved paths look foreign to the current platform).  If the
+        # paths are native-format but the files are simply missing, show a plain
+        # error instead — the user just needs to find the files themselves.
         if not script_path or not os.path.isfile(script_path):
+            if not self._is_foreign_platform_path(script_path or ""):
+                # Same-platform session with missing file — plain error, no remap.
+                messagebox.showerror(
+                    "Script not found",
+                    "The script file referenced by this session could not be found:\n\n"
+                    "{}".format(script_path or "(none)"))
+                return
+
+            # Foreign-platform session — offer to remap paths.
             all_paths  = self._collect_session_paths(data)
             n_missing  = sum(1 for p in all_paths if p and not os.path.isfile(p))
             n_total    = len([p for p in all_paths if p])
@@ -1621,8 +1645,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Media not found",
                 "{} of {} file reference(s) in this session could not be found "
                 "at their saved locations.\n\n"
-                "This usually means the session was created on a different machine "
-                "or the files have moved.\n\n"
+                "This usually means the session was created on a different machine. "
                 "Would you like to locate your media folders so PostBridge can "
                 "remap all paths automatically?".format(n_missing, n_total))
             if not ans:
@@ -1647,9 +1670,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not script_path or not os.path.isfile(script_path):
                 messagebox.showerror(
                     "Script not found",
-                    "Could not find the script file '{}' inside '{}'.\n\n"
-                    "Make sure the script is somewhere inside the selected folder.".format(
-                        os.path.basename(data.get("script", "(none)")), folder))
+                    "Could not find the script file '{}' inside the selected folders.\n\n"
+                    "Make sure the script is somewhere inside the Video or Audio "
+                    "folder you selected.".format(
+                        os.path.basename(data.get("script", "(none)"))))
                 return
 
             # Report how many paths resolved
@@ -1658,7 +1682,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if still_missing:
                 messagebox.showwarning(
                     "Some files not found",
-                    "{} file(s) could not be matched inside the selected folder "
+                    "{} file(s) could not be matched inside the selected folders "
                     "and will be skipped:\n\n{}".format(
                         len(still_missing),
                         "\n".join(os.path.basename(p) for p in still_missing[:8])
@@ -4101,6 +4125,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._aaf_data = parsed
         self._aaf_path = os.path.abspath(path)
+        self.workflow  = "aaf_xml"   # tells save/load routing which flow is active
         # Point the engine cache dir at a .pb_cache folder next to the AAF so
         # detect_rx_offset results persist across builds of the same session.
         engines._cache_dir = os.path.join(os.path.dirname(self._aaf_path), ".pb_cache")
@@ -4895,8 +4920,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if _tr[0] == "write":
                         try: sv.trace_remove("write", _tr[1])
                         except Exception: pass
-                def _on_vid_change(*args, c=container, s=sv):
+                def _on_vid_change(*args, c=container, s=sv, b=base):
                     _apply_color(c, _row_bg(s.get()))
+                    # If this source had a locked/completed sync, invalidate it —
+                    # the assignment changed so the old sync result is stale.
+                    lkv = self._aaf_sync_locked_vars.get(b)
+                    was_locked = lkv and lkv.get()
+                    ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
+                    if was_locked or ssv:
+                        if lkv: lkv.set(False)
+                        ov = self._aaf_source_offset_vars.get(b)
+                        if ov: ov.set("0.000")
+                        sv2 = self._aaf_source_sync_vars.get(b)
+                        if sv2: sv2.set(False)
+                        lv = self._aaf_source_sync_label_vars.get(b)
+                        if lv: lv.set("")
+                        self._aaf_set_sync_state(b, "")
+                        # Refresh sync-tab row so lock icon updates immediately
+                        self.after(0, self._rebuild_aaf_source_rows)
                 sv.trace_add("write", _on_vid_change)
 
                 # Pad bottom of assign-mode row
