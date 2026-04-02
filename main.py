@@ -752,17 +752,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         base = os.path.splitext(self._script_path)[0]
         return base + "_setup.json"
 
-    def _step4_state_path(self):
+    def _pb_cache_dir(self):
+        """Return the .pb_cache directory next to the script, creating it if needed."""
         if not hasattr(self, '_script_path') or not self._script_path:
             return None
-        base = os.path.splitext(self._script_path)[0]
-        return base + "_step4state.json"
+        d = os.path.join(os.path.dirname(self._script_path), ".pb_cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
+
+    def _step4_state_path(self):
+        cache = self._pb_cache_dir()
+        if not cache:
+            return None
+        script_name = os.path.splitext(os.path.basename(self._script_path))[0]
+        return os.path.join(cache, script_name + "_step4state.json")
 
     def _results_sidecar_path(self):
-        if not hasattr(self, '_script_path') or not self._script_path:
+        cache = self._pb_cache_dir()
+        if not cache:
             return None
-        base = os.path.splitext(self._script_path)[0]
-        return base + "_results.json"
+        script_name = os.path.splitext(os.path.basename(self._script_path))[0]
+        return os.path.join(cache, script_name + "_results.json")
 
     def _save_results(self):
         """Persist self.results to a sidecar JSON so open can restore to Step 4."""
@@ -825,6 +838,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _s4_load(self):
         """Return saved Step 4 state dict, or {} if none exists."""
         path = self._step4_state_path()
+        if path and not os.path.isfile(path):
+            # Legacy fallback: sidecar was written beside the script before this change
+            if hasattr(self, '_script_path') and self._script_path:
+                legacy = os.path.splitext(self._script_path)[0] + "_step4state.json"
+                if os.path.isfile(legacy):
+                    path = legacy
         if not path or not os.path.isfile(path):
             return {}
         try:
@@ -1142,11 +1161,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Stash Step 4 state if embedded in the session file
         self._pending_s4_state = data.get("step4_state") or None
 
-        # Results may be embedded directly in the setup JSON (preferred) or in a sidecar
+        # Results may be embedded directly in the setup JSON (preferred) or in a sidecar.
+        # Check .pb_cache/ first (new location), fall back to legacy path beside the script.
         if data.get("results"):
             self._pending_results = data["results"]
         else:
-            results_path = os.path.splitext(script_path)[0] + "_results.json"
+            _cache_dir  = os.path.join(os.path.dirname(script_path), ".pb_cache")
+            _script_stem = os.path.splitext(os.path.basename(script_path))[0]
+            results_path = os.path.join(_cache_dir, _script_stem + "_results.json")
+            if not os.path.isfile(results_path):
+                # Legacy: sidecar written beside the script before this change
+                results_path = os.path.splitext(script_path)[0] + "_results.json"
             if os.path.isfile(results_path):
                 try:
                     with open(results_path, encoding="utf-8") as f:
@@ -2231,16 +2256,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _restore_requested = getattr(self, "_restore_s4", False)
         self._restore_s4   = False   # consume the flag
         if _restore_requested:
-            _pending_s4_was_set = getattr(self, "_pending_s4_state", None) is not None
             _saved_s4 = (getattr(self, "_pending_s4_state", None)
                          or self._s4_load())
-            _restore_source_dbg = "session_json_embedded" if _pending_s4_was_set else "sidecar_fallback"
             self._pending_s4_state = None
         else:
             # Fresh reconciliation run — still load the sidecar so the user's
             # previously saved Step 4 edits are not silently discarded.
             _saved_s4 = self._s4_load()
-            _restore_source_dbg = "sidecar" if _saved_s4 else "none"
         if _saved_s4:
             for r in self.results:
                 entry = _saved_s4.get(str(r["order"]))
@@ -2275,44 +2297,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # Restore VO takes_data (keeps edited per-take segments in sync)
                 if "takes_data" in entry and r.get("is_vo"):
                     r["takes_data"] = entry["takes_data"]
-
-        # ── Diagnostic: write a restore-trace so we can see what was applied ──
-        # Written as <script>_step4restore.json next to the script file.
-        # Shows source (session/sidecar/none), sidecar keys, and a per-clip
-        # diff of what the sidecar had vs what self.results had before the apply.
-        try:
-            _diag_path = self._step4_state_path()
-            if _diag_path:
-                _diag_path = _diag_path.replace("_step4state.json", "_step4restore.json")
-                _diag = {
-                    "restore_source": _restore_source_dbg,
-                    "restore_requested": _restore_requested,
-                    "saved_s4_keys": sorted(_saved_s4.keys()) if _saved_s4 else [],
-                    "results_count": len(self.results),
-                    "clips": []
-                }
-                for _r in self.results:
-                    _ord = str(_r.get("order", "?"))
-                    _entry = _saved_s4.get(_ord) if _saved_s4 else None
-                    _diag["clips"].append({
-                        "order":            _r.get("order"),
-                        "token":            _r.get("token"),
-                        "is_vo":            _r.get("is_vo", False),
-                        "result_segs":      [list(s) for s in (_r.get("segments") or [])],
-                        "result_status":    _r.get("status"),
-                        "sidecar_segs":     [list(s) for s in (_entry.get("segments") or [])] if _entry else None,
-                        "sidecar_status":   _entry.get("status") if _entry else None,
-                        "sidecar_accepted": _entry.get("accepted") if _entry else None,
-                        "sidecar_entry_found": _entry is not None,
-                        "segs_match":       (
-                            [list(s) for s in (_r.get("segments") or [])]
-                            == [list(s) for s in (_entry.get("segments") or [])]
-                        ) if _entry else None,
-                    })
-                with open(_diag_path, "w", encoding="utf-8") as _df:
-                    json.dump(_diag, _df, indent=2)
-        except Exception:
-            pass
 
         # Reset undo/redo stacks for this Step 4 session
         self._s4_undo_stack = []
