@@ -33,7 +33,7 @@ except ImportError:
 # Import our custom modules!
 from config import *
 from config import _SANS
-from utils import basename, secs_tc, tc_secs, is_video, is_audio, is_media, MEDIA_EXTS, parse_dnd
+from utils import basename, secs_tc, tc_secs, is_video, is_audio, is_media, MEDIA_EXTS, VIDEO_EXTS, parse_dnd
 from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
@@ -1544,10 +1544,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     @staticmethod
     def _build_remap_index(folder):
-        """Walk folder recursively and return {lowercase_filename: absolute_path}."""
+        """Walk folder recursively and return {lowercase_filename: absolute_path}.
+        Skips hidden directories (.pb_cache, .git, etc)."""
         index = {}
         for root, dirs, files in os.walk(folder):
-            # Skip hidden dirs (e.g. .pb_cache, .git)
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fn in files:
                 key = fn.lower()
@@ -1556,35 +1556,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return index
 
     @staticmethod
-    def _remap_path(old_path, index):
-        """Return the remapped path for old_path using the filename index, or old_path."""
-        fn = os.path.basename(old_path).lower()
-        return index.get(fn, old_path)
+    def _remap_path(old_path, video_index, audio_index):
+        """Return the remapped path for old_path, routing to the correct index
+        by file type. Falls back to the other index if not found in the primary."""
+        fn  = os.path.basename(old_path).lower()
+        ext = os.path.splitext(fn)[1]
+        if ext in VIDEO_EXTS:
+            return video_index.get(fn) or audio_index.get(fn) or old_path
+        else:
+            return audio_index.get(fn) or video_index.get(fn) or old_path
 
     @classmethod
-    def _remap_session_data(cls, data, index):
-        """Rewrite all path fields in data in-place using the filename index."""
+    def _remap_session_data(cls, data, video_index, audio_index):
+        """Rewrite all path fields in data in-place using separate video/audio indexes."""
         if data.get("script"):
-            data["script"] = cls._remap_path(data["script"], index)
+            data["script"] = cls._remap_path(data["script"], video_index, audio_index)
 
         old_assignments = data.get("assignments", {})
         if old_assignments:
             data["assignments"] = {
-                cls._remap_path(p, index): tok
+                cls._remap_path(p, video_index, audio_index): tok
                 for p, tok in old_assignments.items()
             }
 
         old_ts = data.get("transcript_sources", {})
         if old_ts:
             data["transcript_sources"] = {
-                tok: cls._remap_path(p, index)
+                tok: cls._remap_path(p, video_index, audio_index)
                 for tok, p in old_ts.items()
             }
 
         for r in data.get("results", []):
             for key in ("source_audio", "source_video"):
                 p = r.get(key, "")
-                if p: r[key] = cls._remap_path(p, index)
+                if p: r[key] = cls._remap_path(p, video_index, audio_index)
 
     def _open_session(self):
         """Open a saved *_setup.json and jump straight to Step 2 with everything restored."""
@@ -1618,18 +1623,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "at their saved locations.\n\n"
                 "This usually means the session was created on a different machine "
                 "or the files have moved.\n\n"
-                "Would you like to locate your media folder so PostBridge can "
+                "Would you like to locate your media folders so PostBridge can "
                 "remap all paths automatically?".format(n_missing, n_total))
             if not ans:
                 return
 
-            folder = filedialog.askdirectory(
-                title="Select your media folder (PostBridge will search subfolders)")
-            if not folder:
+            video_folder = filedialog.askdirectory(
+                title="Select your VIDEO folder (PostBridge will search subfolders)")
+            if not video_folder:
                 return
 
-            index = self._build_remap_index(folder)
-            self._remap_session_data(data, index)
+            audio_folder = filedialog.askdirectory(
+                title="Select your AUDIO folder (PostBridge will search subfolders)")
+            if not audio_folder:
+                return
+
+            video_index = self._build_remap_index(video_folder)
+            audio_index = self._build_remap_index(audio_folder)
+            self._remap_session_data(data, video_index, audio_index)
             script_path = data.get("script", "")
 
             # Verify the script resolved — it's the one non-negotiable path.
