@@ -81,8 +81,9 @@ _SR          = 8000     # waveform display sample rate
 _PLAYBACK_SR = 44100    # playback sample rate
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
-_CHUNK_S     = 120.0    # seconds per lazy-load chunk (for scrolling beyond preview)
-_TRIGGER_S   = 15.0     # trigger next chunk when viewport is this close to a loaded edge
+_CHUNK_S          = 120.0   # seconds per lazy-load chunk (for scrolling beyond preview)
+_TRIGGER_S        = 15.0    # trigger next chunk when viewport is this close to a loaded edge
+_AUTO_SNAP_WINDOW = 0.35    # seconds: search radius for automatic boundary snap
 
 # ── Region colours ────────────────────────────────────────────────────────────
 #   "kept"    — audio that will be included in the edit
@@ -201,7 +202,11 @@ class MatchReviewDialog:
         self._playback_end_file = None    # file-time at which playback should auto-stop
 
         # Silence snap
-        self._silence_boundaries = []   # sorted list of silence-edge timestamps (s)
+        self._silence_boundaries = []   # sorted list of all silence-edge timestamps (s)
+        self._sil_starts         = []   # subset: silence onset times (speech ends here)
+        self._sil_ends           = []   # subset: silence offset times (speech starts here)
+        self._auto_snapped       = False  # True once auto-snap has run
+        self._snap_lbl           = None   # Label widget showing snap status
 
         # Undo/redo stacks — each entry is deepcopy of (_segments, _in_s, _out_s)
         self._undo_stack      = []
@@ -365,6 +370,10 @@ class MatchReviewDialog:
         self._dur_var = tk.StringVar()
         tk.Label(tc_row, textvariable=self._dur_var, font=FB,
                  bg=BG, fg=SUB).pack(side="left")
+
+        self._snap_lbl = tk.Label(tc_row, text="", font=FB,
+                                  bg=BG, fg="#5b9bd5")
+        self._snap_lbl.pack(side="left", padx=(10, 0))
 
         # Scripted TC reference — shown on the right side of the same row so
         # the user always has the original script position for comparison.
@@ -589,6 +598,8 @@ class MatchReviewDialog:
                 self._loaded_start_s = preview_start
                 self._loaded_end_s   = preview_start + len(samples) / self._sr
                 self._compute_silence_boundaries()
+                self._auto_snap_boundaries()
+                self._refresh_displays()
                 try:
                     self._loading_lbl.destroy()
                 except Exception:
@@ -1277,16 +1288,24 @@ class MatchReviewDialog:
                     self._pre_play_pos = new_t
 
     def _compute_silence_boundaries(self):
-        """Build a sorted list of silence-region edge timestamps for snap points."""
+        """Build sorted lists of silence-region edge timestamps for snap points.
+
+        _sil_starts: times where a silence begins (= speech just ended → OUT snap target)
+        _sil_ends:   times where a silence ends   (= speech just began → IN snap target)
+        _silence_boundaries: combined list used for tick rendering
+        """
         import numpy as _np
         self._silence_boundaries = []
+        self._sil_starts         = []
+        self._sil_ends           = []
         if self._samples is None or len(self._samples) == 0:
             return
         sr        = self._sr
         win       = max(1, int(sr * 0.02))   # 20 ms windows
         threshold = 0.02                      # RMS threshold (audio is peak-normalised ~0.85)
         n         = len(self._samples)
-        bounds    = []
+        sil_starts = []
+        sil_ends   = []
         in_sil    = False
         sil_start = 0.0
         for i in range(0, n, win):
@@ -1299,15 +1318,75 @@ class MatchReviewDialog:
             elif rms >= threshold and in_sil:
                 sil_end = t
                 if sil_end - sil_start >= 0.1:   # only silences ≥ 100 ms
-                    bounds.append(sil_start)
-                    bounds.append(sil_end)
+                    sil_starts.append(sil_start)
+                    sil_ends.append(sil_end)
                 in_sil = False
         if in_sil:
             sil_end = n / sr
             if sil_end - sil_start >= 0.1:
-                bounds.append(sil_start)
-                bounds.append(sil_end)
-        self._silence_boundaries = sorted(bounds)
+                sil_starts.append(sil_start)
+                sil_ends.append(sil_end)
+        self._sil_starts         = sorted(sil_starts)
+        self._sil_ends           = sorted(sil_ends)
+        self._silence_boundaries = sorted(sil_starts + sil_ends)
+
+    def _auto_snap_boundaries(self):
+        """Snap IN/OUT to the nearest appropriate silence boundary automatically.
+
+        Runs once after Phase 1 audio loads, before the user sees the waveform.
+        Uses directional search so IN snaps to speech onsets and OUT to speech
+        offsets, biased to avoid cutting into the clip rather than away from it.
+
+        Does nothing if already run, or if silence data isn't available.
+        """
+        if self._auto_snapped:
+            return
+        if not self._sil_ends and not self._sil_starts:
+            return
+
+        win  = _AUTO_SNAP_WINDOW
+        orig_in  = self._in_s
+        orig_out = self._out_s
+        new_in   = orig_in
+        new_out  = orig_out
+
+        # IN → nearest silence END (= speech onset) in [in-win, in+win/3]
+        # Biased backward so we find the start of the current word, not
+        # the start of the next one.
+        in_cands = [b for b in self._sil_ends
+                    if orig_in - win <= b <= orig_in + win / 3]
+        if in_cands:
+            new_in = min(in_cands, key=lambda b: abs(b - orig_in))
+
+        # OUT → nearest silence START (= speech offset) in [out-win/3, out+win]
+        # Biased forward so we capture the end of the last word, not cut into it.
+        out_cands = [b for b in self._sil_starts
+                     if orig_out - win / 3 <= b <= orig_out + win]
+        if out_cands:
+            new_out = min(out_cands, key=lambda b: abs(b - orig_out))
+
+        # Safety: don't let snap collapse or invert the region
+        if new_in >= new_out or (new_out - new_in) < 0.1:
+            return
+
+        changed = (new_in != orig_in or new_out != orig_out)
+        if not changed:
+            return
+
+        self._in_s  = new_in
+        self._out_s = new_out
+        if self._segments:
+            s0 = self._segments[0]
+            sl = self._segments[-1]
+            self._segments[0]  = (new_in,  s0[1])
+            self._segments[-1] = (sl[0],   new_out)
+
+        self._auto_snapped = True
+        try:
+            if self._snap_lbl and self._snap_lbl.winfo_exists():
+                self._snap_lbl.config(text="◈ boundary-snapped")
+        except Exception:
+            pass
 
     def _snap_to_silence(self, t):
         """Return t snapped to nearest silence boundary if within ~8 pixels."""
