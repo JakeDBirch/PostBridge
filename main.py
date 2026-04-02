@@ -463,6 +463,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             # macOS uses delta 1/-1 per notch; Windows uses 120/-120
             units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
             canvas.yview_scroll(units, "units")
+            canvas.update_idletasks()
 
         self.bind_all("<MouseWheel>", _on_wheel)
         return sf
@@ -946,6 +947,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "assignments": {r["path"]: r["var"].get()
                             for r in self._pool._rows} if self._pool else {},
             "transcript_sources": src_data,
+            "pad":       self.pad_var.get(),
+            "gap":       self.gap_var.get(),
         }
         # Embed match results so the file is self-contained and restores to Step 4
         if getattr(self, "results", None):
@@ -1180,6 +1183,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     self._pending_results = None
             else:
                 self._pending_results = None
+
+        # Restore pad/gap global values if saved
+        if "pad" in data:
+            self.pad_var.set(data["pad"])
+        if "gap" in data:
+            self.gap_var.set(data["gap"])
 
         self._load_script(script_path)
 
@@ -2494,6 +2503,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 b.config(bg=ACCENT if active else SURF2,
                          fg=BG    if active else TEXT)
 
+            # Freeze scrollregion recalculation during repack
+            _s4cv = getattr(self, "_s4_scroll_canvas", None)
+            if _s4cv:
+                sf.unbind("<Configure>")
+
             # Unpack everything
             for e in self._rv:
                 e["card"].pack_forget()
@@ -2536,6 +2550,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         cur_pi = pi
                 e["card"].pack(fill="x", pady=(0, 4), padx=2)
 
+            # Unfreeze scrollregion — one layout pass covers all repacked cards
+            if _s4cv:
+                sf.bind("<Configure>",
+                        lambda e, c=_s4cv: c.configure(scrollregion=c.bbox("all")))
+                sf.update_idletasks()
+                _s4cv.configure(scrollregion=_s4cv.bbox("all"))
+
         frow = tk.Frame(self.body, bg=BG)
         frow.pack(fill="x", pady=(0, 4))
         _unc_initial = sum(
@@ -2575,6 +2596,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         sf = self._scroll_frame(self.body, height=380)
         self._s4_scroll_canvas = self._last_scroll_canvas
+        # Freeze scrollregion updates during card building — rebind after loop
+        sf.unbind("<Configure>")
         self._rv   = []
         self._skip = []
 
@@ -2927,6 +2950,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _unconfirmed_count[0] = _unc
         if "unconfirmed" in _fbtns:
             _fbtns["unconfirmed"].config(text="UNCONFIRMED  {}".format(_unc))
+
+        # Restore scrollregion binding now that all cards are packed, then do
+        # one layout pass so the canvas knows the full scroll extent.
+        _cv = self._s4_scroll_canvas
+        sf.bind("<Configure>",
+                lambda e, c=_cv: c.configure(scrollregion=c.bbox("all")))
+        sf.update_idletasks()
+        _cv.configure(scrollregion=_cv.bbox("all"))
 
         # Apply default filter and highlight its tab
         _apply_filter(mode="all")
