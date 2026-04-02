@@ -2250,20 +2250,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         _t_rec_start = time.perf_counter()
 
-        def process_pull(pull):
-            if self._cancel.is_set():
-                r = engines._base_result(pull); r["status"] = "cancelled"; return r
-            tsrc = transcript_sources.get(pull["token"])
-            results = [engines.reconcile_interview_pull(pull, tsrc, pad=self.pad_var.get())]
-            # For video-sourced clips (no audio transcript), attach the video path
-            # so the waveform editor can still open for manual IN/OUT adjustment.
-            if not tsrc:
-                vid = next((p for p in int_assets.get(pull["token"], [])
-                            if is_video(p)), None)
-                if vid:
-                    for r in results:
-                        if not r.get("source_audio"):
-                            r["source_video"] = vid
+        def process_token_pulls(token, token_pulls):
+            """Process all pulls for a single token sequentially with a time cursor.
+
+            Pulls are processed in script order.  After each successful match,
+            the cursor advances to rec_out_s so the next pull can only match
+            audio that comes *after* the previous one — enforcing the temporal
+            ordering guarantee the user confirmed (VO files and interview pulls
+            always follow script order in audio time).
+            """
+            results = []
+            cursor  = 0.0
+            tsrc    = transcript_sources.get(token)
+            pad     = self.pad_var.get()
+            for pull in token_pulls:
+                if self._cancel.is_set():
+                    r = engines._base_result(pull)
+                    r["status"] = "cancelled"
+                    results.append(r)
+                    continue
+                r = engines.reconcile_interview_pull(pull, tsrc, pad=pad,
+                                                     min_start_s=cursor)
+                # For video-sourced clips (no audio transcript), attach the video
+                # path so the waveform editor can still open for manual IN/OUT.
+                if not tsrc:
+                    vid = next((p for p in int_assets.get(token, [])
+                                if is_video(p)), None)
+                    if vid and not r.get("source_audio"):
+                        r["source_video"] = vid
+                results.append(r)
+                # Advance the cursor past the matched endpoint so subsequent pulls
+                # from this token don't re-match earlier audio.
+                if r.get("status") in ("ok", "low_confidence", "snapped") \
+                        and r.get("rec_out_s", 0.0) > 0.0:
+                    cursor = max(cursor, r["rec_out_s"])
             return results
 
         def process_vo_part(part_index, blocks):
@@ -2281,9 +2301,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for vb in self.vo_blocks:
             _vo_by_part[vb["part_index"]].append(vb)
 
+        # Group pulls by token and sort each group by script order so the
+        # temporal ordering constraint can be applied with a per-token cursor.
+        _pulls_by_token = _dd(list)
+        for p in pulls:
+            _pulls_by_token[p["token"]].append(p)
+        for _tok in _pulls_by_token:
+            _pulls_by_token[_tok].sort(key=lambda p: p["order"])
+
         all_items = (
-            [("pull",    p)              for p in pulls] +
-            [("vo_part", (pi, blocks))   for pi, blocks in _vo_by_part.items()]
+            [("pull_token", (tok, tpulls)) for tok, tpulls in _pulls_by_token.items()] +
+            [("vo_part",    (pi, blocks))  for pi, blocks in _vo_by_part.items()]
         )
         # Total expected *results* (one per pull + one per individual VO block)
         total = len(pulls) + len(self.vo_blocks)
@@ -2291,8 +2319,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         def dispatch(item):
             t0   = time.perf_counter()
             kind, obj = item
-            if kind == "pull":
-                res = process_pull(obj)
+            if kind == "pull_token":
+                tok, tpulls = obj
+                res = process_token_pulls(tok, tpulls)
             else:
                 pi, blocks = obj
                 res = process_vo_part(pi, blocks)
@@ -2369,12 +2398,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         for f in list(pending):
                             item = futures[f]
                             kind, obj = item
-                            if kind == "pull":
-                                r = engines._base_result(obj)
-                                r["status"]       = "error"
-                                r["matched_text"] = "timeout ({:.0f}s)".format(stall_s)
-                                results.append(r)
-                                done += 1
+                            if kind == "pull_token":
+                                _tok, tpulls = obj
+                                for pull in tpulls:
+                                    r = engines._base_result(pull)
+                                    r["status"]       = "error"
+                                    r["matched_text"] = "timeout ({:.0f}s)".format(stall_s)
+                                    results.append(r)
+                                    done += 1
                             else:
                                 pi, blocks = obj
                                 for b in blocks:
@@ -2402,10 +2433,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         res_list = fut.result()
                     except Exception as e:
                         kind, obj = item
-                        if kind == "pull":
-                            r = engines._base_result(obj)
-                            r["status"] = "error"; r["matched_text"] = str(e)
-                            res_list = [r]
+                        if kind == "pull_token":
+                            _tok, tpulls = obj
+                            res_list = []
+                            for pull in tpulls:
+                                r = engines._base_result(pull)
+                                r["status"] = "error"; r["matched_text"] = str(e)
+                                res_list.append(r)
                         else:
                             pi, blocks = obj
                             res_list = [dict(engines._vo_base_result(b),

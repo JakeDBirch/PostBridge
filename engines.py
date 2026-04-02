@@ -661,7 +661,9 @@ def _base_result(pull):
         "gap_after":      pull.get("gap_after", True),
     }
 
-def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
+_PULL_ORDERING_LOOKBACK = 10.0  # seconds of slack before the cursor for interview pulls
+
+def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.0):
     """
     Reconcile a single @PULL against its source transcript.
 
@@ -688,7 +690,11 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
     # ── Pull-result cache hit ───────────────────────────────────────────────────
     cached = pull_result_cache_load(pull, transcript_file, pad)
     if cached is not None:
-        return cached
+        # Validate cached result against temporal ordering constraint.
+        # If the cached match landed before the cursor, it's a stale result
+        # from a previous run without the constraint — re-run without cache.
+        if min_start_s <= 0.0 or cached.get("rec_in_s", 0.0) >= min_start_s - _PULL_ORDERING_LOOKBACK:
+            return cached
 
     clip_start = max(0.0, orig_in - pad)
     clip_end   = orig_out + pad
@@ -709,6 +715,17 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS):
         words = transcribe_clip(tmp_wav)
         if not words:
             return result
+
+        # ── Temporal ordering constraint ────────────────────────────────────
+        # If min_start_s is set (a cursor from the previous pull of the same
+        # token), exclude any words that fall before it.  We keep a lookback
+        # window so a match that begins slightly before the cursor boundary
+        # (due to padding or a long silence) still resolves correctly.
+        if min_start_s > 0.0:
+            min_clip_s = max(0.0, min_start_s - _PULL_ORDERING_LOOKBACK - clip_start)
+            words = [w for w in words if w.get("start", 0.0) >= min_clip_s]
+            if not words:
+                return result  # entire transcription window is before the cursor
 
         # Offset word timestamps from clip-relative → absolute file time
         # and store on the result so the waveform editor can display them.
