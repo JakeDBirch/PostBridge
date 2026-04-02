@@ -6604,7 +6604,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # Sequence dimensions
                 if (_seq_w <= 0 or _seq_h <= 0) and vpaths:
                     self._aaf_build_progress(55, "Probing media settings\u2026")
+                    print("Probing media settings ({} files)…".format(len(vpaths)))
                     _seq_w, _seq_h, _, _ = engines.probe_media_settings(vpaths)
+                    print("  -> {}x{}".format(_seq_w, _seq_h))
                 if _seq_w <= 0: _seq_w = 1280
                 if _seq_h <= 0: _seq_h = 720
 
@@ -6615,6 +6617,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # assigned video.  Detect where the fragment appears in the video
                 # via cross-correlation so the video <in> points are correct.
                 self._aaf_build_progress(60, "Scanning for audio fragments\u2026")
+                print("Scanning {} clips for AudioSuite fragments…".format(
+                    len(clips_with_media)))
 
                 fragment_jobs = []
                 frag_seen_sf  = set()
@@ -6630,16 +6634,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         frag_seen_sf.add(sf)
                         continue
                     if not os.path.isfile(sf):
+                        print("  skip (missing): {}".format(os.path.basename(sf)))
                         frag_seen_sf.add(sf)
                         continue
                     src_dur = engines._probe_duration(sf)
                     vid_dur = engines._probe_duration(c["video_path"])
                     if src_dur <= 0 or vid_dur <= 0 or src_dur >= vid_dur * 0.5:
+                        print("  skip (dur ratio {:.1f}s / {:.1f}s): {}".format(
+                            src_dur, vid_dur, os.path.basename(sf)))
                         frag_seen_sf.add(sf)
                         continue
+                    print("  fragment: {} ({:.1f}s) vs {} ({:.1f}s)".format(
+                        os.path.basename(sf), src_dur,
+                        os.path.basename(c["video_path"]), vid_dur))
                     frag_seen_sf.add(sf)
                     fragment_jobs.append((sf, c["video_path"], src_dur, vid_dur))
 
+                print("{} fragment job(s) queued.".format(len(fragment_jobs)))
                 frag_offsets = {}
                 n_frags = len(fragment_jobs)
                 for i, (sf, vp, _sd, _vd) in enumerate(fragment_jobs, 1):
@@ -6647,6 +6658,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if len(clip_label) > 45:
                         clip_label = clip_label[:42] + "\u2026"
                     is_cached = engines._rx_offset_cache_load(sf, vp) is not None
+                    print("  [{}/{}]{} {}".format(
+                        i, n_frags, " [cached]" if is_cached else "", clip_label))
                     self._aaf_build_progress(
                         60 + int(9 * i / max(n_frags, 1)),
                         "Fragment sync {}/{}{}: {}".format(
@@ -6654,6 +6667,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             " [cached]" if is_cached else "",
                             clip_label))
                     T = engines.detect_rx_offset(sf, vp)
+                    print("    -> offset {:.3f}s{}".format(
+                        T, " (cached)" if is_cached else ""))
                     if T != 0.0:
                         frag_offsets[os.path.normpath(sf).lower()] = T
 

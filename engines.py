@@ -1495,8 +1495,19 @@ def _extract_mono(src_path, duration, out_sr):
         except: pass
 
 
+_duration_cache = {}   # normpath.lower() → (mtime, duration_s)
+
 def _probe_duration(path):
-    """Return file duration in seconds, or 0 on failure."""
+    """Return file duration in seconds, or 0 on failure.  Result is cached in
+    memory so repeated calls for the same file skip the ffprobe subprocess."""
+    key = os.path.normpath(path).lower()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    cached = _duration_cache.get(key)
+    if cached is not None and abs(cached[0] - mtime) < 1:
+        return cached[1]
     try:
         cmd = _ffprobe_cmd() + [
             '-v', 'quiet', '-show_entries', 'format=duration',
@@ -1504,9 +1515,11 @@ def _probe_duration(path):
         ]
         r = subprocess.run(cmd, capture_output=True, timeout=30,
                            encoding='utf-8', errors='replace')
-        return float(r.stdout.strip())
+        dur = float(r.stdout.strip())
     except Exception:
-        return 0
+        dur = 0
+    _duration_cache[key] = (mtime, dur)
+    return dur
 
 
 # Cache for extracted video audio (keyed by video path) — in-memory, cleared after build
