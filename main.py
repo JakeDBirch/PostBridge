@@ -838,6 +838,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             else:
                 user_action = "unreviewed"
 
+            _mt = (r.get("matched_text") or "").strip()
             clips.append({
                 "order":        r.get("order", 0),
                 "token":        r.get("token", ""),
@@ -848,6 +849,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "user_action":  user_action,
                 "delta_in_s":   round(float(r.get("delta_in")  or 0), 3),
                 "delta_out_s":  round(float(r.get("delta_out") or 0), 3),
+                "rec_in_s":     round(float(r.get("rec_in_s")  or 0), 3),
+                "rec_out_s":    round(float(r.get("rec_out_s") or 0), 3),
+                "matched_text": _mt[:120] if _mt else "",
                 "n_segments":   len(r.get("segments") or []),
             })
 
@@ -899,6 +903,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             pos_acc = {}
 
+        # ── Ordering violations — rec_in_s going backward within a token ────────
+        # When the matched interview position decreases across consecutive script
+        # pulls from the same speaker, it almost always means the algo picked the
+        # wrong instance of a repeated phrase.
+        ordering_violations = []
+        _tok_seq = {}   # token → list of (order, rec_in_s)
+        for c in clips:
+            if c["rec_in_s"] > 0 and c["algo_status"] in (
+                    "ok", "direct", "low_confidence", "manual"):
+                _tok_seq.setdefault(c["token"], []).append(
+                    (c["order"], c["rec_in_s"], c["matched_text"]))
+        for tok, seq in _tok_seq.items():
+            seq.sort(key=lambda x: x[0])   # sort by script order
+            prev_in = -1.0
+            for order, rec_in, mtext in seq:
+                if rec_in < prev_in:
+                    ordering_violations.append({
+                        "token":        tok,
+                        "order":        order,
+                        "rec_in_s":     rec_in,
+                        "prev_rec_in_s": round(prev_in, 3),
+                        "went_back_s":  round(prev_in - rec_in, 3),
+                        "matched_text": mtext[:80],
+                    })
+                prev_in = rec_in
+
         # ── Per-token breakdown ───────────────────────────────────────────────
         by_tok = {}
         for c in clips:
@@ -906,13 +936,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if tok not in by_tok:
                 by_tok[tok] = {"total": 0, "accepted": 0, "adjusted": 0,
                                "ignored": 0, "unreviewed": 0,
-                               "algo_ok": 0, "algo_low": 0, "algo_miss": 0}
+                               "algo_ok": 0, "algo_low": 0, "algo_miss": 0,
+                               "ordering_violations": 0}
             e = by_tok[tok]
             e["total"]      += 1
             e[c["user_action"]] += 1
             if c["algo_status"] in ("ok", "direct"):   e["algo_ok"]  += 1
             elif c["algo_status"] == "low_confidence": e["algo_low"] += 1
             elif c["algo_status"] in ("no_match", "error"): e["algo_miss"] += 1
+        for ov in ordering_violations:
+            if ov["token"] in by_tok:
+                by_tok[ov["token"]]["ordering_violations"] += 1
+
+        # ── Per-token sync offsets (AAF workflow only) ────────────────────────
+        # _aaf_source_offset_vars maps basename → StringVar with detected offset.
+        # Map source files back to tokens via pool assignments where possible.
+        aaf_offsets = {}
+        _offset_vars = getattr(self, "_aaf_source_offset_vars", {})
+        _pool = getattr(self, "_pool", None)
+        if _offset_vars and _pool:
+            try:
+                assignments = _pool.get_assignments()   # {token: [paths]}
+                for tok, paths in assignments.items():
+                    for p in paths:
+                        base = os.path.splitext(os.path.basename(p))[0]
+                        ov = _offset_vars.get(base)
+                        if ov:
+                            try:
+                                aaf_offsets.setdefault(tok, []).append(
+                                    float(ov.get()))
+                            except (ValueError, TypeError):
+                                pass
+            except Exception:
+                pass
 
         total  = len(clips)
         n_acc  = sum(1 for c in clips if c["user_action"] == "accepted")
@@ -932,11 +988,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "ignored":    n_ign,
                     "unreviewed": n_unr,
                 },
-                "automation_rate": round((n_acc + n_adj) / total, 3) if total else 0,
-                "cross_table":     cross,
+                "automation_rate":        round((n_acc + n_adj) / total, 3) if total else 0,
+                "cross_table":            cross,
                 "confidence_calibration": conf_cal,
                 "position_accuracy":      pos_acc,
+                "ordering_violations":    ordering_violations,
                 "by_token":               by_tok,
+                "aaf_sync_offsets":       aaf_offsets,
             },
         }
 
@@ -1071,6 +1129,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _row("Clips >1s off on IN:", str(pa["clips_over_1s_off"]))
             _row("Clips >2s off on IN:", str(pa["clips_over_2s_off"]), ERR if pa["clips_over_2s_off"] > 0 else TEXT)
 
+        # ── Ordering violations ───────────────────────────────────────────────
+        ovs = s.get("ordering_violations", [])
+        if ovs:
+            _section("ORDERING VIOLATIONS  ({} clips matched out of sequence)".format(len(ovs)))
+            tk.Label(outer,
+                     text="These clips matched a position in the interview earlier than the "
+                          "previous pull from the same speaker — likely a wrong instance of "
+                          "a repeated phrase.",
+                     font=FB, bg=BG, fg=SUB,
+                     wraplength=660, justify="left").pack(anchor="w", pady=(0, 4))
+            ov_rows = []
+            for ov in ovs:
+                ov_rows.append((
+                    ov["token"],
+                    "#{:03d}".format(ov["order"]),
+                    "{:.1f}s".format(ov["rec_in_s"]),
+                    "-{:.1f}s".format(ov["went_back_s"]),
+                    (ov.get("matched_text") or "")[:40],
+                ))
+            _table(
+                ["TOKEN", "ORDER", "MATCHED AT", "WENT BACK", "MATCHED TEXT"],
+                ov_rows,
+                [14, 7, 11, 10, 42],
+            )
+
         # ── Per-token ─────────────────────────────────────────────────────────
         _section("PER TOKEN")
         tok_rows = []
@@ -1078,15 +1161,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             n   = e["total"]
             ok  = e["accepted"] + e["adjusted"]
             pct = "{:.0%}".format(ok/n) if n else "—"
+            n_ov = e.get("ordering_violations", 0)
             tok_rows.append((
                 tok, n,
                 "{}/{}".format(e["algo_ok"], e["total"]),
                 e["accepted"], e["adjusted"], e["ignored"], pct,
+                n_ov if n_ov else "—",
             ))
         _table(
-            ["TOKEN", "CLIPS", "ALGO OK/TOTAL", "ACCEPTED", "ADJUSTED", "IGNORED", "USED%"],
+            ["TOKEN", "CLIPS", "ALGO OK/TOTAL", "ACCEPTED", "ADJUSTED", "IGNORED", "USED%", "SEQ?"],
             tok_rows,
-            [16, 6, 14, 10, 10, 8, 7],
+            [16, 6, 14, 10, 10, 8, 7, 5],
         )
 
         # ── Footer ────────────────────────────────────────────────────────────
