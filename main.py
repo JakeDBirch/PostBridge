@@ -725,13 +725,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Restore setup if user came back via "Redo" from step 4
         if getattr(self, "_redo_setup", None):
             redo = self._redo_setup
-            for path, token in redo.get("assignments", []):
-                if os.path.isfile(path):
-                    self._pool._add(path)
-                    self._pool._rows[-1]["var"].set(token)
-            for tok, sp in redo.get("transcript_sources", {}).items():
-                if tok in self._pool._src_vars and sp:
-                    self._pool._src_vars[tok].set(basename(sp))
+            self._pool._bulk_loading = True
+            try:
+                for path, token in redo.get("assignments", []):
+                    if os.path.isfile(path):
+                        self._pool._add(path)
+                        self._pool._rows[-1]["var"].set(token)
+                for tok, sp in redo.get("transcript_sources", {}).items():
+                    if tok in self._pool._src_vars and sp:
+                        self._pool._src_vars[tok].set(basename(sp))
+            finally:
+                self._pool._bulk_loading = False
             self._pool._rebuild_src_dropdowns()
             self._pool._refresh_count()
             del self._redo_setup
@@ -1101,22 +1105,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Apply a setup dict (from _save_setup) to the current pool. Called from _step2."""
         assignments = data.get("assignments", {})
         missing = []
-        for fpath, token in assignments.items():
-            if os.path.exists(fpath):
-                self._pool._add(fpath)
-            else:
-                missing.append(fpath)
-        for r in self._pool._rows:
-            saved_tok = assignments.get(r["path"])
-            if saved_tok:
-                r["var"].set(saved_tok)
-        src_data = data.get("transcript_sources", {})
-        for tok, sp in src_data.items():
-            if tok in self._pool._src_vars and basename(sp) in [
-                basename(p) for p in self._pool.get_interview_assets().get(tok, [])
-                if not is_video(p)
-            ]:
-                self._pool._src_vars[tok].set(basename(sp))
+        self._pool._bulk_loading = True
+        try:
+            for fpath, token in assignments.items():
+                if os.path.exists(fpath):
+                    self._pool._add(fpath)
+                else:
+                    missing.append(fpath)
+            for r in self._pool._rows:
+                saved_tok = assignments.get(r["path"])
+                if saved_tok:
+                    r["var"].set(saved_tok)
+            src_data = data.get("transcript_sources", {})
+            for tok, sp in src_data.items():
+                if tok in self._pool._src_vars and basename(sp) in [
+                    basename(p) for p in self._pool.get_interview_assets().get(tok, [])
+                    if not is_video(p)
+                ]:
+                    self._pool._src_vars[tok].set(basename(sp))
+        finally:
+            self._pool._bulk_loading = False
         self._pool._rebuild_src_dropdowns()
         self._pool._refresh_count()
         if missing:

@@ -197,6 +197,7 @@ class MatchReviewDialog:
         self._remove_hit_areas = []       # [(cx, cy, seg_idx), ...] merge-cut targets
         self._remove_seg_areas = []       # [(cx, cy, seg_idx), ...] delete-segment targets
         self._pre_play_pos    = None      # playhead position saved before playback starts
+        self._words_draw_key  = None      # cache key for _draw_words dedup
         self._playback_end_file = None    # file-time at which playback should auto-stop
 
         # Silence snap
@@ -1042,9 +1043,11 @@ class MatchReviewDialog:
             _ph_col = "#ffaa00" if _snap_active else "#ffffff"
             _ph_w   = 2         if _snap_active else 1
             cv.create_line(ph_px, 0, ph_px, h,
-                           fill=_ph_col, width=_ph_w, dash=(3, 3))
+                           fill=_ph_col, width=_ph_w, dash=(3, 3),
+                           tags=("playhead",))
             cv.create_polygon(ph_px - 5, 0, ph_px + 5, 0, ph_px, 10,
-                               fill=_ph_col, outline="")
+                               fill=_ph_col, outline="",
+                               tags=("playhead",))
 
         # ── Centre line ────────────────────────────────────────────────────
         cv.create_line(0, mid, w, mid, fill=BORDER, dash=(2, 4))
@@ -1097,9 +1100,15 @@ class MatchReviewDialog:
     def _draw_words(self):
         """Draw transcribed words on the word-timeline canvas at their time positions."""
         cv = self._word_cv
-        cv.delete("all")
         if not self._words:
+            cv.delete("all")
             return
+        _key = (tuple(tuple(s) for s in self._segments),
+                self._in_s, self._out_s, self._view_start, self._spp, self._canvas_w)
+        if _key == self._words_draw_key:
+            return
+        self._words_draw_key = _key
+        cv.delete("all")
         try:
             w = cv.winfo_width()
         except Exception:
@@ -1176,6 +1185,28 @@ class MatchReviewDialog:
                     cv.create_text(int(px), 18, text=text, fill=colour,
                                    font=_FONT, anchor="w")
                     prev_right = px + tw
+
+    def _draw_playhead_only(self):
+        """Redraw only the playhead — called every 40 ms during playback.
+        Avoids the full delete("all") + redraw cycle for a static waveform."""
+        cv = self._cv
+        cv.delete("playhead")
+        ph_px = self._t_to_px(self._playhead_s)
+        w = self._canvas_w
+        h = self._canvas_h
+        if -2 <= ph_px <= w + 2:
+            _snap_active = (self._drag and self._drag != "playhead" and
+                            abs(self._playhead_s -
+                                self._px_to_t(getattr(self, "_last_drag_x", -999)))
+                            <= 12 * self._spp / self._sr)
+            _ph_col = "#ffaa00" if _snap_active else "#ffffff"
+            _ph_w   = 2         if _snap_active else 1
+            cv.create_line(ph_px, 0, ph_px, h,
+                           fill=_ph_col, width=_ph_w, dash=(3, 3),
+                           tags=("playhead",))
+            cv.create_polygon(ph_px - 5, 0, ph_px + 5, 0, ph_px, 10,
+                               fill=_ph_col, outline="",
+                               tags=("playhead",))
 
     # ── Interaction ───────────────────────────────────────────────────────
 
@@ -1815,7 +1846,7 @@ class MatchReviewDialog:
                 self._playhead_s >= self._playback_end_file):
             self._stop()
             return
-        self._draw()
+        self._draw_playhead_only()
         try:
             self._playhead_anim = self._win.after(40, self._animate_playhead)
         except Exception:

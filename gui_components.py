@@ -259,7 +259,13 @@ class _FlatDropdown(tk.Frame):
                  padx=8, pady=4, relief="flat",
                  highlightthickness=1, highlightbackground=BORDER).pack()
         tw.update_idletasks()
-        tw.geometry("+{}+{}".format(rx + 12, ry + 16))
+        tw_w = tw.winfo_reqwidth()
+        tw_h = tw.winfo_reqheight()
+        sw   = tw.winfo_screenwidth()
+        sh   = tw.winfo_screenheight()
+        x    = min(rx + 12, sw - tw_w - 4)
+        y    = min(ry + 16, sh - tw_h - 4)
+        tw.geometry("+{}+{}".format(x, y))
 
     def _tint(self, on):
         if self._popup:
@@ -538,6 +544,9 @@ class MediaPool(tk.Frame):
         self._src_vars = {tok: tk.StringVar(value="") for tok in tokens}
         self._aaf_mode          = aaf_mode
         self._prune_scheduled   = False
+        self._sort_scheduled    = False   # deferred _sort_rows flag
+        self._src_dd_scheduled  = False   # deferred _rebuild_src_dropdowns flag
+        self._bulk_loading      = False   # suppresses trace-driven rebuild during restore
         self._user_unassigned   = set()   # paths the user explicitly cleared
 
         hdr = tk.Frame(self, bg=SURF); hdr.pack(fill="x", padx=12, pady=(10,4))
@@ -561,6 +570,7 @@ class MediaPool(tk.Frame):
         self._pool_dd_col_w     = 0
         self._pool_col_user_set = False   # True once the user has dragged the sash
         self._pool_sash_drag    = {}      # transient drag state
+        self._col_hdr_widths    = (0, 0)  # (name_w, dd_w) last drawn in header
 
         # Column header row (rebuilt by _rebuild_col_hdr whenever widths change)
         self._col_hdr = tk.Frame(self, bg=SURF)
@@ -633,10 +643,16 @@ class MediaPool(tk.Frame):
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
             ".wma", ".caf",
         }
-        for root, _, files in os.walk(folder):
-            for fn in sorted(files):
-                if os.path.splitext(fn)[1].lower() in EXTS:
-                    self._add(os.path.join(root, fn))
+        self._dz_lbl.config(text="Scanning folder…")
+        def _walk():
+            paths = []
+            for root, _, files in os.walk(folder):
+                for fn in sorted(files):
+                    if os.path.splitext(fn)[1].lower() in EXTS:
+                        paths.append(os.path.join(root, fn))
+            self.after(0, lambda ps=paths: [self._add(p) for p in ps])
+        import threading as _threading
+        _threading.Thread(target=_walk, daemon=True).start()
 
     def _add(self, path):
         if not path: return
@@ -685,7 +701,8 @@ class MediaPool(tk.Frame):
                     self._user_unassigned.discard(_p)
             _apply_token_style(_v.get())
             self._mirror_assignment(_p, _v.get())
-            self._rebuild_src_dropdowns()
+            if not self._bulk_loading:
+                self._rebuild_src_dropdowns()
         var.trace_add("write", _on_token_change)
 
         initial_bg = _token_row_bg(tok)
@@ -783,8 +800,12 @@ class MediaPool(tk.Frame):
 
         self._dz_lbl.config(text="")
         self._refresh_count()
-        self._sort_rows()
-        self._rebuild_src_dropdowns()
+        if not self._sort_scheduled:
+            self._sort_scheduled = True
+            self.after(50, self._deferred_sort)
+        if not self._src_dd_scheduled:
+            self._src_dd_scheduled = True
+            self.after(60, self._deferred_src_dd)
 
         # In AAF mode, schedule a deferred video-prune once after bulk imports
         if self._aaf_mode and not self._prune_scheduled:
@@ -830,7 +851,10 @@ class MediaPool(tk.Frame):
                     try: df.config(width=self._pool_dd_col_w)
                     except Exception: pass
 
-            self._rebuild_col_hdr()
+            _new_widths = (self._pool_name_col_w, self._pool_dd_col_w)
+            if _new_widths != self._col_hdr_widths:
+                self._col_hdr_widths = _new_widths
+                self._rebuild_col_hdr()
 
         for r in self._rows:
             r["row"].pack_forget()
@@ -886,6 +910,14 @@ class MediaPool(tk.Frame):
         df.pack(side="left", padx=(0, 4))
         tk.Label(df, text="ASSIGNMENT", font=("Courier New", 8, "bold"),
                  bg=SURF, fg=SUB, anchor="w", padx=6).pack(fill="both", expand=True)
+
+    def _deferred_sort(self):
+        self._sort_scheduled = False
+        self._sort_rows()
+
+    def _deferred_src_dd(self):
+        self._src_dd_scheduled = False
+        self._rebuild_src_dropdowns()
 
     def _deferred_prune(self):
         self._prune_scheduled = False
