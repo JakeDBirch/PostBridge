@@ -31,6 +31,11 @@ CHUNK_SILENCE_S      = 1.5    # silence duration (seconds) that triggers a chunk
                               # catches paragraph/take breaks without splitting mid-sentence
 CHUNK_MAX_S          = 90     # max chunk length (seconds); longer chunks are force-split
 
+# ── Developer flags ────────────────────────────────────────────────────────────
+# Set DEV_DIAGNOSTIC = False before shipping a public build to strip the
+# algorithm diagnostic panel, DIAGNOSTIC button, and sidecar JSON writes.
+DEV_DIAGNOSTIC       = True
+
 # ── Palette ────────────────────────────────────────────────────────────────────
 # MeatEater dark theme — charcoal/near-black backgrounds, orange accent
 BG      = "#191919"   # near-black app background

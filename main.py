@@ -2220,15 +2220,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             take_i + 1, len(audio_words)), INFO)
 
                 v_offset = 0.0
-                if vp:
+                # AV offset detection aligns audio takes to their camera video
+                # so FCP can place the video track on the correct frame.
+                # AAF export sends audio-only clips to Pro Tools — no frame
+                # alignment needed — so skip the cross-correlation entirely.
+                if vp and not self._is_aaf_mode():
                     v_offset = engines.detect_av_offset(ap, vp)
                     self._log_line(
                         "  Take {}: {} words  video offset {:+.2f}s".format(
                             take_i + 1, len(audio_words), v_offset), SUCCESS)
                 else:
                     self._log_line(
-                        "  Take {}: {} words  (no video)".format(
-                            take_i + 1, len(audio_words)), SUCCESS)
+                        "  Take {}: {} words{}".format(
+                            take_i + 1, len(audio_words),
+                            "  (no video)" if not vp else "  (AAF — offset skipped)"),
+                        SUCCESS)
 
                 part_takes.append((audio_words, v_offset, vp, ap, blobs))
 
@@ -3402,8 +3408,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "← REDO", self._step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
-        self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
-                  small=True).pack(side="left", padx=(4,0))
+        if DEV_DIAGNOSTIC:
+            self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
+                      small=True).pack(side="left", padx=(4,0))
 
         # Undo / Redo buttons
         _undo_btn = self._btn(nav, "↩ UNDO", self._s4_undo, small=True)
@@ -3784,39 +3791,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try:
                 _t_build_start = time.perf_counter()
 
-                # ── Write a pre-build diagnostic snapshot ────────────────────
+                # ── Write a pre-build diagnostic snapshot (dev only) ─────────
                 # Shows exactly what segments will be sent to build_aaf/build_xml.
                 # Saved next to the output file as <name>_build_debug.json.
-                _debug_path = os.path.splitext(out_path)[0] + "_build_debug.json"
-                try:
-                    _debug_clips = []
-                    for _r in edited:
-                        _td_dbg = None
-                        if _r.get("is_vo"):
-                            _td_raw = _r.get("takes_data") or []
-                            _bi     = _r.get("best_take_index", 0)
-                            _td_dbg = {
-                                "n_takes":   len(_td_raw),
-                                "best_i":    _bi,
-                                "best_apath": (_td_raw[_bi].get("apath") if _bi < len(_td_raw) else None),
-                                "best_segs":  ([list(s) for s in (_td_raw[_bi].get("segments") or [])]
-                                               if _bi < len(_td_raw) else None),
-                            }
-                        _debug_clips.append({
-                            "order":    _r.get("order"),
-                            "token":    _r.get("token"),
-                            "status":   _r.get("status"),
-                            "is_vo":    _r.get("is_vo", False),
-                            "rec_in_s": _r.get("rec_in_s"),
-                            "rec_out_s":_r.get("rec_out_s"),
-                            "segments": [list(s) for s in (_r.get("segments") or [])],
-                            "n_segs":   len(_r.get("segments") or []),
-                            "takes_data_dbg": _td_dbg,
-                        })
-                    with open(_debug_path, "w", encoding="utf-8") as _df:
-                        json.dump(_debug_clips, _df, indent=2)
-                except Exception:
-                    pass
+                if DEV_DIAGNOSTIC:
+                    _debug_path = os.path.splitext(out_path)[0] + "_build_debug.json"
+                    try:
+                        _debug_clips = []
+                        for _r in edited:
+                            _td_dbg = None
+                            if _r.get("is_vo"):
+                                _td_raw = _r.get("takes_data") or []
+                                _bi     = _r.get("best_take_index", 0)
+                                _td_dbg = {
+                                    "n_takes":   len(_td_raw),
+                                    "best_i":    _bi,
+                                    "best_apath": (_td_raw[_bi].get("apath") if _bi < len(_td_raw) else None),
+                                    "best_segs":  ([list(s) for s in (_td_raw[_bi].get("segments") or [])]
+                                                   if _bi < len(_td_raw) else None),
+                                }
+                            _debug_clips.append({
+                                "order":    _r.get("order"),
+                                "token":    _r.get("token"),
+                                "status":   _r.get("status"),
+                                "is_vo":    _r.get("is_vo", False),
+                                "rec_in_s": _r.get("rec_in_s"),
+                                "rec_out_s":_r.get("rec_out_s"),
+                                "segments": [list(s) for s in (_r.get("segments") or [])],
+                                "n_segs":   len(_r.get("segments") or []),
+                                "takes_data_dbg": _td_dbg,
+                            })
+                        with open(_debug_path, "w", encoding="utf-8") as _df:
+                            json.dump(_debug_clips, _df, indent=2)
+                    except Exception:
+                        pass
 
                 _set_status("Probing media settings… ({} clips, {} with edits)".format(
                     len(edited),
@@ -3856,15 +3864,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 n_inc  = len(edited)
                 n_skip = len(skipped)
 
-                # Write diagnostic snapshot alongside the export
-                try:
-                    dp = self._diagnostic_path()
-                    if dp:
-                        _diag = self._build_diagnostic()
-                        with open(dp, "w", encoding="utf-8") as _ddf:
-                            json.dump(_diag, _ddf, indent=2)
-                except Exception:
-                    pass
+                # Write diagnostic snapshot alongside the export (dev only)
+                if DEV_DIAGNOSTIC:
+                    try:
+                        dp = self._diagnostic_path()
+                        if dp:
+                            _diag = self._build_diagnostic()
+                            with open(dp, "w", encoding="utf-8") as _ddf:
+                                json.dump(_diag, _ddf, indent=2)
+                    except Exception:
+                        pass
 
                 def _finish():
                     pbar.stop()
@@ -6681,14 +6690,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         if key in frag_offsets:
                             c["video_offset_secs"] = frag_offsets[key]
 
-            self._aaf_build_progress(70, "Writing diagnostic report\u2026")
-            try:
-                diag_path = os.path.splitext(out)[0] + "_diagnostic.txt"
-                engines.write_build_diagnostic(
-                    clips_with_media, fps, seq_w, seq_h, sr, out_path=diag_path)
-                print("Diagnostic report: {}".format(diag_path))
-            except Exception as diag_exc:
-                print("Diagnostic report failed: {}".format(diag_exc))
+            if DEV_DIAGNOSTIC:
+                self._aaf_build_progress(70, "Writing diagnostic report\u2026")
+                try:
+                    diag_path = os.path.splitext(out)[0] + "_diagnostic.txt"
+                    engines.write_build_diagnostic(
+                        clips_with_media, fps, seq_w, seq_h, sr, out_path=diag_path)
+                    print("Diagnostic report: {}".format(diag_path))
+                except Exception as diag_exc:
+                    print("Diagnostic report failed: {}".format(diag_exc))
 
             self._aaf_build_progress(80, "Building XML\u2026")
             mix_path = getattr(self, "_aaf_mix_var", None)
