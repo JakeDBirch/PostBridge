@@ -1524,6 +1524,68 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "{} file(s) from the saved session were not found:\n{}".format(
                     len(missing), "\n".join(basename(p) for p in missing[:5])))
 
+    # ── Cross-machine session path remapping ──────────────────────────────────
+
+    @staticmethod
+    def _collect_session_paths(data):
+        """Return every file path stored in a session dict, as a flat set."""
+        paths = set()
+        sp = data.get("script", "")
+        if sp: paths.add(sp)
+        for p in data.get("assignments", {}).keys():
+            paths.add(p)
+        for p in data.get("transcript_sources", {}).values():
+            paths.add(p)
+        for r in data.get("results", []):
+            for key in ("source_audio", "source_video"):
+                p = r.get(key, "")
+                if p: paths.add(p)
+        return paths
+
+    @staticmethod
+    def _build_remap_index(folder):
+        """Walk folder recursively and return {lowercase_filename: absolute_path}."""
+        index = {}
+        for root, dirs, files in os.walk(folder):
+            # Skip hidden dirs (e.g. .pb_cache, .git)
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                key = fn.lower()
+                if key not in index:   # first match wins (shallowest path)
+                    index[key] = os.path.join(root, fn)
+        return index
+
+    @staticmethod
+    def _remap_path(old_path, index):
+        """Return the remapped path for old_path using the filename index, or old_path."""
+        fn = os.path.basename(old_path).lower()
+        return index.get(fn, old_path)
+
+    @classmethod
+    def _remap_session_data(cls, data, index):
+        """Rewrite all path fields in data in-place using the filename index."""
+        if data.get("script"):
+            data["script"] = cls._remap_path(data["script"], index)
+
+        old_assignments = data.get("assignments", {})
+        if old_assignments:
+            data["assignments"] = {
+                cls._remap_path(p, index): tok
+                for p, tok in old_assignments.items()
+            }
+
+        old_ts = data.get("transcript_sources", {})
+        if old_ts:
+            data["transcript_sources"] = {
+                tok: cls._remap_path(p, index)
+                for tok, p in old_ts.items()
+            }
+
+        for r in data.get("results", []):
+            for key in ("source_audio", "source_video"):
+                p = r.get(key, "")
+                if p: r[key] = cls._remap_path(p, index)
+
     def _open_session(self):
         """Open a saved *_setup.json and jump straight to Step 2 with everything restored."""
         path = filedialog.askopenfilename(
@@ -1540,11 +1602,56 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
 
         script_path = data.get("script", "")
+
+        # ── Cross-machine path remapping ──────────────────────────────────────
+        # If the script path doesn't exist, the session was probably saved on a
+        # different machine (or the files have moved).  Collect all unique paths,
+        # check how many are missing, and offer to remap by browsing to a folder.
         if not script_path or not os.path.isfile(script_path):
-            messagebox.showerror("Script not found",
-                "The script file referenced by this session could not be found:\n\n"
-                "{}".format(script_path or "(none)"))
-            return
+            all_paths  = self._collect_session_paths(data)
+            n_missing  = sum(1 for p in all_paths if p and not os.path.isfile(p))
+            n_total    = len([p for p in all_paths if p])
+
+            ans = messagebox.askyesno(
+                "Media not found",
+                "{} of {} file reference(s) in this session could not be found "
+                "at their saved locations.\n\n"
+                "This usually means the session was created on a different machine "
+                "or the files have moved.\n\n"
+                "Would you like to locate your media folder so PostBridge can "
+                "remap all paths automatically?".format(n_missing, n_total))
+            if not ans:
+                return
+
+            folder = filedialog.askdirectory(
+                title="Select your media folder (PostBridge will search subfolders)")
+            if not folder:
+                return
+
+            index = self._build_remap_index(folder)
+            self._remap_session_data(data, index)
+            script_path = data.get("script", "")
+
+            # Verify the script resolved — it's the one non-negotiable path.
+            if not script_path or not os.path.isfile(script_path):
+                messagebox.showerror(
+                    "Script not found",
+                    "Could not find the script file '{}' inside '{}'.\n\n"
+                    "Make sure the script is somewhere inside the selected folder.".format(
+                        os.path.basename(data.get("script", "(none)")), folder))
+                return
+
+            # Report how many paths resolved
+            all_paths_after = self._collect_session_paths(data)
+            still_missing   = [p for p in all_paths_after if p and not os.path.isfile(p)]
+            if still_missing:
+                messagebox.showwarning(
+                    "Some files not found",
+                    "{} file(s) could not be matched inside the selected folder "
+                    "and will be skipped:\n\n{}".format(
+                        len(still_missing),
+                        "\n".join(os.path.basename(p) for p in still_missing[:8])
+                        + ("\n…" if len(still_missing) > 8 else "")))
 
         # Migrate legacy workflow keys to the unified script_session workflow.
         # Preserve the old format preference so it pre-selects at Step 5.
@@ -1573,7 +1680,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _script_stem = os.path.splitext(os.path.basename(script_path))[0]
             results_path = os.path.join(_cache_dir, _script_stem + "_results.json")
             if not os.path.isfile(results_path):
-                # Legacy: sidecar written beside the script before this change
                 results_path = os.path.splitext(script_path)[0] + "_results.json"
             if os.path.isfile(results_path):
                 try:
