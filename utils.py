@@ -33,7 +33,7 @@ VIDEO_EXTS = {
     ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v",
     ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".wmv",
     ".flv", ".webm", ".ogv", ".3gp", ".dv", ".r3d",
-    ".braw", ".ari", ".mxf",
+    ".braw", ".ari",
 }
 
 AUDIO_EXTS = {

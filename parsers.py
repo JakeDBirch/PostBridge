@@ -444,7 +444,8 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             r = _sp.run(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
-            raw = open(tmp, "rb").read()
+            with open(tmp, "rb") as _fh:
+                raw = _fh.read()
             if not raw:
                 return None
             data = _np.frombuffer(raw, dtype=_np.float32).copy()
@@ -897,7 +898,6 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
     Returns (offset, 0.0) on any failure so callers can always unpack safely.
     """
     import subprocess as _sp2
-    import tempfile as _tmp2
 
     try:
         import numpy as _np2
@@ -917,7 +917,8 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
             r = _sp2.run(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
-            raw = open(tmp, "rb").read()
+            with open(tmp, "rb") as _fh:
+                raw = _fh.read()
             if not raw:
                 return None
             data = _np2.frombuffer(raw, dtype=_np2.float32).copy()

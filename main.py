@@ -1586,9 +1586,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "CANCEL", self._cancel_reconcile).pack(side="left")
 
+        # Collect transcript source paths here on the main thread — StringVar.get()
+        # is not thread-safe and must not be called from the reconcile thread.
+        transcript_sources = {
+            tok: self._pool.get_transcript_source(tok)
+            for tok in self.tokens
+        }
+
         threading.Thread(
             target=self._run_reconcile,
-            args=(int_assets,),
+            args=(int_assets, transcript_sources),
             daemon=True).start()
 
     @staticmethod
@@ -1626,7 +1633,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._tx_bar.set(n, total)
         self.after(0, _do)
 
-    def _run_reconcile(self, int_assets):
+    def _run_reconcile(self, int_assets, transcript_sources):
         pulls       = self.pulls
         total       = len(pulls)
         done        = 0
@@ -1658,11 +1665,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self.after(0, lambda: messagebox.showerror(
                     "Model Error", str(e)))
                 return
-
-        transcript_sources = {
-            tok: self._pool.get_transcript_source(tok)
-            for tok in self.tokens
-        }
 
         vo_takes_by_part = {}
 
@@ -3239,7 +3241,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── Snapshot all state on the main thread before handing off ─────────
         # Build a lookup keyed by object id so we can match Step 4 row data
-        # (seg_vars edits, skip_var) back to their result dicts.
+        # (skip_var, accepted_flag) back to their result dicts.
         rv_by_id = {id(r["res"]): r for r in getattr(self, "_rv", [])}
 
         edited = []
@@ -3262,30 +3264,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 continue
 
             if segs:
-                # Apply any timecode edits made to segment rows in Step 4.
-                if rv_e and rv_e.get("seg_vars"):
-                    try:
-                        edited_segs = [
-                            (tc_secs(iv.get()), tc_secs(ov.get()))
-                            for iv, ov in rv_e["seg_vars"]
-                        ]
-                        clean_segs = [(s, e) for s, e in edited_segs if e > s]
-                    except Exception:
-                        clean_segs = [(s, e) for s, e in segs if e > s]
-                else:
-                    clean_segs = [(s, e) for s, e in segs if e > s]
+                clean_segs = [(s, e) for s, e in segs if e > s]
             else:
-                # No Whisper match — check for manually entered timecodes.
                 clean_segs = []
-                if rv_e and rv_e.get("seg_vars"):
-                    try:
-                        iv, ov = rv_e["seg_vars"][0]
-                        in_s   = tc_secs(iv.get())
-                        out_s  = tc_secs(ov.get())
-                        if out_s > in_s:
-                            clean_segs = [(in_s, out_s)]
-                    except Exception:
-                        pass
 
             if not clean_segs:
                 continue

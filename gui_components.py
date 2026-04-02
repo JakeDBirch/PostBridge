@@ -52,19 +52,6 @@ def _token_row_bg(token):
         return SURF2
     return _blend_hex(SURF2, tc, 0.20)
 
-def _scroll_guard(event):
-    """Forward scroll events to the toplevel so the canvas still scrolls,
-    but return 'break' so the combobox value never changes on scroll."""
-    tl = event.widget.winfo_toplevel()
-    delta = getattr(event, "delta", 0)
-    if delta:
-        tl.event_generate("<MouseWheel>", delta=delta)
-    elif event.num == 4:
-        tl.event_generate("<Button-4>")
-    elif event.num == 5:
-        tl.event_generate("<Button-5>")
-    return "break"
-
 def _pool_norm(path):
     """Return (plain_norm, stripped_norm) for a file path.
     Both are lower-case with separators collapsed to single spaces.

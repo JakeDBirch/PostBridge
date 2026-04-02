@@ -1763,7 +1763,12 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         out_s = res.get("rec_out_s", 0.0)
         st    = res.get("status", "")
 
-        if st in ("extract_failed", "no_transcript", "cancelled", "no_file"):
+        if st in ("extract_failed", "no_transcript", "cancelled", "no_file",
+                  "no_match", "error"):
+            # no_match / error clips have unverified raw-script timecodes —
+            # skip them so they don't land at wrong positions.  If the user
+            # manually accepts such a clip in Step 4, _accept() promotes its
+            # status to "manual" so it will no longer be caught here.
             skipped.append(res); continue
         if not is_vo and in_s >= out_s:
             skipped.append(res); continue
@@ -2138,7 +2143,7 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
         lines.append("        src_in:       {:.6f}s  (audio frame {})".format(src_in_s, a_src_in))
         lines.append("        v_offset:     {:.6f}s".format(v_offset))
         lines.append("        v_src_in:     {:.6f}s  (video frame {})".format(
-            src_in_s - v_offset, v_src_in))
+            src_in_s + v_offset, v_src_in))
         lines.append("        a_src_in fr:  {}   v_src_in fr: {}   delta fr: {}".format(
             a_src_in, v_src_in, v_src_in - a_src_in))
         lines.append("        video file:   {}".format(os.path.basename(vp) if vp else "NONE"))
@@ -2535,7 +2540,11 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         st       = res.get("status", "")
         segments = res.get("segments") or []
 
-        if st in ("extract_failed", "no_transcript", "cancelled", "no_file"):
+        if st in ("extract_failed", "no_transcript", "cancelled", "no_file",
+                  "no_match", "error"):
+            # no_match / error clips carry unverified raw-script timecodes.
+            # Skip them unless the user explicitly accepted them in Step 4,
+            # in which case _accept() will have promoted status to "manual".
             skipped.append(res); continue
         if not is_vo and not segments:
             skipped.append(res); continue
