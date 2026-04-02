@@ -3984,6 +3984,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._aaf_data = parsed
         self._aaf_path = os.path.abspath(path)
+        # Point the engine cache dir at a .pb_cache folder next to the AAF so
+        # detect_rx_offset results persist across builds of the same session.
+        engines._cache_dir = os.path.join(os.path.dirname(self._aaf_path), ".pb_cache")
         total_clips  = sum(len(t["clips"]) for t in parsed["tracks"])
 
         # Collect unique source base names
@@ -6643,9 +6646,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     clip_label = os.path.basename(sf)
                     if len(clip_label) > 45:
                         clip_label = clip_label[:42] + "\u2026"
+                    is_cached = engines._rx_offset_cache_load(sf, vp) is not None
                     self._aaf_build_progress(
                         60 + int(9 * i / max(n_frags, 1)),
-                        "Fragment sync {}/{}: {}".format(i, n_frags, clip_label))
+                        "Fragment sync {}/{}{}: {}".format(
+                            i, n_frags,
+                            " [cached]" if is_cached else "",
+                            clip_label))
                     T = engines.detect_rx_offset(sf, vp)
                     if T != 0.0:
                         frag_offsets[os.path.normpath(sf).lower()] = T

@@ -1509,8 +1509,53 @@ def _probe_duration(path):
         return 0
 
 
-# Cache for extracted video audio (keyed by video path)
+# Cache for extracted video audio (keyed by video path) — in-memory, cleared after build
 _video_audio_cache = {}   # path → (vid_data_np, vid_dur)
+
+
+# ── Persistent disk cache for detect_rx_offset results ─────────────────────────
+def _rx_offset_cache_path(rx_audio_path, video_path):
+    """Return the disk-cache path for a detect_rx_offset result, or None."""
+    if not _cache_dir:
+        return None
+    try:
+        rx_mtime  = round(os.path.getmtime(rx_audio_path), 2)
+        vid_mtime = round(os.path.getmtime(video_path),    2)
+    except OSError:
+        return None
+    key_obj = {
+        "rx":      os.path.abspath(rx_audio_path),
+        "rx_mt":   rx_mtime,
+        "vid":     os.path.abspath(video_path),
+        "vid_mt":  vid_mtime,
+        "version": CACHE_VERSION,
+    }
+    digest = hashlib.md5(
+        json.dumps(key_obj, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return os.path.join(_cache_dir, "rxoff_{}.json".format(digest))
+
+def _rx_offset_cache_load(rx_audio_path, video_path):
+    cp = _rx_offset_cache_path(rx_audio_path, video_path)
+    if not cp or not os.path.exists(cp):
+        return None
+    try:
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("offset")   # float or None
+    except Exception:
+        return None
+
+def _rx_offset_cache_save(rx_audio_path, video_path, offset):
+    cp = _rx_offset_cache_path(rx_audio_path, video_path)
+    if not cp:
+        return
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        with open(cp, "w", encoding="utf-8") as f:
+            json.dump({"offset": float(offset)}, f)
+    except Exception:
+        pass
 
 
 def detect_rx_offset(rx_audio_path, video_path, sr=1000):
@@ -1526,6 +1571,12 @@ def detect_rx_offset(rx_audio_path, video_path, sr=1000):
         return 0.0
     if not os.path.isfile(rx_audio_path) or not os.path.isfile(video_path):
         return 0.0
+
+    # ── Disk cache hit — skip the entire cross-correlation ─────────────────
+    _cached = _rx_offset_cache_load(rx_audio_path, video_path)
+    if _cached is not None:
+        return float(_cached)
+
     try:
         import numpy as np
     except ImportError:
@@ -1580,6 +1631,7 @@ def detect_rx_offset(rx_audio_path, video_path, sr=1000):
     if offset_s < 0 or offset_s > vid_dur:
         return 0.0
 
+    _rx_offset_cache_save(rx_audio_path, video_path, offset_s)
     return offset_s
 
 
