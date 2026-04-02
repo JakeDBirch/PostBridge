@@ -4056,9 +4056,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
-        self._btn(nav, "\u2190 HOME",    self._home).pack(side="left")
-        self._btn(nav, "SAVE SETUP",     self._aaf_save_setup).pack(side="left", padx=(8,0))
-        self._btn(nav, "LOAD SETUP",     self._aaf_load_setup).pack(side="left", padx=(4,0))
         self._aaf_build_btn = self._btn(nav, "BUILD XML  \u2192", self._aaf_build,
                                         color=ACCENT)
         self._aaf_build_btn.pack(side="right")
@@ -6440,15 +6437,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     len(missing), "\n".join(basename(p) for p in missing[:5])))
 
     def _aaf_build_progress(self, pct, text):
-        """Show/update the build progress bar.  pct is 0–100."""
-        frame = getattr(self, "_aaf_prog_frame", None)
-        if frame is None:
-            return
-        if not frame.winfo_ismapped():
-            frame.pack(side="bottom", fill="x", pady=(6, 0))
-        self._aaf_prog_lbl.config(text=text)
-        self._aaf_prog_bar.set(pct, 100)
-        self.update_idletasks()
+        """Show/update the build progress bar.  pct is 0–100.  Thread-safe."""
+        import threading as _threading
+        def _upd():
+            frame = getattr(self, "_aaf_prog_frame", None)
+            if frame is None:
+                return
+            if not frame.winfo_ismapped():
+                frame.pack(side="bottom", fill="x", pady=(6, 0))
+            self._aaf_prog_lbl.config(text=text)
+            self._aaf_prog_bar.set(pct, 100)
+        if _threading.current_thread() is _threading.main_thread():
+            _upd()
+            self.update_idletasks()
+        else:
+            self.after(0, _upd)
 
     def _aaf_build(self):
         vpaths = self._aaf_video_paths
@@ -6562,135 +6565,135 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             filetypes=[("XML","*.xml"),("All","*.*")],
             initialfile="{}_aaf.xml".format(
                 self._aaf_data.get("session_name","postbridge").replace(" ","_")))
-        if not out: return
+        if not out:
+            return
 
+        # Snapshot Tkinter vars before handing off to the worker thread.
+        sr       = self._aaf_data.get("sample_rate", 48000)
         try:
-            sr = self._aaf_data.get("sample_rate", 48000)
+            seq_w = int(getattr(self, "_aaf_seq_w_var", tk.StringVar()).get() or "0")
+            seq_h = int(getattr(self, "_aaf_seq_h_var", tk.StringVar()).get() or "0")
+        except ValueError:
+            seq_w, seq_h = 0, 0
+        mix_path    = getattr(self, "_aaf_mix_var", None)
+        mix_path    = mix_path.get() if mix_path else ""
+        cam_audio   = getattr(self, "_aaf_cam_audio_var", None)
+        cam_audio_v = bool(cam_audio and cam_audio.get())
+        seq_name    = (self.seq_name.get()
+                       or self._aaf_data.get("session_name", "PostBridge"))
 
-            # Sequence dimensions: use values from the UI if set; else probe.
+        # Disable the button while the worker runs.
+        try:
+            self._aaf_build_btn.config(state="disabled")
+        except Exception:
+            pass
+
+        # ── Worker thread — all heavy work runs here ───────────────────────────
+        def _worker():
+            _seq_w, _seq_h = seq_w, seq_h   # local copies (may be updated by probe)
             try:
-                seq_w = int(getattr(self, "_aaf_seq_w_var", tk.StringVar()).get() or "0")
-                seq_h = int(getattr(self, "_aaf_seq_h_var", tk.StringVar()).get() or "0")
-            except ValueError:
-                seq_w, seq_h = 0, 0
+                # Sequence dimensions
+                if (_seq_w <= 0 or _seq_h <= 0) and vpaths:
+                    self._aaf_build_progress(55, "Probing media settings\u2026")
+                    _seq_w, _seq_h, _, _ = engines.probe_media_settings(vpaths)
+                if _seq_w <= 0: _seq_w = 1280
+                if _seq_h <= 0: _seq_h = 720
 
-            if (seq_w <= 0 or seq_h <= 0) and vpaths:
-                self._aaf_build_progress(55, "Probing media settings\u2026")
-                seq_w, seq_h, _, _ = engines.probe_media_settings(vpaths)
-            if seq_w <= 0:
-                seq_w = 1280
-            if seq_h <= 0:
-                seq_h = 720
+                # ── Fragment auto-sync ─────────────────────────────────────
+                # When an AAF source's audio file is a short rendered fragment
+                # (AudioSuite/RX/bounce) rather than the original full recording,
+                # src_in from the AAF is relative to the fragment — not the
+                # assigned video.  Detect where the fragment appears in the video
+                # via cross-correlation so the video <in> points are correct.
+                self._aaf_build_progress(60, "Scanning for audio fragments\u2026")
 
-            # ── Fragment auto-sync ─────────────────────────────────────────
-            # When an AAF source's audio file is a short rendered fragment
-            # (AudioSuite/RX/bounce) rather than the original full recording,
-            # src_in from the AAF is relative to the fragment — not the
-            # assigned video.  Detect where the fragment appears in the video
-            # via cross-correlation so the video <in> points are correct.
-            self._aaf_build_progress(60, "Scanning for audio fragments\u2026")
-
-            # Pass 1: identify which clips are fragments.
-            # Each RX render is a unique file from a unique point in the video,
-            # so we key by source_file (not base name, which collapses them).
-            fragment_jobs = []   # (clip_index, source_file, video_path, src_dur, vid_dur)
-            frag_seen_sf = set()
-            for idx, c in enumerate(clips_with_media):
-                sf = c.get("source_file", "")
-                if not sf or sf in frag_seen_sf:
-                    continue
-                base = get_clip_base_name(c["clip_name"])
-                off = source_offset.get(base, 0.0)
-                has_sync_audio = bool(source_syncaudio.get(base))
-                if (not c.get("video_path")
-                        or abs(off) >= 0.002  # >2 ms = intentional global sync
-                        or has_sync_audio):
-                    reason = ("no video" if not c.get("video_path")
-                              else "has global offset {:.3f}s".format(off) if abs(off) >= 0.002
-                              else "has sync audio")
-                    print("Fragment skip [{}]: {}".format(reason,
-                          os.path.basename(sf)))
-                    frag_seen_sf.add(sf)
-                    continue
-                vp = c["video_path"]
-                if not os.path.isfile(sf):
-                    frag_seen_sf.add(sf)
-                    continue
-                src_dur = engines._probe_duration(sf)
-                vid_dur = engines._probe_duration(vp)
-                if src_dur <= 0 or vid_dur <= 0:
-                    frag_seen_sf.add(sf)
-                    continue
-                if src_dur >= vid_dur * 0.5:
-                    frag_seen_sf.add(sf)
-                    continue
-                frag_seen_sf.add(sf)
-                fragment_jobs.append((sf, vp, src_dur, vid_dur))
-
-            # Pass 2: cross-correlate each fragment with progress
-            # Key by source_file path so each RX render gets its own offset
-            frag_offsets = {}   # source_file → offset_s
-            n_frags = len(fragment_jobs)
-            for i, (sf, vp, src_dur, vid_dur) in enumerate(fragment_jobs, 1):
-                clip_label = os.path.basename(sf)
-                if len(clip_label) > 45:
-                    clip_label = clip_label[:42] + "\u2026"
-                self._aaf_build_progress(
-                    60 + int(9 * i / max(n_frags, 1)),
-                    "Fragment sync {}/{}: {}".format(i, n_frags, clip_label))
-                print("Fragment auto-sync: {} ({:.1f}s) vs {} ({:.1f}s)".format(
-                    os.path.basename(sf), src_dur,
-                    os.path.basename(vp), vid_dur))
-                T = engines.detect_rx_offset(sf, vp)
-                if T != 0.0:
-                    # build_xml_from_pt uses  v_src_in = src_in_s + v_offset,
-                    # and T is the video position where the fragment starts,
-                    # so v_offset = T directly (positive = camera further along)
-                    frag_offsets[os.path.normpath(sf).lower()] = T
-                    print("  -> T={:.3f}s (video_offset_secs={:.3f}s)".format(T, T))
-                else:
-                    print("  -> detection failed, keeping v_offset=0")
-
-            # Apply per-fragment offsets to matching clips
-            if frag_offsets:
+                fragment_jobs = []
+                frag_seen_sf  = set()
                 for c in clips_with_media:
                     sf = c.get("source_file", "")
-                    if sf:
-                        key = os.path.normpath(sf).lower()
-                        if key in frag_offsets:
-                            c["video_offset_secs"] = frag_offsets[key]
+                    if not sf or sf in frag_seen_sf:
+                        continue
+                    base = get_clip_base_name(c["clip_name"])
+                    off  = source_offset.get(base, 0.0)
+                    if (not c.get("video_path")
+                            or abs(off) >= 0.002
+                            or bool(source_syncaudio.get(base))):
+                        frag_seen_sf.add(sf)
+                        continue
+                    if not os.path.isfile(sf):
+                        frag_seen_sf.add(sf)
+                        continue
+                    src_dur = engines._probe_duration(sf)
+                    vid_dur = engines._probe_duration(c["video_path"])
+                    if src_dur <= 0 or vid_dur <= 0 or src_dur >= vid_dur * 0.5:
+                        frag_seen_sf.add(sf)
+                        continue
+                    frag_seen_sf.add(sf)
+                    fragment_jobs.append((sf, c["video_path"], src_dur, vid_dur))
 
-            if DEV_DIAGNOSTIC:
-                self._aaf_build_progress(70, "Writing diagnostic report\u2026")
-                try:
-                    diag_path = os.path.splitext(out)[0] + "_diagnostic.txt"
-                    engines.write_build_diagnostic(
-                        clips_with_media, fps, seq_w, seq_h, sr, out_path=diag_path)
-                    print("Diagnostic report: {}".format(diag_path))
-                except Exception as diag_exc:
-                    print("Diagnostic report failed: {}".format(diag_exc))
+                frag_offsets = {}
+                n_frags = len(fragment_jobs)
+                for i, (sf, vp, _sd, _vd) in enumerate(fragment_jobs, 1):
+                    clip_label = os.path.basename(sf)
+                    if len(clip_label) > 45:
+                        clip_label = clip_label[:42] + "\u2026"
+                    self._aaf_build_progress(
+                        60 + int(9 * i / max(n_frags, 1)),
+                        "Fragment sync {}/{}: {}".format(i, n_frags, clip_label))
+                    T = engines.detect_rx_offset(sf, vp)
+                    if T != 0.0:
+                        frag_offsets[os.path.normpath(sf).lower()] = T
 
-            self._aaf_build_progress(80, "Building XML\u2026")
-            mix_path = getattr(self, "_aaf_mix_var", None)
-            mix_path = mix_path.get() if mix_path else ""
-            cam_audio = getattr(self, "_aaf_cam_audio_var", None)
-            xmeml = engines.build_xml_from_pt(
-                clips_with_media,
-                track_names_ordered,
-                self.seq_name.get() or self._aaf_data.get("session_name","PostBridge"),
-                seq_w=seq_w, seq_h=seq_h, seq_fps=fps, seq_sr=sr,
-                mix_path=mix_path or None,
-                include_camera_audio=bool(cam_audio and cam_audio.get()))
+                if frag_offsets:
+                    for c in clips_with_media:
+                        sf = c.get("source_file", "")
+                        if sf:
+                            key = os.path.normpath(sf).lower()
+                            if key in frag_offsets:
+                                c["video_offset_secs"] = frag_offsets[key]
 
-            self._aaf_build_progress(95, "Writing file\u2026")
-            engines.write_xml(xmeml, out)
-            engines.clear_rx_cache()
-        except Exception as e:
-            engines.clear_rx_cache()
-            messagebox.showerror("Build Error", str(e)); return
+                if DEV_DIAGNOSTIC:
+                    self._aaf_build_progress(70, "Writing diagnostic report\u2026")
+                    try:
+                        diag_path = os.path.splitext(out)[0] + "_diagnostic.txt"
+                        engines.write_build_diagnostic(
+                            clips_with_media, fps, _seq_w, _seq_h, sr,
+                            out_path=diag_path)
+                    except Exception:
+                        pass
 
-        self.out_path.set(out)
-        self._aaf_done(matched, unmatched, len(clips_with_media), clip_results)
+                self._aaf_build_progress(80, "Building XML\u2026")
+                xmeml = engines.build_xml_from_pt(
+                    clips_with_media,
+                    track_names_ordered,
+                    seq_name,
+                    seq_w=_seq_w, seq_h=_seq_h, seq_fps=fps, seq_sr=sr,
+                    mix_path=mix_path or None,
+                    include_camera_audio=cam_audio_v)
+
+                self._aaf_build_progress(95, "Writing file\u2026")
+                engines.write_xml(xmeml, out)
+                engines.clear_rx_cache()
+
+                def _finish():
+                    self.out_path.set(out)
+                    self._aaf_done(matched, unmatched,
+                                   len(clips_with_media), clip_results)
+                self.after(0, _finish)
+
+            except Exception as e:
+                engines.clear_rx_cache()
+                _err = str(e)
+                def _show_err():
+                    try:
+                        self._aaf_build_btn.config(state="normal")
+                    except Exception:
+                        pass
+                    messagebox.showerror("Build Error", _err)
+                self.after(0, _show_err)
+
+        import threading as _threading
+        _threading.Thread(target=_worker, daemon=True).start()
 
     def _aaf_done(self, matched, unmatched, total, clip_results=None):
         self._clear()
