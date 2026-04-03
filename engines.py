@@ -246,6 +246,97 @@ def cache_load_blobs(media_path):
     except Exception:
         return None
 
+# ── Standalone transcript file (.pb_transcript.json alongside media) ───────────
+# These live next to the media file itself (not in .pb_cache/) so they travel
+# with the asset across machines and remain valid regardless of project location.
+
+def pb_transcript_path(media_path):
+    """Return the .pb_transcript.json path that lives alongside media_path."""
+    base = os.path.splitext(os.path.abspath(media_path))[0]
+    return base + ".pb_transcript.json"
+
+def pb_transcript_load(media_path):
+    """Load a .pb_transcript.json from alongside media_path.
+    Returns (words, blobs) or (None, None) if absent, stale, or invalid."""
+    p = pb_transcript_path(media_path)
+    if not os.path.isfile(p):
+        return None, None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        try:
+            mtime = os.path.getmtime(media_path)
+        except OSError:
+            mtime = 0
+        # Reject if the media file was replaced since transcription
+        if abs(data.get("mtime", 0) - mtime) > 2:
+            return None, None
+        words = data.get("words")
+        if not words:
+            return None, None
+        return words, data.get("blobs")
+    except Exception:
+        return None, None
+
+def pb_transcript_save(media_path, words, blobs=None):
+    """Write a .pb_transcript.json alongside media_path."""
+    p = pb_transcript_path(media_path)
+    try:
+        mtime = os.path.getmtime(media_path)
+    except OSError:
+        mtime = 0
+    data = {"version": 1, "model": WHISPER_MODEL, "mtime": mtime, "words": words}
+    if blobs is not None:
+        data["blobs"] = blobs
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def transcribe_file(media_path, progress_cb=None):
+    """Transcribe an entire media file using the same chunked pipeline as VO
+    reconcile.  Returns (words, blobs).  progress_cb(fraction, status_str) is
+    called periodically if provided."""
+    def _prog(frac, msg):
+        if progress_cb:
+            try: progress_cb(frac, msg)
+            except Exception: pass
+
+    words = None
+    blobs = None
+
+    if WAVEFORM_CONFORM:
+        _prog(0.05, "Detecting silence splits…")
+        chunks = detect_silence_splits(media_path)
+        if chunks:
+            _prog(0.10, "Transcribing ({} chunks)…".format(len(chunks)))
+            words = transcribe_in_chunks(media_path, chunks)
+
+    if words is None:
+        # Either WAVEFORM_CONFORM is off or silence split failed — full-file path
+        _prog(0.10, "Extracting audio…")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp_a = tf.name
+        try:
+            ok, _ = extract_window(media_path, 0, 9999, tmp_a)
+            if not ok:
+                _prog(1.0, "Audio extraction failed")
+                return None, None
+            _prog(0.30, "Transcribing…")
+            words = transcribe_clip(tmp_a)
+        finally:
+            try: os.unlink(tmp_a)
+            except: pass
+
+    if not words:
+        _prog(1.0, "No words detected")
+        return None, None
+
+    if WAVEFORM_CONFORM:
+        _prog(0.85, "Detecting speech boundaries…")
+        blobs = detect_speech_blobs(media_path)
+
+    _prog(1.0, "Done")
+    return words, blobs
+
 # ── Pull-result cache ───────────────────────────────────────────────────────────
 # Caches the final reconciliation result for a pull so that re-runs after a
 # crash or cancel don't need to re-transcribe already-matched clips.

@@ -265,6 +265,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
              "Parse an AAF, match clips to video files by source name, "
              "and generate XML.",
              HAS_AAF),
+            ("Transcribe Media",
+             "transcribe",
+             "Pre-transcribe VO and interview files so reconcile runs instantly. "
+             "Transcription files are saved alongside each media file.",
+             HAS_WHISPER),
         ]
 
         for title, wf_key, desc, available in workflows:
@@ -391,6 +396,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._aaf_load(path)
         elif key == "script_formatter":
             self._script_formatter()
+        elif key == "transcribe":
+            self._transcribe_workflow()
 
     def _tooltip(self, widget, text):
         """Attach a hover tooltip showing full text to any widget."""
@@ -2104,6 +2111,33 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not messagebox.askyesno("Missing Media", msg, icon="warning"):
                 return
 
+        # ── Pre-flight: warn if any VO audio has no pre-transcribed file ─────────
+        _vo_uncached = []
+        for pi, vb in self.vo_bins.items():
+            paths = vb.get_paths()
+            takes = engines.pair_takes(paths)
+            for _vp, ap in takes:
+                if ap:
+                    _pb_words, _ = engines.pb_transcript_load(ap)
+                    if _pb_words is None and engines.cache_load(ap) is None:
+                        _vo_uncached.append(os.path.basename(ap))
+        if _vo_uncached:
+            _names = "\n".join("  •  {}".format(n) for n in _vo_uncached[:6])
+            if len(_vo_uncached) > 6:
+                _names += "\n  …and {} more".format(len(_vo_uncached) - 6)
+            _msg = (
+                "{} VO audio file{} have no pre-transcribed file:\n\n{}\n\n"
+                "PostBridge will transcribe them now, which may take several minutes.\n"
+                "Or cancel and use the Transcribe Media workflow to pre-transcribe "
+                "them first.".format(
+                    len(_vo_uncached),
+                    "s" if len(_vo_uncached) != 1 else "",
+                    _names)
+            )
+            if not messagebox.askyesno("No VO Transcriptions Found", _msg,
+                                       icon="warning"):
+                return
+
         # ── Pre-flight: warn about oversized pull windows ──────────────────────
         suspicious = [p for p in self.pulls
                       if p.get("out_seconds", 0) - p.get("in_seconds", 0) > MAX_EXTRACT_S]
@@ -2304,6 +2338,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     self._set_tx_progress(
                         _tx_done, _total_tx,
                         "VO transcription — {} / {}  [cached]".format(_tx_done, _total_tx))
+                elif (_pb_result := engines.pb_transcript_load(ap))[0] is not None:
+                    # Pre-transcribed file found alongside media
+                    audio_words, blobs = _pb_result
+                    self._log_line(
+                        "  Take {}: {} words  [pre-transcribed]".format(
+                            take_i + 1, len(audio_words)), SUCCESS)
+                    _tx_done   += 1
+                    _tx_cached += 1
+                    self._set_tx_progress(
+                        _tx_done, _total_tx,
+                        "VO transcription — {} / {}  [pre-transcribed]".format(
+                            _tx_done, _total_tx))
                 else:
                     _t0 = time.perf_counter()
                     if WAVEFORM_CONFORM:
@@ -6955,6 +7001,251 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 line = "  {:<50s}  →  {}\n".format(clip_name[:50], vid_label)
                 log.insert("end", line, tag)
             log.configure(state="disabled")
+
+    # ── Transcribe Media workflow ─────────────────────────────────────────────
+
+    def _transcribe_workflow(self):
+        """Standalone batch transcription: drop media files, transcribe them,
+        save a .pb_transcript.json alongside each one for fast reconcile later."""
+        self._clear()
+        self._section("TRANSCRIBE MEDIA")
+
+        tk.Label(self.body,
+                 text="Drop media files below. PostBridge will transcribe each one "
+                      "and save a .pb_transcript.json file alongside it. "
+                      "Once transcribed, the Script \u2192 Session reconcile will "
+                      "load these instantly instead of re-transcribing.",
+                 font=FB, bg=BG, fg=SUB, wraplength=700, justify="left"
+                 ).pack(anchor="w", pady=(0, 16))
+
+        # ── File list ─────────────────────────────────────────────────────────
+        list_outer = tk.Frame(self.body, bg=SURF,
+                              highlightbackground=BORDER, highlightthickness=1)
+        list_outer.pack(fill="both", expand=True, pady=(0, 12))
+
+        list_hdr = tk.Frame(list_outer, bg=SURF3)
+        list_hdr.pack(fill="x")
+        tk.Label(list_hdr, text="FILE", font=FL, bg=SURF3, fg=SUB,
+                 anchor="w", padx=12, pady=6).pack(side="left")
+        tk.Label(list_hdr, text="STATUS", font=FL, bg=SURF3, fg=SUB,
+                 anchor="e", padx=12, pady=6).pack(side="right")
+
+        list_canvas = tk.Canvas(list_outer, bg=SURF, highlightthickness=0, height=280)
+        list_scroll = tk.Scrollbar(list_outer, orient="vertical",
+                                   command=list_canvas.yview)
+        list_scroll.pack(side="right", fill="y")
+        list_canvas.pack(fill="both", expand=True)
+        list_canvas.configure(yscrollcommand=list_scroll.set)
+
+        list_frame = tk.Frame(list_canvas, bg=SURF)
+        list_canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        list_frame.bind("<Configure>",
+                        lambda e: list_canvas.configure(
+                            scrollregion=list_canvas.bbox("all")))
+
+        # ── Drop zone ─────────────────────────────────────────────────────────
+        drop_frame = tk.Frame(self.body, bg=SURF2,
+                              highlightbackground=BORDER, highlightthickness=1)
+        drop_frame.pack(fill="x", pady=(0, 12))
+
+        drop_lbl = tk.Label(drop_frame,
+                            text="Drop media files here  or  click to browse",
+                            font=FB, bg=SURF2, fg=SUB, pady=18)
+        drop_lbl.pack(fill="x")
+
+        # ── Controls row ──────────────────────────────────────────────────────
+        ctrl = tk.Frame(self.body, bg=BG)
+        ctrl.pack(fill="x", pady=(0, 8))
+
+        bg_var = tk.BooleanVar(value=False)
+        bg_frame = tk.Frame(ctrl, bg=BG)
+        bg_frame.pack(side="left")
+        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB, bg=BG, fg=SUB)
+        bg_lbl.pack(side="left", padx=(0, 8))
+        bg_desc = tk.Label(bg_frame,
+                           text="(1 file at a time — lower CPU load)",
+                           font=(_SANS, 10), bg=BG, fg=SURF3)
+        bg_desc.pack(side="left")
+
+        def _toggle_bg():
+            bg_var.set(not bg_var.get())
+            _on  = bg_var.get()
+            bg_ck.config(text="\u2611" if _on else "\u2610",
+                         fg=ACCENT if _on else SUB)
+            bg_desc.config(fg=SUB if _on else SURF3)
+
+        bg_ck = tk.Label(bg_frame, text="\u2610", font=(_SANS, 15),
+                         bg=BG, fg=SUB, cursor="hand2")
+        bg_ck.pack(side="left", padx=(0, 6))
+        bg_ck.bind("<Button-1>", lambda e: _toggle_bg())
+        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
+        # reorder so checkbox appears before label
+        bg_ck.pack_forget()
+        bg_lbl.pack_forget()
+        bg_desc.pack_forget()
+        bg_ck.pack(side="left", padx=(0, 4))
+        bg_lbl.pack(side="left", padx=(0, 8))
+        bg_desc.pack(side="left")
+
+        tx_btn = self._btn(ctrl, "TRANSCRIBE", None, color=ACCENT)
+        tx_btn.pack(side="right")
+
+        clr_btn = self._btn(ctrl, "CLEAR LIST", None, small=True)
+        clr_btn.pack(side="right", padx=(0, 8))
+
+        # ── State ─────────────────────────────────────────────────────────────
+        _files   = []    # list of abs paths
+        _rows    = {}    # path → {"name_lbl", "status_lbl", "row_frame"}
+        _running = [False]
+        _cancel  = [False]
+
+        def _status_color(status):
+            if status in ("done", "skipped"):  return SUCCESS
+            if status == "error":              return ERR
+            if status == "transcribing":       return ACCENT
+            return SUB
+
+        def _add_files(paths):
+            for p in paths:
+                p = os.path.abspath(p)
+                if p in _rows:
+                    continue
+                if not is_media(p):
+                    continue
+                _files.append(p)
+                row = tk.Frame(list_frame, bg=SURF)
+                row.pack(fill="x", padx=4, pady=1)
+                name = tk.Label(row, text=os.path.basename(p), font=FB,
+                                bg=SURF, fg=TEXT, anchor="w")
+                name.pack(side="left", fill="x", expand=True, padx=(8, 4))
+                status = tk.Label(row, text="pending", font=FB,
+                                  bg=SURF, fg=SUB, anchor="e", padx=8)
+                status.pack(side="right")
+                _rows[p] = {"row": row, "status": status}
+            _update_btn_state()
+
+        def _clear_list():
+            if _running[0]:
+                return
+            for w in list(list_frame.winfo_children()):
+                w.destroy()
+            _files.clear()
+            _rows.clear()
+            _update_btn_state()
+
+        def _update_btn_state():
+            has_pending = any(
+                _rows[p]["status"].cget("text") in ("pending", "error")
+                for p in _files if p in _rows
+            )
+            tx_btn.config(state="normal" if (has_pending and not _running[0]) else "disabled")
+            clr_btn.config(state="normal" if not _running[0] else "disabled")
+
+        def _set_status(path, text):
+            def _upd():
+                if path in _rows:
+                    _rows[path]["status"].config(
+                        text=text, fg=_status_color(text))
+            self.after(0, _upd)
+
+        # ── Browse ────────────────────────────────────────────────────────────
+        def _browse(e=None):
+            paths = filedialog.askopenfilenames(
+                title="Select media files",
+                filetypes=[("Media files",
+                            " ".join("*" + x for x in sorted(MEDIA_EXTS))),
+                           ("All files", "*.*")])
+            if paths:
+                _add_files(paths)
+
+        drop_lbl.bind("<Button-1>", _browse)
+        drop_frame.bind("<Button-1>", _browse)
+
+        # Drag-and-drop if tkinterdnd2 is available
+        try:
+            drop_frame.drop_target_register("DND_Files")
+            drop_frame.dnd_bind("<<Drop>>",
+                lambda e: _add_files(
+                    [p.strip().strip("{}") for p in e.data.split()
+                     if os.path.isfile(p.strip().strip("{}"))]))
+            drop_lbl.drop_target_register("DND_Files")
+            drop_lbl.dnd_bind("<<Drop>>",
+                lambda e: _add_files(
+                    [p.strip().strip("{}") for p in e.data.split()
+                     if os.path.isfile(p.strip().strip("{}"))]))
+        except Exception:
+            pass
+
+        # ── Worker ────────────────────────────────────────────────────────────
+        def _run():
+            import concurrent.futures as _cf
+            _running[0] = True
+            _cancel[0]  = False
+            self.after(0, lambda: tx_btn.config(
+                text="CANCEL", state="normal",
+                command=lambda: _cancel.__setitem__(0, True)))
+
+            pending = [p for p in _files
+                       if p in _rows
+                       and _rows[p]["status"].cget("text") in ("pending", "error")]
+
+            max_w = 1 if bg_var.get() else MAX_WORKERS
+
+            def _process_one(path):
+                if _cancel[0]:
+                    return
+                _set_status(path, "transcribing")
+                try:
+                    words, blobs = engines.transcribe_file(path)
+                    if words:
+                        engines.pb_transcript_save(path, words, blobs)
+                        _set_status(path, "done")
+                    else:
+                        _set_status(path, "error")
+                except Exception as exc:
+                    print("Transcribe error [{}]: {}".format(
+                        os.path.basename(path), exc))
+                    _set_status(path, "error")
+
+            if max_w == 1:
+                for path in pending:
+                    if _cancel[0]:
+                        break
+                    _process_one(path)
+            else:
+                with _cf.ThreadPoolExecutor(max_workers=max_w) as pool:
+                    futs = {pool.submit(_process_one, p): p for p in pending}
+                    for fut in _cf.as_completed(futs):
+                        try: fut.result()
+                        except Exception: pass
+
+            _running[0] = False
+            self.after(0, _on_done)
+
+        def _on_done():
+            tx_btn.config(text="TRANSCRIBE", command=_start,
+                          state="normal" if any(
+                              _rows[p]["status"].cget("text") in ("pending", "error")
+                              for p in _files if p in _rows) else "disabled")
+            clr_btn.config(state="normal")
+            n_done = sum(1 for p in _files
+                         if p in _rows
+                         and _rows[p]["status"].cget("text") == "done")
+            if n_done:
+                messagebox.showinfo(
+                    "Transcription complete",
+                    "{} file{} transcribed successfully.\n\n"
+                    "Transcription files are saved alongside your media and will "
+                    "be loaded automatically during reconcile.".format(
+                        n_done, "s" if n_done != 1 else ""))
+
+        def _start():
+            import threading
+            threading.Thread(target=_run, daemon=True).start()
+
+        tx_btn.config(command=_start, state="disabled")
+        clr_btn.config(command=_clear_list)
+        _update_btn_state()
 
     # ── Script Formatter workflow ─────────────────────────────────────────────
 
