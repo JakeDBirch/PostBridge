@@ -7006,7 +7006,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _transcribe_workflow(self):
         """Standalone batch transcription: drop media files, transcribe them,
-        save a .pb_transcript.json alongside each one for fast reconcile later."""
+        save a .pb_transcript.json alongside each one for fast reconcile later.
+        Includes a word-search panel for finding specific words with timestamps."""
         self._clear()
         self._section("TRANSCRIBE MEDIA")
 
@@ -7094,16 +7095,175 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         clr_btn.pack(side="right", padx=(0, 8))
 
         # ── State ─────────────────────────────────────────────────────────────
-        _files   = []    # list of abs paths
-        _rows    = {}    # path → {"name_lbl", "status_lbl", "row_frame"}
-        _running = [False]
-        _cancel  = [False]
+        _files         = []     # list of abs paths
+        _rows          = {}     # path → {"row", "status"}
+        _running       = [False]
+        _cancel        = [False]
+        _selected_file = [None] # path currently loaded in the search panel
+
+        def _fmt_ts(s):
+            """Format seconds as HH:MM:SS.f for display."""
+            h   = int(s // 3600)
+            m   = int((s % 3600) // 60)
+            sec = s % 60
+            return "{:02d}:{:02d}:{:04.1f}".format(h, m, sec)
 
         def _status_color(status):
             if status in ("done", "skipped"):  return SUCCESS
             if status == "error":              return ERR
             if status == "transcribing":       return ACCENT
             return SUB
+
+        # ── Search panel (built before _add_files so _select_file can ref it) ──
+        tk.Frame(self.body, bg=BORDER, height=1).pack(fill="x", pady=(4, 12))
+
+        search_outer = tk.Frame(self.body, bg=SURF,
+                                highlightbackground=BORDER, highlightthickness=1)
+        search_outer.pack(fill="both", expand=True, pady=(0, 4))
+
+        search_hdr = tk.Frame(search_outer, bg=SURF3)
+        search_hdr.pack(fill="x")
+        tk.Label(search_hdr, text="SEARCH TRANSCRIPT", font=FL,
+                 bg=SURF3, fg=SUB, anchor="w", padx=12, pady=6).pack(side="left")
+        search_file_lbl = tk.Label(search_hdr, text="— click a transcribed file above —",
+                                   font=FB, bg=SURF3, fg=SUB, anchor="e", padx=12)
+        search_file_lbl.pack(side="right")
+
+        search_entry_row = tk.Frame(search_outer, bg=SURF, pady=8)
+        search_entry_row.pack(fill="x", padx=12)
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(search_entry_row, textvariable=search_var,
+                                font=FB, bg=SURF2, fg=TEXT,
+                                insertbackground=TEXT, relief="flat",
+                                highlightbackground=BORDER, highlightthickness=1,
+                                width=28)
+        search_entry.pack(side="left", ipady=5, padx=(0, 8))
+        search_entry.insert(0, "")
+        search_count_lbl = tk.Label(search_entry_row, text="", font=FB,
+                                    bg=SURF, fg=SUB)
+        search_count_lbl.pack(side="left")
+
+        # Results canvas
+        res_canvas = tk.Canvas(search_outer, bg=SURF, highlightthickness=0, height=180)
+        res_scroll = tk.Scrollbar(search_outer, orient="vertical",
+                                  command=res_canvas.yview)
+        res_scroll.pack(side="right", fill="y")
+        res_canvas.pack(fill="both", expand=True, padx=(0, 0))
+        res_canvas.configure(yscrollcommand=res_scroll.set)
+        res_frame = tk.Frame(res_canvas, bg=SURF)
+        res_canvas.create_window((0, 0), window=res_frame, anchor="nw")
+        res_frame.bind("<Configure>",
+                       lambda e: res_canvas.configure(
+                           scrollregion=res_canvas.bbox("all")))
+
+        no_results_lbl = tk.Label(res_frame, text="",
+                                  font=FB, bg=SURF, fg=SUB,
+                                  anchor="w", padx=16, pady=10)
+        no_results_lbl.pack(anchor="w")
+
+        def _do_search(*_):
+            term = search_var.get().strip().lower()
+            # Clear previous results
+            for w in list(res_frame.winfo_children()):
+                w.destroy()
+            no_results_lbl_inner = tk.Label(res_frame, text="",
+                                            font=FB, bg=SURF, fg=SUB,
+                                            anchor="w", padx=16, pady=10)
+            no_results_lbl_inner.pack(anchor="w")
+
+            path = _selected_file[0]
+            if not path:
+                no_results_lbl_inner.config(
+                    text="Select a transcribed file above to search.")
+                search_count_lbl.config(text="")
+                return
+            if not term:
+                no_results_lbl_inner.config(text="Type a word to search.")
+                search_count_lbl.config(text="")
+                return
+
+            words, _ = engines.pb_transcript_load(path)
+            if not words:
+                no_results_lbl_inner.config(
+                    text="No transcript found for this file. Transcribe it first.")
+                search_count_lbl.config(text="")
+                return
+
+            CONTEXT = 5   # words of context each side
+            hits = [i for i, w in enumerate(words)
+                    if term in w.get("word", "")]
+
+            search_count_lbl.config(
+                text="{} match{}".format(len(hits), "es" if len(hits) != 1 else "")
+                if hits else "no matches")
+
+            if not hits:
+                no_results_lbl_inner.config(
+                    text='No matches for "{}".'.format(term))
+                return
+
+            no_results_lbl_inner.destroy()
+
+            for idx in hits:
+                w      = words[idx]
+                ts     = _fmt_ts(w.get("start", 0))
+                before = " ".join(x["word"] for x in words[max(0, idx-CONTEXT):idx])
+                after  = " ".join(x["word"] for x in words[idx+1:idx+1+CONTEXT])
+                hit_w  = w.get("word", "")
+
+                row = tk.Frame(res_frame, bg=SURF)
+                row.pack(fill="x", padx=8, pady=2)
+
+                ts_lbl = tk.Label(row, text=ts, font=(_SANS, 11, "bold"),
+                                  bg=SURF, fg=ACCENT, width=11, anchor="w",
+                                  cursor="hand2")
+                ts_lbl.pack(side="left", padx=(4, 8))
+                self._tooltip(ts_lbl, "Click to copy timecode")
+
+                def _copy_ts(t=ts):
+                    self.clipboard_clear()
+                    self.clipboard_append(t)
+                ts_lbl.bind("<Button-1>", lambda e, t=ts: _copy_ts(t))
+
+                ctx_frame = tk.Frame(row, bg=SURF)
+                ctx_frame.pack(side="left", fill="x", expand=True)
+
+                if before:
+                    tk.Label(ctx_frame, text="…" + before + " ",
+                             font=FB, bg=SURF, fg=SUB,
+                             anchor="w").pack(side="left")
+                tk.Label(ctx_frame, text=hit_w,
+                         font=(_SANS, 12, "bold"), bg=SURF, fg=TEXT,
+                         anchor="w").pack(side="left")
+                if after:
+                    tk.Label(ctx_frame, text=" " + after + "…",
+                             font=FB, bg=SURF, fg=SUB,
+                             anchor="w").pack(side="left")
+
+                tk.Frame(res_frame, bg=BORDER, height=1).pack(fill="x", padx=8)
+
+        search_var.trace_add("write", _do_search)
+
+        def _select_file(path):
+            # Deselect previous
+            prev = _selected_file[0]
+            if prev and prev in _rows:
+                _rows[prev]["row"].config(
+                    highlightbackground=SURF, highlightthickness=0)
+
+            # Only allow selecting transcribed files
+            if path not in _rows:
+                return
+            status = _rows[path]["status"].cget("text")
+            has_pb, _ = engines.pb_transcript_load(path)
+            if not has_pb:
+                return
+
+            _selected_file[0] = path
+            _rows[path]["row"].config(
+                highlightbackground=ACCENT, highlightthickness=2)
+            search_file_lbl.config(text=os.path.basename(path))
+            _do_search()   # re-run with new file
 
         def _add_files(paths):
             for p in paths:
@@ -7113,15 +7273,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if not is_media(p):
                     continue
                 _files.append(p)
-                row = tk.Frame(list_frame, bg=SURF)
+                row = tk.Frame(list_frame, bg=SURF,
+                               highlightbackground=SURF, highlightthickness=0,
+                               cursor="hand2")
                 row.pack(fill="x", padx=4, pady=1)
-                name = tk.Label(row, text=os.path.basename(p), font=FB,
-                                bg=SURF, fg=TEXT, anchor="w")
-                name.pack(side="left", fill="x", expand=True, padx=(8, 4))
-                status = tk.Label(row, text="pending", font=FB,
-                                  bg=SURF, fg=SUB, anchor="e", padx=8)
-                status.pack(side="right")
-                _rows[p] = {"row": row, "status": status}
+
+                # Check if a .pb_transcript.json already exists for this file
+                existing, _ = engines.pb_transcript_load(p)
+                init_status = "transcribed" if existing else "pending"
+                init_color  = SUCCESS if existing else SUB
+
+                name_lbl = tk.Label(row, text=os.path.basename(p), font=FB,
+                                    bg=SURF, fg=TEXT, anchor="w")
+                name_lbl.pack(side="left", fill="x", expand=True, padx=(8, 4))
+                status_lbl = tk.Label(row, text=init_status, font=FB,
+                                      bg=SURF, fg=init_color, anchor="e", padx=8)
+                status_lbl.pack(side="right")
+
+                _rows[p] = {"row": row, "status": status_lbl}
+
+                for w in (row, name_lbl, status_lbl):
+                    w.bind("<Button-1>", lambda e, path=p: _select_file(path))
+                    w.bind("<Enter>",
+                           lambda e, r=row: r.config(bg=SURF2) if _selected_file[0] != p else None)
+                    w.bind("<Leave>",
+                           lambda e, r=row: r.config(bg=SURF)  if _selected_file[0] != p else None)
+
             _update_btn_state()
 
         def _clear_list():
@@ -7131,6 +7308,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 w.destroy()
             _files.clear()
             _rows.clear()
+            _selected_file[0] = None
+            search_file_lbl.config(text="— click a transcribed file above —")
+            _do_search()
             _update_btn_state()
 
         def _update_btn_state():
@@ -7143,9 +7323,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         def _set_status(path, text):
             def _upd():
-                if path in _rows:
-                    _rows[path]["status"].config(
-                        text=text, fg=_status_color(text))
+                if path not in _rows:
+                    return
+                _rows[path]["status"].config(
+                    text=text, fg=_status_color(text))
+                # Auto-select first newly-transcribed file for search
+                if text == "done" and _selected_file[0] is None:
+                    _select_file(path)
             self.after(0, _upd)
 
         # ── Browse ────────────────────────────────────────────────────────────
@@ -7161,7 +7345,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         drop_lbl.bind("<Button-1>", _browse)
         drop_frame.bind("<Button-1>", _browse)
 
-        # Drag-and-drop if tkinterdnd2 is available
         try:
             drop_frame.drop_target_register("DND_Files")
             drop_frame.dnd_bind("<<Drop>>",
@@ -7228,16 +7411,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                               _rows[p]["status"].cget("text") in ("pending", "error")
                               for p in _files if p in _rows) else "disabled")
             clr_btn.config(state="normal")
-            n_done = sum(1 for p in _files
-                         if p in _rows
-                         and _rows[p]["status"].cget("text") == "done")
-            if n_done:
-                messagebox.showinfo(
-                    "Transcription complete",
-                    "{} file{} transcribed successfully.\n\n"
-                    "Transcription files are saved alongside your media and will "
-                    "be loaded automatically during reconcile.".format(
-                        n_done, "s" if n_done != 1 else ""))
 
         def _start():
             import threading
@@ -7246,6 +7419,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_btn.config(command=_start, state="disabled")
         clr_btn.config(command=_clear_list)
         _update_btn_state()
+        _do_search()   # seed the search panel with its placeholder state
 
     # ── Script Formatter workflow ─────────────────────────────────────────────
 
