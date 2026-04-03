@@ -7054,6 +7054,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             font=FB, bg=SURF2, fg=SUB, pady=18)
         drop_lbl.pack(fill="x")
 
+        # ── Progress bar ──────────────────────────────────────────────────────
+        prog_frame = tk.Frame(self.body, bg=BG)
+        prog_frame.pack(fill="x", pady=(0, 6))
+        prog_lbl = tk.Label(prog_frame, text="", font=FB, bg=BG, fg=SUB, anchor="w")
+        prog_lbl.pack(side="left")
+
         # ── Controls row ──────────────────────────────────────────────────────
         ctrl = tk.Frame(self.body, bg=BG)
         ctrl.pack(fill="x", pady=(0, 8))
@@ -7061,37 +7067,35 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         bg_var = tk.BooleanVar(value=False)
         bg_frame = tk.Frame(ctrl, bg=BG)
         bg_frame.pack(side="left")
-        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB, bg=BG, fg=SUB)
-        bg_lbl.pack(side="left", padx=(0, 8))
-        bg_desc = tk.Label(bg_frame,
-                           text="(1 file at a time — lower CPU load)",
-                           font=(_SANS, 10), bg=BG, fg=SURF3)
-        bg_desc.pack(side="left")
 
         def _toggle_bg():
             bg_var.set(not bg_var.get())
-            _on  = bg_var.get()
+            _on = bg_var.get()
             bg_ck.config(text="\u2611" if _on else "\u2610",
                          fg=ACCENT if _on else SUB)
             bg_desc.config(fg=SUB if _on else SURF3)
 
         bg_ck = tk.Label(bg_frame, text="\u2610", font=(_SANS, 15),
-                         bg=BG, fg=SUB, cursor="hand2")
-        bg_ck.pack(side="left", padx=(0, 6))
-        bg_ck.bind("<Button-1>", lambda e: _toggle_bg())
-        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
-        # reorder so checkbox appears before label
-        bg_ck.pack_forget()
-        bg_lbl.pack_forget()
-        bg_desc.pack_forget()
-        bg_ck.pack(side="left", padx=(0, 4))
+                         bg=BG, fg=SUB, cursor="hand2", padx=4)
+        bg_ck.pack(side="left")
+        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB, bg=BG, fg=SUB)
         bg_lbl.pack(side="left", padx=(0, 8))
+        bg_desc = tk.Label(bg_frame, text="(1 file at a time — lower CPU load)",
+                           font=(_SANS, 10), bg=BG, fg=SURF3)
         bg_desc.pack(side="left")
+        bg_ck.bind("<Button-1>",  lambda e: _toggle_bg())
+        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
 
-        tx_btn = self._btn(ctrl, "TRANSCRIBE", None, color=ACCENT)
+        # Mutable command slots — _btn captures these dispatchers at bind time;
+        # setting the slot to None disables the button without rebinding.
+        _tx_cmd  = [None]
+        _clr_cmd = [None]
+
+        tx_btn  = self._btn(ctrl, "TRANSCRIBE", lambda: _tx_cmd[0] and _tx_cmd[0](),
+                            color=ACCENT)
         tx_btn.pack(side="right")
-
-        clr_btn = self._btn(ctrl, "CLEAR LIST", None, small=True)
+        clr_btn = self._btn(ctrl, "CLEAR LIST", lambda: _clr_cmd[0] and _clr_cmd[0](),
+                            small=True)
         clr_btn.pack(side="right", padx=(0, 8))
 
         # ── State ─────────────────────────────────────────────────────────────
@@ -7318,8 +7322,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _rows[p]["status"].cget("text") in ("pending", "error")
                 for p in _files if p in _rows
             )
-            tx_btn.config(state="normal" if (has_pending and not _running[0]) else "disabled")
-            clr_btn.config(state="normal" if not _running[0] else "disabled")
+            can_tx  = has_pending and not _running[0]
+            can_clr = not _running[0]
+            _tx_cmd[0]  = _start       if can_tx  else None
+            _clr_cmd[0] = _clear_list  if can_clr else None
+            tx_btn.config( fg=TEXT if can_tx  else SUB)
+            clr_btn.config(fg=TEXT if can_clr else SUB)
+
+        def _set_prog(text):
+            self.after(0, lambda: prog_lbl.config(text=text))
 
         def _set_status(path, text):
             def _upd():
@@ -7364,31 +7375,51 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             import concurrent.futures as _cf
             _running[0] = True
             _cancel[0]  = False
-            self.after(0, lambda: tx_btn.config(
-                text="CANCEL", state="normal",
-                command=lambda: _cancel.__setitem__(0, True)))
+
+            def _enter_cancel_mode():
+                _tx_cmd[0] = lambda: _cancel.__setitem__(0, True)
+                tx_btn.config(text="CANCEL", fg=WARN)
+                _clr_cmd[0] = None
+                clr_btn.config(fg=SUB)
+
+            self.after(0, _enter_cancel_mode)
 
             pending = [p for p in _files
                        if p in _rows
                        and _rows[p]["status"].cget("text") in ("pending", "error")]
 
-            max_w = 1 if bg_var.get() else MAX_WORKERS
+            n_total = len(pending)
+            n_done  = [0]
+            max_w   = 1 if bg_var.get() else MAX_WORKERS
 
             def _process_one(path):
                 if _cancel[0]:
                     return
+                name = os.path.basename(path)
                 _set_status(path, "transcribing")
+                _set_prog("\u23f3  Transcribing {} ({}/{})…".format(
+                    name, n_done[0] + 1, n_total))
+
+                def _progress_cb(frac, msg):
+                    _set_prog("\u23f3  {} — {} ({}/{})".format(
+                        msg, name, n_done[0] + 1, n_total))
+
                 try:
-                    words, blobs = engines.transcribe_file(path)
+                    words, blobs = engines.transcribe_file(
+                        path, progress_cb=_progress_cb)
                     if words:
                         engines.pb_transcript_save(path, words, blobs)
+                        n_done[0] += 1
                         _set_status(path, "done")
+                        _set_prog("\u2713  {} done  ({}/{})".format(
+                            name, n_done[0], n_total))
                     else:
                         _set_status(path, "error")
+                        _set_prog("\u26a0  {} — no words detected".format(name))
                 except Exception as exc:
-                    print("Transcribe error [{}]: {}".format(
-                        os.path.basename(path), exc))
+                    print("Transcribe error [{}]: {}".format(name, exc))
                     _set_status(path, "error")
+                    _set_prog("\u26a0  Error on {}".format(name))
 
             if max_w == 1:
                 for path in pending:
@@ -7406,18 +7437,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.after(0, _on_done)
 
         def _on_done():
-            tx_btn.config(text="TRANSCRIBE", command=_start,
-                          state="normal" if any(
-                              _rows[p]["status"].cget("text") in ("pending", "error")
-                              for p in _files if p in _rows) else "disabled")
-            clr_btn.config(state="normal")
+            n_done = sum(1 for p in _files
+                         if p in _rows
+                         and _rows[p]["status"].cget("text") == "done")
+            n_err  = sum(1 for p in _files
+                         if p in _rows
+                         and _rows[p]["status"].cget("text") == "error")
+            summary = "\u2713  {} file{} transcribed".format(
+                n_done, "s" if n_done != 1 else "")
+            if n_err:
+                summary += "  \u00b7  \u26a0 {} error{}".format(
+                    n_err, "s" if n_err != 1 else "")
+            prog_lbl.config(text=summary, fg=SUCCESS if not n_err else WARN)
+            tx_btn.config(text="TRANSCRIBE")
+            _update_btn_state()
 
         def _start():
             import threading
             threading.Thread(target=_run, daemon=True).start()
 
-        tx_btn.config(command=_start, state="disabled")
-        clr_btn.config(command=_clear_list)
         _update_btn_state()
         _do_search()   # seed the search panel with its placeholder state
 
