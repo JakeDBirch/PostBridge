@@ -1620,6 +1620,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showerror("Load failed", str(e))
             return
 
+        # ── AAF→XML setup file — route to the AAF workflow ───────────────────
+        if "aaf" in data and "script" not in data:
+            aaf_path = data.get("aaf", "")
+            if not aaf_path or not os.path.isfile(aaf_path):
+                messagebox.showerror(
+                    "AAF not found",
+                    "The AAF file referenced by this setup could not be found:\n\n"
+                    "{}".format(aaf_path or "(none)"))
+                return
+            self._pending_aaf_setup = data   # _aaf_step2 will restore after init
+            self._aaf_load(aaf_path)
+            return
+
         script_path = data.get("script", "")
 
         # ── Cross-machine path remapping ──────────────────────────────────────
@@ -5155,6 +5168,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._aaf_auto_match()
 
+        # If opened via the generic Open Session from the home screen, restore
+        # any saved setup state that was stashed before navigating here.
+        pending = getattr(self, "_pending_aaf_setup", None)
+        if pending is not None:
+            self._pending_aaf_setup = None
+            self.after(0, lambda d=pending: self._aaf_restore_setup(d))
+
     # FPS priority order: higher quality / higher frame rate wins
     _FPS_PRIORITY = [
         120.0, 119.88, 60.0, 59.94, 50.0, 48.0, 47.952,
@@ -6508,7 +6528,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 data = json.load(f)
         except Exception as e:
             messagebox.showerror("Load failed", str(e)); return
+        self._aaf_restore_setup(data)
 
+    def _aaf_restore_setup(self, data):
+        """Apply a saved AAF setup dict to the current Step 2 UI state."""
         # ── Batch-add pool files (one rebuild at the very end) ────────────────
         missing = []
         for vp in data.get("video_paths", []):
