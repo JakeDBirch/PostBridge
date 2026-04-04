@@ -204,8 +204,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     from tkinter import PhotoImage
                     self._logo_photo = PhotoImage(file=_path)
                     _h = self._logo_photo.height()
-                    if _h > 46:
-                        div = max(1, _h // 46)
+                    if _h > 56:
+                        div = max(1, _h // 56)
                         self._logo_photo = self._logo_photo.subsample(div, div)
                     tk.Label(logo_frame, image=self._logo_photo, bg=BG).pack()
                     break
@@ -223,10 +223,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         inner = tk.Frame(brand_frame, bg=BG)
         inner.pack(expand=True)   # centers within the remaining space
 
-        tk.Label(inner, text="POSTBRIDGE",
-                 font=FH, bg=BG, fg=ACCENT).pack()
+        # "POST" orange + "BRIDGE" white, mirroring the MEAT/EATER split
+        title_row = tk.Frame(inner, bg=BG)
+        title_row.pack()
+        tk.Label(title_row, text="POST",
+                 font=(_SANS, 17, "bold"), bg=BG, fg=ACCENT).pack(side="left")
+        tk.Label(title_row, text="BRIDGE",
+                 font=(_SANS, 17, "bold"), bg=BG, fg=TEXT).pack(side="left")
+
         tk.Label(inner, text="audio/video post-production bridge",
-                 font=(_SANS, 10, "italic"), bg=BG, fg=TEXT).pack(pady=(2, 0))
+                 font=(_SANS, 9, "italic"), bg=BG, fg=SUB).pack(pady=(1, 0))
 
         _dep_warnings = []
         if not HAS_WHISPER:
