@@ -6,7 +6,8 @@ import queue
 import tempfile
 import time
 from concurrent.futures import (ThreadPoolExecutor,
-                                wait as _fut_wait, FIRST_COMPLETED)
+                                wait as _fut_wait, FIRST_COMPLETED,
+                                as_completed as _fut_as_completed)
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -2303,14 +2304,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         _t_run_start = time.perf_counter()   # overall wall-clock start
         _t_tx_start  = time.perf_counter()
-        for pi, vb in self.vo_bins.items():
-            if self._cancel.is_set():
-                break
+
+        # Shared counters — protected by a lock because VO parts now transcribe
+        # concurrently (one thread per VO part, up to MAX_WORKERS).
+        import threading as _th
+        _tx_lock = _th.Lock()
+
+        def _transcribe_vo_part(pi, vb):
+            """Transcribe all takes for one VO part. Returns list of take tuples."""
+            nonlocal _tx_done, _tx_cached, _tx_fresh
 
             paths = vb.get_paths()
             takes = engines.pair_takes(paths)
             if not takes:
-                continue
+                return []
 
             self._log_line(
                 "Transcribing VO Part {} — {} take{}…".format(
@@ -2323,129 +2330,140 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                 if not ap:
                     self._log_line(
-                        "  Take {}: no audio file, skipping".format(take_i + 1), WARN)
+                        "  Part {} Take {}: no audio file, skipping".format(
+                            pi, take_i + 1), WARN)
                     continue
 
                 blobs       = None
                 audio_words = engines.cache_load(ap)
                 if audio_words is not None:
                     blobs = engines.cache_load_blobs(ap)
+                    with _tx_lock:
+                        _tx_done   += 1
+                        _tx_cached += 1
+                        _d, _t = _tx_done, _total_tx
                     self._log_line(
-                        "  Take {}: {} words  [cached]".format(
-                            take_i + 1, len(audio_words)), INFO)
-                    _tx_done   += 1
-                    _tx_cached += 1
+                        "  Part {} Take {}: {} words  [cached]".format(
+                            pi, take_i + 1, len(audio_words)), INFO)
                     self._set_tx_progress(
-                        _tx_done, _total_tx,
-                        "VO transcription — {} / {}  [cached]".format(_tx_done, _total_tx))
+                        _d, _t, "VO transcription — {} / {}  [cached]".format(_d, _t))
                 elif (_pb_result := engines.pb_transcript_load(ap))[0] is not None:
-                    # Pre-transcribed file found alongside media
                     audio_words, blobs = _pb_result
+                    with _tx_lock:
+                        _tx_done   += 1
+                        _tx_cached += 1
+                        _d, _t = _tx_done, _total_tx
                     self._log_line(
-                        "  Take {}: {} words  [pre-transcribed]".format(
-                            take_i + 1, len(audio_words)), SUCCESS)
-                    _tx_done   += 1
-                    _tx_cached += 1
+                        "  Part {} Take {}: {} words  [pre-transcribed]".format(
+                            pi, take_i + 1, len(audio_words)), SUCCESS)
                     self._set_tx_progress(
-                        _tx_done, _total_tx,
-                        "VO transcription — {} / {}  [pre-transcribed]".format(
-                            _tx_done, _total_tx))
+                        _d, _t, "VO transcription — {} / {}  [pre-transcribed]".format(
+                            _d, _t))
                 else:
                     _t0 = time.perf_counter()
                     if WAVEFORM_CONFORM:
-                        # ── Step 1a: silence-split chunked transcription ───────────
-                        # Split the file at pauses ≥ CHUNK_SILENCE_S, then transcribe
-                        # each chunk independently.  Gives Whisper shorter, cleaner
-                        # segments → better accuracy and no mkl_malloc memory errors.
                         chunks = engines.detect_silence_splits(ap)
                         if chunks:
-                            _chunk_counts.append((pi, take_i + 1, len(chunks)))
+                            with _tx_lock:
+                                _chunk_counts.append((pi, take_i + 1, len(chunks)))
                             self._log_line(
-                                "  Take {}: {} chunk{} from silence analysis — "
-                                "transcribing…".format(
-                                    take_i + 1, len(chunks),
+                                "  Part {} Take {}: {} chunk{} — transcribing…".format(
+                                    pi, take_i + 1, len(chunks),
                                     "s" if len(chunks) != 1 else ""), INFO)
                             audio_words = engines.transcribe_in_chunks(ap, chunks)
                             self._log_line(
-                                "  Take {}: chunked transcription done in {:.1f}s  "
+                                "  Part {} Take {}: chunked done in {:.1f}s "
                                 "({} words)".format(
-                                    take_i + 1, time.perf_counter() - _t0,
+                                    pi, take_i + 1, time.perf_counter() - _t0,
                                     len(audio_words) if audio_words else 0), INFO)
                         else:
                             self._log_line(
-                                "  Take {}: silence analysis failed — "
-                                "falling back to full-file transcription".format(
-                                    take_i + 1), WARN)
+                                "  Part {} Take {}: silence analysis failed — "
+                                "falling back to full-file".format(
+                                    pi, take_i + 1), WARN)
 
-                    # ── Step 1b: full-file fallback (WAVEFORM_CONFORM off or failed) ─
                     if audio_words is None:
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                             tmp_a = tf.name
                         try:
                             ok, err = engines.extract_window(ap, 0, 9999, tmp_a)
                             if not ok:
-                                msg = "  Take {}: audio extract failed".format(take_i + 1)
+                                msg = "  Part {} Take {}: audio extract failed".format(
+                                    pi, take_i + 1)
                                 if err:
-                                    msg += " — {}".format(err[:200] if len(err) > 200 else err)
+                                    msg += " — {}".format(
+                                        err[:200] if len(err) > 200 else err)
                                 self._log_line(msg, ERR)
                                 continue
                             audio_words = engines.transcribe_clip(tmp_a)
                             self._log_line(
-                                "  Take {}: full-file transcription done in {:.1f}s  "
+                                "  Part {} Take {}: full-file done in {:.1f}s "
                                 "({} words)".format(
-                                    take_i + 1, time.perf_counter() - _t0,
+                                    pi, take_i + 1, time.perf_counter() - _t0,
                                     len(audio_words) if audio_words else 0), INFO)
                         finally:
                             try: os.unlink(tmp_a)
                             except: pass
 
-                    # ── Step 2: blob detection for in/out point snapping ───────────
                     if WAVEFORM_CONFORM and audio_words:
                         _t1 = time.perf_counter()
                         blobs = engines.detect_speech_blobs(ap)
                         self._log_line(
-                            "  Take {}: {} blob{} detected in {:.1f}s  (edge snapping)".format(
-                                take_i + 1,
+                            "  Part {} Take {}: {} blob{} in {:.1f}s".format(
+                                pi, take_i + 1,
                                 len(blobs) if blobs else 0,
                                 "s" if (blobs and len(blobs) != 1) else "",
                                 time.perf_counter() - _t1), INFO)
 
-                    _tx_done  += 1
-                    _tx_fresh += 1
+                    with _tx_lock:
+                        _tx_done  += 1
+                        _tx_fresh += 1
+                        _d, _t = _tx_done, _total_tx
                     self._set_tx_progress(
-                        _tx_done, _total_tx,
-                        "VO transcription — {} / {}".format(_tx_done, _total_tx))
+                        _d, _t, "VO transcription — {} / {}".format(_d, _t))
 
                     if not audio_words:
                         self._log_line(
-                            "  Take {}: no words transcribed".format(take_i + 1), ERR)
+                            "  Part {} Take {}: no words transcribed".format(
+                                pi, take_i + 1), ERR)
                         continue
                     engines.cache_save(ap, audio_words, blobs=blobs)
                     self._log_line(
-                        "  Take {}: {} words  [saved to cache]".format(
-                            take_i + 1, len(audio_words)), INFO)
+                        "  Part {} Take {}: {} words  [saved to cache]".format(
+                            pi, take_i + 1, len(audio_words)), INFO)
 
                 v_offset = 0.0
-                # AV offset detection aligns audio takes to their camera video
-                # so FCP can place the video track on the correct frame.
-                # AAF export sends audio-only clips to Pro Tools — no frame
-                # alignment needed — so skip the cross-correlation entirely.
                 if vp and not self._is_aaf_mode():
                     v_offset = engines.detect_av_offset(ap, vp)
                     self._log_line(
-                        "  Take {}: {} words  video offset {:+.2f}s".format(
-                            take_i + 1, len(audio_words), v_offset), SUCCESS)
+                        "  Part {} Take {}: {} words  video offset {:+.2f}s".format(
+                            pi, take_i + 1, len(audio_words), v_offset), SUCCESS)
                 else:
                     self._log_line(
-                        "  Take {}: {} words{}".format(
-                            take_i + 1, len(audio_words),
+                        "  Part {} Take {}: {} words{}".format(
+                            pi, take_i + 1, len(audio_words),
                             "  (no video)" if not vp else "  (AAF — offset skipped)"),
                         SUCCESS)
 
                 part_takes.append((audio_words, v_offset, vp, ap, blobs))
 
-            if part_takes:
-                vo_takes_by_part[pi] = part_takes
+            return part_takes
+
+        # Submit all VO parts concurrently — independent files can transcribe
+        # in parallel; MAX_WORKERS caps the concurrency.
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as vo_ex:
+            vo_futs = {vo_ex.submit(_transcribe_vo_part, pi, vb): pi
+                       for pi, vb in self.vo_bins.items()
+                       if not self._cancel.is_set()}
+            for fut in _fut_as_completed(vo_futs):
+                pi = vo_futs[fut]
+                try:
+                    part_takes = fut.result()
+                    if part_takes:
+                        vo_takes_by_part[pi] = part_takes
+                except Exception as e:
+                    self._log_line(
+                        "VO Part {}: transcription error — {}".format(pi, e), ERR)
 
         if _total_tx:
             self._set_tx_progress(_total_tx, _total_tx, "VO transcription complete")
@@ -7058,7 +7076,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         prog_frame = tk.Frame(self.body, bg=BG)
         prog_frame.pack(fill="x", pady=(0, 6))
         prog_lbl = tk.Label(prog_frame, text="", font=FB, bg=BG, fg=SUB, anchor="w")
-        prog_lbl.pack(side="left")
+        prog_lbl.pack(anchor="w")
+        prog_bar = _FlatProgressBar(prog_frame, height=6)
+        prog_bar.pack(fill="x", pady=(4, 0))
 
         # ── Controls row ──────────────────────────────────────────────────────
         ctrl = tk.Frame(self.body, bg=BG)
@@ -7329,8 +7349,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             tx_btn.config( fg=TEXT if can_tx  else SUB)
             clr_btn.config(fg=TEXT if can_clr else SUB)
 
-        def _set_prog(text):
-            self.after(0, lambda: prog_lbl.config(text=text))
+        def _set_prog(text, done=None, total=None):
+            def _upd():
+                prog_lbl.config(text=text)
+                if done is not None and total:
+                    prog_bar.set(done, total)
+            self.after(0, _upd)
 
         def _set_status(path, text):
             def _upd():
@@ -7398,11 +7422,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 name = os.path.basename(path)
                 _set_status(path, "transcribing")
                 _set_prog("\u23f3  Transcribing {} ({}/{})…".format(
-                    name, n_done[0] + 1, n_total))
+                    name, n_done[0] + 1, n_total),
+                    done=n_done[0], total=n_total)
 
                 def _progress_cb(frac, msg):
                     _set_prog("\u23f3  {} — {} ({}/{})".format(
-                        msg, name, n_done[0] + 1, n_total))
+                        msg, name, n_done[0] + 1, n_total),
+                        done=n_done[0], total=n_total)
 
                 try:
                     words, blobs = engines.transcribe_file(
@@ -7412,14 +7438,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         n_done[0] += 1
                         _set_status(path, "done")
                         _set_prog("\u2713  {} done  ({}/{})".format(
-                            name, n_done[0], n_total))
+                            name, n_done[0], n_total),
+                            done=n_done[0], total=n_total)
                     else:
                         _set_status(path, "error")
-                        _set_prog("\u26a0  {} — no words detected".format(name))
+                        _set_prog("\u26a0  {} — no words detected".format(name),
+                                  done=n_done[0], total=n_total)
                 except Exception as exc:
                     print("Transcribe error [{}]: {}".format(name, exc))
                     _set_status(path, "error")
-                    _set_prog("\u26a0  Error on {}".format(name))
+                    _set_prog("\u26a0  Error on {}".format(name),
+                              done=n_done[0], total=n_total)
 
             if max_w == 1:
                 for path in pending:
@@ -7449,6 +7478,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 summary += "  \u00b7  \u26a0 {} error{}".format(
                     n_err, "s" if n_err != 1 else "")
             prog_lbl.config(text=summary, fg=SUCCESS if not n_err else WARN)
+            prog_bar.set(n_done, max(n_done + n_err, 1))
             tx_btn.config(text="TRANSCRIBE")
             _update_btn_state()
 
