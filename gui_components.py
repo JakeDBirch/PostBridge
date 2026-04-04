@@ -554,7 +554,7 @@ class MediaPool(tk.Frame):
         tk.Label(hdr, text="EPISODE MEDIA POOL",
                  font=FL, bg=SURF, fg=ACCENT).pack(side="left")
         self._count_lbl = tk.Label(hdr, text="", font=FB, bg=SURF, fg=SUB)
-        self._count_lbl.pack(side="right")
+        self._count_lbl.pack(side="left", padx=(10, 0))
 
         hint = ("Drop all episode files here at once  "
                 "(Riverside audio + video + VO takes)"
@@ -573,9 +573,9 @@ class MediaPool(tk.Frame):
         self._pool_sash_drag    = {}      # transient drag state
         self._col_hdr_widths    = (0, 0)  # (name_w, dd_w) last drawn in header
 
-        # Column header row (rebuilt by _rebuild_col_hdr whenever widths change)
+        # Column header row — always kept in pack order; empty = zero height
         self._col_hdr = tk.Frame(self, bg=SURF)
-        self._col_hdr.pack(fill="x", padx=12, pady=(0, 0))
+        self._col_hdr.pack(fill="x", padx=12, pady=(2, 0))
         self._rebuild_col_hdr()
 
         self._table = tk.Frame(self, bg=SURF)
@@ -867,21 +867,18 @@ class MediaPool(tk.Frame):
             w.destroy()
 
         if not self._rows:
-            # Hide the header frame itself when there are no rows
-            self._col_hdr.pack_forget()
-            # Show drop zone if hidden
+            # Show drop zone, leave _col_hdr in place (empty = zero height)
             try:
                 self.dz.pack(fill="x", padx=12, pady=(0, 6))
             except Exception:
                 pass
             return
 
-        # Hide drop zone while rows are present; show compact drop hint instead
+        # Hide drop zone while rows are present
         try:
             self.dz.pack_forget()
         except Exception:
             pass
-        self._col_hdr.pack(fill="x", padx=12, pady=(2, 0))
 
         _HDR_H = 20   # explicit header row height in pixels
 

@@ -766,7 +766,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                               aaf_mode=(self.workflow in ("script_aaf", "script_session")))
         self._pool.pack(fill="x", pady=(0,10), padx=2)
         self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
-                  small=True).pack(side="right", padx=(0, 4))
+                  small=True).pack(side="left", padx=(10, 0))
 
         # Pre-load any files dropped at Step 1
         for p in getattr(self, "_prefetch_media", []):
