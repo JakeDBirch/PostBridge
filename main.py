@@ -2200,38 +2200,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._clear()
         self._section("STEP 3 — RECONCILING")
 
-        tk.Label(self.body,
-                 text="Processing audio clips and matching to your script.  "
-                      "Each clip is extracted and transcribed — this step can take "
-                      "several minutes for longer episodes.  The progress bar updates "
-                      "as each clip finishes.",
-                 font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
+        _desc = tk.Label(self.body,
+                         text="Extracting and transcribing each interview pull, "
+                              "then matching to your script. "
+                              "May take several minutes — status updates as each clip finishes.",
+                         font=FB, bg=BG, fg=SUB, justify="left", anchor="w")
+        _desc.pack(fill="x", pady=(0, 10))
+        _desc.bind("<Configure>", lambda e: _desc.config(wraplength=e.width))
 
         prog_outer = tk.Frame(self.body, bg=SURF,
                               highlightbackground=BORDER, highlightthickness=1)
         prog_outer.pack(fill="x", pady=(0,8))
-        prog_row = tk.Frame(prog_outer, bg=SURF)
-        prog_row.pack(fill="x", padx=12, pady=8)
-        _total_items = len(self.pulls) + len(self.vo_blocks)
-        self._prog_lbl = tk.Label(prog_row, text="0 / {}".format(_total_items),
-                                   font=FL, bg=SURF, fg=TEXT)
-        self._prog_lbl.pack(side="left")
-        self._prog_bar = ttk.Progressbar(prog_row, length=560,
-                                          maximum=_total_items)
-        self._prog_bar.pack(side="left", padx=12)
 
-        tx_row = tk.Frame(prog_outer, bg=SURF)
-        tx_row.pack(fill="x", padx=12, pady=(0, 8))
-        self._tx_lbl = tk.Label(tx_row, text="", font=FL, bg=SURF, fg=SUB,
-                                width=34, anchor="w")
-        self._tx_lbl.pack(side="left")
-        self._tx_bar = _FlatProgressBar(tx_row, height=4)
-        self._tx_bar.pack(side="left", fill="x", expand=True)
+        prog_row = tk.Frame(prog_outer, bg=SURF)
+        prog_row.pack(fill="x", padx=12, pady=(10, 4))
+        _total_items = len(self.pulls) + len(self.vo_blocks)
+        self._prog_lbl = tk.Label(prog_row, text="Starting…",
+                                  font=FL, bg=SURF, fg=TEXT, anchor="w")
+        self._prog_lbl.pack(side="left")
+        self._prog_bar = _FlatProgressBar(prog_row, height=6)
+        self._prog_bar.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        self._prog_bar.set(0, max(_total_items, 1))
 
         # Animated liveness dots — cycles independently of clip-level progress
         self._dot_lbl = tk.Label(prog_outer, text="", font=FL, bg=SURF, fg=ACCENT,
-                                 anchor="w", padx=12, pady=(0))
-        self._dot_lbl.pack(anchor="w", pady=(0, 4))
+                                 anchor="w", padx=12)
+        self._dot_lbl.pack(anchor="w", pady=(0, 6))
         self._dot_running = True
 
         def _pulse_dots(step=0):
@@ -2306,10 +2300,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _set_tx_progress(self, n, total, label=""):
         def _do():
-            if not hasattr(self, "_tx_lbl"):
+            if not hasattr(self, "_prog_lbl"):
                 return
-            self._tx_lbl.configure(text=label)
-            self._tx_bar.set(n, total)
+            self._prog_lbl.configure(text=label)
+            self._prog_bar.set(n, total)
         self.after(0, _do)
 
     def _run_reconcile(self, int_assets, transcript_sources, n_workers=None):
@@ -2651,7 +2645,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _d_snap = done
                     def _stall_upd(d=_d_snap, n=n_left, s=stall_s):
                         self._prog_lbl.config(
-                            text="{} / {}  —  {} still running…  ({:.0f}s)".format(
+                            text="Matching pulls — {} / {}  ({} running… {:.0f}s)".format(
                                 d, total, n, s))
                     self.after(0, _stall_upd)
 
@@ -2770,8 +2764,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 SUB)
 
                         def _update(d=done):
-                            self._prog_bar["value"] = d
-                            self._prog_lbl.config(text="{} / {}".format(d, total))
+                            self._prog_bar.set(d, total)
+                            self._prog_lbl.config(
+                                text="Matching pulls — {} / {}".format(d, total))
                         self.after(0, _update)
         finally:
             ex.shutdown(wait=False)
