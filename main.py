@@ -719,6 +719,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "RECONCILE  →",   self._start_reconcile,
                   color=ACCENT).pack(side="right")
 
+        # ── Background mode toggle ────────────────────────────────────────────
+        if not hasattr(self, "_reconcile_bg_mode"):
+            self._reconcile_bg_mode = tk.BooleanVar(value=False)
+        bg_ck2 = tk.Label(nav,
+                          text="\u2611" if self._reconcile_bg_mode.get() else "\u2610",
+                          font=(_SANS, 15), bg=BG,
+                          fg=ACCENT if self._reconcile_bg_mode.get() else SUB,
+                          cursor="hand2", padx=4)
+        bg_ck2.pack(side="right", padx=(0, 6))
+        bg_lbl2 = tk.Label(nav, text="Background mode", font=FB, bg=BG, fg=SUB,
+                           cursor="hand2")
+        bg_lbl2.pack(side="right", padx=(0, 2))
+
+        def _toggle_reconcile_bg(lbl=bg_ck2):
+            self._reconcile_bg_mode.set(not self._reconcile_bg_mode.get())
+            _on = self._reconcile_bg_mode.get()
+            lbl.config(text="\u2611" if _on else "\u2610",
+                       fg=ACCENT if _on else SUB)
+
+        bg_ck2.bind("<Button-1>",  lambda e: _toggle_reconcile_bg())
+        bg_lbl2.bind("<Button-1>", lambda e: _toggle_reconcile_bg())
+
         # ── Scrollable content area fills remaining space ─────────────────────
         sf = self._scroll_frame(self.body)
 
@@ -2216,9 +2238,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             for tok in self.tokens
         }
 
+        # Compute worker count: CPU-aware default, capped by MAX_WORKERS config.
+        # cpu_count // 2 is conservative since CTranslate2 (Whisper's backend)
+        # already uses multiple cores internally per inference call.
+        _cpu   = os.cpu_count() or 4
+        _n_workers = 1 if getattr(self, "_reconcile_bg_mode",
+                                  tk.BooleanVar()).get() else max(
+            1, min(MAX_WORKERS, _cpu // 2))
+
         threading.Thread(
             target=self._run_reconcile,
-            args=(int_assets, transcript_sources),
+            args=(int_assets, transcript_sources, _n_workers),
             daemon=True).start()
 
     @staticmethod
@@ -2256,7 +2286,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._tx_bar.set(n, total)
         self.after(0, _do)
 
-    def _run_reconcile(self, int_assets, transcript_sources):
+    def _run_reconcile(self, int_assets, transcript_sources, n_workers=None):
+        if n_workers is None:
+            _cpu = os.cpu_count() or 4
+            n_workers = max(1, min(MAX_WORKERS, _cpu // 2))
         pulls       = self.pulls
         total       = len(pulls)
         done        = 0
@@ -2450,8 +2483,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return part_takes
 
         # Submit all VO parts concurrently — independent files can transcribe
-        # in parallel; MAX_WORKERS caps the concurrency.
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as vo_ex:
+        # in parallel; n_workers caps the concurrency.
+        with ThreadPoolExecutor(max_workers=n_workers) as vo_ex:
             vo_futs = {vo_ex.submit(_transcribe_vo_part, pi, vb): pi
                        for pi, vb in self.vo_bins.items()
                        if not self._cancel.is_set()}
@@ -2567,7 +2600,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         #       futures have finished yet.
         #   (b) The UI can display "N still running… (Xs)" when items stall so the
         #       user knows the process is alive.
-        ex = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        ex = ThreadPoolExecutor(max_workers=n_workers)
         try:
             futures       = {ex.submit(dispatch, item): item for item in all_items}
             pending       = set(futures.keys())
