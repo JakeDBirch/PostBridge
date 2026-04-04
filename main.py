@@ -204,7 +204,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._logo_photo = None
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         _assets = os.path.join(_script_dir, "assets")
-        for _name in ("meateater_logo.png",
+        for _name in ("ME_HortLogo_OrgWht.png",
+                      "meateater_logo.png",
                       "channels4_profile-d0f26706-7f7c-46be-b8be-cd47fd3401bf.png"):
             _path = os.path.join(_assets, _name)
             if os.path.isfile(_path):
