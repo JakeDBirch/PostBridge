@@ -7117,27 +7117,43 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         ctrl = tk.Frame(self.body, bg=BG)
         ctrl.pack(fill="x", pady=(0, 8))
 
-        bg_var = tk.BooleanVar(value=False)
-        bg_frame = tk.Frame(ctrl, bg=BG)
-        bg_frame.pack(side="left")
+        # ── Worker count stepper — adjustable live during a run ───────────────
+        _cpu_max   = max(1, (os.cpu_count() or 4) // 2)
+        _workers   = [1]          # mutable: current target concurrency
+        _cond      = __import__("threading").Condition()  # wakes blocked slots
+        _active    = [0]          # mutable: currently running threads
 
-        def _toggle_bg():
-            bg_var.set(not bg_var.get())
-            _on = bg_var.get()
-            bg_ck.config(text="\u2611" if _on else "\u2610",
-                         fg=ACCENT if _on else SUB)
-            bg_desc.config(fg=SUB if _on else SURF3)
+        wk_frame = tk.Frame(ctrl, bg=BG)
+        wk_frame.pack(side="left")
 
-        bg_ck = tk.Label(bg_frame, text="\u2610", font=(_SANS, 15),
-                         bg=BG, fg=SUB, cursor="hand2", padx=4)
-        bg_ck.pack(side="left")
-        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB, bg=BG, fg=SUB)
-        bg_lbl.pack(side="left", padx=(0, 8))
-        bg_desc = tk.Label(bg_frame, text="(1 file at a time — lower CPU load)",
-                           font=(_SANS, 10), bg=BG, fg=SURF3)
-        bg_desc.pack(side="left")
-        bg_ck.bind("<Button-1>",  lambda e: _toggle_bg())
-        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
+        tk.Label(wk_frame, text="Workers:", font=FB, bg=BG, fg=SUB).pack(
+            side="left", padx=(0, 6))
+
+        wk_minus = tk.Label(wk_frame, text="−", font=(_SANS, 14, "bold"),
+                            bg=BG, fg=TEXT, cursor="hand2", padx=4)
+        wk_minus.pack(side="left")
+
+        wk_lbl = tk.Label(wk_frame, text="1", font=FBT, bg=BG, fg=ACCENT, width=2)
+        wk_lbl.pack(side="left")
+
+        wk_plus = tk.Label(wk_frame, text="+", font=(_SANS, 14, "bold"),
+                           bg=BG, fg=TEXT, cursor="hand2", padx=4)
+        wk_plus.pack(side="left")
+
+        wk_cap = tk.Label(wk_frame,
+                          text="(max {})".format(_cpu_max),
+                          font=(_SANS, 10), bg=BG, fg=SUB)
+        wk_cap.pack(side="left", padx=(4, 0))
+
+        def _set_workers(n):
+            n = max(1, min(_cpu_max, n))
+            _workers[0] = n
+            wk_lbl.config(text=str(n))
+            with _cond:
+                _cond.notify_all()   # wake any blocked _acquire() calls
+
+        wk_minus.bind("<Button-1>", lambda e: _set_workers(_workers[0] - 1))
+        wk_plus.bind( "<Button-1>", lambda e: _set_workers(_workers[0] + 1))
 
         # Mutable command slots — _btn captures these dispatchers at bind time;
         # setting the slot to None disables the button without rebinding.
@@ -7447,10 +7463,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             n_total = len(pending)
             n_done  = [0]
-            max_w   = 1 if bg_var.get() else MAX_WORKERS
+
+            # ── Condition-variable gate — supports live worker-count changes ──
+            import threading as _th
+
+            def _acquire():
+                """Block until a slot is free, then claim it."""
+                with _cond:
+                    while _active[0] >= _workers[0]:
+                        _cond.wait(timeout=0.3)
+                        if _cancel[0]:
+                            return False
+                    _active[0] += 1
+                    return True
+
+            def _release():
+                with _cond:
+                    _active[0] = max(0, _active[0] - 1)
+                    _cond.notify_all()
 
             def _process_one(path):
                 if _cancel[0]:
+                    _release()
                     return
                 name = os.path.basename(path)
                 _set_status(path, "transcribing")
@@ -7482,18 +7516,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _set_status(path, "error")
                     _set_prog("\u26a0  Error on {}".format(name),
                               done=n_done[0], total=n_total)
+                finally:
+                    _release()
 
-            if max_w == 1:
-                for path in pending:
-                    if _cancel[0]:
-                        break
-                    _process_one(path)
-            else:
-                with _cf.ThreadPoolExecutor(max_workers=max_w) as pool:
-                    futs = {pool.submit(_process_one, p): p for p in pending}
-                    for fut in _cf.as_completed(futs):
-                        try: fut.result()
-                        except Exception: pass
+            # Dispatcher: iterate pending, acquire a slot, spin up a thread.
+            # When _workers[0] is 1 the gate allows only one through at a time;
+            # increasing it live wakes blocked iterations immediately.
+            dispatch_threads = []
+            for path in pending:
+                if _cancel[0]:
+                    break
+                if not _acquire():   # returns False on cancel
+                    break
+                t = _th.Thread(target=_process_one, args=(path,), daemon=True)
+                dispatch_threads.append(t)
+                t.start()
+
+            # Wait for all launched threads to finish
+            for t in dispatch_threads:
+                t.join()
+
+            _active[0] = 0
 
             _running[0] = False
             self.after(0, _on_done)
