@@ -100,23 +100,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._header()
         self.body = tk.Frame(self, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=44, pady=(0,4))
-
-        # Persistent footer: SAVE / SAVE AS / OPEN — lives on every screen
-        self._footer = tk.Frame(self, bg=BG)
-        self._footer.pack(fill="x", padx=44, pady=(2, 14))
-        tk.Frame(self._footer, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
-        _ftr_row = tk.Frame(self._footer, bg=BG)
-        _ftr_row.pack(fill="x")
-        self._footer_save_btn = [None]
-        def _ftr_save():
-            self._quick_save(self._footer_save_btn)
-        _fsb = self._btn(_ftr_row, "SAVE", _ftr_save, small=True)
-        _fsb.pack(side="left", padx=(0, 4))
-        self._footer_save_btn[0] = _fsb
-        self._btn(_ftr_row, "SAVE AS", self._save_as, small=True).pack(side="left", padx=(0, 4))
-        self._btn(_ftr_row, "OPEN",    self._open_session, small=True).pack(side="left")
-        self._btn(_ftr_row, "⌂ HOME",  self._home, small=True).pack(side="right")
+        self.body.pack(fill="both", expand=True, padx=44, pady=(0, 14))
 
         # Global keyboard shortcuts — active on every screen
         self.bind_all("<Control-s>",       lambda e: self._quick_save(self._footer_save_btn))
@@ -186,40 +170,76 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _header(self):
         tk.Frame(self, bg=ACCENT, height=6).pack(fill="x")
         bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", padx=36, pady=(20,10))
-        tk.Label(bar, text="POSTBRIDGE", font=FH, bg=BG, fg=TEXT).pack(side="left")
-        tk.Label(bar, text="  ·  ", font=FS, bg=BG, fg=ACCENT).pack(side="left", pady=(8,0))
-        tk.Label(bar, text="audio/video post-production bridge", font=FS, bg=BG, fg=SUB).pack(side="left", pady=(8,0))
-        # MeatEater brand: logo if present, else text
+        bar.pack(fill="x", padx=36, pady=(14, 10))
+
+        # ── Left: persistent action buttons (Save / Save As / Open / Home) ────
+        btn_frame = tk.Frame(bar, bg=BG)
+        btn_frame.pack(side="left")
+        self._footer_save_btn = [None]
+        def _hdr_save():
+            self._quick_save(self._footer_save_btn)
+        _fsb = self._btn(btn_frame, "SAVE", _hdr_save, small=True)
+        _fsb.pack(side="left", padx=(0, 4))
+        self._footer_save_btn[0] = _fsb
+        self._btn(btn_frame, "SAVE AS", self._save_as,
+                  small=True).pack(side="left", padx=(0, 4))
+        self._btn(btn_frame, "OPEN",    self._open_session,
+                  small=True).pack(side="left", padx=(0, 10))
+        self._btn(btn_frame, "\u2302 HOME", self._home,
+                  small=True).pack(side="left")
+
+        # ── Right: PostBridge + MeatEater branding ───────────────────────────
+        brand_frame = tk.Frame(bar, bg=BG)
+        brand_frame.pack(side="right")
+
+        # Dependency warnings (packed right-to-left, so they appear between
+        # the PostBridge text and the MeatEater logo)
+        _dep_warnings = []
+        if not HAS_WHISPER:
+            _dep_warnings.append("pip install faster-whisper")
+        if not HAS_DND:
+            _dep_warnings.append("pip install tkinterdnd2")
+
+        # MeatEater brand — rightmost element
         self._logo_photo = None
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         _assets = os.path.join(_script_dir, "assets")
-        for _name in ("meateater_logo.png", "channels4_profile-d0f26706-7f7c-46be-b8be-cd47fd3401bf.png"):
+        for _name in ("meateater_logo.png",
+                      "channels4_profile-d0f26706-7f7c-46be-b8be-cd47fd3401bf.png"):
             _path = os.path.join(_assets, _name)
             if os.path.isfile(_path):
                 try:
                     from tkinter import PhotoImage
                     self._logo_photo = PhotoImage(file=_path)
-                    # Scale to a reasonable header size (e.g. 36px tall)
                     _h = self._logo_photo.height()
                     if _h > 36:
                         div = max(1, _h // 36)
                         self._logo_photo = self._logo_photo.subsample(div, div)
-                    tk.Label(bar, image=self._logo_photo, bg=BG).pack(side="right", padx=(12,0), pady=(4,0))
+                    tk.Label(brand_frame, image=self._logo_photo,
+                             bg=BG).pack(side="right", padx=(10, 0), pady=(4, 0))
                     break
                 except Exception:
                     pass
         if self._logo_photo is None:
-            tk.Label(bar, text="MEATEATER", font=("Courier New", 9, "bold"),
-                     bg=BG, fg=ACCENT).pack(side="right", pady=(8,0))
-        warnings = []
-        if not HAS_WHISPER:
-            warnings.append("pip install faster-whisper")
-        if not HAS_DND:
-            warnings.append("pip install tkinterdnd2")
-        if warnings:
-            tk.Label(bar, text="  [" + "  ·  ".join(warnings) + "]",
-                     font=("Courier New",10), bg=BG, fg=WARN).pack(side="right")
+            tk.Label(brand_frame, text="MEATEATER",
+                     font=("Courier New", 9, "bold"),
+                     bg=BG, fg=ACCENT).pack(side="right", padx=(10, 0), pady=(8, 0))
+
+        if _dep_warnings:
+            tk.Label(brand_frame,
+                     text="  [" + "  \u00b7  ".join(_dep_warnings) + "]",
+                     font=("Courier New", 10), bg=BG, fg=WARN).pack(side="right")
+
+        # PostBridge title + subtitle (left of MeatEater, packed right-to-left)
+        tk.Label(brand_frame, text="  \u00b7  ", font=FS,
+                 bg=BG, fg=BORDER).pack(side="right", pady=(8, 0))
+        tk.Label(brand_frame, text="audio/video post-production bridge",
+                 font=FS, bg=BG, fg=SUB).pack(side="right", pady=(8, 0))
+        tk.Label(brand_frame, text="  \u00b7  ", font=FS,
+                 bg=BG, fg=ACCENT).pack(side="right", pady=(8, 0))
+        tk.Label(brand_frame, text="POSTBRIDGE",
+                 font=FH, bg=BG, fg=TEXT).pack(side="right")
+
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=36)
 
     def _clear(self):
@@ -714,8 +734,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
-        self._btn(nav, "← HOME",          self._home).pack(side="left")
-        self._btn(nav, "⟳ REFRESH POOL", self._refresh_pool).pack(side="left", padx=(8,0))
         self._btn(nav, "RECONCILE  →",   self._start_reconcile,
                   color=ACCENT).pack(side="right")
 
@@ -747,6 +765,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._pool = MediaPool(sf, self.tokens, self.parts,
                               aaf_mode=(self.workflow in ("script_aaf", "script_session")))
         self._pool.pack(fill="x", pady=(0,10), padx=2)
+        self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
+                  small=True).pack(side="right", padx=(0, 4))
 
         # Pre-load any files dropped at Step 1
         for p in getattr(self, "_prefetch_media", []):
@@ -7376,6 +7396,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         def _clear_list():
             if _running[0]:
+                return
+            if not messagebox.askyesno("Clear List",
+                    "Remove all files from the list?\n\n"
+                    "Transcription files on disk are not affected."):
                 return
             for w in list(list_frame.winfo_children()):
                 w.destroy()

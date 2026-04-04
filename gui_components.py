@@ -549,7 +549,8 @@ class MediaPool(tk.Frame):
         self._bulk_loading      = False   # suppresses trace-driven rebuild during restore
         self._user_unassigned   = set()   # paths the user explicitly cleared
 
-        hdr = tk.Frame(self, bg=SURF); hdr.pack(fill="x", padx=12, pady=(10,4))
+        self._hdr = hdr = tk.Frame(self, bg=SURF)
+        hdr.pack(fill="x", padx=12, pady=(10,4))
         tk.Label(hdr, text="EPISODE MEDIA POOL",
                  font=FL, bg=SURF, fg=ACCENT).pack(side="left")
         self._count_lbl = tk.Label(hdr, text="", font=FB, bg=SURF, fg=SUB)
