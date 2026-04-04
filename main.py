@@ -261,6 +261,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._current_session_file = None
         self._export_fmt           = None
         self._restore_s4           = False
+        self.workflow              = None
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
@@ -1773,24 +1774,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Stash Step 4 state if embedded in the session file
         self._pending_s4_state = data.get("step4_state") or None
 
-        # Results may be embedded directly in the setup JSON (preferred) or in a sidecar.
-        # Check .pb_cache/ first (new location), fall back to legacy path beside the script.
-        if data.get("results"):
-            self._pending_results = data["results"]
-        else:
-            _cache_dir  = os.path.join(os.path.dirname(script_path), ".pb_cache")
-            _script_stem = os.path.splitext(os.path.basename(script_path))[0]
-            results_path = os.path.join(_cache_dir, _script_stem + "_results.json")
-            if not os.path.isfile(results_path):
-                results_path = os.path.splitext(script_path)[0] + "_results.json"
-            if os.path.isfile(results_path):
-                try:
-                    with open(results_path, encoding="utf-8") as f:
-                        self._pending_results = json.load(f)
-                except Exception:
-                    self._pending_results = None
+        # Only auto-jump to Step 4 when the session was explicitly saved there.
+        # step4_state is written by _build_full_session_data only when _rv exists
+        # (i.e. Step 4 is the current screen).  Sessions saved at Step 2 never
+        # carry step4_state, so stale sidecar result files won't cause a jump.
+        if data.get("step4_state"):
+            if data.get("results"):
+                self._pending_results = data["results"]
             else:
-                self._pending_results = None
+                _cache_dir   = os.path.join(os.path.dirname(script_path), ".pb_cache")
+                _script_stem = os.path.splitext(os.path.basename(script_path))[0]
+                results_path = os.path.join(_cache_dir, _script_stem + "_results.json")
+                if not os.path.isfile(results_path):
+                    results_path = os.path.splitext(script_path)[0] + "_results.json"
+                if os.path.isfile(results_path):
+                    try:
+                        with open(results_path, encoding="utf-8") as f:
+                            self._pending_results = json.load(f)
+                    except Exception:
+                        self._pending_results = None
+                else:
+                    self._pending_results = None
+        else:
+            self._pending_results = None
 
         # Restore pad/gap global values if saved
         if "pad" in data:
