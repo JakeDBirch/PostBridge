@@ -188,22 +188,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(btn_frame, "\u2302 HOME", self._home,
                   small=True).pack(side="left")
 
-        # ── Right: PostBridge + MeatEater branding ───────────────────────────
-        brand_frame = tk.Frame(bar, bg=BG)
-        brand_frame.pack(side="right")
-
-        # Dependency warnings (packed right-to-left, so they appear between
-        # the PostBridge text and the MeatEater logo)
-        _dep_warnings = []
-        if not HAS_WHISPER:
-            _dep_warnings.append("pip install faster-whisper")
-        if not HAS_DND:
-            _dep_warnings.append("pip install tkinterdnd2")
-
-        # MeatEater brand — rightmost element
+        # ── Right: MeatEater logo ─────────────────────────────────────────────
+        # Must be packed before the expanding center frame.
         self._logo_photo = None
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         _assets = os.path.join(_script_dir, "assets")
+        logo_frame = tk.Frame(bar, bg=BG)
+        logo_frame.pack(side="right")
         for _name in ("ME_HortLogo_OrgWht.png",
                       "meateater_logo.png",
                       "channels4_profile-d0f26706-7f7c-46be-b8be-cd47fd3401bf.png"):
@@ -213,33 +204,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     from tkinter import PhotoImage
                     self._logo_photo = PhotoImage(file=_path)
                     _h = self._logo_photo.height()
-                    if _h > 36:
-                        div = max(1, _h // 36)
+                    if _h > 46:
+                        div = max(1, _h // 46)
                         self._logo_photo = self._logo_photo.subsample(div, div)
-                    tk.Label(brand_frame, image=self._logo_photo,
-                             bg=BG).pack(side="right", padx=(10, 0), pady=(4, 0))
+                    tk.Label(logo_frame, image=self._logo_photo, bg=BG).pack()
                     break
                 except Exception:
                     pass
         if self._logo_photo is None:
-            tk.Label(brand_frame, text="MEATEATER",
+            tk.Label(logo_frame, text="MEATEATER",
                      font=("Courier New", 9, "bold"),
-                     bg=BG, fg=ACCENT).pack(side="right", padx=(10, 0), pady=(8, 0))
+                     bg=BG, fg=ACCENT).pack()
 
+        # ── Center: PostBridge title + subtitle ───────────────────────────────
+        brand_frame = tk.Frame(bar, bg=BG)
+        brand_frame.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(brand_frame, bg=BG)
+        inner.pack(expand=True)   # centers within the remaining space
+
+        tk.Label(inner, text="POSTBRIDGE",
+                 font=FH, bg=BG, fg=ACCENT).pack()
+        tk.Label(inner, text="audio/video post-production bridge",
+                 font=(_SANS, 10, "italic"), bg=BG, fg=TEXT).pack(pady=(2, 0))
+
+        _dep_warnings = []
+        if not HAS_WHISPER:
+            _dep_warnings.append("pip install faster-whisper")
+        if not HAS_DND:
+            _dep_warnings.append("pip install tkinterdnd2")
         if _dep_warnings:
-            tk.Label(brand_frame,
+            tk.Label(inner,
                      text="  [" + "  \u00b7  ".join(_dep_warnings) + "]",
-                     font=("Courier New", 10), bg=BG, fg=WARN).pack(side="right")
-
-        # PostBridge title + subtitle (left of MeatEater, packed right-to-left)
-        tk.Label(brand_frame, text="  \u00b7  ", font=FS,
-                 bg=BG, fg=BORDER).pack(side="right", pady=(8, 0))
-        tk.Label(brand_frame, text="audio/video post-production bridge",
-                 font=FS, bg=BG, fg=SUB).pack(side="right", pady=(8, 0))
-        tk.Label(brand_frame, text="  \u00b7  ", font=FS,
-                 bg=BG, fg=ACCENT).pack(side="right", pady=(8, 0))
-        tk.Label(brand_frame, text="POSTBRIDGE",
-                 font=FH, bg=BG, fg=TEXT).pack(side="right")
+                     font=("Courier New", 9), bg=BG, fg=WARN).pack(pady=(3, 0))
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=36)
 
