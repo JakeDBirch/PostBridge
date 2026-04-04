@@ -204,8 +204,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     from tkinter import PhotoImage
                     self._logo_photo = PhotoImage(file=_path)
                     _h = self._logo_photo.height()
-                    if _h > 56:
-                        div = max(1, _h // 56)
+                    if _h > 50:
+                        div = max(1, _h // 50)
                         self._logo_photo = self._logo_photo.subsample(div, div)
                     tk.Label(logo_frame, image=self._logo_photo, bg=BG).pack()
                     break
@@ -227,9 +227,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         title_row = tk.Frame(inner, bg=BG)
         title_row.pack()
         tk.Label(title_row, text="POST",
-                 font=(_SANS, 17, "bold"), bg=BG, fg=ACCENT).pack(side="left")
+                 font=(_SANS, 18, "bold"), bg=BG, fg=ACCENT, padx=0).pack(side="left")
         tk.Label(title_row, text="BRIDGE",
-                 font=(_SANS, 17, "bold"), bg=BG, fg=TEXT).pack(side="left")
+                 font=(_SANS, 18, "bold"), bg=BG, fg=TEXT, padx=0).pack(side="left")
 
         tk.Label(inner, text="audio/video post-production bridge",
                  font=(_SANS, 9, "italic"), bg=BG, fg=SUB).pack(pady=(1, 0))
