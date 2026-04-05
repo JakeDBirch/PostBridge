@@ -287,6 +287,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._restore_s4           = False
         self.workflow              = None
         self._pending_results      = None
+        # Clear AAF pool so re-entering the workflow starts blank
+        self._aaf_video_paths = []
+        self._aaf_audio_paths = []
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
@@ -1547,14 +1550,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 json.dump(self._build_full_session_data(), f,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._current_session_file = path
-            messagebox.showinfo("Saved", "Session saved to:\n{}".format(path))
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
     def _quick_save(self, btn_ref=None):
         """Save to the current session file; prompt for a path on the first save."""
         if getattr(self, 'workflow', None) == 'aaf_xml':
-            self._aaf_save_setup()
+            self._aaf_save_setup(prompt=False)
             return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
@@ -4743,6 +4745,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  cursor="hand2").pack(side="left")
         self._aaf_count_lbl = tk.Label(ph, text="0 files", font=FB, bg=SURF, fg=SUB)
         self._aaf_count_lbl.pack(side="right")
+        self._btn(ph, "\u21bb REFRESH", self._aaf_refresh_pool,
+                  small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FOLDER", self._aaf_browse_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FILES",  self._aaf_browse_files,
@@ -4796,6 +4800,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_audio_count_lbl = tk.Label(aph, text="0 files", font=FB,
                                              bg=SURF, fg=SUB)
         self._aaf_audio_count_lbl.pack(side="right")
+        self._btn(aph, "\u21bb REFRESH", self._aaf_refresh_pool,
+                  small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FOLDER", self._aaf_browse_audio_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FILES",  self._aaf_browse_audio_files,
@@ -6962,6 +6968,52 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_schedule_detect_fps()
         self._aaf_update_seq_presets()
 
+    def _aaf_refresh_pool(self):
+        """Scan each directory already in the video/audio pools for new media files.
+
+        Existing entries are kept as-is.  Any file found in the same folder(s)
+        that isn't already in a pool is added automatically.  This lets editors
+        drop new footage into a watched folder and hit Refresh instead of
+        re-browsing.
+        """
+        dirs = set()
+        for p in self._aaf_video_paths + self._aaf_audio_paths:
+            d = os.path.dirname(p)
+            if os.path.isdir(d):
+                dirs.add(d)
+        if not dirs:
+            return
+
+        existing = set(self._aaf_video_paths) | set(self._aaf_audio_paths)
+        new_video, new_audio = [], []
+        for d in sorted(dirs):
+            try:
+                for fn in sorted(os.listdir(d)):
+                    if fn.startswith("._"):
+                        continue
+                    fp = os.path.join(d, fn)
+                    if not os.path.isfile(fp) or fp in existing:
+                        continue
+                    if is_video(fp):
+                        new_video.append(fp)
+                    elif is_audio(fp):
+                        new_audio.append(fp)
+            except OSError:
+                pass
+
+        if not new_video and not new_audio:
+            self._aaf_set_status("No new files found.")
+            return
+
+        if new_video:
+            self._aaf_add_video_batch(new_video)
+        if new_audio:
+            self._aaf_add_audio_batch(new_audio)
+
+        total = len(new_video) + len(new_audio)
+        self._aaf_set_status(
+            "Added {} new file{}.".format(total, "s" if total != 1 else ""))
+
     def _aaf_set_status(self, msg):
         """Update the import status label (no-op if label not yet created)."""
         if hasattr(self, "_aaf_status_lbl"):
@@ -6973,8 +7025,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return None
         return os.path.splitext(self._aaf_path)[0] + "_setup.json"
 
-    def _aaf_save_setup(self):
-        data = {
+    def _aaf_build_setup_data(self):
+        """Return the current AAF setup as a serialisable dict."""
+        return {
             "version":     2,
             "aaf":         getattr(self, "_aaf_path", ""),
             "video_paths": self._aaf_video_paths,
@@ -7008,7 +7061,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "mix_path":      getattr(self, "_aaf_mix_var", tk.StringVar()).get(),
             "camera_audio":  getattr(self, "_aaf_cam_audio_var", tk.BooleanVar()).get(),
         }
-        sidecar   = self._aaf_sidecar_path()
+
+    def _aaf_save_setup(self, prompt=True):
+        """Save AAF setup. When prompt=False, writes silently to the sidecar path."""
+        data    = self._aaf_build_setup_data()
+        sidecar = self._aaf_sidecar_path()
+
+        if not prompt and sidecar:
+            # Quick-save: overwrite sidecar directly, no dialog
+            try:
+                with open(sidecar, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+            return
+
+        # Save As: always prompt
         init_dir  = os.path.dirname(sidecar)  if sidecar else ""
         init_file = os.path.basename(sidecar) if sidecar else "aaf_setup.json"
         path = filedialog.asksaveasfilename(
@@ -7016,10 +7084,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             defaultextension=".json",
             filetypes=[("JSON","*.json"),("All","*.*")],
             initialdir=init_dir, initialfile=init_file)
-        if not path: return
+        if not path:
+            return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        messagebox.showinfo("Saved", "Setup saved to:\n{}".format(path))
 
     def _aaf_load_setup(self):
         path = filedialog.askopenfilename(
