@@ -628,16 +628,23 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
 
         return results if results else [(0.0, 0.0)]
 
-    # ── Stage 1: 5 Hz RMS envelope, full probe window ─────────────────────
-    # Five RMS samples per second (200 ms windows).
-    # Handles offsets up to ±probe_duration/2 s.  Accuracy: ±100 ms.
-    # Extraction stays at 8 kHz (same ffmpeg cost as before); the finer
-    # 200 ms window captures sentence-level amplitude rhythm and reduces
-    # false-peak susceptibility compared to the old 1 Hz / 1 s windows.
-    SR1        = 5          # 5 Hz effective envelope rate
+    # ── Stage 1: 50 Hz RMS envelope, full probe window ────────────────────
+    # ARCHITECTURE NOTE
+    # Previously this used 5 Hz (200 ms windows).  A -2 s offset is only
+    # 10 samples in the 1500-sample coarse envelope — geometrically
+    # indistinguishable from speech-rhythm autocorrelation false peaks.
+    # Upgrading to 50 Hz (20 ms windows) on the same ffmpeg extract gives
+    # 100 samples for a 2 s offset, reliable detection of small negative
+    # offsets (common when DAW starts before camera), and eliminates the
+    # need for the near-zero patch that was added as a workaround.
+    # Cost: trivially larger numpy arrays; ffmpeg calls are unchanged.
+    #
+    # arg order: audio first, video second — C[L] = sum_t AUDIO[t]*VIDEO[t+L]
+    # Peak at L>0 means VIDEO leads AUDIO (camera started early) → T1>0
+    SR1        = 50         # 50 Hz effective envelope rate  (was 5 Hz)
     DUR1       = min(probe_duration, 600.0)
     _SR1_EXTR  = 8000       # ffmpeg extraction sample rate (unchanged)
-    WIN1       = _SR1_EXTR // SR1   # 1600 samples = 200 ms per envelope window
+    WIN1       = _SR1_EXTR // SR1   # 160 samples = 20 ms per envelope window
 
     # Both extractions are independent — run them in parallel threads.
     raw_a1, raw_b1 = _extract_pair(video_path, start_offset,
@@ -646,109 +653,25 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     if raw_a1 is None or raw_b1 is None:
         return 0.0, 0.0
 
-    env_a1 = _peak_env(raw_a1, WIN1, top_pct=15)   # 5 samples/s, loudest 15 %
-    env_b1 = _peak_env(raw_b1, WIN1, top_pct=15)
+    env_a1 = _peak_env(raw_a1, WIN1, top_pct=20)   # 50 samples/s, loudest 20 %
+    env_b1 = _peak_env(raw_b1, WIN1, top_pct=20)
 
     if env_a1 is None or env_b1 is None or len(env_a1) < 4 or len(env_b1) < 4:
         return 0.0, 0.0
 
-    # ── Multi-candidate Stage 1 + near-zero direct candidate ─────────────────
-    #
-    # ROOT CAUSE OF SYSTEMATIC NEGATIVE-OFFSET FAILURES
-    # ─────────────────────────────────────────────────
-    # The 5 Hz coarse search (200 ms windows, ±150 s range) cannot reliably
-    # detect small offsets.  A true T of -2 s is only 10 envelope samples;
-    # speech-rhythm autocorrelation creates competing peaks at many lags that
-    # easily outscore it.  The algorithm then seeds Stage 2 at a wrong large
-    # positive peak, and Stage 2 refines the WRONG position.
-    #
-    # The fix has two parts:
-    #
-    # 1. Top-3 Stage-1 candidates + mirror negations.
-    #    Each candidate also tests its negated lag (mirror).  For the common
-    #    case where the xcorr returns +|T| when the true offset is -|T|
-    #    (the two give similar peak heights for similar VO signals), the
-    #    mirror test recovers the correct sign.
-    #
-    # 2. Near-zero direct candidate (most important for Crites-style projects).
-    #    Run a 50 Hz / ±10 s search on the first 30 s of both files.  This
-    #    directly detects any small offset (-10 s < T < +10 s) at Stage-2
-    #    resolution, bypassing Stage 1 entirely.  For correctly-detected
-    #    large-T recordings (e.g. T ≈ +15 s), only ~15 s of the 30 s window
-    #    overlaps, so confidence is low and the Stage-1 candidate wins.
-
-    # arg order: audio first, video second — C[L] = sum_t AUDIO[t]*VIDEO[t+L]
-    # Peak at L>0 means VIDEO leads AUDIO (camera started early) → T1>0
     _S1_MIN_GAP = max(1, int(SR1 * 2))   # candidates must be ≥2 s apart
-    _s1_raw     = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
+    _s1_cands   = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
                                 n_peaks=3, min_gap=_S1_MIN_GAP)
 
-    # Expand with mirror candidates (negated lag, discounted confidence)
-    _s1_cands = []
-    for _lag, _conf in _s1_raw:
-        _s1_cands.append((_lag, _conf))
-        if abs(_lag) >= _S1_MIN_GAP:
-            _s1_cands.append((-_lag, _conf * 0.7))   # mirror, slightly discounted
-
-    # Shared validate constants: 50 Hz envelope, 10 s window, ±1 s search
-    _QV_SR    = 8000
-    _QV_WIN   = _QV_SR // 50          # 20 ms windows → 50 Hz effective
-    _QV_EFF   = _QV_SR // _QV_WIN
-    _QV_PROBE = 10.0
-    _QV_MSRCH = int(1.0 * _QV_EFF)   # ±1 s in envelope samples
-
-    T1    = float(_s1_raw[0][0]) / SR1   # fallback = best Stage-1 peak
-    conf1 = _s1_raw[0][1]
-    _best_val_score = -1.0
-
-    for _lag_s1, _conf_s1 in _s1_cands:
-        _t1_c      = float(_lag_s1) / SR1
-        _v_c_ideal = start_offset + _t1_c
-        if _v_c_ideal < 0.0:
-            _v_c = 0.0
-            _a_c = start_offset + (-_v_c_ideal)
-        else:
-            _v_c = _v_c_ideal
-            _a_c = start_offset
-        _raw_a_c, _raw_v_c = _extract_pair(audio_path, _a_c,
-                                            video_path,  _v_c, _QV_PROBE, _QV_SR)
-        if _raw_a_c is None or _raw_v_c is None:
-            continue
-        _env_a_c = _peak_env(_raw_a_c, _QV_WIN, top_pct=35)
-        _env_v_c = _peak_env(_raw_v_c, _QV_WIN, top_pct=35)
-        if _env_a_c is None or _env_v_c is None:
-            continue
-        _, _conf_v = _xcorr_bounded(_env_a_c, _env_v_c, _QV_MSRCH)
-        _score = _conf_s1 * _conf_v
-        if _score > _best_val_score:
-            _best_val_score = _score
-            T1    = _t1_c
-            conf1 = _conf_s1
-
-    # ── Near-zero direct candidate ────────────────────────────────────────────
-    # 50 Hz envelope, 30 s probe, ±10 s search — finds small offsets that
-    # the 5 Hz Stage 1 misses entirely.
-    _QV_PROBE_Z = 30.0
-    _QV_MSRCH_Z = int(10.0 * _QV_EFF)   # ±10 s at 50 Hz effective rate
-    _raw_a_z, _raw_v_z = _extract_pair(audio_path, start_offset,
-                                        video_path,  start_offset, _QV_PROBE_Z, _QV_SR)
-    if _raw_a_z is not None and _raw_v_z is not None:
-        _env_a_z = _peak_env(_raw_a_z, _QV_WIN, top_pct=25)
-        _env_v_z = _peak_env(_raw_v_z, _QV_WIN, top_pct=25)
-        if _env_a_z is not None and _env_v_z is not None:
-            _lag_z, _conf_z = _xcorr_bounded(_env_a_z, _env_v_z, _QV_MSRCH_Z)
-            _t_z = float(_lag_z) / _QV_EFF
-            if _conf_z > _best_val_score:
-                _best_val_score = _conf_z
-                T1    = _t_z
-                conf1 = _conf_z
+    T1    = float(_s1_cands[0][0]) / SR1
+    conf1 = _s1_cands[0][1]
 
     # ── Stage 2: 50 Hz RMS envelope, ±20 s search around T1 ──────────────
     # Accuracy: ±10 ms.
     SR2      = 8000
     WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
     PROBE2   = 60.0            # seconds to extract
-    SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
+    SEARCH2  = 5.0             # ±5 s search — Stage 1 is now 50 Hz so seed is ±20 ms accurate
 
     sr2_eff  = SR2 // WIN2                       # 50 Hz effective
     max_lag2 = int(SEARCH2 * sr2_eff)
