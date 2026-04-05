@@ -652,12 +652,55 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     if env_a1 is None or env_b1 is None or len(env_a1) < 4 or len(env_b1) < 4:
         return 0.0, 0.0
 
-    # audio first, video second — C[L] = sum_t AUDIO[t] * VIDEO[t+L]
-    # Peak at L=+10 means VIDEO leads AUDIO by 10s (camera started 10s early) → T1=+10
-    # Consistent with Stage 2 and Stage 3 argument order.
-    lag1, conf1 = _xcorr_bounded(env_b1, env_a1, len(env_b1) // 2)
-    # Both extractions started at start_offset; v_start = a_start, so:
-    T1 = float(lag1) / SR1   # seconds; positive = camera started before DAW
+    # ── Multi-candidate Stage 1 ──────────────────────────────────────────────
+    # Get top-3 coarse peaks instead of committing to the single strongest
+    # one.  A false xcorr peak at the coarse 5 Hz scale is common when a
+    # device has a long pre-roll of silence (periodic RMS patterns can beat
+    # with the true peak), or when one recording is much shorter than the
+    # probe window.  Each candidate is validated with a quick 10 s / 50 Hz
+    # fine-scale cross-correlation (±1 s search); the candidate whose
+    # coarse confidence × fine validation score is highest wins.
+    #
+    # arg order: audio first, video second — C[L] = sum_t AUDIO[t]*VIDEO[t+L]
+    # Peak at L>0 means VIDEO leads AUDIO (camera started early) → T1>0
+    _S1_MIN_GAP = max(1, int(SR1 * 2))   # candidates must be ≥2 s apart
+    _s1_cands   = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
+                                n_peaks=3, min_gap=_S1_MIN_GAP)
+
+    # Quick-validate constants (50 Hz envelope, 10 s window, ±1 s search)
+    _QV_SR    = 8000
+    _QV_WIN   = _QV_SR // 50          # 20 ms windows → 50 Hz effective
+    _QV_EFF   = _QV_SR // _QV_WIN
+    _QV_PROBE = 10.0
+    _QV_MSRCH = int(1.0 * _QV_EFF)   # ±1 s in envelope samples
+
+    T1    = float(_s1_cands[0][0]) / SR1   # fallback = best Stage-1 peak
+    conf1 = _s1_cands[0][1]
+    _best_val_score = -1.0
+
+    for _lag_s1, _conf_s1 in _s1_cands:
+        _t1_c      = float(_lag_s1) / SR1
+        _v_c_ideal = start_offset + _t1_c
+        if _v_c_ideal < 0.0:
+            _v_c = 0.0
+            _a_c = start_offset + (-_v_c_ideal)
+        else:
+            _v_c = _v_c_ideal
+            _a_c = start_offset
+        _raw_a_c, _raw_v_c = _extract_pair(audio_path, _a_c,
+                                            video_path,  _v_c, _QV_PROBE, _QV_SR)
+        if _raw_a_c is None or _raw_v_c is None:
+            continue
+        _env_a_c = _peak_env(_raw_a_c, _QV_WIN, top_pct=35)
+        _env_v_c = _peak_env(_raw_v_c, _QV_WIN, top_pct=35)
+        if _env_a_c is None or _env_v_c is None:
+            continue
+        _, _conf_v = _xcorr_bounded(_env_a_c, _env_v_c, _QV_MSRCH)
+        _score = _conf_s1 * _conf_v
+        if _score > _best_val_score:
+            _best_val_score = _score
+            T1    = _t1_c
+            conf1 = _conf_s1
 
     # ── Stage 2: 50 Hz RMS envelope, ±20 s search around T1 ──────────────
     # Accuracy: ±10 ms.

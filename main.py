@@ -1557,6 +1557,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Save to the current session file; prompt for a path on the first save."""
         if getattr(self, 'workflow', None) == 'aaf_xml':
             self._aaf_save_setup(prompt=False)
+            b = btn_ref[0] if btn_ref else None
+            if b:
+                try:
+                    b.config(text="SAVED \u2713")
+                    self.after(1800, lambda: b.config(text="SAVE"))
+                except Exception:
+                    pass
             return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
@@ -5937,8 +5944,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Tick the 'sync' checkbox on at least one source that has both a video "
                 "and a reference audio file assigned.")
             return
+        # Gate concurrency: cpu_count-1 syncs running simultaneously (same
+        # scheme as reconcile), so we don't saturate disk I/O or CPU.
+        _cpu = os.cpu_count() or 2
+        _sem = threading.Semaphore(max(1, _cpu - 1))
         for base in sources_to_sync:
-            self._aaf_do_sync(base)
+            self._aaf_do_sync(base, _sem=_sem)
 
     def _aaf_hide_source(self, base):
         """Hide a source from the assignment list (reversible — source preserved in AAF data)."""
@@ -6097,7 +6108,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             btn.config(text=text, fg=SUB)
 
-    def _aaf_do_sync(self, base):
+    def _aaf_do_sync(self, base, _sem=None):
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
             return
@@ -6168,8 +6179,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _ap_basename = basename(ap)
 
         def _run():
-            return detect_sync_offset(vp, ap, probe_duration=300.0,
-                                      start_offset=start_offset)
+            if _sem is not None:
+                _sem.acquire()
+            try:
+                return detect_sync_offset(vp, ap, probe_duration=300.0,
+                                          start_offset=start_offset)
+            finally:
+                if _sem is not None:
+                    _sem.release()
 
         def _done(fut):
             _animating[0] = False
