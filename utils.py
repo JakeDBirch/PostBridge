@@ -55,7 +55,13 @@ def is_media(p):
     return os.path.splitext(p)[1].lower() in MEDIA_EXTS
 
 def clean_words(text):
-    """Lowercase, strip punctuation, return list of words."""
+    """Lowercase, strip punctuation, return list of words.
+
+    Smart/curly apostrophes (U+2018/U+2019) are normalised to a plain ASCII
+    apostrophe before matching so that script text written in Word or Google
+    Docs ("That\u2019s") aligns correctly with Whisper output ("that's").
+    """
+    text = text.replace('\u2019', "'").replace('\u2018', "'")
     return re.findall(r"[a-z']+", text.lower())
 
 def suggest_token(filename, tokens):

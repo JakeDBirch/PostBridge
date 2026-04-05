@@ -1,4 +1,39 @@
-import os, re, io, json, tempfile, subprocess, time, wave, hashlib
+import os, re, io, json, tempfile, subprocess, time, wave, hashlib, threading
+
+
+def _safe_net_call(fn, default, _timeout=2.0):
+    """
+    Run fn() in a daemon thread with a hard timeout.
+
+    On Windows, filesystem calls (getmtime, isfile, exists, …) on paths that
+    live on an inaccessible network share (dead SMB connection, sleeping NAS,
+    unmounted drive letter) can block INDEFINITELY — the call never raises, it
+    just never returns.  Running the call in a daemon thread and joining with a
+    timeout ensures these operations always complete promptly even when source
+    files are offline.
+    """
+    result = [default]
+    def _worker():
+        try:
+            result[0] = fn()
+        except Exception:
+            pass
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=_timeout)
+    return result[0]
+
+def _safe_getmtime(path, _timeout=2.0):
+    """Return os.path.getmtime(path) with a hard timeout (see _safe_net_call)."""
+    return _safe_net_call(lambda: os.path.getmtime(path), 0.0, _timeout)
+
+def _safe_isfile(path, _timeout=2.0):
+    """Return os.path.isfile(path) with a hard timeout (see _safe_net_call)."""
+    return _safe_net_call(lambda: os.path.isfile(path), False, _timeout)
+
+def _safe_exists(path, _timeout=2.0):
+    """Return os.path.exists(path) with a hard timeout (see _safe_net_call)."""
+    return _safe_net_call(lambda: os.path.exists(path), False, _timeout)
 from xml.etree.ElementTree import Element, SubElement, ElementTree, indent
 
 try:
@@ -24,6 +59,7 @@ class BuildCancelled(Exception):
 _cache_dir = None   # Will be set by App when script is loaded
 _channel_cache = {}
 _model_cache = {}
+_model_lock  = threading.Lock()
 
 # ── Audio extraction (uses bundled ffmpeg if not on PATH) ───────────────────────
 def _ffmpeg_cmd():
@@ -190,10 +226,7 @@ def _cache_path(media_path):
     return os.path.join(_cache_dir, "{}.json".format(key))
 
 def _cache_key_meta(media_path):
-    try:
-        mtime = os.path.getmtime(media_path)
-    except OSError:
-        mtime = 0
+    mtime = _safe_getmtime(media_path)
     return {
         "path":    os.path.abspath(media_path),
         "mtime":   mtime,
@@ -259,15 +292,12 @@ def pb_transcript_load(media_path):
     """Load a .pb_transcript.json from alongside media_path.
     Returns (words, blobs) or (None, None) if absent, stale, or invalid."""
     p = pb_transcript_path(media_path)
-    if not os.path.isfile(p):
+    if not _safe_isfile(p):
         return None, None
     try:
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
-        try:
-            mtime = os.path.getmtime(media_path)
-        except OSError:
-            mtime = 0
+        mtime = _safe_getmtime(media_path)
         # Reject if the media file was replaced since transcription
         if abs(data.get("mtime", 0) - mtime) > 2:
             return None, None
@@ -281,10 +311,7 @@ def pb_transcript_load(media_path):
 def pb_transcript_save(media_path, words, blobs=None):
     """Write a .pb_transcript.json alongside media_path."""
     p = pb_transcript_path(media_path)
-    try:
-        mtime = os.path.getmtime(media_path)
-    except OSError:
-        mtime = 0
+    mtime = _safe_getmtime(media_path)
     data = {"version": 1, "model": WHISPER_MODEL, "mtime": mtime, "words": words}
     if blobs is not None:
         data["blobs"] = blobs
@@ -348,10 +375,7 @@ def _pull_result_cache_path(pull, transcript_path, pad):
     if not _cache_dir or not transcript_path:
         return None
     import hashlib
-    try:
-        mtime = round(os.path.getmtime(transcript_path), 2)
-    except OSError:
-        mtime = 0
+    mtime = round(_safe_getmtime(transcript_path), 2)
     key_obj = {
         "transcript": os.path.abspath(transcript_path),
         "mtime":      mtime,
@@ -397,15 +421,60 @@ def pull_result_cache_save(pull, transcript_path, pad, result):
 
 # ── Transcription ──────────────────────────────────────────────────────────────
 def get_model(size=WHISPER_MODEL):
-    if size not in _model_cache:
-        try:
-            import torch
-            device  = "cuda" if torch.cuda.is_available() else "cpu"
-            compute = "float16" if device == "cuda" else "int8"
-        except ImportError:
-            device = "cpu"; compute = "int8"
-        _model_cache[size] = WhisperModel(size, device=device, compute_type=compute)
-    return _model_cache[size]
+    # Fast path — no lock needed once the model is loaded.
+    if size in _model_cache:
+        return _model_cache[size]
+    # Slow path — load once, thread-safe via double-checked locking.
+    with _model_lock:
+        if size not in _model_cache:
+            try:
+                import torch
+                device  = "cuda" if torch.cuda.is_available() else "cpu"
+                compute = "float16" if device == "cuda" else "int8"
+            except ImportError:
+                device = "cpu"; compute = "int8"
+            _model_cache[size] = WhisperModel(size, device=device, compute_type=compute)
+        return _model_cache[size]
+
+def _clip_rms_db(wav_path):
+    """Return the mean RMS volume of a WAV clip in dBFS, or -99.0 on failure."""
+    try:
+        cmd = _ffmpeg_cmd() + [
+            "-i", wav_path,
+            "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+            "-f", "null", "-"
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=15,
+                           text=True, encoding="utf-8", errors="replace")
+        for line in (r.stdout + r.stderr).splitlines():
+            if "RMS_level" in line and "=" in line:
+                val = line.split("=")[-1].strip()
+                if val not in ("-inf", ""):
+                    return float(val)
+    except Exception:
+        pass
+    return -99.0
+
+def _transcribe_raw(wav_path):
+    """
+    Transcribe wav_path with no VAD filter and a permissive no-speech threshold.
+    Used only for diagnostics when the normal transcription returns nothing.
+    Returns the raw text string (may be empty or hallucinated).
+    """
+    try:
+        model = get_model()
+        segments, _ = model.transcribe(
+            wav_path,
+            word_timestamps=False,
+            language="en",
+            beam_size=5,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            no_speech_threshold=0.95,
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    except Exception as e:
+        return "error: {}".format(e)
 
 def transcribe_clip(wav_path):
     model = get_model()
@@ -698,6 +767,78 @@ def _match_last(quote_text, words, gap_thresh=GAP_THRESH, conf_floor=0.35):
 
     return best
 
+
+def _match_best(quote_text, words, gap_thresh=GAP_THRESH, conf_floor=0.35):
+    """
+    Find the best (highest-confidence) occurrence of quote_text in words.
+
+    Scans the full word list for every candidate occurrence and returns the
+    one with the highest confidence score.  On near-equal confidence (within
+    0.05) the later occurrence wins, matching _match_last semantics so the
+    final-take delivery is preferred over an equally-good earlier rehearsal.
+
+    Critically different from _match_last: when match_segments returns None
+    (the false start was so badly truncated that _find_chunk_bounds scored it
+    below its own MIN_SCORE floor), this function advances to the next
+    occurrence of an anchor word and tries again rather than giving up
+    immediately.  This lets severely-truncated false starts and mid-recording
+    slates be skipped so the correct full take is still found.
+    """
+    if not words or not quote_text.strip():
+        return None
+
+    # Pre-compute first-chunk anchor words for manual advance on None returns.
+    _raw = re.split(r'[.]{2,}|[\u2026]', quote_text)
+    _raw = [c.strip().strip('\u201c\u201d\u2018\u2019"\'') for c in _raw]
+    _raw = [c for c in _raw if c.strip()]
+    anchor_words = clean_words(_raw[0])[:4] if _raw else []
+    anchor_set   = set(anchor_words)
+
+    word_list = [w["word"] for w in words]
+    best      = None
+    word_idx  = 0
+
+    while word_idx < len(words):
+        candidate = match_segments(quote_text, words[word_idx:], gap_thresh)
+
+        if candidate is not None and candidate["segments"]:
+            # Advance past this match (+1.5 s gap to clear trailing silence)
+            last_end_s = candidate["segments"][-1][1]
+            advance = next(
+                (i for i, w in enumerate(words[word_idx:])
+                 if w.get("start", 0) > last_end_s + 1.5),
+                None,
+            )
+            if candidate["confidence"] >= conf_floor:
+                # Keep highest confidence; on near-tie (≤0.05) prefer the
+                # later delivery so the final recorded take wins.
+                if (best is None
+                        or candidate["confidence"] > best["confidence"] + 0.05
+                        or abs(candidate["confidence"] - best["confidence"]) <= 0.05):
+                    best = candidate
+            if advance is None:
+                break
+            word_idx += advance
+
+        else:
+            # match_segments returned None — the current position's false start
+            # or slate scored below _find_chunk_bounds MIN_SCORE.  Advance to
+            # the next occurrence of an anchor word and retry from there.
+            if not anchor_set:
+                break
+            nxt = next(
+                (word_idx + 1 + i
+                 for i, wrd in enumerate(word_list[word_idx + 1:])
+                 if wrd in anchor_set),
+                None,
+            )
+            if nxt is None:
+                break
+            word_idx = nxt   # try match_segments from this new anchor position
+
+    return best
+
+
 # ── Per-pull reconciler helpers ────────────────────────────────────────────────
 def _clamp(val, lo, hi):
     return max(lo, min(hi, val))
@@ -799,12 +940,34 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         tmp_wav = tf.name
     try:
-        ok, _ = extract_window(transcript_file, clip_start, clip_end, tmp_wav)
+        ok, extract_err = extract_window(transcript_file, clip_start, clip_end, tmp_wav)
         if not ok:
+            result["_diag"] = "extract_failed: {}".format(extract_err or "unknown")
             return result
 
         words = transcribe_clip(tmp_wav)
         if not words:
+            # ── Diagnostic: re-run without VAD/no-speech filtering to see if
+            # Whisper would find ANYTHING in this clip when restrictions are off
+            raw_text = _transcribe_raw(tmp_wav)
+            rms_db   = _clip_rms_db(tmp_wav)
+            diag_str = "PULL_DIAG  order={}  token={}  tc={}-{}  rms={:.1f}dB  raw={}".format(
+                result.get("order", "?"),
+                result.get("token", "?"),
+                result.get("in_tc",  "?"),
+                result.get("out_tc", "?"),
+                rms_db,
+                repr(raw_text[:200]) if raw_text else "''")
+            result["_diag"] = diag_str
+            # Also write directly to the debug log so it appears regardless
+            # of how the result dict is handled upstream.
+            try:
+                _dlog = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "_debug_run.log")
+                with open(_dlog, "a", encoding="utf-8") as _f:
+                    _f.write(diag_str + "\n")
+            except Exception:
+                pass
             return result
 
         # ── Temporal ordering constraint ────────────────────────────────────
@@ -1358,10 +1521,11 @@ def reconcile_vo_part(vo_blocks, takes):
                 takes_data.append(None)
                 continue
 
-            # _match_last finds the final occurrence within this window
-            # so that any repeated lines within the window resolve to the
-            # last delivery (the correct one).
-            match = _match_last(text, window)
+            # _match_best finds the highest-confidence occurrence within
+            # this window.  It also advances past failed anchors (truncated
+            # false starts, slates) instead of giving up on a None return,
+            # so multi-take files with intros/retakes are handled correctly.
+            match = _match_best(text, window)
             if match is None or not match["segments"]:
                 takes_data.append(None)
                 continue
@@ -1592,10 +1756,7 @@ def _probe_duration(path):
     """Return file duration in seconds, or 0 on failure.  Result is cached in
     memory so repeated calls for the same file skip the ffprobe subprocess."""
     key = os.path.normpath(path).lower()
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        mtime = 0
+    mtime = _safe_getmtime(path)
     cached = _duration_cache.get(key)
     if cached is not None and abs(cached[0] - mtime) < 1:
         return cached[1]
@@ -1622,11 +1783,8 @@ def _rx_offset_cache_path(rx_audio_path, video_path):
     """Return the disk-cache path for a detect_rx_offset result, or None."""
     if not _cache_dir:
         return None
-    try:
-        rx_mtime  = round(os.path.getmtime(rx_audio_path), 2)
-        vid_mtime = round(os.path.getmtime(video_path),    2)
-    except OSError:
-        return None
+    rx_mtime  = round(_safe_getmtime(rx_audio_path), 2)
+    vid_mtime = round(_safe_getmtime(video_path),    2)
     key_obj = {
         "rx":      os.path.abspath(rx_audio_path),
         "rx_mt":   rx_mtime,
@@ -1673,7 +1831,7 @@ def detect_rx_offset(rx_audio_path, video_path, sr=1000):
     """
     if not rx_audio_path or not video_path:
         return 0.0
-    if not os.path.isfile(rx_audio_path) or not os.path.isfile(video_path):
+    if not _safe_isfile(rx_audio_path) or not _safe_isfile(video_path):
         return 0.0
 
     # ── Disk cache hit — skip the entire cross-correlation ─────────────────
@@ -2398,11 +2556,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             continue
 
         # Audio uses the reference-audio src position directly (no camera offset).
-        # Video ADDS v_offset: positive offset = camera started before DAW (common).
-        # Convention matches detect_av_offset / detect_sync_offset and build_xml.
-        a_src_in  = max(0, f2fr(src_in_s,  fps) - head_ext)
+        # Video ADDS v_offset: positive offset = camera started before DAW (common),
+        # negative offset = audio started before camera (both are valid).
+        a_src_in  = max(0, f2fr(src_in_s,          fps) - head_ext)
         a_src_out = f2fr(src_out_s, fps) + fo_fr
-        v_src_in  = max(0, f2fr(src_in_s  + v_offset, fps) - head_ext)
+        v_src_in  = max(0, f2fr(src_in_s + v_offset, fps) - head_ext)
         v_src_out = max(0, f2fr(src_out_s + v_offset, fps)) + fo_fr
         # If clamping collapsed the video window, push out by clip duration
         if v_src_out <= v_src_in:

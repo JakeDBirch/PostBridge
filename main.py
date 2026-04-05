@@ -93,11 +93,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._cancel    = threading.Event()
         self._aaf_data  = None
 
+        # Thread-safe UI queue — Python 3.14 no longer allows self.after() from
+        # background threads, so workers post callbacks here and the main thread
+        # drains the queue every 20 ms via _pump_ui().
+        self._ui_q = queue.Queue()
+        self._pump_ui()
+
         self.seq_name   = tk.StringVar()
         self.out_path   = tk.StringVar()
         self.gap_var    = tk.DoubleVar(value=DEFAULT_GAP)
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
+        self._load_prefs()
         self._header()
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=44, pady=(0, 14))
@@ -108,6 +115,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.bind_all("<Control-o>",       lambda e: self._open_session())
 
         self._home()
+
+    def _ui(self, cb):
+        """Post cb onto the main-thread UI queue. Safe to call from any thread."""
+        self._ui_q.put(cb)
+
+    def _pump_ui(self):
+        """Drain the UI queue on the main thread and reschedule itself."""
+        try:
+            while True:
+                cb = self._ui_q.get_nowait()
+                try:
+                    cb()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.after(20, self._pump_ui)
 
     def _center(self, w, h):
         self.update_idletasks()
@@ -170,11 +194,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _header(self):
         tk.Frame(self, bg=ACCENT, height=6).pack(fill="x")
         bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", padx=36, pady=(14, 10))
+        bar.pack(fill="x", padx=36, pady=(10, 8))
 
-        # ── Left: persistent action buttons (Save / Save As / Open / Home) ────
+        # ── Left: persistent action buttons (Home / Save / Save As / Open) ─────
         btn_frame = tk.Frame(bar, bg=BG)
         btn_frame.pack(side="left")
+        self._btn(btn_frame, "\u2302 HOME", self._home,
+                  small=True).pack(side="left", padx=(0, 10))
         self._footer_save_btn = [None]
         def _hdr_save():
             self._quick_save(self._footer_save_btn)
@@ -184,8 +210,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(btn_frame, "SAVE AS", self._save_as,
                   small=True).pack(side="left", padx=(0, 4))
         self._btn(btn_frame, "OPEN",    self._open_session,
-                  small=True).pack(side="left", padx=(0, 10))
-        self._btn(btn_frame, "\u2302 HOME", self._home,
                   small=True).pack(side="left")
 
         # ── Right: MeatEater logo ─────────────────────────────────────────────
@@ -232,7 +256,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  font=(_SANS, 18, "bold"), bg=BG, fg=TEXT, padx=0).pack(side="left")
 
         tk.Label(inner, text="audio/video post-production bridge",
-                 font=(_SANS, 9, "italic"), bg=BG, fg=SUB).pack(pady=(1, 0))
+                 font=(_SANS, 9, "italic"), bg=BG, fg=SUB, pady=0).pack()
 
         _dep_warnings = []
         if not HAS_WHISPER:
@@ -262,11 +286,46 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._export_fmt           = None
         self._restore_s4           = False
         self.workflow              = None
+        self._pending_results      = None
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
         tk.Label(self.body, text="Choose a workflow",
-                 font=FBT, bg=BG, fg=SUB).pack(pady=(0,24))
+                 font=FBT, bg=BG, fg=SUB).pack(pady=(0,16))
+
+        # ── Resume last project (shown only when a previous script is known) ──
+        _last_script = self._prefs.get("last_script", "")
+        if _last_script and os.path.isfile(_last_script):
+            _ls_name = os.path.splitext(os.path.basename(_last_script))[0]
+            resume_row = tk.Frame(self.body, bg=SURF,
+                                  highlightbackground=BORDER, highlightthickness=1)
+            resume_row.pack(fill="x", padx=20, pady=(0, 16))
+            tk.Frame(resume_row, bg=ACCENT, width=4).pack(side="left", fill="y")
+            _ri = tk.Frame(resume_row, bg=SURF)
+            _ri.pack(fill="x", padx=24, pady=10)
+            tk.Label(_ri, text="Resume last project",
+                     font=(_SANS, 11, "bold"), bg=SURF, fg=SUB).pack(side="left")
+            tk.Label(_ri, text="  —  " + _ls_name,
+                     font=(_SANS, 11), bg=SURF, fg=TEXT).pack(side="left")
+            _ra = tk.Label(_ri, text="\u2192", font=(_SANS, 16, "bold"),
+                           bg=SURF, fg=BORDER, padx=8)
+            _ra.pack(side="right")
+            _rw = [resume_row, _ri, _ra]
+            def _resume_enter(e, ws=_rw, c=resume_row, a=_ra):
+                for w in ws: w.config(bg="#303030")
+                c.config(highlightbackground=ACCENT); a.config(fg=ACCENT)
+            def _resume_leave(e, ws=_rw, c=resume_row, a=_ra):
+                for w in ws: w.config(bg=SURF)
+                c.config(highlightbackground=BORDER); a.config(fg=BORDER)
+            def _resume_click(e, sp=_last_script):
+                self.workflow = "script_session"
+                self._export_fmt = None
+                self._load_script(sp)
+            for _lbl in _ri.winfo_children(): _rw.append(_lbl)
+            for _w in _rw:
+                _w.bind("<Enter>",    _resume_enter)
+                _w.bind("<Leave>",    _resume_leave)
+                _w.bind("<Button-1>", _resume_click)
 
         cards_frame = tk.Frame(self.body, bg=BG)
         cards_frame.pack(fill="x", padx=20)
@@ -277,25 +336,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         hover_bg    = "#303030"
 
         workflows = [
-            ("Script Formatter",
+            ("Format Script",
              "script_formatter",
              "Build @PART, @VO, and @PULL blocks and copy them into your script.",
              True),
-            ("Script \u2192 Session",
-             "script_session",
-             "Whisper-reconcile a script and export as AAF or XML \u2014 "
-             "format is chosen at the export step.",
-             HAS_WHISPER),
-            ("AAF \u2192 XML",
-             "pt_xml",
-             "Parse an AAF, match clips to video files by source name, "
-             "and generate XML.",
-             HAS_AAF),
             ("Transcribe Media",
              "transcribe",
              "Pre-transcribe VO and interview files so reconcile runs instantly. "
              "Transcription files are saved alongside each media file.",
              HAS_WHISPER),
+            ("Reconcile Script \u2192 Session",
+             "script_session",
+             "Whisper-reconcile a script and export as AAF or XML \u2014 "
+             "format is chosen at the export step.",
+             HAS_WHISPER),
+            ("Convert AAF \u2192 XML",
+             "pt_xml",
+             "Parse an AAF, match clips to video files by source name, "
+             "and generate XML.",
+             HAS_AAF),
         ]
 
         for title, wf_key, desc, available in workflows:
@@ -405,8 +464,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.workflow = key
         self._export_fmt = None   # reset any previous format choice
         if key in ("script_aaf", "script_xml", "script_session"):
+            _last = self._prefs.get("last_script", "")
+            _init_dir = os.path.dirname(_last) if _last and os.path.isfile(_last) else None
             path = filedialog.askopenfilename(
                 title="Open Script",
+                initialdir=_init_dir,
                 filetypes=[("Text", "*.txt"), ("All", "*.*")])
             if not path:
                 self.workflow = None   # user cancelled — stay on home
@@ -671,6 +733,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       filedialog.askopenfilename(
                           filetypes=[("Text","*.txt"),("All","*.*")]))).pack()
 
+    # ── Persistent user prefs (last script dir, etc.) ─────────────────────────
+    def _prefs_path(self):
+        return os.path.join(os.path.expanduser("~"), ".postbridge_prefs.json")
+
+    def _load_prefs(self):
+        try:
+            with open(self._prefs_path(), encoding="utf-8") as f:
+                self._prefs = json.load(f)
+        except Exception:
+            self._prefs = {}
+
+    def _save_prefs(self):
+        try:
+            with open(self._prefs_path(), "w", encoding="utf-8") as f:
+                json.dump(self._prefs, f, indent=2)
+        except Exception:
+            pass
+
     def _load_script(self, path):
         if not path or not os.path.isfile(path): return
         self._script_path = os.path.abspath(path)
@@ -697,7 +777,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Set cache dir next to the script file inside the engines module
         engines._cache_dir = os.path.join(os.path.dirname(os.path.abspath(path)), ".pb_cache")
-        
+
+        # Remember this script so the next file-dialog opens in the right place
+        # and the home screen can offer a one-click resume.
+        self._prefs["last_script"] = self._script_path
+        self._save_prefs()
+
         self.seq_name.set("{} (AUTO)".format(doc_title))
 
         if hasattr(self, "_s1"):
@@ -716,7 +801,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       self._step2, color=ACCENT).pack(side="right")
             self._step1_next_added = True
         else:
-            self.after(0, self._step2)
+            self._ui(self._step2)
 
     def _step2(self):
         self._clear()
@@ -2099,6 +2184,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return result["proceed"]
 
     def _start_reconcile(self):
+        # A fresh reconcile always produces new results — discard any loaded results.
+        self._pending_results = None
+
         if not HAS_WHISPER:
             messagebox.showerror("Not Installed",
                 "faster-whisper is not installed.\n\nRun:\n  pip install faster-whisper")
@@ -2165,7 +2253,48 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
 
         # ── Pre-flight: warn if any VO audio has no pre-transcribed file ─────────
-        _vo_uncached = []
+        def _cache_miss_reason(ap):
+            """Return a short string explaining why both VO caches missed for ap."""
+            # Check .pb_cache/
+            _cp = engines._cache_path(ap) if engines._cache_dir else None
+            if not engines._cache_dir:
+                pb_reason = "no cache dir"
+            elif not _cp or not os.path.exists(_cp):
+                pb_reason = "not in .pb_cache"
+            else:
+                try:
+                    with open(_cp, encoding="utf-8") as _f:
+                        _d = json.load(_f)
+                    if _d.get("path") != os.path.abspath(ap):
+                        pb_reason = "path mismatch in cache"
+                    elif abs(_d.get("mtime", 0) - os.path.getmtime(ap)) > 1:
+                        pb_reason = "mtime changed ({:.0f}s drift)".format(
+                            abs(_d.get("mtime", 0) - os.path.getmtime(ap)))
+                    elif _d.get("version") != CACHE_VERSION:
+                        pb_reason = "cache version mismatch"
+                    else:
+                        pb_reason = "cache read error"
+                except Exception:
+                    pb_reason = "cache read error"
+            # Check .pb_transcript.json
+            _pbt = engines.pb_transcript_path(ap)
+            if not os.path.isfile(_pbt):
+                pbt_reason = "no .pb_transcript.json"
+            else:
+                try:
+                    with open(_pbt, encoding="utf-8") as _f:
+                        _d = json.load(_f)
+                    if abs(_d.get("mtime", 0) - os.path.getmtime(ap)) > 2:
+                        pbt_reason = "pb_transcript mtime changed"
+                    elif not _d.get("words"):
+                        pbt_reason = "pb_transcript empty"
+                    else:
+                        pbt_reason = "pb_transcript load error"
+                except Exception:
+                    pbt_reason = "pb_transcript read error"
+            return "{}  ·  {}".format(pb_reason, pbt_reason)
+
+        _vo_uncached = []   # list of (basename, reason) tuples
         for pi, vb in self.vo_bins.items():
             paths = vb.get_paths()
             takes = engines.pair_takes(paths)
@@ -2173,13 +2302,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if ap:
                     _pb_words, _ = engines.pb_transcript_load(ap)
                     if _pb_words is None and engines.cache_load(ap) is None:
-                        _vo_uncached.append(os.path.basename(ap))
+                        _vo_uncached.append((os.path.basename(ap),
+                                             _cache_miss_reason(ap)))
         if _vo_uncached:
-            _names = "\n".join("  •  {}".format(n) for n in _vo_uncached[:6])
+            _names = "\n".join(
+                "  •  {}  ({})".format(n, r) for n, r in _vo_uncached[:6])
             if len(_vo_uncached) > 6:
                 _names += "\n  …and {} more".format(len(_vo_uncached) - 6)
             _msg = (
-                "{} VO audio file{} have no pre-transcribed file:\n\n{}\n\n"
+                "{} VO audio file{} have no usable transcription cache:\n\n{}\n\n"
                 "PostBridge will transcribe them now, which may take several minutes.\n"
                 "Or cancel and use the Transcribe Media workflow to pre-transcribe "
                 "them first.".format(
@@ -2187,7 +2318,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "s" if len(_vo_uncached) != 1 else "",
                     _names)
             )
-            if not messagebox.askyesno("No VO Transcriptions Found", _msg,
+            if not messagebox.askyesno("VO Transcription Cache Missing", _msg,
                                        icon="warning"):
                 return
 
@@ -2212,8 +2343,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                               highlightbackground=BORDER, highlightthickness=1)
         prog_outer.pack(fill="x", pady=(0,8))
 
+        # Elapsed-time clock — top row of the progress card
+        _clock_row = tk.Frame(prog_outer, bg=SURF)
+        _clock_row.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(_clock_row, text="ELAPSED", font=FB, bg=SURF, fg=SUB).pack(side="left")
+        self._elapsed_lbl = tk.Label(_clock_row, text="0:00",
+                                     font=FL, bg=SURF, fg=TEXT)
+        self._elapsed_lbl.pack(side="left", padx=(6, 0))
+        self._elapsed_running = True
+        _t_clock_start = time.perf_counter()
+
+        def _tick_elapsed(t0=_t_clock_start):
+            if not self._elapsed_running:
+                return
+            elapsed = int(time.perf_counter() - t0)
+            m, s = divmod(elapsed, 60)
+            try:
+                self._elapsed_lbl.config(text="{}:{:02d}".format(m, s))
+            except Exception:
+                return
+            self.after(1000, _tick_elapsed, t0)
+
+        self.after(1000, _tick_elapsed)
+
         prog_row = tk.Frame(prog_outer, bg=SURF)
-        prog_row.pack(fill="x", padx=12, pady=(10, 4))
+        prog_row.pack(fill="x", padx=12, pady=(6, 4))
         _total_items = len(self.pulls) + len(self.vo_blocks)
         self._prog_lbl = tk.Label(prog_row, text="Starting…",
                                   font=FL, bg=SURF, fg=TEXT, anchor="w")
@@ -2238,7 +2392,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
             self.after(300, _pulse_dots, step + 1)
 
-        self.after(0, _pulse_dots)
+        self._ui(_pulse_dots)
 
         log_frame = tk.Frame(self.body, bg=SURF3,
                              highlightbackground=BORDER, highlightthickness=1)
@@ -2255,20 +2409,56 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "CANCEL", self._cancel_reconcile).pack(side="left")
 
-        # Collect transcript source paths here on the main thread — StringVar.get()
-        # is not thread-safe and must not be called from the reconcile thread.
+        # Background-mode toggle — works on the fly via shared live-workers ref
+        _cpu    = os.cpu_count() or 2
+        _n_fast = max(1, _cpu - 1)
+        _is_bg  = getattr(self, "_reconcile_bg_mode", tk.BooleanVar()).get()
+        if not hasattr(self, "_reconcile_bg_mode"):
+            self._reconcile_bg_mode = tk.BooleanVar(value=False)
+        _lw     = [1 if _is_bg else _n_fast]
+        _cond   = threading.Condition()
+        _active = [0]
+        self._reconcile_live_workers = _lw
+        self._reconcile_live_cond    = _cond
+        self._reconcile_live_active  = _active
+        self._reconcile_n_fast       = _n_fast
+
+        bg_s3_frame = tk.Frame(nav, bg=BG)
+        bg_s3_frame.pack(side="right")
+        bg_s3_ck = tk.Label(bg_s3_frame,
+                            text="\u2611" if _is_bg else "\u2610",
+                            font=(_SANS, 15), bg=BG,
+                            fg=ACCENT if _is_bg else SUB,
+                            cursor="hand2", padx=4)
+        bg_s3_ck.pack(side="left")
+        bg_s3_lbl = tk.Label(bg_s3_frame, text="Background mode",
+                             font=FB, bg=BG, fg=SUB, cursor="hand2")
+        bg_s3_lbl.pack(side="left")
+
+        def _toggle_s3_bg():
+            self._reconcile_bg_mode.set(not self._reconcile_bg_mode.get())
+            _on = self._reconcile_bg_mode.get()
+            bg_s3_ck.config(text="\u2611" if _on else "\u2610",
+                            fg=ACCENT if _on else SUB)
+            _lw[0] = 1 if _on else _n_fast
+            with _cond:
+                _cond.notify_all()
+
+        bg_s3_ck.bind("<Button-1>",  lambda e: _toggle_s3_bg())
+        bg_s3_lbl.bind("<Button-1>", lambda e: _toggle_s3_bg())
+
+        # Collect all tkinter variable values here on the main thread.
+        # IntVar/DoubleVar/StringVar.get() is not thread-safe and must not be
+        # called from the reconcile thread (causes deadlocks on Python 3.14+).
         transcript_sources = {
             tok: self._pool.get_transcript_source(tok)
             for tok in self.tokens
         }
-
-        _cpu   = os.cpu_count() or 2
-        _n_workers = 1 if getattr(self, "_reconcile_bg_mode",
-                                  tk.BooleanVar()).get() else max(1, _cpu - 1)
+        pad_secs = self.pad_var.get()
 
         threading.Thread(
             target=self._run_reconcile,
-            args=(int_assets, transcript_sources, _n_workers),
+            args=(int_assets, transcript_sources, pad_secs),
             daemon=True).start()
 
     @staticmethod
@@ -2280,6 +2470,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return "{:d}m {:.0f}s  ({:.1f}s)".format(m, s, secs)
         return "{:.1f}s".format(secs)
 
+    # Fixed-path debug mirror — readable by the dev without knowing the script location.
+    _DEBUG_LOG      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_debug_run.log")
+    _DEBUG_LOG_LOCK = threading.Lock()   # serialise concurrent thread writes to the log file
+
     def _log_line(self, msg, color=None):
         # Also write to the run log file if one is open
         if getattr(self, "_run_log_fh", None):
@@ -2288,6 +2482,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._run_log_fh.flush()
             except Exception:
                 pass
+        # Mirror to the fixed debug log — lock prevents concurrent open() collisions on Windows
+        try:
+            with self._DEBUG_LOG_LOCK:
+                with open(self._DEBUG_LOG, "a", encoding="utf-8") as _dlf:
+                    _dlf.write(msg + "\n")
+        except Exception:
+            pass
         def _do():
             self._log.configure(state="normal")
             tag = "c{}".format(abs(hash(color or "")))
@@ -2296,7 +2497,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._log.insert("end", msg + "\n", tag if color else "")
             self._log.see("end")
             self._log.configure(state="disabled")
-        self.after(0, _do)
+        self._ui(_do)
 
     def _set_tx_progress(self, n, total, label=""):
         def _do():
@@ -2304,12 +2505,37 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
             self._prog_lbl.configure(text=label)
             self._prog_bar.set(n, total)
-        self.after(0, _do)
+        self._ui(_do)
 
-    def _run_reconcile(self, int_assets, transcript_sources, n_workers=None):
-        if n_workers is None:
+    def _run_reconcile(self, int_assets, transcript_sources, pad_secs=PAD_SECS, n_workers=None):
+        # Clear the debug mirror at the start of each run
+        try:
+            open(self._DEBUG_LOG, "w").close()
+        except Exception:
+            pass
+        # Live concurrency control — shared with the UI toggle so Fast↔Background
+        # switching takes effect immediately without restarting the run.
+        _live_workers = getattr(self, "_reconcile_live_workers", None)
+        _cond         = getattr(self, "_reconcile_live_cond",    None)
+        _active_ref   = getattr(self, "_reconcile_live_active",  None)
+        if _live_workers is None:
             _cpu = os.cpu_count() or 2
-            n_workers = max(1, _cpu - 1)
+            n_workers     = n_workers or max(1, _cpu - 1)
+            _live_workers = [n_workers]
+            _cond         = threading.Condition()
+            _active_ref   = [0]
+
+        def _gate_in():
+            with _cond:
+                while _active_ref[0] >= _live_workers[0]:
+                    _cond.wait(timeout=0.3)
+                _active_ref[0] += 1
+
+        def _gate_out():
+            with _cond:
+                _active_ref[0] -= 1
+                _cond.notify_all()
+
         pulls       = self.pulls
         total       = len(pulls)
         done        = 0
@@ -2330,16 +2556,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception:
             self._run_log_fh = None
 
-        self._log_line("Loading model ({})…".format(WHISPER_MODEL), INFO)
+        # Log gate concurrency level so we can verify fast vs background mode
+        _lw_val = _live_workers[0] if _live_workers else "?"
+        self._log_line(
+            "Concurrency: {} worker(s)  [{}]".format(
+                _lw_val,
+                "background" if _lw_val == 1 else "fast"),
+            SUB)
 
+        # Pre-load Whisper model before any gated work starts.
+        # Without this, the first thread to need it loads the model while holding
+        # a gate slot — freezing progress for 60+ seconds with nothing visible.
         if HAS_WHISPER:
             try:
+                self._log_line("Loading model ({})…".format(WHISPER_MODEL), INFO)
                 engines.get_model()
-                self._log_line("Model loaded.", SUCCESS)
+                self._log_line("Model ready.", SUCCESS)
             except Exception as e:
                 self._log_line("Model load failed: {}".format(e), ERR)
-                self.after(0, lambda: messagebox.showerror(
-                    "Model Error", str(e)))
+                self._elapsed_running = False
                 return
 
         vo_takes_by_part = {}
@@ -2413,6 +2648,49 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         _d, _t, "VO transcription — {} / {}  [pre-transcribed]".format(
                             _d, _t))
                 else:
+                    # ── Log why both caches missed (helps diagnose stale/moved files) ──
+                    _why = []
+                    _cp = engines._cache_path(ap) if engines._cache_dir else None
+                    if not engines._cache_dir:
+                        _why.append(".pb_cache: no cache dir")
+                    elif not _cp or not os.path.exists(_cp):
+                        _why.append(".pb_cache: file not found")
+                    else:
+                        try:
+                            with open(_cp, encoding="utf-8") as _cf:
+                                _cd = json.load(_cf)
+                            _exp = os.path.abspath(ap)
+                            if _cd.get("path") != _exp:
+                                _why.append(".pb_cache: path mismatch")
+                            elif abs(_cd.get("mtime", 0) - os.path.getmtime(ap)) > 1:
+                                _why.append(".pb_cache: mtime stale")
+                            elif _cd.get("version") != CACHE_VERSION:
+                                _why.append(".pb_cache: version mismatch")
+                            else:
+                                _why.append(".pb_cache: load error")
+                        except Exception:
+                            _why.append(".pb_cache: read error")
+                    _pbt = engines.pb_transcript_path(ap)
+                    if not os.path.isfile(_pbt):
+                        _why.append("no .pb_transcript.json")
+                    else:
+                        try:
+                            with open(_pbt, encoding="utf-8") as _pf:
+                                _pd = json.load(_pf)
+                            _pm = os.path.getmtime(ap)
+                            if abs(_pd.get("mtime", 0) - _pm) > 2:
+                                _why.append(".pb_transcript: mtime stale")
+                            elif not _pd.get("words"):
+                                _why.append(".pb_transcript: no words")
+                            else:
+                                _why.append(".pb_transcript: load error")
+                        except Exception:
+                            _why.append(".pb_transcript: read error")
+                    self._log_line(
+                        "  Part {} Take {}: cache miss ({}) — transcribing fresh".format(
+                            pi, take_i + 1, "  ·  ".join(_why)),
+                        WARN)
+
                     _t0 = time.perf_counter()
                     if WAVEFORM_CONFORM:
                         chunks = engines.detect_silence_splits(ap)
@@ -2502,71 +2780,91 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             return part_takes
 
-        # Submit all VO parts concurrently — independent files can transcribe
-        # in parallel; n_workers caps the concurrency.
-        with ThreadPoolExecutor(max_workers=n_workers) as vo_ex:
-            vo_futs = {vo_ex.submit(_transcribe_vo_part, pi, vb): pi
-                       for pi, vb in self.vo_bins.items()
-                       if not self._cancel.is_set()}
-            for fut in _fut_as_completed(vo_futs):
-                pi = vo_futs[fut]
-                try:
-                    part_takes = fut.result()
-                    if part_takes:
-                        vo_takes_by_part[pi] = part_takes
-                except Exception as e:
-                    self._log_line(
-                        "VO Part {}: transcription error — {}".format(pi, e), ERR)
-
-        if _total_tx:
-            self._set_tx_progress(_total_tx, _total_tx, "VO transcription complete")
-            _tx_total_s = time.perf_counter() - _t_tx_start
-            self._log_line(
-                "VO transcription total: {}  ({} fresh  ·  {} cached)".format(
-                    self._fmt_duration(_tx_total_s), _tx_fresh, _tx_cached), INFO)
-            if _chunk_counts:
-                _all_n = [n for _, _, n in _chunk_counts]
-                self._log_line(
-                    "  Chunks — min: {}  max: {}  avg: {:.1f}  total: {}".format(
-                        min(_all_n), max(_all_n),
-                        sum(_all_n) / len(_all_n), sum(_all_n)), INFO)
+        # ── VO transcription via gated raw threads ────────────────────────────
+        # Each thread acquires the live-worker gate before doing heavy work, so
+        # Fast↔Background toggling takes effect immediately.  Threads also submit
+        # their reconcile future as soon as transcription completes (pipelining).
+        _new_recon_q = queue.Queue()   # VO reconcile futures added mid-run
 
         _t_rec_start = time.perf_counter()
 
         def process_token_pulls(token, token_pulls):
-            """Process all pulls for a single token sequentially with a time cursor.
-
-            Pulls are processed in script order.  After each successful match,
-            the cursor advances to rec_out_s so the next pull can only match
-            audio that comes *after* the previous one — enforcing the temporal
-            ordering guarantee the user confirmed (VO files and interview pulls
-            always follow script order in audio time).
-            """
+            """Process all pulls for a single token sequentially with a time cursor."""
             results = []
             cursor  = 0.0
             tsrc    = transcript_sources.get(token)
-            pad     = self.pad_var.get()
+            pad     = pad_secs
+
+            self._log_line(
+                "  [{}] starting {} pull(s)  src={}".format(
+                    token, len(token_pulls),
+                    os.path.basename(tsrc) if tsrc else "none"),
+                SUB)
+
+            # Log pull result cache status for this token on first pull
+            # (checked AFTER reconcile_interview_pull so we don't double-call
+            # os.path.getmtime — which can hang indefinitely on inaccessible files)
+            _logged_pull_cache = False
             for pull in token_pulls:
                 if self._cancel.is_set():
                     r = engines._base_result(pull)
                     r["status"] = "cancelled"
                     results.append(r)
                     continue
+                _pull_t0 = time.perf_counter()
+                # Only enforce the temporal ordering cursor when this pull's
+                # source in-point is at or after the cursor.  If the script
+                # uses clips non-chronologically (narrative order ≠ source
+                # file order), the cursor would otherwise filter out ALL words
+                # from legitimately earlier parts of the interview.
+                _pull_in_s = pull.get("in_seconds", 0.0)
+                _effective_cursor = (cursor
+                                     if _pull_in_s >= cursor - engines._PULL_ORDERING_LOOKBACK
+                                     else 0.0)
                 r = engines.reconcile_interview_pull(pull, tsrc, pad=pad,
-                                                     min_start_s=cursor)
-                # For video-sourced clips (no audio transcript), attach the video
-                # path so the waveform editor can still open for manual IN/OUT.
+                                                     min_start_s=_effective_cursor)
+                _pull_elapsed = time.perf_counter() - _pull_t0
+                # ── Pull cache diagnostic (once per token, after the call) ──────
+                if not _logged_pull_cache:
+                    _logged_pull_cache = True
+                    if r.get("from_cache"):
+                        self._log_line(
+                            "  ↳ PULL cache HIT for '{}'".format(token), SUCCESS
+                        )
+                    else:
+                        if not tsrc:
+                            _miss = "no transcript source"
+                        elif not engines._cache_dir:
+                            _miss = ".pb_cache dir not set"
+                        else:
+                            _miss = "no cached result (status: {})".format(
+                                r.get("status", "?"))
+                        self._log_line(
+                            "  ↳ PULL cache MISS for '{}': {}".format(token, _miss), WARN
+                        )
+                # Per-pull timing log — helps identify which specific pulls are slow
+                _diag = r.get("_diag", "")
+                self._log_line(
+                    "    pull #{} '{}' → {}{}  ({:.1f}s)".format(
+                        pull.get("order", "?"), token,
+                        r.get("status", "?"),
+                        "  [{}]".format(_diag) if _diag else "",
+                        _pull_elapsed),
+                    SUB)
+                # ─────────────────────────────────────────────────────────────────
                 if not tsrc:
                     vid = next((p for p in int_assets.get(token, [])
                                 if is_video(p)), None)
                     if vid and not r.get("source_audio"):
                         r["source_video"] = vid
                 results.append(r)
-                # Advance the cursor past the matched endpoint so subsequent pulls
-                # from this token don't re-match earlier audio.
                 if r.get("status") in ("ok", "low_confidence", "snapped") \
                         and r.get("rec_out_s", 0.0) > 0.0:
                     cursor = max(cursor, r["rec_out_s"])
+
+            self._log_line(
+                "  [{}] done — {} pull(s) completed".format(token, len(results)),
+                SUB)
             return results
 
         def process_vo_part(part_index, blocks):
@@ -2576,27 +2874,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             takes = vo_takes_by_part.get(part_index, [])
             return engines.reconcile_vo_part(blocks, takes)
 
-        # Group VO blocks by part so they are processed in sequence with a
-        # shared cursor — this prevents the matcher from scanning 2000+ words
-        # for every block independently.
         from collections import defaultdict as _dd
         _vo_by_part = _dd(list)
         for vb in self.vo_blocks:
             _vo_by_part[vb["part_index"]].append(vb)
 
-        # Group pulls by token and sort each group by script order so the
-        # temporal ordering constraint can be applied with a per-token cursor.
         _pulls_by_token = _dd(list)
         for p in pulls:
             _pulls_by_token[p["token"]].append(p)
         for _tok in _pulls_by_token:
             _pulls_by_token[_tok].sort(key=lambda p: p["order"])
 
-        all_items = (
-            [("pull_token", (tok, tpulls)) for tok, tpulls in _pulls_by_token.items()] +
-            [("vo_part",    (pi, blocks))  for pi, blocks in _vo_by_part.items()]
-        )
-        # Total expected *results* (one per pull + one per individual VO block)
+        # Total expected results (one per pull + one per individual VO block)
         total = len(pulls) + len(self.vo_blocks)
 
         def dispatch(item):
@@ -2613,41 +2902,124 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 r["_dispatch_s"] = elapsed
             return res
 
-        # ── Reconcile loop ─────────────────────────────────────────────────────
-        # We poll with a 2-second timeout rather than blocking in as_completed()
-        # so that:
-        #   (a) Cancel works immediately — we check _cancel every 2 s even if no
-        #       futures have finished yet.
-        #   (b) The UI can display "N still running… (Xs)" when items stall so the
-        #       user knows the process is alive.
-        ex = ThreadPoolExecutor(max_workers=n_workers)
-        try:
-            futures       = {ex.submit(dispatch, item): item for item in all_items}
-            pending       = set(futures.keys())
-            _stall_t      = time.perf_counter()   # time of last progress update
-            _stall_logged = set()                  # thresholds already written to log
+        def dispatch_gated(item):
+            """Dispatch one reconcile item, obeying the live worker gate."""
+            _gate_in()
+            try:
+                return dispatch(item)
+            finally:
+                _gate_out()
 
-            while pending:
-                # ── Check cancel before waiting ──────────────────────────────
+        # ── Reconcile loop ─────────────────────────────────────────────────────
+        # Pool is sized to hold all possible items; the gate controls concurrency.
+        # Pull-token items are submitted IMMEDIATELY so interview pull reconciliation
+        # runs concurrently with VO transcription (pipelining).  VO-part items are
+        # submitted by the VO transcription threads as each part completes.
+        _total_recon_items = len(_pulls_by_token) + len(_vo_by_part)
+        ex = ThreadPoolExecutor(max_workers=max(1, _total_recon_items))
+        futures = {}   # fut → item (all futures ever submitted)
+
+        # Submit interview-pull items now — they don't depend on VO transcription
+        for tok, tpulls in _pulls_by_token.items():
+            if not self._cancel.is_set():
+                item = ("pull_token", (tok, tpulls))
+                fut  = ex.submit(dispatch_gated, item)
+                futures[fut] = item
+
+        # VO transcription: one thread per part with its own semaphore — completely
+        # independent from the reconcile gate so stalled reconcile futures cannot
+        # block VO transcription from starting.
+        _n_fast_ref = getattr(self, "_reconcile_n_fast", MAX_WORKERS)
+        _n_vo_concurrent = max(1, min(len(self.vo_bins), (_n_fast_ref + 1) // 2))
+        _vo_sem = threading.Semaphore(_n_vo_concurrent)
+        _vo_done_event = threading.Event()
+
+        def _vo_thread(pi, vb):
+            _vo_sem.acquire()
+            try:
+                part_takes = _transcribe_vo_part(pi, vb)
+            except Exception as e:
+                self._log_line(
+                    "VO Part {}: transcription error — {}".format(pi, e), ERR)
+                part_takes = []
+            finally:
+                _vo_sem.release()
+            if part_takes:
+                vo_takes_by_part[pi] = part_takes
+            # Submit VO reconcile immediately — takes are populated above
+            if not self._cancel.is_set():
+                blocks = _vo_by_part.get(pi, [])
+                if blocks:
+                    item = ("vo_part", (pi, blocks))
+                    fut  = ex.submit(dispatch_gated, item)
+                    futures[fut] = item
+                    _new_recon_q.put(fut)
+
+        _vo_threads = []
+        for pi, vb in self.vo_bins.items():
+            if not self._cancel.is_set():
+                t = threading.Thread(target=_vo_thread, args=(pi, vb), daemon=True)
+                t.start()
+                _vo_threads.append(t)
+
+        def _watch_vo():
+            for t in _vo_threads:
+                t.join()
+            if _total_tx:
+                _tx_total_s = time.perf_counter() - _t_tx_start
+                self._set_tx_progress(_total_tx, _total_tx,
+                                      "VO transcription complete")
+                self._log_line(
+                    "VO transcription total: {}  ({} fresh  ·  {} cached)".format(
+                        self._fmt_duration(_tx_total_s), _tx_fresh, _tx_cached),
+                    INFO)
+                if _chunk_counts:
+                    _all_n = [n for _, _, n in _chunk_counts]
+                    self._log_line(
+                        "  Chunks — min: {}  max: {}  avg: {:.1f}  total: {}".format(
+                            min(_all_n), max(_all_n),
+                            sum(_all_n) / len(_all_n), sum(_all_n)), INFO)
+            _vo_done_event.set()
+        threading.Thread(target=_watch_vo, daemon=True).start()
+
+        pending       = set(futures.keys())
+        _stall_t      = time.perf_counter()
+        _stall_logged = set()
+
+        try:
+            while pending or not _vo_done_event.is_set() or not _new_recon_q.empty():
+                # Pick up any VO reconcile futures submitted since last iteration
+                while True:
+                    try:
+                        pending.add(_new_recon_q.get_nowait())
+                    except queue.Empty:
+                        break
+
                 if self._cancel.is_set():
                     for f in pending:
                         f.cancel()
                     break
 
+                if not pending:
+                    # VO still transcribing; no reconcile items queued yet
+                    time.sleep(0.3)
+                    continue
+
                 # Wait up to 2 s for at least one future to finish
                 done_set, pending = _fut_wait(
                     pending, timeout=2.0, return_when=FIRST_COMPLETED)
 
-                # ── Still no completions? surface a stall indicator ──────────
+                # Pick up VO reconcile futures submitted while we waited
+                while True:
+                    try:
+                        pending.add(_new_recon_q.get_nowait())
+                    except queue.Empty:
+                        break
+
+                # ── Still no completions? log stall milestones ───────────────
                 if not done_set:
                     stall_s = time.perf_counter() - _stall_t
                     n_left  = len(pending)
-                    _d_snap = done
-                    def _stall_upd(d=_d_snap, n=n_left, s=stall_s):
-                        self._prog_lbl.config(
-                            text="Matching pulls — {} / {}  ({} running… {:.0f}s)".format(
-                                d, total, n, s))
-                    self.after(0, _stall_upd)
 
                     # Write to the log pane at 10 / 30 / 60+ s milestones
                     for threshold in (10, 30, 60):
@@ -2699,7 +3071,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                     results.append(r)
                                     done += 1
                         pending.clear()
-                        break   # exit while pending — proceed to summary
+                        break   # exit outer loop — proceed to summary
 
                     continue
 
@@ -2767,7 +3139,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             self._prog_bar.set(d, total)
                             self._prog_lbl.config(
                                 text="Matching pulls — {} / {}".format(d, total))
-                        self.after(0, _update)
+                        self._ui(_update)
         finally:
             ex.shutdown(wait=False)
 
@@ -2783,6 +3155,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # summary lines as instance variables, then schedule ONE after(0,...)
         # call to finish the UI work on the main thread.
 
+        self._elapsed_running = False
+
         if self._cancel.is_set():
             # Write "Cancelled" directly to file; main-thread UI update via after
             if self._run_log_fh:
@@ -2793,7 +3167,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 except Exception:
                     pass
                 self._run_log_fh = None
-            self.after(0, lambda: self._log_line("Cancelled.", WARN))
+            self._ui(self._step2)
             return
 
         # ── Compute summary (pure Python, no Tk) ──────────────────────────────
@@ -2932,7 +3306,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._vo_takes_by_part = vo_takes_by_part
         self._pending_summary = sum_lines   # consumed by _finish_reconcile
 
-        self.after(0, self._finish_reconcile)
+        self._ui(self._finish_reconcile)
 
     def _finish_reconcile(self):
         """Called on the main thread after _run_reconcile completes.
@@ -2945,6 +3319,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.after(800, self._step4)
 
     def _cancel_reconcile(self):
+        if not messagebox.askyesno(
+                "Cancel reconciliation?",
+                "Stop the current reconcile run?\n\n"
+                "Work completed so far is already cached and will be skipped on the next run.",
+                default="no"):
+            return
         self._cancel.set()
         self._dot_running = False
         self._log_line("Cancel requested — stopping after current items finish…", WARN)
@@ -2970,20 +3350,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             self._reconcile_log_text = getattr(self, "_reconcile_log_text", "")
 
-        # Always restore saved Step 4 edits for this script so that accepted
-        # changes survive fresh reconciliation runs.  When a session file was
-        # explicitly opened via OPEN, prefer the session-embedded state over
-        # the sidecar (the session file may carry newer edits than the sidecar).
-        _restore_requested = getattr(self, "_restore_s4", False)
-        self._restore_s4   = False   # consume the flag
-        if _restore_requested:
-            _saved_s4 = (getattr(self, "_pending_s4_state", None)
-                         or self._s4_load())
-            self._pending_s4_state = None
-        else:
-            # Fresh reconciliation run — still load the sidecar so the user's
-            # previously saved Step 4 edits are not silently discarded.
-            _saved_s4 = self._s4_load()
+        # Restore saved Step 4 state only when the user explicitly navigated
+        # Back → re-ran reconcile (or opened a saved session file).  A fresh
+        # reconcile run always starts Step 4 clean — the reconcile cache means
+        # re-running is fast, so there's no cost to starting fresh.
+        # Reconcile always opens Step 4 with a clean slate — the reconcile
+        # cache makes re-runs fast, so there is no benefit to carrying over
+        # confirmed/ignored state from a previous run.
+        self._restore_s4       = False
+        self._pending_s4_state = None
+        _saved_s4 = {}
         if _saved_s4:
             for r in self.results:
                 entry = _saved_s4.get(str(r["order"]))
@@ -3728,7 +4104,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 path = fut.result()
             except Exception:
                 if status_var is not None:
-                    self.after(0, lambda: status_var.set(""))
+                    self._ui(lambda: status_var.set(""))
                 return
             def _play():
                 try:
@@ -3739,7 +4115,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     pass
                 if status_var is not None:
                     status_var.set("")
-            self.after(0, _play)
+            self._ui(_play)
 
         ex = ThreadPoolExecutor(max_workers=1)
         ex.submit(_do).add_done_callback(_done)
@@ -4019,13 +4395,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         status_lbl.pack()
 
         cancel_evt = threading.Event()
-        cancel_btn = self._btn(self.body, "CANCEL",
-                               lambda: cancel_evt.set(), small=True)
+        def _confirm_cancel_sync():
+            if messagebox.askyesno("Cancel sync detection?",
+                                   "Stop sync detection for this source?",
+                                   default="no"):
+                cancel_evt.set()
+        cancel_btn = self._btn(self.body, "CANCEL", _confirm_cancel_sync, small=True)
         cancel_btn.pack(pady=(20, 0))
 
         def _set_status(msg):
             """Thread-safe status update."""
-            self.after(0, lambda m=msg: status_lbl.config(text=m))
+            self._ui(lambda m=msg: status_lbl.config(text=m))
 
         def _disable_cancel():
             try:
@@ -4127,14 +4507,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     pbar.stop()
                     _disable_cancel()
                     self._done(n_inc, n_skip, report_path)
-                self.after(0, _finish)
+                self._ui(_finish)
 
             except engines.BuildCancelled:
                 def _on_cancel():
                     pbar.stop()
                     _disable_cancel()
                     self._step5()   # return user to config screen
-                self.after(0, _on_cancel)
+                self._ui(_on_cancel)
 
             except Exception as exc:
                 err = str(exc)
@@ -4144,7 +4524,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _disable_cancel()
                     messagebox.showerror("Build Error", err)
                     self._step5()   # return user to config screen
-                self.after(0, _on_err)
+                self._ui(_on_err)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -4295,7 +4675,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       self._aaf_step2, color=ACCENT).pack(side="right")
             self._aaf_step1_next_added = True
         else:
-            self.after(0, self._aaf_step2)
+            self._ui(self._aaf_step2)
 
     def _aaf_step2(self):
         # Preserve pool state so Back → Next doesn't lose work
@@ -5068,7 +5448,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         if lv: lv.set("")
                         self._aaf_set_sync_state(b, "")
                         # Refresh sync-tab row so lock icon updates immediately
-                        self.after(0, self._rebuild_aaf_source_rows)
+                        self._ui(self._rebuild_aaf_source_rows)
                 sv.trace_add("write", _on_vid_change)
 
                 # Pad bottom of assign-mode row
@@ -5291,7 +5671,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         pending = getattr(self, "_pending_aaf_setup", None)
         if pending is not None:
             self._pending_aaf_setup = None
-            self.after(0, lambda d=pending: self._aaf_restore_setup(d))
+            self._ui(lambda d=pending: self._aaf_restore_setup(d))
 
     # FPS priority order: higher quality / higher frame rate wins
     _FPS_PRIORITY = [
@@ -5353,7 +5733,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try:
                 best_fps = fut.result()
             except Exception:
-                self.after(0, lambda: self._aaf_set_status(""))
+                self._ui(lambda: self._aaf_set_status(""))
                 return
             def _apply():
                 if best_fps is not None:
@@ -5364,7 +5744,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         display = "{:.3f}".format(best_fps).rstrip("0").rstrip(".")
                         self._aaf_fps_var.set(display)
                 self._aaf_set_status("")
-            self.after(0, _apply)
+            self._ui(_apply)
 
         try:
             from concurrent.futures import ThreadPoolExecutor
@@ -5420,7 +5800,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             ex = ThreadPoolExecutor(max_workers=1)
             fut = ex.submit(_probe)
             fut.add_done_callback(
-                lambda f: self.after(0,
+                lambda f: self._ui(
                     lambda: _apply([] if f.exception() else f.result())))
             ex.shutdown(wait=False)
         except Exception:
@@ -5778,7 +6158,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if btn:
                         btn.config(text="\u26a0 error", fg="#e05050", state="normal")
                     messagebox.showerror("Sync Failed", str(exc))
-                self.after(0, _err)
+                self._ui(_err)
                 return
 
             def _apply():
@@ -5812,7 +6192,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # Mark as auto-synced (amber dot) until manually confirmed
                 self._aaf_set_sync_state(base, "auto")
 
-            self.after(0, _apply)
+            self._ui(_apply)
 
         from concurrent.futures import ThreadPoolExecutor
         ex  = ThreadPoolExecutor(max_workers=1)
@@ -6292,7 +6672,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception:
                 pass
 
-            vid_start = max(0.0, start_s + offset_s)
+            vid_start = start_s + offset_s
+            if vid_start < 0.0:
+                # Negative offset shifts video before frame 0 — trim audio start
+                # forward by the overshoot to keep A/V locked together in the preview.
+                start_s  = start_s + (-vid_start)
+                vid_start = 0.0
 
             ref_wav = os.path.join(tmp_dir, "_qa_ref.wav")
             vid_wav = os.path.join(tmp_dir, "_qa_vid.wav")
@@ -6329,10 +6714,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 def _err():
                     self._aaf_qa_stop()
                     messagebox.showerror("QA Play failed", str(exc))
-                self.after(0, _err)
+                self._ui(_err)
                 return
             if not wav:
-                self.after(0, self._aaf_qa_stop)
+                self._ui(self._aaf_qa_stop)
                 return
 
             def _play():
@@ -6348,7 +6733,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # winsound async gives no completion callback; poll until silent
                 self._qa_poll(base, wav)
 
-            self.after(0, _play)
+            self._ui(_play)
 
         from concurrent.futures import ThreadPoolExecutor
         ex = ThreadPoolExecutor(max_workers=1)
@@ -6759,7 +7144,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _upd()
             self.update_idletasks()
         else:
-            self.after(0, _upd)
+            self._ui(_upd)
 
     def _aaf_build(self):
         vpaths = self._aaf_video_paths
@@ -7006,7 +7391,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     self.out_path.set(out)
                     self._aaf_done(matched, unmatched,
                                    len(clips_with_media), clip_results)
-                self.after(0, _finish)
+                self._ui(_finish)
 
             except Exception as e:
                 engines.clear_rx_cache()
@@ -7017,7 +7402,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     except Exception:
                         pass
                     messagebox.showerror("Build Error", _err)
-                self.after(0, _show_err)
+                self._ui(_show_err)
 
         import threading as _threading
         _threading.Thread(target=_worker, daemon=True).start()
@@ -7415,7 +7800,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 prog_lbl.config(text=text)
                 if done is not None and total:
                     prog_bar.set(done, total)
-            self.after(0, _upd)
+            self._ui(_upd)
 
         def _set_status(path, text):
             def _upd():
@@ -7426,7 +7811,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # Auto-select first newly-transcribed file for search
                 if text == "done" and _selected_file[0] is None:
                     _select_file(path)
-            self.after(0, _upd)
+            self._ui(_upd)
 
         # ── Browse ────────────────────────────────────────────────────────────
         def _browse(e=None):
@@ -7461,13 +7846,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _running[0] = True
             _cancel[0]  = False
 
+            def _confirm_cancel_transcribe():
+                if messagebox.askyesno("Cancel transcription?",
+                                       "Stop transcribing? Files already completed are saved.",
+                                       default="no"):
+                    _cancel.__setitem__(0, True)
+
             def _enter_cancel_mode():
-                _tx_cmd[0] = lambda: _cancel.__setitem__(0, True)
+                _tx_cmd[0] = _confirm_cancel_transcribe
                 tx_btn.config(text="CANCEL", fg=WARN)
                 _clr_cmd[0] = None
                 clr_btn.config(fg=SUB)
 
-            self.after(0, _enter_cancel_mode)
+            self._ui(_enter_cancel_mode)
 
             pending = [p for p in _files
                        if p in _rows
@@ -7551,7 +7942,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _active[0] = 0
 
             _running[0] = False
-            self.after(0, _on_done)
+            self._ui(_on_done)
 
         def _on_done():
             n_done = sum(1 for p in _files

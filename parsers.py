@@ -653,9 +653,21 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     PROBE2   = 60.0            # seconds to extract
     SEARCH2  = 20.0            # ±20 s search (wider catches Stage-1 errors up to 20 s)
 
-    a_start2 = start_offset
     sr2_eff  = SR2 // WIN2                       # 50 Hz effective
     max_lag2 = int(SEARCH2 * sr2_eff)
+
+    # When T1 is negative the video file started after the audio.
+    # Anchor the extraction at video frame 0 and advance audio start by the
+    # same amount so we're always correlating the same speech content.
+    # (Clamping video to 0 while keeping audio at start_offset would align
+    # mismatched windows and produce a garbage Stage-2 result.)
+    _v2_ideal = start_offset + T1
+    if _v2_ideal < 0.0:
+        v_start2 = 0.0
+        a_start2 = start_offset + (-_v2_ideal)   # skip audio that predates camera
+    else:
+        v_start2 = _v2_ideal
+        a_start2 = start_offset
 
     raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
 
@@ -664,8 +676,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     if raw_a2 is not None:
         env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
         if env_a2 is not None:
-            v_start2 = max(0.0, start_offset + T1)
-            raw_v2   = _extract(video_path, v_start2, PROBE2, SR2)
+            raw_v2 = _extract(video_path, v_start2, PROBE2, SR2)
             if raw_v2 is not None:
                 env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
                 if env_v2 is not None:
@@ -685,8 +696,16 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     # file is the worst region for clean correlation: camera operators are still
     # getting rolling, talent is adjusting mics, and transients there are random
     # rather than matched between camera and VO recordings.
-    a_start3 = a_start2 + PROBE2 * 0.3
-    v_start3 = max(0.0, a_start3 + T2)
+    # Same anchor logic as Stage 2: when T2 is negative advance audio start
+    # rather than clamping video to 0.
+    _a_start3_base = a_start2 + PROBE2 * 0.3
+    _v3_ideal      = _a_start3_base + T2
+    if _v3_ideal < 0.0:
+        v_start3 = 0.0
+        a_start3 = _a_start3_base + (-_v3_ideal)
+    else:
+        v_start3 = _v3_ideal
+        a_start3 = _a_start3_base
 
     raw_a3 = _extract(audio_path, a_start3, PROBE3, SR3)
     raw_v3 = _extract(video_path,  v_start3, PROBE3, SR3)
@@ -717,8 +736,15 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         _sr3r_eff  = SR3 // WIN3
         _max_lag3r = int(SEARCH3 * _sr3r_eff)
         # Anchor audio at the same 30 % point Stage 3 uses; anchor video on T1_best.
-        _a_start3r = a_start2 + PROBE2 * 0.3
-        _v_start3r = max(0.0, _a_start3r + T1_best)
+        # Apply the same negative-offset correction: advance audio rather than clamping.
+        _a_start3r_base = a_start2 + PROBE2 * 0.3
+        _v3r_ideal      = _a_start3r_base + T1_best
+        if _v3r_ideal < 0.0:
+            _v_start3r = 0.0
+            _a_start3r = _a_start3r_base + (-_v3r_ideal)
+        else:
+            _v_start3r = _v3r_ideal
+            _a_start3r = _a_start3r_base
         _raw_a3r   = _extract(audio_path, _a_start3r, PROBE3, SR3)
         _raw_v3r   = _extract(video_path,  _v_start3r, PROBE3, SR3)
         if _raw_a3r is not None and _raw_v3r is not None:
