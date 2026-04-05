@@ -461,6 +461,18 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             except Exception:
                 pass
 
+    def _extract_pair(path_a, t_a, path_b, t_b, t_dur, out_sr):
+        """Run two _extract calls concurrently; returns (result_a, result_b).
+
+        Both ffmpeg subprocesses are I/O-bound and independent, so running
+        them in parallel threads roughly halves Stage-1 wall-clock time.
+        """
+        from concurrent.futures import ThreadPoolExecutor as _TPE2
+        with _TPE2(max_workers=2) as _pex:
+            _fa = _pex.submit(_extract, path_a, t_a, t_dur, out_sr)
+            _fb = _pex.submit(_extract, path_b, t_b, t_dur, out_sr)
+            return _fa.result(), _fb.result()
+
     def _peak_env(sig, win_samples, top_pct=20):
         """
         Peak-selective RMS envelope.
@@ -627,8 +639,9 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     _SR1_EXTR  = 8000       # ffmpeg extraction sample rate (unchanged)
     WIN1       = _SR1_EXTR // SR1   # 1600 samples = 200 ms per envelope window
 
-    raw_a1 = _extract(video_path, start_offset, DUR1, _SR1_EXTR)
-    raw_b1 = _extract(audio_path, start_offset, DUR1, _SR1_EXTR)
+    # Both extractions are independent — run them in parallel threads.
+    raw_a1, raw_b1 = _extract_pair(video_path, start_offset,
+                                    audio_path, start_offset, DUR1, _SR1_EXTR)
 
     if raw_a1 is None or raw_b1 is None:
         return 0.0, 0.0
@@ -669,20 +682,19 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         v_start2 = _v2_ideal
         a_start2 = start_offset
 
-    raw_a2 = _extract(audio_path, a_start2, PROBE2, SR2)
+    # Run both Stage-2 extractions concurrently; they are independent.
+    raw_a2, raw_v2 = _extract_pair(audio_path, a_start2,
+                                    video_path, v_start2, PROBE2, SR2)
 
     T2, conf2 = T1, conf1   # fallback if extraction fails entirely
     T1_best   = T1
-    if raw_a2 is not None:
+    if raw_a2 is not None and raw_v2 is not None:
         env_a2 = _peak_env(raw_a2, WIN2, top_pct=25)
-        if env_a2 is not None:
-            raw_v2 = _extract(video_path, v_start2, PROBE2, SR2)
-            if raw_v2 is not None:
-                env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
-                if env_v2 is not None:
-                    lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
-                    T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
-                    T1_best = T1
+        env_v2 = _peak_env(raw_v2, WIN2, top_pct=25)
+        if env_a2 is not None and env_v2 is not None:
+            lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
+            T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
+            T1_best = T1
 
     # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
     # Accuracy: ±1 ms (sub-frame).
@@ -707,8 +719,8 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         v_start3 = _v3_ideal
         a_start3 = _a_start3_base
 
-    raw_a3 = _extract(audio_path, a_start3, PROBE3, SR3)
-    raw_v3 = _extract(video_path,  v_start3, PROBE3, SR3)
+    raw_a3, raw_v3 = _extract_pair(audio_path, a_start3,
+                                    video_path,  v_start3, PROBE3, SR3)
 
     stage3_ran = False
     T3, conf3  = T2, conf2   # fallback
@@ -745,8 +757,8 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         else:
             _v_start3r = _v3r_ideal
             _a_start3r = _a_start3r_base
-        _raw_a3r   = _extract(audio_path, _a_start3r, PROBE3, SR3)
-        _raw_v3r   = _extract(video_path,  _v_start3r, PROBE3, SR3)
+        _raw_a3r, _raw_v3r = _extract_pair(audio_path, _a_start3r,
+                                            video_path,  _v_start3r, PROBE3, SR3)
         if _raw_a3r is not None and _raw_v3r is not None:
             _env_a3r = _peak_env(_raw_a3r, WIN3, top_pct=35)
             _env_v3r = _peak_env(_raw_v3r, WIN3, top_pct=35)

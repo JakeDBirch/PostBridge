@@ -6144,9 +6144,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # both recordings is where the overlap lives.
         start_offset = 0.0
 
-        # Disable button while running
+        # Disable button and start spinner animation while running
         if btn:
-            btn.config(text="SYNCING\u2026", state="disabled", fg=SUB)
+            btn.config(text="SYNCING \u00b7  ", state="disabled", fg=SUB)
+
+        _animating = [True]
+        _spin_frames = ["SYNCING \u00b7  ", "SYNCING \u00b7\u00b7 ", "SYNCING \u00b7\u00b7\u00b7"]
+        _spin_idx    = [0]
+
+        def _spin_tick():
+            if not _animating[0]:
+                return
+            if btn:
+                try:
+                    btn.config(text=_spin_frames[_spin_idx[0] % len(_spin_frames)])
+                except Exception:
+                    return
+            _spin_idx[0] += 1
+            self.after(350, _spin_tick)
+
+        self.after(350, _spin_tick)
 
         _ap_basename = basename(ap)
 
@@ -6155,6 +6172,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                       start_offset=start_offset)
 
         def _done(fut):
+            _animating[0] = False
             try:
                 offset, confidence = fut.result()
             except Exception as exc:
