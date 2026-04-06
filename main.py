@@ -6466,16 +6466,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "or add audio files to the reference audio pool.")
             return
 
-        # Validate video assignment
+        # Collect all assigned video files for this source (slot 1 + extras).
+        # For N>1 files, sync is run against every file and the best confidence
+        # winner is promoted to slot-1 — the user doesn't need to know which
+        # file has the relevant audio in advance.
+        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        _all_vps = []
         fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
-        if fn == "— no video —":
+        if fn != "— no video —" and fn in path_by_fn:
+            _all_vps.append(path_by_fn[fn])
+        for _ev in getattr(self, "_aaf_source_extra_vars", {}).get(base, []):
+            fn2 = _ev.get()
+            if fn2 != "— no video —" and fn2 in path_by_fn:
+                vp2 = path_by_fn[fn2]
+                if vp2 not in _all_vps:
+                    _all_vps.append(vp2)
+
+        if not _all_vps:
             messagebox.showwarning("No Video",
                 "Assign a video file to this source before syncing.")
-            return
-
-        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
-        vp = path_by_fn.get(fn)
-        if not vp:
             return
 
         ap = audio_var.get()
@@ -6484,9 +6493,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Reference audio file not found:\n{}".format(ap))
             return
 
-        # Always probe from the start of both files.  Each source is its own
-        # video + audio pair, so there's no reason to seek — the beginning of
-        # both recordings is where the overlap lives.
         start_offset = 0.0
 
         # Disable button and start spinner animation while running
@@ -6511,13 +6517,35 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.after(350, _spin_tick)
 
         _ap_basename = basename(ap)
+        _n_vps = len(_all_vps)
 
         def _run():
             if _sem is not None:
                 _sem.acquire()
             try:
-                return detect_sync_offset(vp, ap, probe_duration=300.0,
-                                          start_offset=start_offset)
+                if _n_vps == 1:
+                    off, conf = detect_sync_offset(_all_vps[0], ap,
+                                                   probe_duration=300.0,
+                                                   start_offset=start_offset)
+                    return off, conf, _all_vps[0]
+                # Multi-file: probe all candidates in parallel, pick best confidence
+                from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
+                results = []
+                with _TPE(max_workers=_n_vps) as _ex:
+                    _fmap = {_ex.submit(detect_sync_offset, _vp, ap,
+                                        probe_duration=300.0,
+                                        start_offset=start_offset): _vp
+                             for _vp in _all_vps}
+                    for _f in _asc(_fmap):
+                        try:
+                            _off, _conf = _f.result()
+                            results.append((_off, _conf, _fmap[_f]))
+                        except Exception:
+                            pass
+                if not results:
+                    raise RuntimeError(
+                        "Sync failed on all {} video files".format(_n_vps))
+                return max(results, key=lambda r: r[1])
             finally:
                 if _sem is not None:
                     _sem.release()
@@ -6525,7 +6553,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         def _done(fut):
             _animating[0] = False
             try:
-                offset, confidence = fut.result()
+                offset, confidence, best_vp = fut.result()
             except Exception as exc:
                 def _err():
                     lv = self._aaf_source_sync_label_vars.get(base)
@@ -6537,6 +6565,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
 
             def _apply():
+                # For multi-file sources, promote the winning file to slot-1 so
+                # the build step always uses the sync-verified file for all clips.
+                best_fn = basename(best_vp)
+                sv = self._aaf_source_file_vars.get(base)
+                if sv and sv.get() != best_fn:
+                    sv.set(best_fn)
+                    # For single-slot view, update the button label directly
+                    n_slots = getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
+                    if n_slots == 1:
+                        btn_lbl = getattr(self, "_aaf_vid_btn_labels", {}).get(base)
+                        if btn_lbl:
+                            try:
+                                btn_lbl.config(text=best_fn)
+                            except Exception:
+                                pass
+
                 offset_var = self._aaf_source_offset_vars.get(base)
                 if offset_var:
                     offset_var.set("{:.3f}".format(offset))
@@ -7657,11 +7701,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not messagebox.askyesno("Incomplete Assignments", _pmsg):
                 return
 
-        # Build per-source sync offset (seconds) and reference audio path
+        # Build per-source sync offset (seconds) and reference audio path.
+        # Also track which sources have been sync'd (affects multi-file build logic).
         source_offset     = {}
         source_syncaudio  = {}
+        source_sync_done  = set()
         for base in self._aaf_sources:
             if self._aaf_source_sync_vars.get(base, tk.BooleanVar()).get():
+                source_sync_done.add(base)
                 try:
                     source_offset[base] = float(
                         self._aaf_source_offset_vars[base].get())
@@ -7693,9 +7740,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             _paths = source_video.get(base)
             if _paths:
-                _idx = _occ_count.get(base, 0)
-                vp   = _paths[min(_idx, len(_paths) - 1)]
-                _occ_count[base] = _idx + 1
+                # When sync has been run on a multi-file source, slot-1 holds the
+                # sync-verified file (promoted by _aaf_do_sync).  Use it for every
+                # clip from this source rather than guessing by position.
+                if base in source_sync_done and len(_paths) > 1:
+                    vp = _paths[0]
+                else:
+                    _idx = _occ_count.get(base, 0)
+                    vp   = _paths[min(_idx, len(_paths) - 1)]
+                    _occ_count[base] = _idx + 1
                 matched += 1
                 clip_results.append((clip["clip_name"], basename(vp), SUCCESS))
             else:
