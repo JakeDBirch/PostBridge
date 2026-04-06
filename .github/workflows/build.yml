@@ -4,9 +4,7 @@ name: Build PostBridge
 # Can also be triggered manually: GitHub → Actions tab → Build PostBridge → Run workflow.
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:   # manual trigger button in the Actions tab
+  workflow_dispatch:   # manual trigger only — Actions tab → Build PostBridge → Run workflow
 
 jobs:
 
