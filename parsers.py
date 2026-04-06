@@ -1,5 +1,8 @@
 import os
 import re
+import subprocess
+import tempfile
+import json
 from utils import tc_secs, basename
 
 # ── Script parser ──────────────────────────────────────────────────────────────
@@ -294,13 +297,11 @@ def match_pt_clip_to_media(clip_name, media_paths):
     """
     Match a PT clip name back to a media file in the pool.
     """
-    import re as _re
-
     def _normalize(name):
         name = os.path.splitext(name)[0]
-        name = _re.sub(r'\.[LR]$', '', name)
-        name = _re.sub(r'-Norm_\d+(-\d+)?$', '', name)
-        name = _re.sub(r'-\d{2}$', '', name)
+        name = re.sub(r'\.[LR]$', '', name)
+        name = re.sub(r'-Norm_\d+(-\d+)?$', '', name)
+        name = re.sub(r'-\d{2}$', '', name)
         return name.lower().strip()
 
     clip_base = _normalize(clip_name)
@@ -316,8 +317,8 @@ def match_pt_clip_to_media(clip_name, media_paths):
                 best_score = score
                 best_path  = path
         else:
-            fn_words   = set(_re.findall(r'[a-z0-9]+', fn))
-            clip_words = set(_re.findall(r'[a-z0-9]+', clip_base))
+            fn_words   = set(re.findall(r'[a-z0-9]+', fn))
+            clip_words = set(re.findall(r'[a-z0-9]+', clip_base))
             if fn_words and clip_words:
                 overlap = len(fn_words & clip_words) / max(len(fn_words), len(clip_words))
                 if overlap > best_score:
@@ -345,8 +346,6 @@ def match_source_to_video(source_base, video_paths):
 
     Returns the best matching path, or None if no confident match found.
     """
-    import re as _re
-
     # Standalone roman numerals that are worth distinguishing as ordinals.
     # Single-char 'i', 'v', 'x' are included because in file names they almost
     # always appear as ordinals ("Part I", "Episode V") rather than as letters.
@@ -358,7 +357,7 @@ def match_source_to_video(source_base, video_paths):
     def _sig_words(text):
         """Lowercase alphanumeric tokens that are 4+ chars, pure digits, or roman numerals."""
         result = set()
-        for w in _re.findall(r'[a-z0-9]+', text.lower()):
+        for w in re.findall(r'[a-z0-9]+', text.lower()):
             if len(w) >= 4 or w.isdigit() or w in _ROMAN:
                 result.add(w)
         return result
@@ -415,9 +414,6 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     Stage 2  – 50 Hz RMS envelope, ±10 s search       → accuracy ±10 ms
     Stage 3  – 2 ms RMS envelope,  ±0.5 s search      → accuracy ±1 ms
     """
-    import subprocess as _sp
-    import tempfile
-
     try:
         import numpy as _np
     except ImportError:
@@ -441,7 +437,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
                     "-ar", str(int(out_sr)),
                     "-f",  "f32le",
                     tmp]
-            r = _sp.run(cmd, capture_output=True, timeout=120)
+            r = subprocess.run(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
             with open(tmp, "rb") as _fh:
@@ -628,50 +624,95 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
 
         return results if results else [(0.0, 0.0)]
 
-    # ── Stage 1: 50 Hz RMS envelope, full probe window ────────────────────
-    # ARCHITECTURE NOTE
-    # Previously this used 5 Hz (200 ms windows).  A -2 s offset is only
-    # 10 samples in the 1500-sample coarse envelope — geometrically
-    # indistinguishable from speech-rhythm autocorrelation false peaks.
-    # Upgrading to 50 Hz (20 ms windows) on the same ffmpeg extract gives
-    # 100 samples for a 2 s offset, reliable detection of small negative
-    # offsets (common when DAW starts before camera), and eliminates the
-    # need for the near-zero patch that was added as a workaround.
-    # Cost: trivially larger numpy arrays; ffmpeg calls are unchanged.
+    # ── Stage 1: two-pass coarse search ──────────────────────────────────
     #
-    # arg order: audio first, video second — C[L] = sum_t AUDIO[t]*VIDEO[t+L]
-    # Peak at L>0 means VIDEO leads AUDIO (camera started early) → T1>0
-    SR1        = 50         # 50 Hz effective envelope rate  (was 5 Hz)
-    DUR1       = min(probe_duration, 600.0)
-    _SR1_EXTR  = 8000       # ffmpeg extraction sample rate (unchanged)
-    WIN1       = _SR1_EXTR // SR1   # 160 samples = 20 ms per envelope window
+    # WHY TWO PASSES
+    # ──────────────
+    # A single 50 Hz envelope over 300 s with ±150 s max_lag finds massive
+    # false peaks at 22–146 s for interview recordings.  Speech periodicity
+    # at 20 ms resolution produces many spurious correlation peaks spread
+    # across the full ±150 s window; those distant false peaks outcompete
+    # the true ±1–5 s offset every time.
+    #
+    # A single 5 Hz envelope (200 ms windows, 300 s probe, ±150 s) is
+    # reliable for large offsets (>10 s) because the coarse windows average
+    # out phoneme/syllable periodicity.  But a 2 s offset is only 10 samples
+    # at 5 Hz — indistinguishable from zero or from the nearest speech-rhythm
+    # peak.
+    #
+    # Solution: extract once, compute two envelopes, run two xcorrs.
+    #
+    #   Pass A — 50 Hz envelope, FIRST 60 s of audio only, ±30 s max_lag.
+    #            60 s of speech has few repetitions, and the ±30 s cap
+    #            eliminates the 22–146 s false peaks entirely.
+    #            Overlap at the true ±3 s lag:  57/60 = 95 %.
+    #            Overlap at max lag (±30 s):     30/60 = 50 %.
+    #            → true peak dominates when real offset < 30 s.
+    #
+    #   Pass B — 5 Hz envelope, full 300 s probe, ±120 s max_lag.
+    #            Same coarse search that worked well for large-offset
+    #            productions (Blyth, etc.).  Blind for offsets < 5 s.
+    #
+    # Selection: if Pass A reports conf ≥ 0.30, use it (small-offset case).
+    #            Otherwise fall back to Pass B (large-offset case).
+    #
+    # arg order in xcorr: audio (b_sig) first, video (a_sig) second.
+    # C[L] = sum_t VIDEO[t+L] * AUDIO[t].  Peak at L>0 → VIDEO leads AUDIO
+    # (camera started early) → T positive.
 
-    # Both extractions are independent — run them in parallel threads.
-    raw_a1, raw_b1 = _extract_pair(video_path, start_offset,
-                                    audio_path, start_offset, DUR1, _SR1_EXTR)
+    _SR1_EXTR = 8000
+    DUR1      = min(probe_duration, 300.0)
 
-    if raw_a1 is None or raw_b1 is None:
+    # Single extraction — both passes reuse these raw arrays.
+    raw_vid1, raw_aud1 = _extract_pair(video_path, start_offset,
+                                        audio_path, start_offset,
+                                        DUR1, _SR1_EXTR)
+    if raw_vid1 is None or raw_aud1 is None:
         return 0.0, 0.0
 
-    env_a1 = _peak_env(raw_a1, WIN1, top_pct=20)   # 50 samples/s, loudest 20 %
-    env_b1 = _peak_env(raw_b1, WIN1, top_pct=20)
+    # ── Pass A: 50 Hz, first 60 s, ±30 s ─────────────────────────────────
+    _WIN_A   = _SR1_EXTR // 50          # 160 samples = 20 ms
+    _DUR_A   = int(60.0 * _SR1_EXTR)   # first 60 s in raw samples
+    _raw_v_a = raw_vid1[:_DUR_A]
+    _raw_a_a = raw_aud1[:_DUR_A]
+    _env_v_a = _peak_env(_raw_v_a, _WIN_A, top_pct=20) if len(_raw_v_a) >= _WIN_A else None
+    _env_a_a = _peak_env(_raw_a_a, _WIN_A, top_pct=20) if len(_raw_a_a) >= _WIN_A else None
+    T1A, conf1A = 0.0, 0.0
+    if _env_v_a is not None and _env_a_a is not None and len(_env_v_a) >= 4:
+        _MAX_LAG_A  = int(30.0 * 50)              # ±30 s at 50 Hz = 1500 samples
+        _MIN_GAP_A  = max(1, int(50 * 2))         # ≥2 s between candidates
+        _cands_a    = _xcorr_top_n(_env_a_a, _env_v_a, _MAX_LAG_A,
+                                    n_peaks=3, min_gap=_MIN_GAP_A)
+        T1A    = float(_cands_a[0][0]) / 50.0
+        conf1A = _cands_a[0][1]
 
-    if env_a1 is None or env_b1 is None or len(env_a1) < 4 or len(env_b1) < 4:
-        return 0.0, 0.0
+    # ── Pass B: 5 Hz, full 300 s, ±120 s ─────────────────────────────────
+    _WIN_B  = _SR1_EXTR // 5            # 1600 samples = 200 ms
+    _env_v_b = _peak_env(raw_vid1, _WIN_B, top_pct=15)
+    _env_a_b = _peak_env(raw_aud1, _WIN_B, top_pct=15)
+    T1B, conf1B = 0.0, 0.0
+    if _env_v_b is not None and _env_a_b is not None and len(_env_v_b) >= 4:
+        _MAX_LAG_B = min(int(120.0 * 5), len(_env_v_b) // 2)  # ±120 s at 5 Hz = 600 samp
+        _MIN_GAP_B = max(1, int(5 * 5))                         # ≥5 s between candidates
+        _cands_b   = _xcorr_top_n(_env_a_b, _env_v_b, _MAX_LAG_B,
+                                   n_peaks=3, min_gap=_MIN_GAP_B)
+        T1B    = float(_cands_b[0][0]) / 5.0
+        conf1B = _cands_b[0][1]
 
-    _S1_MIN_GAP = max(1, int(SR1 * 2))   # candidates must be ≥2 s apart
-    _s1_cands   = _xcorr_top_n(env_b1, env_a1, len(env_b1) // 2,
-                                n_peaks=3, min_gap=_S1_MIN_GAP)
+    # Select pass
+    if conf1A >= 0.30:
+        T1, conf1 = T1A, conf1A
+        _s1_pass  = "A"
+    else:
+        T1, conf1 = T1B, conf1B
+        _s1_pass  = "B"
 
-    T1    = float(_s1_cands[0][0]) / SR1
-    conf1 = _s1_cands[0][1]
-
-    # ── Stage 2: 50 Hz RMS envelope, ±20 s search around T1 ──────────────
+    # ── Stage 2: 50 Hz RMS envelope, ±5 s search around T1 ───────────────
     # Accuracy: ±10 ms.
     SR2      = 8000
     WIN2     = SR2 // 50       # 20 ms RMS windows → 50 effective Hz
     PROBE2   = 60.0            # seconds to extract
-    SEARCH2  = 5.0             # ±5 s search — Stage 1 is now 50 Hz so seed is ±20 ms accurate
+    SEARCH2  = 5.0             # ±5 s search (Stage 1 seed is ≤ 100 ms accurate)
 
     sr2_eff  = SR2 // WIN2                       # 50 Hz effective
     max_lag2 = int(SEARCH2 * sr2_eff)
@@ -702,6 +743,56 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             lag2, conf2 = _xcorr_bounded(env_a2, env_v2, max_lag2)
             T2      = (v_start2 - a_start2) + float(lag2) / sr2_eff
             T1_best = T1
+
+    # ── Stage 2M: Mirror – test -T1 to recover negative offsets ──────────
+    # When Stage 1 returns a false positive T1 > 0 and the true offset is
+    # negative (e.g. camera started late), anchoring Stage 2M at -T1 places
+    # the true peak within ±SEARCH2M.
+    # Proof: T2_M = (v_start2M − a_start2M) + L_residual = −|true_T|.
+    # For large positive true offsets (e.g. Blyth +15 s), conf2M < conf2
+    # because the true peak sits >20 s outside the search window → ignored.
+    _used_mirror = False
+    T2M, conf2M  = T2, 0.0
+    if abs(T1) >= 0.5:
+        T1_M      = -T1
+        _v2M_ideal = start_offset + T1_M
+        if _v2M_ideal < 0.0:
+            v_start2M = 0.0
+            a_start2M = start_offset + (-_v2M_ideal)
+        else:
+            v_start2M = _v2M_ideal
+            a_start2M = start_offset
+        SEARCH2M  = 20.0
+        max_lag2M = int(SEARCH2M * sr2_eff)
+        raw_a2M, raw_v2M = _extract_pair(audio_path, a_start2M,
+                                          video_path,  v_start2M, PROBE2, SR2)
+        if raw_a2M is not None and raw_v2M is not None:
+            env_a2M = _peak_env(raw_a2M, WIN2, top_pct=25)
+            env_v2M = _peak_env(raw_v2M, WIN2, top_pct=25)
+            if env_a2M is not None and env_v2M is not None:
+                lag2M, conf2M = _xcorr_bounded(env_a2M, env_v2M, max_lag2M)
+                T2M = (v_start2M - a_start2M) + float(lag2M) / sr2_eff
+                # ── Same-sign check: mirror found original false peak again ──────
+                # If T2M ≈ T1 in both sign and magnitude the wide search looped
+                # back to the same spurious peak.  Retry with a tight ±5 s window
+                # on the already-extracted signals; the true (negative) peak is
+                # typically <1 s from the mirror anchor so it survives, while the
+                # false peak (which is |T1| + |true_T| away) gets excluded.
+                if conf2M > 0 and abs(T2M - T1) < 1.0:
+                    max_lag2M_narrow = int(5.0 * sr2_eff)
+                    lag2M_n, conf2M_n = _xcorr_bounded(env_a2M, env_v2M,
+                                                        max_lag2M_narrow)
+                    T2M_n = (v_start2M - a_start2M) + float(lag2M_n) / sr2_eff
+                    # Accept narrow result only if it escapes the same-sign trap
+                    if conf2M_n > 0 and abs(T2M_n - T1) >= 1.0:
+                        T2M, conf2M = T2M_n, conf2M_n
+                    else:
+                        conf2M = 0.0   # mirror entirely failed, don't use it
+                if conf2M > conf2:
+                    T2           = T2M
+                    conf2        = conf2M
+                    T1_best      = T2M   # spread → 0 so t12 penalty vanishes
+                    _used_mirror = True
 
     # ── Stage 3: 2 ms RMS envelope, ±0.5 s search around T2 ──────────────
     # Accuracy: ±1 ms (sub-frame).
@@ -863,7 +954,6 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     # the algorithm output for those files already lands on the true offset.
     # "wrong" verdicts are skipped so a mis-found file never corrupts the cache.
     try:
-        import json as _jcal
         _cal_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".pb_cache")
         _corr_path = os.path.join(_cal_cache, "sync_corrections.jsonl")
@@ -873,7 +963,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             with open(_corr_path, "r", encoding="utf-8") as _fc:
                 for _line in _fc:
                     try:
-                        _ce = _jcal.loads(_line)
+                        _ce = json.loads(_line)
                         if (_ce.get("audio") == _audio_name and
                                 _ce.get("verdict") not in ("wrong", "verified")):
                             _last_good = _ce
@@ -893,7 +983,6 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
     # .pb_cache/sync_runs.jsonl accumulates one entry per detection run.
     # At session start these can be read to understand algorithm behaviour.
     try:
-        import json as _json
         import datetime as _dt
         _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    ".pb_cache")
@@ -902,7 +991,9 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
             "video":         os.path.basename(video_path),
             "audio":         os.path.basename(audio_path),
-            "s1_hz":         SR1,
+            "s1_pass":       _s1_pass,           "s1_hz": 50 if _s1_pass == "A" else 5,
+            "T1A":           round(T1A, 4),      "conf1A": round(conf1A, 4),
+            "T1B":           round(T1B, 4),      "conf1B": round(conf1B, 4),
             "T1":            round(T1, 4),       "conf1":  round(conf1, 4),
             "T1_best":       round(T1_best, 4),
             "T2":            round(T2, 4),       "conf2":  round(conf2, 4),
@@ -912,6 +1003,8 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
             "t12_factor":    round(t12_factor, 3),
             "spread_ms":     round(spread * 1000, 1) if spread is not None else None,
             "stage3_ran":    stage3_ran,
+            "T2M":           round(T2M, 4),       "conf2M": round(conf2M, 4),
+            "used_mirror":   _used_mirror,
             "rescue_T3R":    round(T3R, 6)       if rescue_ran else None,
             "rescue_conf":   round(conf3R_raw, 4) if rescue_ran else None,
             "used_rescue":   _used_rescue,
@@ -920,7 +1013,7 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         }
         with open(os.path.join(_cache_dir, "sync_runs.jsonl"),
                   "a", encoding="utf-8") as _fh:
-            _fh.write(_json.dumps(_entry) + "\n")
+            _fh.write(json.dumps(_entry) + "\n")
     except Exception:
         pass
 
@@ -942,8 +1035,6 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
 
     Returns (offset, 0.0) on any failure so callers can always unpack safely.
     """
-    import subprocess as _sp2
-
     try:
         import numpy as _np2
     except ImportError:
@@ -959,7 +1050,7 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
             cmd += ["-t", "{:.3f}".format(max(t_dur, 0.1)),
                     "-i", path, "-ac", "1", "-ar", str(int(out_sr)),
                     "-f", "f32le", tmp]
-            r = _sp2.run(cmd, capture_output=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
             with open(tmp, "rb") as _fh:
@@ -1066,8 +1157,6 @@ def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=80
 
     Requires ffmpeg in PATH and numpy.
     """
-    import subprocess as _sp
-    import tempfile
     import wave as _wave
 
     try:
@@ -1076,7 +1165,7 @@ def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=80
         raise RuntimeError("numpy is required.\nRun:  pip install numpy")
 
     def _extract(src, dst):
-        r = _sp.run(
+        r = subprocess.run(
             ["ffmpeg", "-y",
              "-t", str(search_secs),
              "-i", src,
@@ -1152,23 +1241,22 @@ def get_clip_base_name(clip_name):
       'Fade 1' / 'Fade 107'                   -> None  (skip rendered fades)
       'JORDAN_INTERVIEW'                       -> 'JORDAN_INTERVIEW'
     """
-    import re as _re
     if not clip_name or clip_name.startswith('('):
         return None
     # Skip Pro Tools rendered fade regions ("Fade N")
-    if _re.match(r'^Fade\s+\d+$', clip_name, _re.IGNORECASE):
+    if re.match(r'^Fade\s+\d+$', clip_name, re.IGNORECASE):
         return None
     # Strip rightmost copy-number suffix -NN (2+ digits) with optional .L/.R
     # Discard .L/.R entirely — L and R tracks consolidate to the same source entry
-    m = _re.match(r'^(.+)-(\d{2,})(\.[LR])?$', clip_name)
+    m = re.match(r'^(.+)-(\d{2,})(\.[LR])?$', clip_name)
     name = m.group(1) if m else clip_name
     # Strip iZotope RX processing suffix: -RX10Dk_43, -RX8Dn_01, etc.
-    name = _re.sub(r'-RX\d+[A-Za-z]+_\d+', '', name)
+    name = re.sub(r'-RX\d+[A-Za-z]+_\d+', '', name)
     # Strip any remaining trailing .L/.R channel designator
-    name = _re.sub(r'\.[LR]$', '', name)
+    name = re.sub(r'\.[LR]$', '', name)
     # Strip common audio/video file extensions
-    name = _re.sub(r'\.(wav|aif|aiff|mp3|m4v|mp4|mxf|mov|wmv|avi|mkv)$', '', name,
-                   flags=_re.IGNORECASE)
+    name = re.sub(r'\.(wav|aif|aiff|mp3|m4v|mp4|mxf|mov|wmv|avi|mkv)$', '', name,
+                  flags=re.IGNORECASE)
     return name or None
 
 
@@ -1197,8 +1285,7 @@ def parse_aaf_session(aaf_path):
         markers       : [ { name: str, position_secs: float } ],
       }
     """
-    import re as _re
-    _fade_pat = _re.compile(r'^Fade\s+\d+$', _re.IGNORECASE)
+    _fade_pat = re.compile(r'^Fade\s+\d+$', re.IGNORECASE)
 
     try:
         import aaf2

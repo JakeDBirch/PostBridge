@@ -154,8 +154,6 @@ class MatchReviewDialog:
         self._segments   = [list(s) for s in segments]  # mutable copy
         self._in_s       = self._segments[0][0]  if self._segments else 0.0
         self._out_s      = self._segments[-1][1] if self._segments else 0.0
-        self._orig_in_s  = self._in_s
-        self._orig_out_s = self._out_s
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -1311,7 +1309,7 @@ class MatchReviewDialog:
         for i in range(0, n, win):
             chunk = self._samples[i : i + win]
             rms   = float(_np.sqrt(_np.mean(chunk ** 2)))
-            t     = i / sr
+            t     = self._ctx_start + i / sr
             if rms < threshold and not in_sil:
                 sil_start = t
                 in_sil    = True
@@ -1322,7 +1320,7 @@ class MatchReviewDialog:
                     sil_ends.append(sil_end)
                 in_sil = False
         if in_sil:
-            sil_end = n / sr
+            sil_end = self._ctx_start + n / sr
             if sil_end - sil_start >= 0.1:
                 sil_starts.append(sil_start)
                 sil_ends.append(sil_end)
@@ -1378,8 +1376,8 @@ class MatchReviewDialog:
         if self._segments:
             s0 = self._segments[0]
             sl = self._segments[-1]
-            self._segments[0]  = (new_in,  s0[1])
-            self._segments[-1] = (sl[0],   new_out)
+            self._segments[0]  = [new_in,  s0[1]]
+            self._segments[-1] = [sl[0],   new_out]
 
         self._auto_snapped = True
         try:
@@ -1510,21 +1508,11 @@ class MatchReviewDialog:
             return
         pad = 3.0  # seconds of context on each side of the match
         w   = max(1, self._canvas_w)
-        view_start_s = max(0.0, self._in_s - pad)
-        view_end_s   = min(self._ctx_dur, self._out_s + pad)
+        view_start_s = max(self._ctx_start, self._in_s - pad)
+        view_end_s   = min(self._ctx_start + self._ctx_dur, self._out_s + pad)
         view_dur_s   = max(0.1, view_end_s - view_start_s)
         self._spp        = max(1, int(view_dur_s * self._sr / w))
-        self._view_start = int(view_start_s * self._sr)
-        self._draw()
-
-    def _zoom_all(self):
-        """Zoom to show the entire file."""
-        if self._samples is None:
-            return
-        n = len(self._samples)
-        w = max(1, self._canvas_w)
-        self._spp        = max(1, n // w)
-        self._view_start = 0
+        self._view_start = int((view_start_s - self._ctx_start) * self._sr)
         self._draw()
 
     def _zoom_to(self, t_center, window_s=10.0):
@@ -1605,30 +1593,6 @@ class MatchReviewDialog:
         self._dur_var.set("({})".format(self._fmt_tc(dur)))
 
     # ── Playback ──────────────────────────────────────────────────────────
-
-    def _play_match(self):
-        """Play the matched region exactly from IN to OUT."""
-        # Commit any typed-but-uncommitted timecode edits first.
-        # (Label buttons don't take focus, so FocusOut may not have fired.)
-        self._commit_in_entry()
-        self._commit_out_entry()
-        start = self._in_s
-        dur   = max(0.1, self._out_s - self._in_s)
-        self._play(start, dur)
-
-    def _play_context(self):
-        """Play 2.5 s before IN through 2.5 s after OUT."""
-        self._commit_in_entry()
-        self._commit_out_entry()
-        pre   = 2.5
-        start = max(0.0, self._in_s - pre)
-        dur   = (self._out_s - self._in_s) + pre * 2
-        self._play(start, dur)
-
-    def _play_from_cursor(self):
-        """Play from the current playhead position for 5 seconds."""
-        dur = 5.0
-        self._play(self._playhead_s, dur)
 
     def _toggle_play(self):
         """Spacebar handler — stop if playing, play/edit if stopped."""

@@ -1,4 +1,4 @@
-import os, re, io, json, tempfile, subprocess, time, wave, hashlib, threading
+import os, re, io, json, tempfile, subprocess, wave, hashlib, threading
 
 
 def _safe_net_call(fn, default, _timeout=2.0):
@@ -221,7 +221,6 @@ def get_audio_channels(path):
 def _cache_path(media_path):
     if not _cache_dir:
         return None
-    import hashlib
     key = hashlib.md5(os.path.abspath(media_path).encode()).hexdigest()[:16]
     return os.path.join(_cache_dir, "{}.json".format(key))
 
@@ -315,8 +314,11 @@ def pb_transcript_save(media_path, words, blobs=None):
     data = {"version": 1, "model": WHISPER_MODEL, "mtime": mtime, "words": words}
     if blobs is not None:
         data["blobs"] = blobs
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 def transcribe_file(media_path, progress_cb=None):
     """Transcribe an entire media file using the same chunked pipeline as VO
@@ -351,7 +353,7 @@ def transcribe_file(media_path, progress_cb=None):
             words = transcribe_clip(tmp_a)
         finally:
             try: os.unlink(tmp_a)
-            except: pass
+            except Exception: pass
 
     if not words:
         _prog(1.0, "No words detected")
@@ -374,7 +376,6 @@ def _pull_result_cache_path(pull, transcript_path, pad):
     """Return the cache file path for a specific pull computation, or None."""
     if not _cache_dir or not transcript_path:
         return None
-    import hashlib
     mtime = round(_safe_getmtime(transcript_path), 2)
     key_obj = {
         "transcript": os.path.abspath(transcript_path),
@@ -1074,7 +1075,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             pull_result_cache_save(pull, transcript_file, pad, result)
     finally:
         try: os.unlink(tmp_wav)
-        except: pass
+        except Exception: pass
 
     return result
 
@@ -1215,7 +1216,7 @@ def transcribe_with_blobs(audio_path, blobs):
             ok, _ = extract_window(audio_path, blob["raw_start"], blob["raw_end"], tf.name)
             if not ok:
                 try: os.unlink(tf.name)
-                except: pass
+                except Exception: pass
                 continue
             duration = blob["raw_end"] - blob["raw_start"]
             tmp_clips.append(tf.name)
@@ -1251,10 +1252,10 @@ def transcribe_with_blobs(audio_path, blobs):
     finally:
         for p in tmp_clips:
             try: os.unlink(p)
-            except: pass
+            except Exception: pass
         if stitched_path:
             try: os.unlink(stitched_path)
-            except: pass
+            except Exception: pass
 
     # ── 4. Map stitched timestamps back to original file positions ──────────────
     all_words = []
@@ -1381,7 +1382,7 @@ def transcribe_in_chunks(audio_path, chunks):
         finally:
             if tmp:
                 try: os.unlink(tmp)
-                except: pass
+                except Exception: pass
     return all_words
 
 
@@ -1692,7 +1693,7 @@ def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
             return None
         finally:
             try: os.unlink(tmp)
-            except: pass
+            except Exception: pass
 
     a_data = extract_mono(audio_path, search_secs, sr)
     v_data = extract_mono(video_path, search_secs, sr)
@@ -1747,7 +1748,7 @@ def _extract_mono(src_path, duration, out_sr):
         return None
     finally:
         try: os.unlink(tmp)
-        except: pass
+        except Exception: pass
 
 
 _duration_cache = {}   # normpath.lower() → (mtime, duration_s)
@@ -2350,7 +2351,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
 def write_xml(xmeml, out_path):
     try: indent(xmeml)
-    except: pass
+    except Exception: pass
     buf = io.BytesIO()
     ElementTree(xmeml).write(buf, encoding="utf-8", xml_declaration=False)
     with open(out_path, "wb") as f:
@@ -3009,11 +3010,10 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     # 2-second silent WAV used as source for PARTS marker clips.
     # Must be at least ~0.5 s so Pro Tools renders the clip wide enough to
     # show its name label in the track.
-    import wave as _wave
     marker_dur_sa   = sr * 2         # 2 seconds in samples
     marker_wav_path = os.path.join(audio_dir, "_part_markers.wav")
     try:
-        with _wave.open(marker_wav_path, "w") as _wf:
+        with wave.open(marker_wav_path, "w") as _wf:
             _wf.setnchannels(1); _wf.setsampwidth(3); _wf.setframerate(sr)
             _wf.writeframes(b"\x00" * 3 * marker_dur_sa)   # 2 seconds of silence
     except Exception:
@@ -3225,8 +3225,7 @@ def generate_report(results, skipped, parts, seq_name, xml_path):
 
     lines += [
         hr("═"),
-        "  BLOOD TRAILS — RECONCILE REPORT",
-        "  {}".format(seq_name),
+        "  {} — RECONCILE REPORT".format(seq_name),
         "  Generated: {}".format(now),
         "  XML: {}".format(xml_path),
         hr("═"),

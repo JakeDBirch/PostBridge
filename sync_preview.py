@@ -8,13 +8,9 @@ audio recording.
 
 import logging
 import os
-import struct
-import sys
 import tempfile
-import traceback
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from os.path import basename
 
 # ── Crash log ─────────────────────────────────────────────────────────────────
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),

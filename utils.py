@@ -164,17 +164,15 @@ def _strip_take_number(filename):
     return name.strip()
 
 def _strip_media_type(filename):
-    import re as _re
     name = os.path.splitext(filename)[0]
-    name = _re.sub(r'[_-]raw[_-]?(audio|synced[_-]video[_-]cfr|video[_-]cfr|video)',
-                   '', name, flags=_re.IGNORECASE)
-    name = _re.sub(r'[-_]{2,}', '_', name).strip('_- ')
+    name = re.sub(r'[_-]raw[_-]?(audio|synced[_-]video[_-]cfr|video[_-]cfr|video)',
+                  '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[-_]{2,}', '_', name).strip('_- ')
     return name.lower()
 
 def _name_similarity(a, b):
-    import re as _re
-    a_words = set(_re.sub(r'[^a-z0-9]', ' ', a).split())
-    b_words = set(_re.sub(r'[^a-z0-9]', ' ', b).split())
+    a_words = set(re.sub(r'[^a-z0-9]', ' ', a).split())
+    b_words = set(re.sub(r'[^a-z0-9]', ' ', b).split())
     if not a_words or not b_words: return 0.0
     return len(a_words & b_words) / max(len(a_words), len(b_words))
 

@@ -1,4 +1,4 @@
-import sys, os
+import sys
 
 LOG_PATH = r"F:\PostBridge\PostBridge_Modular\aaf_dump.txt"
 _log = open(LOG_PATH, "w", encoding="utf-8")
@@ -33,7 +33,7 @@ with aaf2.open(path, "r") as f:
     for mob in f.content.mobs:
         if class_name(mob) == 'MasterMob':
             try: master_names.append(mob.name or '<blank>')
-            except: master_names.append('<err>')
+            except Exception: master_names.append('<err>')
     print(f"\n=== MASTERMOB NAMES ({len(master_names)} total) ===")
     for n in sorted(set(master_names))[:80]:
         print(f"  {n!r}")
@@ -49,12 +49,10 @@ with aaf2.open(path, "r") as f:
         usage    = None
         try:
             usage = mob['AppCode'].value
-        except:
-            pass
+        except Exception:             pass
         try:
             usage = mob['UsageCode'].value
-        except:
-            pass
+        except Exception:             pass
 
         print(f"\n{'='*70}")
         print(f"MOB [{i}] type={mob_type}  name={mob_name!r}")
@@ -71,8 +69,7 @@ with aaf2.open(path, "r") as f:
                 print(f"    segment class = {seg_cn}")
                 try:
                     print(f"    segment length = {seg.length}")
-                except:
-                    pass
+                except Exception:                     pass
                 # If sequence, show components (limit to first 5 for brevity)
                 if seg_cn == 'Sequence':
                     for ci, comp in enumerate(seg.components):
@@ -114,7 +111,7 @@ with aaf2.open(path, "r") as f:
                                     if s_cn == 'SourceClip':
                                         try:
                                             print(f" src_id={s['SourceID'].value}", end='')
-                                        except: pass
+                                        except Exception: pass
                                     print()
                             except Exception as e:
                                 print(f"      ['InputSegments'] ERROR: {e}")

@@ -121,9 +121,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._ui_q.put(cb)
 
     def _pump_ui(self):
-        """Drain the UI queue on the main thread and reschedule itself."""
+        """Drain up to 20 queued callbacks per tick to avoid blocking the event loop."""
         try:
-            while True:
+            for _ in range(20):
                 cb = self._ui_q.get_nowait()
                 try:
                     cb()
@@ -3359,50 +3359,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             self._reconcile_log_text = getattr(self, "_reconcile_log_text", "")
 
-        # Restore saved Step 4 state only when the user explicitly navigated
-        # Back → re-ran reconcile (or opened a saved session file).  A fresh
-        # reconcile run always starts Step 4 clean — the reconcile cache means
-        # re-running is fast, so there's no cost to starting fresh.
-        # Reconcile always opens Step 4 with a clean slate — the reconcile
-        # cache makes re-runs fast, so there is no benefit to carrying over
-        # confirmed/ignored state from a previous run.
+        # Step 4 always opens with a clean slate — reconcile is fast (cached)
+        # so there is no benefit to carrying over confirmed/ignored state.
         self._restore_s4       = False
         self._pending_s4_state = None
-        _saved_s4 = {}
-        if _saved_s4:
-            for r in self.results:
-                entry = _saved_s4.get(str(r["order"]))
-                if not entry:
-                    continue
-                # New format stores float segments directly
-                if entry.get("segments"):
-                    segs = entry["segments"]
-                    r["segments"]  = segs
-                    r["rec_in_s"]  = segs[0][0]
-                    r["rec_out_s"] = segs[-1][1]
-                    r["rec_in_tc"]  = entry.get("rec_in_tc",  secs_tc(segs[0][0]))
-                    r["rec_out_tc"] = entry.get("rec_out_tc", secs_tc(segs[-1][1]))
-                elif entry.get("segs"):
-                    # Legacy format: list of (in_tc_str, out_tc_str)
-                    segs_tc = entry["segs"]
-                    r["rec_in_tc"]  = segs_tc[0][0]
-                    r["rec_out_tc"] = segs_tc[-1][1]
-                    try:
-                        r["rec_in_s"]  = tc_secs(segs_tc[0][0])
-                        r["rec_out_s"] = tc_secs(segs_tc[-1][1])
-                        r["segments"]  = [(tc_secs(i), tc_secs(o))
-                                          for i, o in segs_tc]
-                    except Exception:
-                        pass
-                if entry.get("status"):
-                    r["status"] = entry["status"]
-                r["_s4_ignored"]  = entry.get("ignored",  False)
-                r["_s4_accepted"] = entry.get("accepted", False)
-                if "gap_after_s" in entry:
-                    r["gap_after_s"] = entry["gap_after_s"]
-                # Restore VO takes_data (keeps edited per-take segments in sync)
-                if "takes_data" in entry and r.get("is_vo"):
-                    r["takes_data"] = entry["takes_data"]
 
         # Reset undo/redo stacks for this Step 4 session
         self._s4_undo_stack = []
@@ -4651,16 +4611,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         engines._cache_dir = os.path.join(os.path.dirname(self._aaf_path), ".pb_cache")
         total_clips  = sum(len(t["clips"]) for t in parsed["tracks"])
 
-        # Collect unique source base names
-        sources = {}
+        # Collect unique source base names and clip counts
+        sources     = {}
+        clip_counts = {}
         for track in parsed["tracks"]:
             for clip in track["clips"]:
                 base = get_clip_base_name(clip["clip_name"])
                 if base is None:
                     continue
                 sources.setdefault(base, set()).add(track["name"])
-        self._aaf_sources       = sorted(sources.keys())
-        self._aaf_source_tracks = sources   # base_name -> set of track names
+                clip_counts[base] = clip_counts.get(base, 0) + 1
+        self._aaf_sources            = sorted(sources.keys())
+        self._aaf_source_tracks      = sources     # base_name -> set of track names
+        self._aaf_source_clip_counts = clip_counts # base_name -> total clip count
         # Reset column widths so they recompute from new content on next visit
         if hasattr(self, "_aaf_col_widths"):
             del self._aaf_col_widths
@@ -4927,6 +4890,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._aaf_source_offset_vars     = {}
         if not hasattr(self, "_aaf_source_sync_label_vars"):
             self._aaf_source_sync_label_vars = {}
+        if not hasattr(self, "_aaf_source_slot_counts"):
+            self._aaf_source_slot_counts = {}   # base → int (default 1)
+        if not hasattr(self, "_aaf_source_extra_vars"):
+            self._aaf_source_extra_vars = {}    # base → list of StringVars (slots 2..N)
         self._aaf_sync_btns = {}   # always reset — widget refs are stale after _clear()
         # Close any sync preview dialogs left open from a previous visit
         for _dlg in getattr(self, "_aaf_sync_previews", {}).values():
@@ -5088,6 +5055,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Rebuild per-source rows; layout depends on current page mode."""
         for w in self._aaf_assign_frame.winfo_children():
             w.destroy()
+        # Clear per-row widget refs — repopulated below
+        if not hasattr(self, "_aaf_vid_btn_labels"):   self._aaf_vid_btn_labels   = {}
+        if not hasattr(self, "_aaf_ctr_n_labels"):     self._aaf_ctr_n_labels     = {}
+        if not hasattr(self, "_aaf_ctr_minus_btns"):   self._aaf_ctr_minus_btns   = {}
+        self._aaf_vid_btn_labels.clear()
+        self._aaf_ctr_n_labels.clear()
+        self._aaf_ctr_minus_btns.clear()
         self._aaf_sync_btns       = {}   # stale widget refs — repopulated below
         self._aaf_sync_dot_labels = getattr(self, "_aaf_sync_dot_labels", {})
         self._aaf_sync_dot_labels.clear()
@@ -5140,6 +5114,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "tracks": min(max(60,  _trk_nat),  300),
                 "video":  max(200, _vid_nat),
                 "audio":  max(200, _aud_nat),
+                "files":  82,
             }
             self._aaf_col_widths_vid_count = _cur_sentinel
 
@@ -5232,6 +5207,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                     lambda e: self._aaf_sort_by("video"))
                         self._aaf_col_sash(hdr, "video", SURF)
 
+                # FILES — dedicated column for multi-slot counter
+                _ff = tk.Frame(hdr, bg=SURF,
+                               width=_col_widths.get("files", 82))
+                _ff.pack_propagate(False)
+                _ff.pack(side="left", fill="y")
+                tk.Label(_ff, text="FILES", font=FB, bg=SURF, fg=SUB,
+                         anchor="center").pack(fill="both", expand=True)
+
                 # SYNC and HIDE — left-packed immediately after last column
                 tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
                          width=5, anchor="center").pack(side="left", padx=(6, 0))
@@ -5278,6 +5261,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # SYNC (remaining space)
                 tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
                          anchor="w", padx=8).pack(side="left", fill="x", expand=True)
+
+        # Ensure clip counts exist — may be absent if AAF was loaded before this
+        # field was added, or if a setup was restored without a fresh AAF parse.
+        if not hasattr(self, "_aaf_source_clip_counts") or not self._aaf_source_clip_counts:
+            _cc = {}
+            for _trk in getattr(self, "_aaf_data", {}).get("tracks", []):
+                for _cl in _trk.get("clips", []):
+                    _b = get_clip_base_name(_cl.get("clip_name", ""))
+                    if _b:
+                        _cc[_b] = _cc.get(_b, 0) + 1
+            self._aaf_source_clip_counts = _cc
 
         options      = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
         aud_options  = ["— no audio —"] + [basename(p) for p in self._aaf_audio_paths]
@@ -5328,6 +5322,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._aaf_needs_sync_vars[base]        = tk.BooleanVar(value=False)
             if base not in self._aaf_sync_locked_vars:
                 self._aaf_sync_locked_vars[base]       = tk.BooleanVar(value=False)
+
+            # Multi-slot state
+            if not hasattr(self, "_aaf_source_slot_counts"):
+                self._aaf_source_slot_counts = {}
+            if not hasattr(self, "_aaf_source_extra_vars"):
+                self._aaf_source_extra_vars = {}
+            if base not in self._aaf_source_slot_counts:
+                self._aaf_source_slot_counts[base] = 1
+            if base not in self._aaf_source_extra_vars:
+                self._aaf_source_extra_vars[base] = []
+            _n_slots = self._aaf_source_slot_counts[base]
+            # Trim extra_vars if count decreased
+            del self._aaf_source_extra_vars[base][_n_slots - 1:]
+            # Extend extra_vars if count increased
+            while len(self._aaf_source_extra_vars[base]) < _n_slots - 1:
+                self._aaf_source_extra_vars[base].append(
+                    tk.StringVar(value="— no video —"))
 
             sv = self._aaf_source_file_vars[base]
             if sv.get() not in options:
@@ -5380,12 +5391,91 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         tk.Label(tf, text=tracks_str, font=FB, bg=bg, fg=SUB,
                                  anchor="w").pack(fill="x")
                     elif _col == "video":
+                        _n_slots2  = self._aaf_source_slot_counts.get(base, 1)
+                        _extra_evs = self._aaf_source_extra_vars.get(base, [])
+                        _n_filled2 = (1 if sv.get() != "— no video —" else 0) + sum(
+                            1 for _ev in _extra_evs if _ev.get() != "— no video —")
+                        _partial2  = _n_slots2 > 1 and _n_filled2 < _n_slots2
+
+                        # Build button label text
+                        if _n_slots2 == 1:
+                            _vid_lbl_txt = sv.get()
+                        else:
+                            _clip_cnt2 = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+                            _vid_lbl_txt = "{}/{} files".format(_n_filled2, _n_slots2)
+                            if _clip_cnt2 > 0:
+                                _vid_lbl_txt += "  ·  {} clips".format(_clip_cnt2)
+
                         vrf = tk.Frame(row1, bg=bg,
                                        width=_col_widths.get("video", 200))
                         vrf.pack_propagate(False)
                         vrf.pack(side="left", fill="y", padx=(1, 0))
-                        _FlatDropdown(vrf, textvariable=sv, values=options,
-                                      state="readonly", font=FB).pack(fill="x")
+
+                        # Multi-select button (replaces _FlatDropdown)
+                        _vid_btn_frame = tk.Frame(
+                            vrf, bg=SURF3,
+                            highlightbackground=BORDER, highlightthickness=1,
+                            cursor="hand2")
+                        _vid_btn_frame.pack(fill="x")
+                        _vid_btn_lbl = tk.Label(
+                            _vid_btn_frame,
+                            text=_vid_lbl_txt,
+                            font=FB, bg=SURF3,
+                            fg=WARN if _partial2 else (SUB if sv.get() == "— no video —" else TEXT),
+                            anchor="w", padx=6, pady=3)
+                        _vid_btn_lbl.pack(side="left", fill="x", expand=True)
+                        tk.Label(_vid_btn_frame, text="\u25bc", font=(_SANS, 7),
+                                 bg=SURF3, fg=SUB, padx=4).pack(side="right")
+                        # Store ref for in-place update (avoids full rebuild on popup apply)
+                        self._aaf_vid_btn_labels[base] = _vid_btn_lbl
+
+                        def _open_ms(e, b=base, w=_vid_btn_frame):
+                            self._aaf_open_video_multiselect(b, w)
+                        _vid_btn_frame.bind("<ButtonRelease-1>", _open_ms)
+                        _vid_btn_lbl.bind("<ButtonRelease-1>",   _open_ms)
+
+                # ── FILES column: dedicated counter [−] N [+] ─────────────────
+                _n_slots   = self._aaf_source_slot_counts.get(base, 1)
+                _extra_evs = self._aaf_source_extra_vars.get(base, [])
+                _n_filled  = (1 if sv.get() != "— no video —" else 0) + sum(
+                    1 for _ev in _extra_evs if _ev.get() != "— no video —")
+                _partial   = _n_slots > 1 and _n_filled < _n_slots
+                _clip_cnt  = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+
+                _files_col = tk.Frame(row1, bg=bg,
+                                      width=_col_widths.get("files", 82))
+                _files_col.pack_propagate(False)
+                _files_col.pack(side="left", fill="y")
+
+                _ctr = tk.Frame(_files_col, bg=bg)
+                _ctr.pack(anchor="center", expand=True)
+                _minus_btn = tk.Label(
+                    _ctr, text="\u2212", font=FB,
+                    bg=SURF3, fg=TEXT if _n_slots > 1 else BORDER,
+                    cursor="hand2" if _n_slots > 1 else "",
+                    padx=5, pady=1, bd=0,
+                    highlightbackground=BORDER, highlightthickness=1)
+                _minus_btn.pack(side="left")
+                _n_lbl = tk.Label(
+                    _ctr, text=str(_n_slots), font=FB,
+                    bg=SURF3, fg=WARN if _partial else TEXT,
+                    padx=6, pady=1)
+                _n_lbl.pack(side="left", padx=(1, 1))
+                _plus_btn = tk.Label(
+                    _ctr, text="+", font=FB,
+                    bg=SURF3, fg=TEXT,
+                    cursor="hand2", padx=5, pady=1, bd=0,
+                    highlightbackground=BORDER, highlightthickness=1)
+                _plus_btn.pack(side="left")
+                # Store refs for in-place counter updates (no rebuild needed)
+                self._aaf_ctr_n_labels[base]   = _n_lbl
+                self._aaf_ctr_minus_btns[base] = _minus_btn
+
+                # Always bind both buttons; handler guards against N<1
+                _plus_btn.bind("<ButtonRelease-1>",
+                               lambda e, b=base: self._aaf_update_slot_count(b, +1))
+                _minus_btn.bind("<ButtonRelease-1>",
+                                lambda e, b=base: self._aaf_update_slot_count(b, -1))
 
                 # SYNC checkbox + HIDE — left-packed immediately after TRACK
                 _ck_var = self._aaf_needs_sync_vars[base]
@@ -5463,6 +5553,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         # Refresh sync-tab row so lock icon updates immediately
                         self._ui(self._rebuild_aaf_source_rows)
                 sv.trace_add("write", _on_vid_change)
+
+                # Remove stale traces on extra slot vars (no row rendered — managed via popup)
+                for _slot_ev in self._aaf_source_extra_vars.get(base, []):
+                    if _slot_ev.get() not in options:
+                        _slot_ev.set("— no video —")
+                    for _tr in list(_slot_ev.trace_info()):
+                        if _tr[0] == "write":
+                            try: _slot_ev.trace_remove("write", _tr[1])
+                            except Exception: pass
+                    _slot_ev.trace_add("write", lambda *_a: None)
 
                 # Pad bottom of assign-mode row
                 tk.Frame(container, bg=bg, height=4).pack()
@@ -5951,6 +6051,235 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for base in sources_to_sync:
             self._aaf_do_sync(base, _sem=_sem)
 
+    def _aaf_update_slot_count(self, base, delta):
+        """Increment or decrement the slot counter in-place — no row rebuild."""
+        old_n = self._aaf_source_slot_counts.get(base, 1)
+        new_n = max(1, old_n + delta)
+        if new_n == old_n:
+            return
+        self._aaf_source_slot_counts[base] = new_n
+
+        # Trim / extend extra_vars to match new count
+        evs = self._aaf_source_extra_vars.get(base, [])
+        del evs[new_n - 1:]
+        while len(evs) < new_n - 1:
+            evs.append(tk.StringVar(value="— no video —"))
+        self._aaf_source_extra_vars[base] = evs
+
+        sv = self._aaf_source_file_vars.get(base)
+        n_filled = 0
+        if sv and sv.get() != "— no video —":
+            n_filled += 1
+        n_filled += sum(1 for ev in evs if ev.get() != "— no video —")
+        partial = new_n > 1 and n_filled < new_n
+
+        # ── Update N label ────────────────────────────────────────────────────
+        try:
+            n_lbl = self._aaf_ctr_n_labels.get(base)
+            if n_lbl and n_lbl.winfo_exists():
+                n_lbl.config(text=str(new_n), fg=WARN if partial else TEXT)
+        except Exception:
+            pass
+
+        # ── Update minus button state ─────────────────────────────────────────
+        try:
+            mb = self._aaf_ctr_minus_btns.get(base)
+            if mb and mb.winfo_exists():
+                mb.config(fg=TEXT if new_n > 1 else BORDER,
+                          cursor="hand2" if new_n > 1 else "")
+        except Exception:
+            pass
+
+        # ── Update video button label ─────────────────────────────────────────
+        try:
+            btn_lbl = self._aaf_vid_btn_labels.get(base)
+            if btn_lbl and btn_lbl.winfo_exists():
+                if new_n == 1:
+                    new_text = sv.get() if sv else "— no video —"
+                else:
+                    clip_cnt = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+                    new_text = "{}/{} files".format(n_filled, new_n)
+                    if clip_cnt > 0:
+                        new_text += "  ·  {} clips".format(clip_cnt)
+                new_fg = WARN if partial else (
+                    SUB if (not sv or sv.get() == "— no video —") else TEXT)
+                btn_lbl.config(text=new_text, fg=new_fg)
+        except Exception:
+            pass
+
+    def _aaf_open_video_multiselect(self, base, anchor_widget):
+        """Open a scrollable listbox to assign video files to a source token.
+
+        The slot counter (N) is intentionally NOT modified here — only the file
+        assignments change.  When N=1 the listbox uses SINGLE select mode;
+        when N>1 it uses MULTIPLE.  Selected files are clamped to N slots.
+        """
+        options_bn = [basename(p) for p in self._aaf_video_paths]
+        if not options_bn:
+            return
+        sv        = self._aaf_source_file_vars[base]
+        extra_evs = self._aaf_source_extra_vars.get(base, [])
+        n_slots   = self._aaf_source_slot_counts.get(base, 1)
+
+        current_set = set()
+        if sv.get() != "— no video —":
+            current_set.add(sv.get())
+        for ev in extra_evs:
+            if ev.get() != "— no video —":
+                current_set.add(ev.get())
+
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.config(bg=BORDER)
+
+        try:
+            anchor_widget.update_idletasks()
+            ax = anchor_widget.winfo_rootx()
+            ay = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+            aw = anchor_widget.winfo_width()
+        except Exception:
+            ax, ay, aw = 200, 200, 200
+        popup.geometry("+{}+{}".format(ax, ay))
+
+        inner = tk.Frame(popup, bg=SURF2, padx=6, pady=6)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        list_frame = tk.Frame(inner, bg=SURF2)
+        list_frame.pack(fill="both", expand=True)
+
+        _max_rows  = 12
+        _lb_w      = max(aw - 20, 200)
+        _sel_mode  = tk.SINGLE if n_slots == 1 else tk.MULTIPLE
+        _hint      = ("Click to select  \u2022  Enter to apply" if n_slots == 1
+                      else "Click to select  \u2022  Shift/Ctrl for multi  \u2022  Enter to apply")
+
+        sb = tk.Scrollbar(list_frame, orient="vertical")
+        lb = tk.Listbox(
+            list_frame,
+            selectmode=_sel_mode,
+            bg=SURF3, fg=TEXT, font=FB,
+            selectbackground=ACCENT, selectforeground=BG,
+            highlightthickness=0, bd=0, relief="flat",
+            activestyle="dotbox",
+            yscrollcommand=sb.set,
+            height=min(len(options_bn), _max_rows),
+            width=int(_lb_w // 9),
+        )
+        sb.config(command=lb.yview)
+        lb.pack(side="left", fill="both", expand=True)
+        if len(options_bn) > _max_rows:
+            sb.pack(side="right", fill="y")
+
+        for bn in options_bn:
+            lb.insert(tk.END, "  " + bn)
+        for i, bn in enumerate(options_bn):
+            if bn in current_set:
+                lb.selection_set(i)
+
+        def _scroll(e):
+            lb.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        lb.bind("<MouseWheel>", _scroll)
+
+        def _enforce_max(e):
+            """Block selection of a new item once N slots are filled."""
+            if n_slots <= 1:
+                return   # SINGLE mode handles itself
+            idx = lb.nearest(e.y)
+            if idx < 0 or idx >= len(options_bn):
+                return
+            if len(lb.curselection()) >= n_slots and idx not in lb.curselection():
+                return "break"   # at capacity and this item isn't selected — block
+        lb.bind("<ButtonPress-1>", _enforce_max, add=True)
+
+        if n_slots == 1:
+            # Single-select: close immediately on item click — behaves like a
+            # normal dropdown where choosing an item dismisses the list.
+            lb.bind("<ButtonRelease-1>", lambda e: self.after(0, _apply))
+
+        tk.Label(inner, text=_hint, font=(_SANS, 8),
+                 bg=SURF2, fg=SUB).pack(anchor="w", pady=(4, 0))
+
+        _closed = [False]
+
+        def _apply():
+            if _closed[0]:
+                return
+            _closed[0] = True
+
+            # ── Assign selected files to existing slots — counter unchanged ──
+            selected = [options_bn[i] for i in lb.curselection()]
+            selected = selected[:n_slots]          # clamp to N — never exceeds
+
+            # Ensure extra_vars list matches current N (may have drifted)
+            evs = self._aaf_source_extra_vars.get(base, [])
+            del evs[n_slots - 1:]
+            while len(evs) < n_slots - 1:
+                evs.append(tk.StringVar(value="— no video —"))
+            self._aaf_source_extra_vars[base] = evs
+
+            if selected:
+                sv.set(selected[0])
+                for i, ev in enumerate(evs):
+                    ev.set(selected[i + 1] if i + 1 < len(selected) else "— no video —")
+            else:
+                sv.set("— no video —")
+                for ev in evs:
+                    ev.set("— no video —")
+
+            popup.grab_release()
+            popup.destroy()
+
+            # ── In-place label update — no full row rebuild ───────────────────
+            try:
+                btn_lbl = getattr(self, "_aaf_vid_btn_labels", {}).get(base)
+                if btn_lbl and btn_lbl.winfo_exists():
+                    n_filled = (1 if sv.get() != "— no video —" else 0) + sum(
+                        1 for ev in evs if ev.get() != "— no video —")
+                    partial  = n_slots > 1 and n_filled < n_slots
+                    if n_slots == 1:
+                        new_text = sv.get()
+                    else:
+                        _cc = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+                        new_text = "{}/{} files".format(n_filled, n_slots)
+                        if _cc > 0:
+                            new_text += "  ·  {} clips".format(_cc)
+                    new_fg   = WARN if partial else (SUB if sv.get() == "— no video —" else TEXT)
+                    btn_lbl.config(text=new_text, fg=new_fg)
+                    n_lbl = getattr(self, "_aaf_ctr_n_labels", {}).get(base)
+                    if n_lbl and n_lbl.winfo_exists():
+                        n_lbl.config(fg=WARN if partial else TEXT)
+                    return
+            except Exception:
+                pass
+            self._rebuild_aaf_source_rows()
+
+        def _cancel():
+            if _closed[0]:
+                return
+            _closed[0] = True
+            popup.grab_release()
+            popup.destroy()
+
+        popup.grab_set()
+
+        def _outside_release(e):
+            # ButtonRelease events on children (listbox, scrollbar) bubble up
+            # to this Toplevel binding.  Only close if the release was actually
+            # outside the popup's screen bounds.
+            try:
+                if (popup.winfo_rootx() <= e.x_root <= popup.winfo_rootx() + popup.winfo_width()
+                        and popup.winfo_rooty() <= e.y_root <= popup.winfo_rooty() + popup.winfo_height()):
+                    return   # inside — keep popup open
+            except Exception:
+                pass
+            _apply()
+
+        popup.bind("<ButtonRelease-1>", _outside_release)
+        popup.bind("<Return>",          lambda e: _apply())
+        popup.bind("<Escape>",          lambda e: _cancel())
+        lb.bind("<Return>",           lambda e: _apply())
+        lb.focus_set()
+
     def _aaf_hide_source(self, base):
         """Hide a source from the assignment list (reversible — source preserved in AAF data)."""
         self._aaf_push_full_undo()
@@ -5982,14 +6311,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
           3. Audio files in the pool not used as sync audio for any source
         Confirms once before doing anything.
         """
-        # 1 — unassigned sources
+        # 1 — unassigned sources (all slots empty)
         dead_sources = [b for b in self._aaf_sources
                         if self._aaf_source_file_vars.get(
-                            b, tk.StringVar(value="— no video —")).get() == "— no video —"]
+                            b, tk.StringVar(value="— no video —")).get() == "— no video —"
+                        and all(ev.get() == "— no video —"
+                                for ev in getattr(self, "_aaf_source_extra_vars", {}).get(b, []))]
 
-        # 2 — video pool files not used by any source
+        # 2 — video pool files not used by any source (slot 1 or extra slots)
         used_vid_fns = {sv.get() for sv in self._aaf_source_file_vars.values()
                         if sv.get() not in ("— no video —", "")}
+        for _evs in getattr(self, "_aaf_source_extra_vars", {}).values():
+            used_vid_fns.update(
+                ev.get() for ev in _evs if ev.get() not in ("— no video —", ""))
         dead_vids = [p for p in self._aaf_video_paths
                      if basename(p) not in used_vid_fns]
 
@@ -6924,6 +7258,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Remove any pooled video files that aren't assigned to any source clip."""
         assigned_fns = {sv.get() for sv in self._aaf_source_file_vars.values()
                         if sv.get() != "— no video —"}
+        for _evs in getattr(self, "_aaf_source_extra_vars", {}).values():
+            assigned_fns.update(ev.get() for ev in _evs if ev.get() != "— no video —")
         to_remove = [p for p in self._aaf_video_paths
                      if basename(p) not in assigned_fns]
         if not to_remove:
@@ -6961,7 +7297,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_update_seq_presets()
 
     def _aaf_browse_files(self):
-        from utils import VIDEO_EXTS
         exts = sorted(VIDEO_EXTS)
         ext_glob = (" ".join("*" + e for e in exts) + " " +
                     " ".join("*" + e.upper() for e in exts))
@@ -6971,7 +7306,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_add_video_batch(paths)
 
     def _aaf_browse_folder(self):
-        from utils import VIDEO_EXTS
         folder = filedialog.askdirectory(title="Select folder with video files")
         if not folder: return
         self._aaf_set_status("Scanning folder…")
@@ -7069,6 +7403,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "audio_paths": self._aaf_audio_paths,
             "assignments": {base: sv.get()
                             for base, sv in self._aaf_source_file_vars.items()},
+            "slot_counts": {base: getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
+                            for base in self._aaf_sources
+                            if getattr(self, "_aaf_source_slot_counts", {}).get(base, 1) > 1},
+            "extra_assignments": {
+                base: [ev.get() for ev in
+                       getattr(self, "_aaf_source_extra_vars", {}).get(base, [])]
+                for base in self._aaf_sources
+                if getattr(self, "_aaf_source_slot_counts", {}).get(base, 1) > 1
+            },
             "sync": {
                 base: {
                     "enabled":    self._aaf_source_sync_vars[base].get(),
@@ -7167,6 +7510,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if base in self._aaf_source_file_vars and fn in options:
                 self._aaf_source_file_vars[base].set(fn)
 
+        # ── Restore multi-slot counts and extra assignments ───────────────────
+        if not hasattr(self, "_aaf_source_slot_counts"):
+            self._aaf_source_slot_counts = {}
+        if not hasattr(self, "_aaf_source_extra_vars"):
+            self._aaf_source_extra_vars = {}
+        for base, n in data.get("slot_counts", {}).items():
+            if base in self._aaf_sources and n > 1:
+                self._aaf_source_slot_counts[base] = n
+                if base not in self._aaf_source_extra_vars:
+                    self._aaf_source_extra_vars[base] = []
+                while len(self._aaf_source_extra_vars[base]) < n - 1:
+                    self._aaf_source_extra_vars[base].append(
+                        tk.StringVar(value="— no video —"))
+        for base, fns in data.get("extra_assignments", {}).items():
+            _evs = self._aaf_source_extra_vars.get(base, [])
+            for _i, _fn in enumerate(fns):
+                if _i < len(_evs) and _fn in options:
+                    _evs[_i].set(_fn)
+
         aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
         for base, sd in data.get("sync", {}).items():
             if base in self._aaf_source_sync_vars:
@@ -7234,7 +7596,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_build_progress(self, pct, text):
         """Show/update the build progress bar.  pct is 0–100.  Thread-safe."""
-        import threading as _threading
         def _upd():
             frame = getattr(self, "_aaf_prog_frame", None)
             if frame is None:
@@ -7243,7 +7604,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 frame.pack(side="bottom", fill="x", pady=(6, 0))
             self._aaf_prog_lbl.config(text=text)
             self._aaf_prog_bar.set(pct, 100)
-        if _threading.current_thread() is _threading.main_thread():
+        if threading.current_thread() is threading.main_thread():
             _upd()
             self.update_idletasks()
         else:
@@ -7261,12 +7622,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         group_mode = self._aaf_group_var.get()   # "single" or "by_source"
 
-        # Build source → video path lookup from dropdown selections
+        # Build source → video path list (slot 1 + any extra slots)
         source_video = {}
         for base, sv in self._aaf_source_file_vars.items():
+            _paths = []
             fn = sv.get()
             if fn != "— no video —" and fn in path_by_fn:
-                source_video[base] = path_by_fn[fn]
+                _paths.append(path_by_fn[fn])
+            for _ev in getattr(self, "_aaf_source_extra_vars", {}).get(base, []):
+                fn2 = _ev.get()
+                if fn2 != "— no video —" and fn2 in path_by_fn:
+                    _paths.append(path_by_fn[fn2])
+            if _paths:
+                source_video[base] = _paths
+
+        # Warn if any multi-slot source has unfilled slots
+        _partial_fills = []
+        for base in self._aaf_sources:
+            _n = getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
+            if _n > 1:
+                _sv0 = self._aaf_source_file_vars.get(base)
+                _evs = getattr(self, "_aaf_source_extra_vars", {}).get(base, [])
+                _filled = (1 if _sv0 and _sv0.get() != "— no video —" else 0) + sum(
+                    1 for _ev in _evs if _ev.get() != "— no video —")
+                if _filled < _n:
+                    _partial_fills.append((base, _filled, _n))
+        if _partial_fills:
+            _pmsg = "Some sources have partially assigned slots:\n\n"
+            for _pb, _pf, _pn in _partial_fills[:5]:
+                _pmsg += "  {}  ({}/{} slots filled)\n".format(_pb, _pf, _pn)
+            if len(_partial_fills) > 5:
+                _pmsg += "  \u2026 and {} more\n".format(len(_partial_fills) - 5)
+            _pmsg += "\nProceed? Unfilled slots fall back to the last assigned file."
+            if not messagebox.askyesno("Incomplete Assignments", _pmsg):
+                return
 
         # Build per-source sync offset (seconds) and reference audio path
         source_offset     = {}
@@ -7295,17 +7684,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         clip_results = []   # (clip_name, video_label, color) — for the colored summary
         clips_with_media    = []
         track_names_ordered = []   # preserves insertion order for XML track sequence
+        _occ_count = {}   # base → occurrence index (for multi-slot positional assignment)
 
         for clip in all_clips:
             base = get_clip_base_name(clip["clip_name"])
             if base is None:
                 continue   # skip fades and unresolvable clips entirely
 
-            vp = source_video.get(base)
-            if vp:
+            _paths = source_video.get(base)
+            if _paths:
+                _idx = _occ_count.get(base, 0)
+                vp   = _paths[min(_idx, len(_paths) - 1)]
+                _occ_count[base] = _idx + 1
                 matched += 1
                 clip_results.append((clip["clip_name"], basename(vp), SUCCESS))
             else:
+                vp = None
                 unmatched += 1
                 clip_results.append((clip["clip_name"], "— no video assigned —", WARN))
 
@@ -7507,8 +7901,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     messagebox.showerror("Build Error", _err)
                 self._ui(_show_err)
 
-        import threading as _threading
-        _threading.Thread(target=_worker, daemon=True).start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _aaf_done(self, matched, unmatched, total, clip_results=None):
         self._clear()
@@ -7630,7 +8023,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _cpu_fast  = max(1, (os.cpu_count() or 2) - 1)  # all cores minus one
         _bg_mode   = [False]      # False = fast, True = background
         _workers   = [_cpu_fast]  # mutable: current target concurrency
-        _cond      = __import__("threading").Condition()  # wakes blocked slots
+        _cond      = threading.Condition()  # wakes blocked slots
         _active    = [0]          # mutable: currently running threads
 
         bg_frame = tk.Frame(ctrl, bg=BG)
@@ -7868,9 +8261,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 for w in (row, name_lbl, status_lbl):
                     w.bind("<Button-1>", lambda e, path=p: _select_file(path))
                     w.bind("<Enter>",
-                           lambda e, r=row: r.config(bg=SURF2) if _selected_file[0] != p else None)
+                           lambda e, r=row, _p=p: r.config(bg=SURF2) if _selected_file[0] != _p else None)
                     w.bind("<Leave>",
-                           lambda e, r=row: r.config(bg=SURF)  if _selected_file[0] != p else None)
+                           lambda e, r=row, _p=p: r.config(bg=SURF)  if _selected_file[0] != _p else None)
 
             _update_btn_state()
 
@@ -7945,7 +8338,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── Worker ────────────────────────────────────────────────────────────
         def _run():
-            import concurrent.futures as _cf
             _running[0] = True
             _cancel[0]  = False
 

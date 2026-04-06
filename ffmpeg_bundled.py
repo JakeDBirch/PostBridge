@@ -8,7 +8,6 @@ import ssl
 import sys
 import stat
 import subprocess
-import tempfile
 import urllib.request
 
 # Shaka-project static builds (n7.1-2): one ffmpeg + one ffprobe per platform
@@ -202,7 +201,8 @@ def _ensure_bundled():
         return True
     key = _platform_key()
     machine = key[1]
-    if machine.upper() in ("AMD64", "X64"):
+    # Normalise macOS/Linux machine strings; Windows uses "AMD64" directly in _ASSETS
+    if sys.platform != "win32" and machine.upper() in ("AMD64", "X64"):
         key = (key[0], "x86_64")
     elif machine.lower() == "aarch64":
         key = (key[0], "arm64")
@@ -211,12 +211,9 @@ def _ensure_bundled():
         _last_ensure_error = "Unsupported platform: {} {}".format(sys.platform, machine)
         return False
     ffmpeg_asset, ffprobe_asset = assets
-    fp, fpp = _bundled_paths()
-    dest_ffmpeg = os.path.join(_app_ffmpeg_dir(), "ffmpeg" + (".exe" if sys.platform == "win32" else ""))
-    dest_ffprobe = os.path.join(_app_ffmpeg_dir(), "ffprobe" + (".exe" if sys.platform == "win32" else ""))
-    if sys.platform != "win32":
-        dest_ffmpeg = os.path.join(_app_ffmpeg_dir(), "ffmpeg")
-        dest_ffprobe = os.path.join(_app_ffmpeg_dir(), "ffprobe")
+    ext          = ".exe" if sys.platform == "win32" else ""
+    dest_ffmpeg  = os.path.join(_app_ffmpeg_dir(), "ffmpeg"  + ext)
+    dest_ffprobe = os.path.join(_app_ffmpeg_dir(), "ffprobe" + ext)
     try:
         _download_binary("{}/{}".format(_BASE, ffmpeg_asset), dest_ffmpeg)
         _download_binary("{}/{}".format(_BASE, ffprobe_asset), dest_ffprobe)

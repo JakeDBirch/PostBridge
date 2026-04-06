@@ -1,6 +1,7 @@
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import re
+from tkinter import filedialog
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -57,10 +58,9 @@ def _pool_norm(path):
     Both are lower-case with separators collapsed to single spaces.
     stripped_norm also removes Riverside-style _raw_audio / _raw_synced_video_cfr
     suffixes so counterpart pairs share the same core name."""
-    import re as _re
     base = os.path.splitext(os.path.basename(path))[0]
-    plain    = ' '.join(_re.sub(r'[_\-\.]+', ' ', base.lower()).split())
-    stripped = ' '.join(_re.sub(r'[_\-\.]+', ' ', _strip_media_type(base)).split())
+    plain    = ' '.join(re.sub(r'[_\-\.]+', ' ', base.lower()).split())
+    stripped = ' '.join(re.sub(r'[_\-\.]+', ' ', _strip_media_type(base)).split())
     return plain, stripped
 
 # ── Slim scrollbar ────────────────────────────────────────────────────────────
