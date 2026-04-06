@@ -47,7 +47,7 @@ jobs:
         with:
           name: PostBridge-windows
           path: PostBridge-windows.zip
-          retention-days: 30
+          retention-days: 5
 
   # ── macOS  Apple Silicon (M1 / M2 / M3) ─────────────────────────────────────
   build-macos-arm:
@@ -85,7 +85,7 @@ jobs:
         with:
           name: PostBridge-mac-arm64
           path: PostBridge-mac-arm64.zip
-          retention-days: 30
+          retention-days: 5
 
   # Intel Macs (pre-2020) run the ARM build via Rosetta 2 — no separate job needed.
   # macos-13 Intel runners were deprecated by GitHub in early 2025.
