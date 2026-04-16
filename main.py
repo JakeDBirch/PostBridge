@@ -1733,6 +1733,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         data["workflow"] = getattr(self, "workflow", "script_xml")
         if getattr(self, '_rv', None):
             data["step4_state"] = self._s4_snapshot()
+        # Persist any per-token source overrides set by re-reconcile so that
+        # re-opening the session exports against the correct file automatically.
+        _rr_ov = getattr(self, "_rereconcile_src_override", None)
+        if _rr_ov:
+            data["rereconcile_src_override"] = dict(_rr_ov)
         return data
 
     def _save_as(self):
@@ -2078,6 +2083,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Stash Step 4 state if embedded in the session file
         self._pending_s4_state = data.get("step4_state") or None
+
+        # Restore any re-reconcile source overrides so Step 5 uses the right files
+        self._rereconcile_src_override = data.get("rereconcile_src_override") or {}
 
         # Only auto-jump to Step 4 when the session was explicitly saved there.
         # step4_state is written by _build_full_session_data only when _rv exists
