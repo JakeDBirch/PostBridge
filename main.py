@@ -1540,7 +1540,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             snap.pop(str(p["order"]), None)
 
         # ── Clear pull-result cache for these pulls (both old & new src) ──────
-        pad    = config.PAD_SECS
+        pad    = PAD_SECS
         old_src = next(
             (r.get("src_path") or r.get("transcript_path")
              for r in getattr(self, "results", []) if r.get("token") == token),
