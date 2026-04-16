@@ -1554,6 +1554,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # ── Store partial snapshot; _step4() will apply it after rebuild ──────
         self._s4_rereconcile_restore = snap
 
+        # ── Remember the new file so Step 5 export uses it instead of pool ───
+        if not hasattr(self, "_rereconcile_src_override"):
+            self._rereconcile_src_override = {}
+        self._rereconcile_src_override[token] = file_path
+
         # ── Progress label with live pull counter ────────────────────────────
         _prog_var = tk.StringVar(
             value="·  Re-reconciling  0 / {}  for {}".format(len(token_pulls), token))
@@ -4539,6 +4544,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             edited.append(res)
 
         int_assets = self._pool.get_interview_assets()
+
+        # If any token was re-reconciled against a different file, make sure that
+        # file is the one the export uses — the pool still points to the original.
+        for _tok, _fp in getattr(self, "_rereconcile_src_override", {}).items():
+            if not _fp:
+                continue
+            existing = int_assets.get(_tok, [])
+            others   = [p for p in existing if p != _fp]
+            int_assets[_tok] = [_fp] + others   # re-reconciled file first
+
         try:
             vo_bin_data = {pi: vb for pi, vb in self.vo_bins.items()}
         except Exception:
