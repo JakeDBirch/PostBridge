@@ -1438,6 +1438,111 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 e.get("set_normal_fn", lambda: None)()
                 dec(r.get("status", ""))
 
+    def _s4_fix_export_src(self):
+        """Update which source file the export uses for a token — without
+        re-running reconcile or touching any Step 4 edits.
+
+        Use this when the reconcile results in Step 4 are already correct but
+        the wrong file was used (so the exported AAF/XML would reference it).
+        All confirmed states, adjusted timecodes, and accepted flags are
+        completely untouched.
+        """
+        pulls_all = getattr(self, "pulls", [])
+        token_set = sorted({p["token"] for p in pulls_all if p.get("token")})
+        if not token_set:
+            messagebox.showinfo("Fix Export Source",
+                                "No interview pulls found in this session.", parent=self)
+            return
+
+        class _Dlg(tk.Toplevel):
+            def __init__(self_, parent, tokens):
+                super().__init__(parent)
+                self_.result = None
+                self_.title("Fix Export Source")
+                self_.configure(bg=BG)
+                self_.resizable(False, False)
+                self_.grab_set()
+
+                tk.Label(self_,
+                         text="This updates which file the AAF/XML export uses\n"
+                              "for a token without changing any Step 4 edits.",
+                         font=FB, bg=BG, fg=SUB, justify="left").pack(
+                             padx=20, pady=(18, 10), anchor="w")
+
+                tk.Label(self_, text="Token:", font=FB, bg=BG, fg=TEXT).pack(
+                    padx=20, pady=(0, 4), anchor="w")
+                tok_var = tk.StringVar(value=tokens[0])
+                ttk.Combobox(self_, textvariable=tok_var, values=tokens,
+                             state="readonly", font=FB).pack(padx=20, fill="x")
+
+                tk.Label(self_, text="Correct source file:", font=FB, bg=BG, fg=TEXT
+                         ).pack(padx=20, pady=(14, 4), anchor="w")
+
+                file_var = tk.StringVar()
+                frm = tk.Frame(self_, bg=BG); frm.pack(padx=20, fill="x")
+                tk.Label(frm, textvariable=file_var, font=FB, bg=SURF, fg=TEXT,
+                         anchor="w", padx=6, pady=4, width=42,
+                         wraplength=320).pack(side="left", fill="x", expand=True)
+
+                def _pick():
+                    from tkinter.filedialog import askopenfilename
+                    p = askopenfilename(
+                        parent=self_, title="Source file for " + tok_var.get(),
+                        filetypes=[("Audio / Video",
+                                    "*.wav *.aif *.aiff *.mp3 *.m4a "
+                                    "*.mp4 *.mov *.mxf *.bwf"),
+                                   ("All files", "*.*")])
+                    if p:
+                        file_var.set(p)
+
+                tk.Button(frm, text="Browse…", command=_pick,
+                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
+                          padx=8, pady=4, cursor="hand2").pack(
+                              side="right", padx=(6, 0))
+
+                bf = tk.Frame(self_, bg=BG); bf.pack(padx=20, pady=18, fill="x")
+                tk.Button(bf, text="Cancel", command=self_.destroy,
+                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
+                          padx=12, pady=6, cursor="hand2").pack(side="left")
+                tk.Button(bf, text="Apply", command=lambda: self_._ok(tok_var, file_var),
+                          bg=ACCENT, fg=TEXT, font=FB, relief="flat",
+                          padx=12, pady=6, cursor="hand2").pack(side="right")
+
+                def _ok(tv, fv):
+                    if not fv.get():
+                        messagebox.showwarning("No file", "Please select a file.",
+                                               parent=self_)
+                        return
+                    self_.result = (tv.get(), fv.get())
+                    self_.destroy()
+                self_._ok = _ok
+
+                self_.update_idletasks()
+                pw = parent.winfo_width();  ph = parent.winfo_height()
+                px = parent.winfo_rootx(); py = parent.winfo_rooty()
+                dw = self_.winfo_width();   dh = self_.winfo_height()
+                self_.geometry("+{}+{}".format(
+                    px + (pw - dw) // 2, py + (ph - dh) // 2))
+
+        dlg = _Dlg(self, token_set)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        token, file_path = dlg.result
+
+        if not hasattr(self, "_rereconcile_src_override"):
+            self._rereconcile_src_override = {}
+        self._rereconcile_src_override[token] = file_path
+
+        # Persist immediately so a quick-save captures it
+        self._s4_save()
+
+        messagebox.showinfo(
+            "Export source updated",
+            "Export for '{}' will now use:\n{}".format(
+                token, os.path.basename(file_path)),
+            parent=self)
+
     def _s4_rereconcile_token(self):
         """Re-reconcile all pulls for one token against a user-chosen source file,
         while preserving every other token's confirmed Step 4 state."""
@@ -4231,6 +4336,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
                       small=True).pack(side="left", padx=(4,0))
 
+        self._btn(nav, "FIX EXPORT SRC…", self._s4_fix_export_src,
+                  small=True).pack(side="left", padx=(12, 0))
         self._btn(nav, "RE-RECONCILE TOKEN…", self._s4_rereconcile_token,
                   small=True).pack(side="left", padx=(12, 0))
 
