@@ -1554,28 +1554,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # ── Store partial snapshot; _step4() will apply it after rebuild ──────
         self._s4_rereconcile_restore = snap
 
-        # ── Show progress label ───────────────────────────────────────────────
-        prog = tk.Label(self.body,
-                        text="⟳  Re-reconciling {} pull(s) for {}…".format(
-                            len(token_pulls), token),
+        # ── Progress label with live pull counter ────────────────────────────
+        _prog_var = tk.StringVar(
+            value="·  Re-reconciling  0 / {}  for {}".format(len(token_pulls), token))
+        prog = tk.Label(self.body, textvariable=_prog_var,
                         font=FB, bg=BG, fg=WARN)
         prog.pack(pady=6)
         self.update_idletasks()
 
         # ── Run reconcile in a background thread ──────────────────────────────
-        _holder = {"done": False, "result": None, "error": None}
+        _holder  = {"done": False, "result": None, "error": None, "progress": 0}
+        _frames  = ["·  ", "·· ", "···", " ··", "  ·", "   "]
+        _fi      = [0]
 
         def _run():
             try:
                 out    = []
                 cursor = 0.0
-                for pull in token_pulls:
+                for idx, pull in enumerate(token_pulls):
                     r = engines.reconcile_interview_pull(
                         pull, file_path, pad=pad, min_start_s=cursor
                     )
                     if r.get("rec_out_s"):
                         cursor = max(cursor, r["rec_out_s"])
                     out.append((pull["order"], r))
+                    _holder["progress"] = idx + 1
                 _holder["result"] = out
             except Exception as exc:
                 _holder["error"] = exc
@@ -1585,31 +1588,59 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _thr.Thread(target=_run, daemon=True).start()
 
         def _check():
-            if not _holder["done"]:
-                self.after(200, _check)
-                return
+            try:
+                # Animate label every tick
+                _fi[0] = (_fi[0] + 1) % len(_frames)
+                done = _holder["done"]
+                n    = _holder["progress"]
+                _prog_var.set("{}Re-reconciling  {} / {}  for {}{}".format(
+                    _frames[_fi[0]], n, len(token_pulls), token,
+                    "  ✓" if done and not _holder["error"] else ""))
+
+                if not done:
+                    self.after(200, _check)
+                    return
+
+                # Done — small pause so user sees the ✓ tick
+                self.after(600, _finish)
+            except Exception:
+                self.after(200, _check)   # keep polling even if label update fails
+
+        def _finish():
             try:
                 prog.destroy()
             except Exception:
                 pass
             if _holder["error"]:
                 self._s4_rereconcile_restore = None
-                messagebox.showerror("Re-reconcile Error",
-                                     str(_holder["error"]), parent=self)
+                import traceback as _tb
+                messagebox.showerror(
+                    "Re-reconcile Error",
+                    "{}\n\n{}".format(_holder["error"],
+                                      _tb.format_exc() if hasattr(_holder["error"], "__traceback__") else ""),
+                    parent=self)
                 return
             # Merge new results back into self.results
-            by_order = {r["order"]: i for i, r in enumerate(self.results)}
-            for order, new_r in _holder["result"]:
-                if order in by_order:
-                    old = self.results[by_order[order]]
-                    old.update(new_r)
-                    old.pop("_s4_accepted",    None)
-                    old.pop("_s4_ignored",     None)
-                    old.pop("_original_status", None)
-                else:
-                    self.results.append(new_r)
-            # Rebuild Step 4 — _s4_rereconcile_restore applied automatically
-            self._step4()
+            try:
+                by_order = {r["order"]: i for i, r in enumerate(self.results)
+                            if "order" in r}
+                for order, new_r in _holder["result"]:
+                    if order in by_order:
+                        old = self.results[by_order[order]]
+                        old.update(new_r)
+                        old.pop("_s4_accepted",    None)
+                        old.pop("_s4_ignored",     None)
+                        old.pop("_original_status", None)
+                    else:
+                        self.results.append(new_r)
+                # Rebuild Step 4 — _s4_rereconcile_restore applied automatically
+                self._step4()
+            except Exception as exc:
+                self._s4_rereconcile_restore = None
+                import traceback as _tb
+                messagebox.showerror("Re-reconcile Error",
+                                     "Error applying results:\n" + _tb.format_exc(),
+                                     parent=self)
 
         self.after(200, _check)
 
