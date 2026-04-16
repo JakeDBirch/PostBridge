@@ -27,6 +27,8 @@ BLOB_SILENCE_DB      = -35    # dBFS threshold below which a frame counts as sil
 BLOB_MIN_SPEECH_MS   = 300    # minimum speech blob to keep (ms) — edge snapping only
 BLOB_MIN_SILENCE_MS  = 500    # minimum silence gap between speech blobs (ms) — edge snapping
 BLOB_SNAP_THRESH     = 0.35   # seconds: snap segment edge to nearest blob boundary
+SNAP_IN_OFFSET       = 0.08   # seconds added to IN  after auto-snap — advances past breath lead-in
+SNAP_OUT_OFFSET      = 0.10   # seconds added to OUT after auto-snap — ensures word tail is included
 CHUNK_SILENCE_S      = 1.5    # silence duration (seconds) that triggers a chunk split —
                               # catches paragraph/take breaks without splitting mid-sentence
 CHUNK_MAX_S          = 90     # max chunk length (seconds); longer chunks are force-split

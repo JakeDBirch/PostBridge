@@ -24,7 +24,8 @@ logging.basicConfig(
 _log = logging.getLogger("match_review")
 
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
-                    SUCCESS, WARN, ERR, FB, FBT, FH)
+                    SUCCESS, WARN, ERR, FB, FBT, FH,
+                    SNAP_IN_OFFSET, SNAP_OUT_OFFSET)
 from engines import extract_audio_segment, extract_mono_pcm, get_media_duration
 
 # ── Waveform disk cache ────────────────────────────────────────────────────────
@@ -1348,20 +1349,19 @@ class MatchReviewDialog:
         new_in   = orig_in
         new_out  = orig_out
 
-        # IN → nearest silence END (= speech onset) in [in-win, in+win/3]
-        # Biased backward so we find the start of the current word, not
-        # the start of the next one.
+        # IN → nearest silence END (= speech onset) in [in-win, in+win/3],
+        # then advance by SNAP_IN_OFFSET to land after the initial breath.
         in_cands = [b for b in self._sil_ends
                     if orig_in - win <= b <= orig_in + win / 3]
         if in_cands:
-            new_in = min(in_cands, key=lambda b: abs(b - orig_in))
+            new_in = min(in_cands, key=lambda b: abs(b - orig_in)) + SNAP_IN_OFFSET
 
-        # OUT → nearest silence START (= speech offset) in [out-win/3, out+win]
-        # Biased forward so we capture the end of the last word, not cut into it.
+        # OUT → nearest silence START (= speech offset) in [out-win/3, out+win],
+        # then advance by SNAP_OUT_OFFSET to include the tail of the last word.
         out_cands = [b for b in self._sil_starts
                      if orig_out - win / 3 <= b <= orig_out + win]
         if out_cands:
-            new_out = min(out_cands, key=lambda b: abs(b - orig_out))
+            new_out = min(out_cands, key=lambda b: abs(b - orig_out)) + SNAP_OUT_OFFSET
 
         # Safety: don't let snap collapse or invert the region
         if new_in >= new_out or (new_out - new_in) < 0.1:

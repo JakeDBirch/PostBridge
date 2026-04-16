@@ -420,6 +420,16 @@ def pull_result_cache_save(pull, transcript_path, pad, result):
     except Exception:
         pass
 
+def pull_result_cache_clear(pull, transcript_path, pad):
+    """Delete the cached result for a specific pull, forcing a fresh reconcile on
+    the next run regardless of whether the source file has changed."""
+    cp = _pull_result_cache_path(pull, transcript_path, pad)
+    if cp and os.path.exists(cp):
+        try:
+            os.remove(cp)
+        except Exception:
+            pass
+
 # ── Transcription ──────────────────────────────────────────────────────────────
 def get_model(size=WHISPER_MODEL):
     # Fast path — no lock needed once the model is loaded.

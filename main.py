@@ -1438,6 +1438,181 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 e.get("set_normal_fn", lambda: None)()
                 dec(r.get("status", ""))
 
+    def _s4_rereconcile_token(self):
+        """Re-reconcile all pulls for one token against a user-chosen source file,
+        while preserving every other token's confirmed Step 4 state."""
+        import threading as _thr
+
+        pulls_all = getattr(self, "pulls", [])
+        token_set = sorted({p["token"] for p in pulls_all if p.get("token")})
+        if not token_set:
+            messagebox.showinfo("Re-reconcile Token",
+                                "No interview pulls found in this session.", parent=self)
+            return
+
+        # ── Inline dialog: pick token + source file ───────────────────────────
+        class _Dlg(tk.Toplevel):
+            def __init__(self_, parent, tokens):
+                super().__init__(parent)
+                self_.result = None
+                self_.title("Re-reconcile Token")
+                self_.configure(bg=BG)
+                self_.resizable(False, False)
+                self_.grab_set()
+
+                tk.Label(self_, text="Token to re-reconcile:",
+                         font=FB, bg=BG, fg=TEXT).pack(padx=20, pady=(18, 4), anchor="w")
+
+                tok_var = tk.StringVar(value=tokens[0])
+                tok_dd  = ttk.Combobox(self_, textvariable=tok_var, values=tokens,
+                                       state="readonly", font=FB)
+                tok_dd.pack(padx=20, fill="x")
+
+                tk.Label(self_, text="Correct source audio file:",
+                         font=FB, bg=BG, fg=TEXT).pack(padx=20, pady=(14, 4), anchor="w")
+
+                file_var  = tk.StringVar()
+                file_frm  = tk.Frame(self_, bg=BG)
+                file_frm.pack(padx=20, fill="x")
+                file_lbl  = tk.Label(file_frm, textvariable=file_var, font=FB,
+                                     bg=SURF, fg=TEXT, anchor="w", padx=6, pady=4,
+                                     width=42, wraplength=320)
+                file_lbl.pack(side="left", fill="x", expand=True)
+
+                def _pick():
+                    from tkinter.filedialog import askopenfilename
+                    p = askopenfilename(
+                        parent=self_,
+                        title="Source audio for " + tok_var.get(),
+                        filetypes=[("Audio / Video", "*.wav *.aif *.aiff *.mp3 *.m4a "
+                                    "*.mp4 *.mov *.mxf *.bwf"), ("All files", "*.*")]
+                    )
+                    if p:
+                        file_var.set(p)
+
+                tk.Button(file_frm, text="Browse…", command=_pick,
+                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
+                          padx=8, pady=4, cursor="hand2").pack(side="right", padx=(6, 0))
+
+                btn_frm = tk.Frame(self_, bg=BG)
+                btn_frm.pack(padx=20, pady=18, fill="x")
+
+                def _ok():
+                    if not file_var.get():
+                        messagebox.showwarning("No file selected",
+                                               "Please select a source audio file.", parent=self_)
+                        return
+                    self_.result = (tok_var.get(), file_var.get())
+                    self_.destroy()
+
+                tk.Button(btn_frm, text="Cancel", command=self_.destroy,
+                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
+                          padx=12, pady=6, cursor="hand2").pack(side="left")
+                tk.Button(btn_frm, text="Re-reconcile", command=_ok,
+                          bg=ACCENT, fg=TEXT, font=FB, relief="flat",
+                          padx=12, pady=6, cursor="hand2").pack(side="right")
+
+                self_.update_idletasks()
+                pw = parent.winfo_width();  ph = parent.winfo_height()
+                px = parent.winfo_rootx(); py = parent.winfo_rooty()
+                dw = self_.winfo_width();   dh = self_.winfo_height()
+                self_.geometry("+{}+{}".format(px + (pw - dw) // 2, py + (ph - dh) // 2))
+
+        dlg = _Dlg(self, token_set)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        token, file_path = dlg.result
+
+        # ── Identify pulls for this token ─────────────────────────────────────
+        token_pulls = sorted(
+            [p for p in pulls_all if p.get("token") == token],
+            key=lambda p: p["order"]
+        )
+        if not token_pulls:
+            messagebox.showinfo("Re-reconcile Token",
+                                "No pulls found for token '{}'.".format(token), parent=self)
+            return
+
+        # ── Snapshot Step 4 state; strip entries for the chosen token ─────────
+        snap = self._s4_snapshot()
+        for p in token_pulls:
+            snap.pop(str(p["order"]), None)
+
+        # ── Clear pull-result cache for these pulls (both old & new src) ──────
+        pad    = config.PAD_SECS
+        old_src = next(
+            (r.get("src_path") or r.get("transcript_path")
+             for r in getattr(self, "results", []) if r.get("token") == token),
+            None
+        )
+        for pull in token_pulls:
+            engines.pull_result_cache_clear(pull, file_path, pad)
+            if old_src and old_src != file_path:
+                engines.pull_result_cache_clear(pull, old_src, pad)
+
+        # ── Store partial snapshot; _step4() will apply it after rebuild ──────
+        self._s4_rereconcile_restore = snap
+
+        # ── Show progress label ───────────────────────────────────────────────
+        prog = tk.Label(self.body,
+                        text="⟳  Re-reconciling {} pull(s) for {}…".format(
+                            len(token_pulls), token),
+                        font=FB, bg=BG, fg=WARN)
+        prog.pack(pady=6)
+        self.update_idletasks()
+
+        # ── Run reconcile in a background thread ──────────────────────────────
+        _holder = {"done": False, "result": None, "error": None}
+
+        def _run():
+            try:
+                out    = []
+                cursor = 0.0
+                for pull in token_pulls:
+                    r = engines.reconcile_interview_pull(
+                        pull, file_path, pad=pad, min_start_s=cursor
+                    )
+                    if r.get("rec_out_s"):
+                        cursor = max(cursor, r["rec_out_s"])
+                    out.append((pull["order"], r))
+                _holder["result"] = out
+            except Exception as exc:
+                _holder["error"] = exc
+            finally:
+                _holder["done"] = True
+
+        _thr.Thread(target=_run, daemon=True).start()
+
+        def _check():
+            if not _holder["done"]:
+                self.after(200, _check)
+                return
+            try:
+                prog.destroy()
+            except Exception:
+                pass
+            if _holder["error"]:
+                self._s4_rereconcile_restore = None
+                messagebox.showerror("Re-reconcile Error",
+                                     str(_holder["error"]), parent=self)
+                return
+            # Merge new results back into self.results
+            by_order = {r["order"]: i for i, r in enumerate(self.results)}
+            for order, new_r in _holder["result"]:
+                if order in by_order:
+                    old = self.results[by_order[order]]
+                    old.update(new_r)
+                    old.pop("_s4_accepted",    None)
+                    old.pop("_s4_ignored",     None)
+                    old.pop("_original_status", None)
+                else:
+                    self.results.append(new_r)
+            # Rebuild Step 4 — _s4_rereconcile_restore applied automatically
+            self._step4()
+
+        self.after(200, _check)
+
     def _s4_push_undo(self):
         """Save current state onto the undo stack before a mutation."""
         stack = getattr(self, "_s4_undo_stack", None)
@@ -3991,6 +4166,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Apply default filter and highlight its tab
         _apply_filter(mode="all")
 
+        # If this Step 4 was triggered by a selective re-reconcile, restore the
+        # confirmed states for all tokens that were NOT re-reconciled.
+        _rr = getattr(self, "_s4_rereconcile_restore", None)
+        if _rr is not None:
+            self._s4_apply_state(_rr)
+            self._s4_rereconcile_restore = None
+
         # Flush the current (fully-restored) state to the sidecar so that if
         # the user clicks ← REDO and re-runs reconciliation, the next Step 4
         # entry can reload the correct positions from the sidecar rather than
@@ -4004,6 +4186,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if DEV_DIAGNOSTIC:
             self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
                       small=True).pack(side="left", padx=(4,0))
+
+        self._btn(nav, "RE-RECONCILE TOKEN…", self._s4_rereconcile_token,
+                  small=True).pack(side="left", padx=(12, 0))
 
         # Undo / Redo buttons
         _undo_btn = self._btn(nav, "↩ UNDO", self._s4_undo, small=True)
