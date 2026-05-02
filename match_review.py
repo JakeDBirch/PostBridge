@@ -82,6 +82,7 @@ _SR          = 8000     # waveform display sample rate
 _PLAYBACK_SR = 44100    # playback sample rate
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
+_SLIP_DRAG_PX = 4       # pixels mouse must move before a body-press becomes a slip
 _CHUNK_S          = 120.0   # seconds per lazy-load chunk (for scrolling beyond preview)
 _TRIGGER_S        = 15.0    # trigger next chunk when viewport is this close to a loaded edge
 _AUTO_SNAP_WINDOW = 0.35    # seconds: search radius for automatic boundary snap
@@ -332,6 +333,7 @@ class MatchReviewDialog:
         self._cv.bind("<ButtonRelease-1>", self._on_release)
         self._cv.bind("<MouseWheel>",      self._on_scroll)
         self._cv.bind("<Configure>",       self._on_resize)
+        self._cv.bind("<Motion>",          self._on_hover)
 
         # ── Word timeline — words positioned by timestamp below waveform ────────
         # Only shown when transcription data is available for this file.
@@ -1268,6 +1270,15 @@ class MatchReviewDialog:
                         break
             if interior_hit:
                 self._drag = interior_hit
+            elif in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
+                # Inside the selected region body.  We don't know yet whether
+                # this is a click (→ playhead) or a drag (→ slip), so park in
+                # "slip_pending" and decide in _on_drag_motion / _on_release.
+                self._drag              = "slip_pending"
+                self._slip_anchor_x    = event.x
+                self._slip_anchor_in   = self._in_s
+                self._slip_anchor_out  = self._out_s
+                self._slip_anchor_segs = [list(s) for s in self._segments]
             elif abs(event.x - ph_px) <= _MARKER_HIT or event.y <= 14:
                 self._drag = "playhead"
             else:
@@ -1424,6 +1435,13 @@ class MatchReviewDialog:
     def _on_drag_motion(self, event):
         if not self._drag or self._samples is None:
             return
+        # Promote slip_pending → slip only once the mouse has moved enough.
+        # Until then, suppress all motion handling so a simple click doesn't
+        # accidentally shift the region.
+        if self._drag == "slip_pending":
+            if abs(event.x - self._slip_anchor_x) <= _SLIP_DRAG_PX:
+                return
+            self._drag = "slip"   # commit: this is a real drag
         # Push undo once per drag gesture (not for playhead moves)
         if not self._drag_undo_pushed and self._drag != "playhead":
             self._push_undo()
@@ -1451,12 +1469,73 @@ class MatchReviewDialog:
                 self._segments[idx][1] = max(
                     this_in + self._frame_s,
                     min(t, next_in - self._frame_s))
+        elif self._drag == "slip":
+            # Shift the entire region (IN + OUT + all segment boundaries) by the
+            # same delta, anchored from the initial press position so floating-
+            # point errors don't accumulate across many motion events.
+            raw_delta = self._px_to_t(event.x) - self._px_to_t(self._slip_anchor_x)
+            dur       = self._slip_anchor_out - self._slip_anchor_in
+            new_in    = max(0.0, self._slip_anchor_in + raw_delta)
+            new_in    = min(new_in, self._ctx_dur - dur)   # don't run past end
+            new_out   = new_in + dur
+            shift     = new_in - self._slip_anchor_in
+            self._in_s  = new_in
+            self._out_s = new_out
+            if self._slip_anchor_segs:
+                self._segments = [[s[0] + shift, s[1] + shift]
+                                  for s in self._slip_anchor_segs]
+            self._refresh_displays()
         else:  # playhead
             self._playhead_s = min(t, self._ctx_dur)
         self._draw()
 
     def _on_release(self, event):
+        if self._drag == "slip_pending":
+            # Mouse was pressed in the region body but never dragged far enough
+            # to become a slip — treat it as a plain playhead click, matching
+            # the behaviour of clicking outside the region (including jump-to
+            # position during playback).
+            new_t = max(0.0, min(self._px_to_t(event.x), self._ctx_dur))
+            self._playhead_s = new_t
+            was_playing = self._playback_start_wall is not None
+            self._draw()
+            if was_playing:
+                if self._play_edit_mode and self._play_edit_mode.get():
+                    self._play_or_edit()
+                else:
+                    remain = max(0.5, self._ctx_dur - new_t)
+                    self._play(new_t, min(remain, 30.0))
+                self._pre_play_pos = new_t
         self._drag = None
+
+    def _on_hover(self, event):
+        """Update the canvas cursor to reflect what a click-drag would do."""
+        if self._samples is None:
+            return
+        in_px  = self._t_to_px(self._in_s)
+        out_px = self._t_to_px(self._out_s)
+        # Outer IN / OUT handles
+        if (abs(event.x - in_px) <= _MARKER_HIT or
+                abs(event.x - out_px) <= _MARKER_HIT):
+            self._cv.config(cursor="sb_h_double_arrow")
+            return
+        # Interior segment cut boundaries (CUT IN / CUT OUT lines)
+        n = len(self._segments)
+        for i in range(n):
+            if i > 0:
+                px = self._t_to_px(self._segments[i][0])
+                if abs(event.x - px) <= _MARKER_HIT:
+                    self._cv.config(cursor="sb_h_double_arrow")
+                    return
+            if i < n - 1:
+                px = self._t_to_px(self._segments[i][1])
+                if abs(event.x - px) <= _MARKER_HIT:
+                    self._cv.config(cursor="sb_h_double_arrow")
+                    return
+        if in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
+            self._cv.config(cursor="fleur")               # slip / move region
+        else:
+            self._cv.config(cursor="")                    # default
 
     def _on_scroll(self, event):
         # Scroll wheel always zooms; Shift+scroll pans.

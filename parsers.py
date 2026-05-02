@@ -937,43 +937,66 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         _used_rescue = True
 
     # ── Calibration offset ─────────────────────────────────────────────────
-    # Global fallback: +54.5 ms systematic positive bias measured across
-    # correctly-found files (deterministic, from peak-envelope window centroid
-    # assignment).  Per-file calibration below overrides this for known files
-    # using the accumulated corrections history.
-    _T_CAL_GLOBAL = -0.046       # seconds  (≈ -46 ms)
-    _T_CAL_S      = _T_CAL_GLOBAL
+    # Empirically measured from sync_corrections.jsonl across 58 "exact" user
+    # acceptances: the raw algorithm output is on average ~6 ms LATER than the
+    # user's accepted ground truth.  The previous -46 ms global was over-
+    # correcting by ~40 ms — see _CAL_GLOBAL_LEGACY below for the historical
+    # value.  All log entries from the legacy era have auto_T = raw_T - 0.046,
+    # so per-file lookups must back that out before re-applying the new global.
+    _T_CAL_GLOBAL        = -0.006   # current value, written into new log entries
+    _T_CAL_GLOBAL_LEGACY = -0.046   # value used for entries before the fix
+    _T_CAL_S             = _T_CAL_GLOBAL
 
-    # Per-file learned calibration: look up the last non-wrong correction for
-    # this audio file in sync_corrections.jsonl.  The auto_T stored there had
-    # _T_CAL_GLOBAL applied, so the per-file calibration is:
-    #   _T_CAL_S = delta + _T_CAL_GLOBAL
-    # where delta = accepted_T - auto_T (0.0 when the user accepted unchanged).
-    # Group A files (delta≈0) get the same -46 ms as the global default.
-    # Group B files (delta≈+46 ms) end up with cal≈0, which is correct since
-    # the algorithm output for those files already lands on the true offset.
-    # "wrong" verdicts are skipped so a mis-found file never corrupts the cache.
+    # Per-file learned calibration.
+    #
+    # Two design changes from the previous version:
+    #
+    #   (1) Use the FIRST (chronologically earliest) good correction for this
+    #       audio file rather than the LAST.  When the user accepts a sync
+    #       unchanged, that produces a "delta = 0" entry — using the LAST
+    #       entry would make _T_CAL_S collapse back to _T_CAL_GLOBAL on every
+    #       run after the first acceptance, defeating the per-file learning.
+    #       The FIRST entry captures the calibration jump from raw → truth
+    #       and stays stable across subsequent unchanged acceptances.
+    #
+    #   (2) Honour the per-entry "cal_global" field so we can change
+    #       _T_CAL_GLOBAL safely in future without invalidating the cache.
+    #       Old entries (no field) are interpreted with _T_CAL_GLOBAL_LEGACY.
+    #
+    # Math — entry was logged as auto_T = raw_T + cal_at_that_time, and the
+    # user accepted accepted_T (the truth).  We want final_T == accepted_T:
+    #
+    #   final_T = raw_T + _T_CAL_S
+    #           = (auto_T - cal_at_that_time) + _T_CAL_S
+    #   set     = accepted_T
+    #   ⇒ _T_CAL_S = accepted_T - auto_T + cal_at_that_time
+    #             = delta + cal_at_that_time
+    #
+    # "wrong" / "verified" verdicts are skipped so a mis-found file never
+    # corrupts the cache.
     try:
         _cal_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".pb_cache")
         _corr_path = os.path.join(_cal_cache, "sync_corrections.jsonl")
         if os.path.exists(_corr_path):
             _audio_name = os.path.basename(audio_path)
-            _last_good  = None
+            _first_good = None
             with open(_corr_path, "r", encoding="utf-8") as _fc:
                 for _line in _fc:
                     try:
                         _ce = json.loads(_line)
                         if (_ce.get("audio") == _audio_name and
                                 _ce.get("verdict") not in ("wrong", "verified")):
-                            _last_good = _ce
+                            _first_good = _ce
+                            break   # first match wins
                     except Exception:
                         pass
-            if _last_good is not None:
-                _delta   = (0.0 if _last_good["verdict"] == "accepted"
-                            else (_last_good.get("accepted_T", 0.0)
-                                  - _last_good.get("auto_T",     0.0)))
-                _T_CAL_S = _delta + _T_CAL_GLOBAL
+            if _first_good is not None:
+                _delta = (_first_good.get("accepted_T", 0.0)
+                          - _first_good.get("auto_T",     0.0))
+                _cal_at_log = _first_good.get("cal_global",
+                                              _T_CAL_GLOBAL_LEGACY)
+                _T_CAL_S = _delta + _cal_at_log
     except Exception:
         pass
 

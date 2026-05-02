@@ -1,7 +1,11 @@
-dist/ 
-build/ 
-ffmpeg-bin/ 
-__pycache__/ 
-*.pyc 
+dist/
+build/
+ffmpeg-bin/
+__pycache__/
+*.pyc
 .pb_cache/
 .bt_cache/
+_debug_run.log
+sync_preview_log.txt
+match_review_log.txt
+waveform_cache/

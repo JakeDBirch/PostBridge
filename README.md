@@ -8,10 +8,10 @@ Built for **Windows** and **macOS** (Apple Silicon + Intel via Rosetta 2).
 
 ## Download
 
-Pre-built app bundles are available from [GitHub Actions](https://github.com/JakeDBirch/PostBridge/actions):
+Pre-built app bundles are produced manually via [GitHub Actions](https://github.com/JakeDBirch/PostBridge/actions):
 
-1. Click the most recent **Build PostBridge** run
-2. Download the artifact for your platform:
+1. Go to the **Actions** tab → click a **Build PostBridge** run marked ✓
+2. Download the artifact for your platform under the **Artifacts** section:
    - `PostBridge-windows` → Windows (x64)
    - `PostBridge-mac-arm64` → macOS Apple Silicon (M1/M2/M3)
 
@@ -85,8 +85,9 @@ Export your Pro Tools session as an AAF (**File → Export → As AAF**, using *
 
 A grid shows each source clip from the AAF. For each source:
 
-- **Source Assign tab** — drop in the corresponding video file and (optionally) a reference audio file for sync detection
-- **Source Sync tab** — PostBridge detects the offset between your audio and video using waveform cross-correlation. Review the result, adjust manually if needed, then lock it
+- **Video file(s)** — assign one or more video files using the file counter `[−] N [+]`. If a source has multiple associated recordings, assign all of them — PostBridge will automatically probe each one during sync and promote the best match.
+- **Reference audio** — optionally assign a reference audio file (e.g. a mix or ISO recording) for waveform sync detection.
+- **Sync** — click the sync button to detect the offset between audio and video using waveform cross-correlation. If multiple video files are assigned, all are tested in parallel and the highest-confidence result is used automatically. Review the result, adjust manually if needed using the waveform alignment view, then lock it.
 
 Sync results are cached to disk — re-running the same session is fast.
 
@@ -185,7 +186,7 @@ build.bat
 bash build.sh
 ```
 
-Or let GitHub Actions build it — every push to `main` produces Windows and macOS artifacts automatically.
+Or trigger a build manually via GitHub Actions: **Actions tab → Build PostBridge → Run workflow**.
 
 ---
 

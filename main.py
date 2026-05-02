@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import threading
 import queue
@@ -339,15 +340,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         hover_bg    = "#303030"
 
         workflows = [
+            ("Pull Quotes",
+             "pull_quotes",
+             "Transcribe interview sessions, browse the transcripts, and "
+             "copy passages as ready-to-paste @PULL blocks for your script.",
+             HAS_WHISPER),
             ("Format Script",
              "script_formatter",
              "Build @PART, @VO, and @PULL blocks and copy them into your script.",
              True),
-            ("Transcribe Media",
-             "transcribe",
-             "Pre-transcribe VO and interview files so reconcile runs instantly. "
-             "Transcription files are saved alongside each media file.",
-             HAS_WHISPER),
             ("Reconcile Script \u2192 Session",
              "script_session",
              "Whisper-reconcile a script and export as AAF or XML \u2014 "
@@ -487,8 +488,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._aaf_load(path)
         elif key == "script_formatter":
             self._script_formatter()
-        elif key == "transcribe":
-            self._transcribe_workflow()
+        elif key == "pull_quotes":
+            self._pq_open_home()
 
     def _tooltip(self, widget, text):
         """Attach a hover tooltip showing full text to any widget."""
@@ -817,6 +818,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       "Adjust any incorrect assignments via the dropdown on each row.",
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
+        # ── Confirmed-carryover banner (shown when coming back via ← REDO) ────
+        _carryover = getattr(self, "_confirmed_carryover", None) or {}
+        if _carryover:
+            _n = len(_carryover)
+            _co_frm = tk.Frame(self.body, bg=SURF, pady=6, padx=10)
+            _co_frm.pack(fill="x", pady=(0, 10))
+            tk.Label(_co_frm,
+                     text="ℹ  {} confirmed edit{} from the previous run will be "
+                          "preserved — only unconfirmed rows will be re-reconciled.".format(
+                              _n, "s" if _n != 1 else ""),
+                     font=FB, bg=SURF, fg=INFO,
+                     wraplength=760, justify="left").pack(side="left",
+                                                          fill="x", expand=True)
+            def _clear_carryover(frm=_co_frm):
+                self._confirmed_carryover = {}
+                frm.destroy()
+            tk.Button(_co_frm, text="Run All Fresh", command=_clear_carryover,
+                      bg=SURF3, fg=SUB, font=FB, relief="flat",
+                      padx=8, pady=2, cursor="hand2").pack(side="right")
+
         # ── Nav pinned to bottom first so it's always visible ─────────────────
         cache_row = tk.Frame(self.body, bg=BG)
         cache_row.pack(side="bottom", fill="x", pady=(4,0))
@@ -874,12 +895,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if os.path.isfile(path):
                         self._pool._add(path)
                         self._pool._rows[-1]["var"].set(token)
-                for tok, sp in redo.get("transcript_sources", {}).items():
-                    if tok in self._pool._src_vars and sp:
-                        self._pool._src_vars[tok].set(basename(sp))
             finally:
                 self._pool._bulk_loading = False
-            self._pool._rebuild_src_dropdowns()
             self._pool._refresh_count()
             del self._redo_setup
 
@@ -1644,7 +1661,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for p in token_pulls:
             snap.pop(str(p["order"]), None)
 
-        # ── Clear pull-result cache for these pulls (both old & new src) ──────
+        # ── Clear pull-result cache for this pull (both old & new src) ──────
         pad    = PAD_SECS
         old_src = next(
             (r.get("src_path") or r.get("transcript_path")
@@ -1783,19 +1800,42 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._s4_apply_state(stack.pop())
         self._s4_save()
 
+    def _s4_x_toggle_ignore(self, event=None):
+        """X key — toggle IGNORE on the most-recently-clicked Step 4 card."""
+        # Ignore key presses that originate inside a text-entry widget so
+        # that typing 'x' in a search box or entry field is never hijacked.
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Text)):
+            return
+        fn = getattr(self, "_s4_active_toggle", None)
+        if fn is not None:
+            fn()
+
+    def _s4_redo_to_step2(self):
+        """Go back to Step 2 while preserving confirmed Step 4 edits.
+
+        Confirmed rows are stashed in _confirmed_carryover so that
+        _run_reconcile can pass them through untouched.  Only pulls
+        without a confirmed result will be re-reconciled, letting the
+        user fix file assignments for problem tokens without losing
+        any confirmed work.
+        """
+        confirmed = {
+            r["order"]: r
+            for r in getattr(self, "results", [])
+            if r.get("_s4_accepted")
+        }
+        self._confirmed_carryover = confirmed
+        self._step2()
+
     def _build_setup_data(self):
         """Return a serialisable setup dict for the current state."""
-        src_data = {}
-        for tok in self.tokens:
-            sp = self._pool.get_transcript_source(tok) if self._pool else None
-            if sp: src_data[tok] = sp
         d = {
             "version":   1,
             "workflow":  getattr(self, "workflow", "script_xml"),
             "script":    getattr(self, "_script_path", ""),
             "assignments": {r["path"]: r["var"].get()
                             for r in self._pool._rows} if self._pool else {},
-            "transcript_sources": src_data,
             "pad":       self.pad_var.get(),
             "gap":       self.gap_var.get(),
         }
@@ -1850,6 +1890,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if getattr(self, 'workflow', None) == 'aaf_xml':
             self._aaf_save_setup()
             return
+        if getattr(self, 'workflow', None) == 'pull_quotes':
+            self._pq_save_episode_project(prompt_path=True)
+            return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
             return
@@ -1878,6 +1921,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """Save to the current session file; prompt for a path on the first save."""
         if getattr(self, 'workflow', None) == 'aaf_xml':
             self._aaf_save_setup(prompt=False)
+            b = btn_ref[0] if btn_ref else None
+            if b:
+                try:
+                    b.config(text="SAVED \u2713")
+                    self.after(1800, lambda: b.config(text="SAVE"))
+                except Exception:
+                    pass
+            return
+        if getattr(self, 'workflow', None) == 'pull_quotes':
+            self._pq_save_episode_project(prompt_path=False)
             b = btn_ref[0] if btn_ref else None
             if b:
                 try:
@@ -1929,14 +1982,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             saved_tok = assignments.get(r["path"])
             if saved_tok:
                 r["var"].set(saved_tok)
-        src_data = data.get("transcript_sources", {})
-        for tok, sp in src_data.items():
-            if tok in self._pool._src_vars and basename(sp) in [
-                basename(p) for p in self._pool.get_interview_assets().get(tok, [])
-                if not is_video(p)
-            ]:
-                self._pool._src_vars[tok].set(basename(sp))
-        self._pool._rebuild_src_dropdowns()
         self._pool._refresh_count()
         if missing:
             messagebox.showwarning("Missing files",
@@ -1978,16 +2023,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 saved_tok = assignments.get(r["path"])
                 if saved_tok:
                     r["var"].set(saved_tok)
-            src_data = data.get("transcript_sources", {})
-            for tok, sp in src_data.items():
-                if tok in self._pool._src_vars and basename(sp) in [
-                    basename(p) for p in self._pool.get_interview_assets().get(tok, [])
-                    if not is_video(p)
-                ]:
-                    self._pool._src_vars[tok].set(basename(sp))
         finally:
             self._pool._bulk_loading = False
-        self._pool._rebuild_src_dropdowns()
         self._pool._refresh_count()
         if missing:
             messagebox.showwarning("Missing files",
@@ -2003,8 +2040,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         sp = data.get("script", "")
         if sp: paths.add(sp)
         for p in data.get("assignments", {}).keys():
-            paths.add(p)
-        for p in data.get("transcript_sources", {}).values():
             paths.add(p)
         for r in data.get("results", []):
             for key in ("source_audio", "source_video"):
@@ -2063,24 +2098,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 for p, tok in old_assignments.items()
             }
 
-        old_ts = data.get("transcript_sources", {})
-        if old_ts:
-            data["transcript_sources"] = {
-                tok: cls._remap_path(p, video_index, audio_index)
-                for tok, p in old_ts.items()
-            }
-
         for r in data.get("results", []):
             for key in ("source_audio", "source_video"):
                 p = r.get(key, "")
                 if p: r[key] = cls._remap_path(p, video_index, audio_index)
 
-    def _open_session(self):
-        """Open a saved *_setup.json and jump straight to Step 2 with everything restored."""
-        path = filedialog.askopenfilename(
-            title="Open Session",
-            filetypes=[("JSON files", "*.json"),
-                       ("All files", "*.*")])
+    def _open_session(self, path=None):
+        """Open a saved *_setup.json and jump straight to Step 2 with everything restored.
+
+        When *path* is None (the default), prompt the user with a file dialog.
+        When *path* is provided (e.g. from a CLI arg / Windows file association),
+        load that file directly without prompting.
+        """
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open Session",
+                filetypes=[("JSON files", "*.json"),
+                           ("All files", "*.*")])
         if not path or not os.path.exists(path):
             return
         try:
@@ -2101,6 +2135,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
             self._pending_aaf_setup = data   # _aaf_step2 will restore after init
             self._aaf_load(aaf_path)
+            return
+
+        # ── Pull Quotes — Episode Project / Interview Session ────────────────
+        wf = data.get("workflow", "")
+        if wf == "episode_project":
+            self.workflow = "pull_quotes"
+            self._pq_load_project(data, file_path=path)
+            return
+        if wf == "interview_session":
+            self.workflow = "pull_quotes"
+            self._pq_open_standalone_session(data, file_path=path)
             return
 
         script_path = data.get("script", "")
@@ -2196,6 +2241,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # step4_state is written by _build_full_session_data only when _rv exists
         # (i.e. Step 4 is the current screen).  Sessions saved at Step 2 never
         # carry step4_state, so stale sidecar result files won't cause a jump.
+        # Clear any stale carryover from a previous session so it can't
+        # bleed into this freshly opened one.
+        self._confirmed_carryover = {}
+
         if data.get("step4_state"):
             if data.get("results"):
                 self._pending_results = data["results"]
@@ -2534,11 +2583,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Save setup so "Redo" can restore it (pool is destroyed by _clear below)
         self._redo_setup = {
             "assignments": [(r["path"], r["var"].get()) for r in self._pool._rows],
-            "transcript_sources": {
-                tok: self._pool.get_transcript_source(tok)
-                for tok in self.tokens
-                if self._pool.get_transcript_source(tok)
-            },
         }
 
         int_assets = self._pool.get_interview_assets()
@@ -2644,9 +2688,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _names += "\n  …and {} more".format(len(_vo_uncached) - 6)
             _msg = (
                 "{} VO audio file{} have no usable transcription cache:\n\n{}\n\n"
-                "PostBridge will transcribe them now, which may take several minutes.\n"
-                "Or cancel and use the Transcribe Media workflow to pre-transcribe "
-                "them first.".format(
+                "PostBridge will transcribe them now, which may take several "
+                "minutes.".format(
                     len(_vo_uncached),
                     "s" if len(_vo_uncached) != 1 else "",
                     _names)
@@ -2783,15 +2826,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Collect all tkinter variable values here on the main thread.
         # IntVar/DoubleVar/StringVar.get() is not thread-safe and must not be
         # called from the reconcile thread (causes deadlocks on Python 3.14+).
-        transcript_sources = {
-            tok: self._pool.get_transcript_source(tok)
+        asgn = self._pool.get_assignments()
+        token_audio_paths = {
+            tok: [p for p in asgn.get(tok, []) if not is_video(p)]
             for tok in self.tokens
         }
         pad_secs = self.pad_var.get()
 
         threading.Thread(
             target=self._run_reconcile,
-            args=(int_assets, transcript_sources, pad_secs),
+            args=(int_assets, token_audio_paths, pad_secs),
             daemon=True).start()
 
     @staticmethod
@@ -2840,12 +2884,43 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._prog_bar.set(n, total)
         self._ui(_do)
 
-    def _run_reconcile(self, int_assets, transcript_sources, pad_secs=PAD_SECS, n_workers=None):
+    def _run_reconcile(self, int_assets, token_audio_paths, pad_secs=PAD_SECS, n_workers=None):
         # Clear the debug mirror at the start of each run
         try:
             open(self._DEBUG_LOG, "w").close()
         except Exception:
             pass
+
+        # ── Build transcript_sources: mix multi-file tokens to a temp WAV ────
+        # Single-file tokens pass through unchanged.  Mix files from the previous
+        # run are cleaned up here (not in _finish_reconcile) so they stay alive
+        # through the whole Step 4 editing session — the waveform editor uses them
+        # as source_audio so the user hears the full mixed audio while reviewing.
+        for _old in getattr(self, "_temp_mix_files", []):
+            try:
+                os.remove(_old)
+            except Exception:
+                pass
+        self._temp_mix_files = []
+        transcript_sources   = {}
+        for tok, paths in token_audio_paths.items():
+            if not paths:
+                transcript_sources[tok] = None
+            elif len(paths) == 1:
+                transcript_sources[tok] = paths[0]
+            else:
+                try:
+                    tmp = engines.mix_for_transcript(paths)
+                    transcript_sources[tok] = tmp
+                    self._temp_mix_files.append(tmp)
+                    self._log_line(
+                        "  [{}] mixed {} tracks → {}".format(
+                            tok, len(paths), os.path.basename(tmp)), SUB)
+                except Exception as exc:
+                    self._log_line(
+                        "  [{}] mix failed ({}); falling back to first track".format(
+                            tok, exc), WARN)
+                    transcript_sources[tok] = paths[0]
         # Live concurrency control — shared with the UI toggle so Fast↔Background
         # switching takes effect immediately without restarting the run.
         _live_workers = getattr(self, "_reconcile_live_workers", None)
@@ -3127,11 +3202,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             cursor  = 0.0
             tsrc    = transcript_sources.get(token)
             pad     = pad_secs
+            # Pulls confirmed in the previous run are passed through as-is so
+            # the user can fix problem tokens via REDO without re-running work
+            # they've already approved.
+            _carryover = getattr(self, "_confirmed_carryover", None) or {}
 
             self._log_line(
-                "  [{}] starting {} pull(s)  src={}".format(
+                "  [{}] starting {} pull(s)  src={}{}".format(
                     token, len(token_pulls),
-                    os.path.basename(tsrc) if tsrc else "none"),
+                    os.path.basename(tsrc) if tsrc else "none",
+                    "  [{} confirmed carried over]".format(
+                        sum(1 for p in token_pulls if p.get("order") in _carryover))
+                    if _carryover else ""),
                 SUB)
 
             # Log pull result cache status for this token on first pull
@@ -3139,6 +3221,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             # os.path.getmtime — which can hang indefinitely on inaccessible files)
             _logged_pull_cache = False
             for pull in token_pulls:
+                # ── Carry over confirmed results from the previous run ────────
+                if pull.get("order") in _carryover:
+                    r = _carryover[pull["order"]]
+                    results.append(r)
+                    if r.get("rec_out_s", 0.0) > 0.0:
+                        cursor = max(cursor, r["rec_out_s"])
+                    continue
+
                 if self._cancel.is_set():
                     r = engines._base_result(pull)
                     r["status"] = "cancelled"
@@ -3156,6 +3246,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                      else 0.0)
                 r = engines.reconcile_interview_pull(pull, tsrc, pad=pad,
                                                      min_start_s=_effective_cursor)
+                # source_audio is set to tsrc (the mix WAV) inside
+                # reconcile_interview_pull.  We keep it pointing there — the mix
+                # file stays alive through Step 4 so the waveform editor shows the
+                # full blended audio instead of just one track.
                 _pull_elapsed = time.perf_counter() - _pull_t0
                 # ── Pull cache diagnostic (once per token, after the call) ──────
                 if not _logged_pull_cache:
@@ -3649,6 +3743,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
+        self._confirmed_carryover = {}   # consumed; clear for next run
+        # Mix files (_temp_mix_files) are intentionally kept alive here so the
+        # waveform editor can use them during Step 4.  They are cleaned up at the
+        # start of the next reconcile run, or when the window closes.
         self.after(800, self._step4)
 
     def _cancel_reconcile(self):
@@ -4262,7 +4360,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 lambda e, f=_toggle_ignore: f())
 
             # ── Card click → open waveform editor ──────────────────────────────
-            def _hdr_click(event=None, sv=skip_var, fn=_open_review):
+            def _hdr_click(event=None, sv=skip_var, fn=_open_review,
+                           ti=_toggle_ignore):
+                self._s4_active_toggle = ti  # track for X shortcut
                 if not sv.get():   # ignored cards do nothing on click
                     fn()
 
@@ -4329,7 +4429,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._s4_save()
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "← REDO", self._step2).pack(side="left")
+        self._btn(nav, "← REDO", self._s4_redo_to_step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
         if DEV_DIAGNOSTIC:
@@ -4355,6 +4455,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.bind_all("<Control-Z>",       self._s4_undo)
         self.bind_all("<Control-Shift-z>", self._s4_redo)
         self.bind_all("<Control-Shift-Z>", self._s4_redo)
+
+        # X — toggle IGNORE on the most-recently-clicked card
+        self.bind_all("<x>", self._s4_x_toggle_ignore)
+        self.bind_all("<X>", self._s4_x_toggle_ignore)
 
     # ── Inline card-level audio playback ──────────────────────────────────────
 
@@ -4660,14 +4764,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         int_assets = self._pool.get_interview_assets()
 
-        # If any token was re-reconciled against a different file, make sure that
-        # file is the one the export uses — the pool still points to the original.
+        # If any token was re-reconciled or had its export source fixed, make sure
+        # the correct file is first — the pool still points to the originals.
+        # The chosen file leads; all other pool files (including the host/Jordan
+        # track) are preserved in their original order behind it.
+        # Skip any override that points at a transient mix WAV (these live in
+        # the OS temp folder and must never reach the export).
         for _tok, _fp in getattr(self, "_rereconcile_src_override", {}).items():
             if not _fp:
                 continue
+            if os.path.basename(_fp).startswith("_pb_mix_"):
+                continue
             existing = int_assets.get(_tok, [])
             others   = [p for p in existing if p != _fp]
-            int_assets[_tok] = [_fp] + others   # re-reconciled file first
+            int_assets[_tok] = [_fp] + others
 
         try:
             vo_bin_data = {pi: vb for pi, vb in self.vo_bins.items()}
@@ -4764,8 +4874,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 "n_segs":   len(_r.get("segments") or []),
                                 "takes_data_dbg": _td_dbg,
                             })
+                        # Also dump int_assets and rereconcile_src_override so
+                        # we can post-mortem any source-file leak (e.g. a temp
+                        # mix WAV ending up in the AAF).
+                        _debug_payload = {
+                            "clips":      _debug_clips,
+                            "int_assets": {tok: list(paths)
+                                           for tok, paths in int_assets.items()},
+                            "rereconcile_src_override":
+                                dict(getattr(self, "_rereconcile_src_override", {}) or {}),
+                        }
                         with open(_debug_path, "w", encoding="utf-8") as _df:
-                            json.dump(_debug_clips, _df, indent=2)
+                            json.dump(_debug_payload, _df, indent=2)
                     except Exception:
                         pass
 
@@ -5347,6 +5467,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         if not hasattr(self, "_aaf_mix_var"):
             self._aaf_mix_var = tk.StringVar(value="")
+        # If audio files were prefetched before this step rendered, scan them
+        # now for a FOR VID file and pre-fill the mix field if it's still empty.
+        if not self._aaf_mix_var.get():
+            for _p in self._aaf_audio_paths:
+                if "FOR VID" in os.path.basename(_p).upper():
+                    self._aaf_mix_var.set(_p)
+                    break
 
         mix_body = tk.Frame(mix_frame, bg=SURF)
         mix_body.pack(fill="x", padx=12, pady=(0, 10))
@@ -7004,6 +7131,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _verdict = ("exact"  if _correction_ms < 50  else
                             "close"  if _correction_ms < 500 else
                             "wrong")
+                # Record the cal_global active at the time of this run so
+                # detect_sync_offset can decode the auto_T correctly even if
+                # _T_CAL_GLOBAL changes later.
+                try:
+                    from parsers import detect_sync_offset as _dso
+                    import inspect as _ins
+                    _src = _ins.getsource(_dso)
+                    import re as _re
+                    _m = _re.search(r"_T_CAL_GLOBAL\s*=\s*([-+]?[\d.]+)", _src)
+                    _cal_global = float(_m.group(1)) if _m else -0.006
+                except Exception:
+                    _cal_global = -0.006
+
                 _entry = {
                     "ts":            _dt.datetime.now().isoformat(timespec="seconds"),
                     "source":        base,
@@ -7013,6 +7153,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "accepted_T":    round(accepted_offset, 4),
                     "correction_ms": _correction_ms,
                     "verdict":       _verdict,
+                    "cal_global":    _cal_global,
                 }
                 with open(_os.path.join(_cache_dir, "sync_corrections.jsonl"),
                           "a", encoding="utf-8") as _fh:
@@ -7532,6 +7673,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if path in self._aaf_audio_paths: return
         if not is_media(path): return
         self._aaf_audio_paths.append(path)
+        # Auto-fill the stereo mix field when a FOR VID file is added and
+        # nothing has been set manually yet.
+        if "FOR VID" in os.path.basename(path).upper():
+            _mv = getattr(self, "_aaf_mix_var", None)
+            if _mv is not None and not _mv.get():
+                _mv.set(path)
         row = tk.Frame(self._aaf_audio_file_list, bg=SURF2,
                        highlightbackground=BORDER, highlightthickness=1)
         row.pack(fill="x", pady=1)
@@ -8354,514 +8501,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 log.insert("end", line, tag)
             log.configure(state="disabled")
 
-    # ── Transcribe Media workflow ─────────────────────────────────────────────
-
-    def _transcribe_workflow(self):
-        """Standalone batch transcription: drop media files, transcribe them,
-        save a .pb_transcript.json alongside each one for fast reconcile later.
-        Includes a word-search panel for finding specific words with timestamps."""
-        self._clear()
-        self._section("TRANSCRIBE MEDIA")
-
-        tk.Label(self.body,
-                 text="Drop media files below. PostBridge will transcribe each one "
-                      "and save a .pb_transcript.json file alongside it. "
-                      "Once transcribed, the Script \u2192 Session reconcile will "
-                      "load these instantly instead of re-transcribing.",
-                 font=FB, bg=BG, fg=SUB, wraplength=700, justify="left"
-                 ).pack(anchor="w", pady=(0, 16))
-
-        # ── File list ─────────────────────────────────────────────────────────
-        list_outer = tk.Frame(self.body, bg=SURF,
-                              highlightbackground=BORDER, highlightthickness=1)
-        list_outer.pack(fill="both", expand=True, pady=(0, 12))
-
-        list_hdr = tk.Frame(list_outer, bg=SURF3)
-        list_hdr.pack(fill="x")
-        tk.Label(list_hdr, text="FILE", font=FL, bg=SURF3, fg=SUB,
-                 anchor="w", padx=12, pady=6).pack(side="left")
-        tk.Label(list_hdr, text="STATUS", font=FL, bg=SURF3, fg=SUB,
-                 anchor="e", padx=12, pady=6).pack(side="right")
-
-        list_canvas = tk.Canvas(list_outer, bg=SURF, highlightthickness=0, height=280)
-        list_scroll = tk.Scrollbar(list_outer, orient="vertical",
-                                   command=list_canvas.yview)
-        list_scroll.pack(side="right", fill="y")
-        list_canvas.pack(fill="both", expand=True)
-        list_canvas.configure(yscrollcommand=list_scroll.set)
-
-        list_frame = tk.Frame(list_canvas, bg=SURF)
-        list_canvas.create_window((0, 0), window=list_frame, anchor="nw")
-        list_frame.bind("<Configure>",
-                        lambda e: list_canvas.configure(
-                            scrollregion=list_canvas.bbox("all")))
-
-        # ── Drop zone ─────────────────────────────────────────────────────────
-        drop_frame = tk.Frame(self.body, bg=SURF2,
-                              highlightbackground=BORDER, highlightthickness=1)
-        drop_frame.pack(fill="x", pady=(0, 12))
-
-        drop_lbl = tk.Label(drop_frame,
-                            text="Drop media files here  or  click to browse",
-                            font=FB, bg=SURF2, fg=SUB, pady=18)
-        drop_lbl.pack(fill="x")
-
-        # ── Progress bar ──────────────────────────────────────────────────────
-        prog_frame = tk.Frame(self.body, bg=BG)
-        prog_frame.pack(fill="x", pady=(0, 6))
-        prog_lbl = tk.Label(prog_frame, text="", font=FB, bg=BG, fg=SUB, anchor="w")
-        prog_lbl.pack(anchor="w")
-        prog_bar = _FlatProgressBar(prog_frame, height=6)
-        prog_bar.pack(fill="x", pady=(4, 0))
-
-        # ── Controls row ──────────────────────────────────────────────────────
-        ctrl = tk.Frame(self.body, bg=BG)
-        ctrl.pack(fill="x", pady=(0, 8))
-
-        # ── Fast / Background mode toggle ─────────────────────────────────────
-        _cpu_fast  = max(1, (os.cpu_count() or 2) - 1)  # all cores minus one
-        _bg_mode   = [False]      # False = fast, True = background
-        _workers   = [_cpu_fast]  # mutable: current target concurrency
-        _cond      = threading.Condition()  # wakes blocked slots
-        _active    = [0]          # mutable: currently running threads
-
-        bg_frame = tk.Frame(ctrl, bg=BG)
-        bg_frame.pack(side="left")
-
-        bg_ck = tk.Label(bg_frame, text="\u2610", font=(_SANS, 15),
-                         bg=BG, fg=SUB, cursor="hand2", padx=4)
-        bg_ck.pack(side="left")
-        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB, bg=BG, fg=SUB,
-                          cursor="hand2")
-        bg_lbl.pack(side="left")
-
-        def _toggle_bg():
-            _bg_mode[0] = not _bg_mode[0]
-            _on = _bg_mode[0]
-            _workers[0] = 1 if _on else _cpu_fast
-            bg_ck.config(text="\u2611" if _on else "\u2610",
-                         fg=ACCENT if _on else SUB)
-            with _cond:
-                _cond.notify_all()
-
-        bg_ck.bind("<Button-1>",  lambda e: _toggle_bg())
-        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
-
-        # Mutable command slots — _btn captures these dispatchers at bind time;
-        # setting the slot to None disables the button without rebinding.
-        _tx_cmd  = [None]
-        _clr_cmd = [None]
-
-        tx_btn  = self._btn(ctrl, "TRANSCRIBE", lambda: _tx_cmd[0] and _tx_cmd[0](),
-                            color=ACCENT)
-        tx_btn.pack(side="right")
-        clr_btn = self._btn(ctrl, "CLEAR LIST", lambda: _clr_cmd[0] and _clr_cmd[0](),
-                            small=True)
-        clr_btn.pack(side="right", padx=(0, 8))
-
-        # ── State ─────────────────────────────────────────────────────────────
-        _files         = []     # list of abs paths
-        _rows          = {}     # path → {"row", "status"}
-        _running       = [False]
-        _cancel        = [False]
-        _selected_file = [None] # path currently loaded in the search panel
-
-        def _fmt_ts(s):
-            """Format seconds as HH:MM:SS.f for display."""
-            h   = int(s // 3600)
-            m   = int((s % 3600) // 60)
-            sec = s % 60
-            return "{:02d}:{:02d}:{:04.1f}".format(h, m, sec)
-
-        def _status_color(status):
-            if status in ("done", "skipped"):  return SUCCESS
-            if status == "error":              return ERR
-            if status == "transcribing":       return ACCENT
-            return SUB
-
-        # ── Search panel (built before _add_files so _select_file can ref it) ──
-        tk.Frame(self.body, bg=BORDER, height=1).pack(fill="x", pady=(4, 12))
-
-        search_outer = tk.Frame(self.body, bg=SURF,
-                                highlightbackground=BORDER, highlightthickness=1)
-        search_outer.pack(fill="both", expand=True, pady=(0, 4))
-
-        search_hdr = tk.Frame(search_outer, bg=SURF3)
-        search_hdr.pack(fill="x")
-        tk.Label(search_hdr, text="SEARCH TRANSCRIPT", font=FL,
-                 bg=SURF3, fg=SUB, anchor="w", padx=12, pady=6).pack(side="left")
-        search_file_lbl = tk.Label(search_hdr, text="— click a transcribed file above —",
-                                   font=FB, bg=SURF3, fg=SUB, anchor="e", padx=12)
-        search_file_lbl.pack(side="right")
-
-        search_entry_row = tk.Frame(search_outer, bg=SURF, pady=8)
-        search_entry_row.pack(fill="x", padx=12)
-        search_var = tk.StringVar()
-        search_entry = tk.Entry(search_entry_row, textvariable=search_var,
-                                font=FB, bg=SURF2, fg=TEXT,
-                                insertbackground=TEXT, relief="flat",
-                                highlightbackground=BORDER, highlightthickness=1,
-                                width=28)
-        search_entry.pack(side="left", ipady=5, padx=(0, 8))
-        search_entry.insert(0, "")
-        search_count_lbl = tk.Label(search_entry_row, text="", font=FB,
-                                    bg=SURF, fg=SUB)
-        search_count_lbl.pack(side="left")
-
-        # Results canvas
-        res_canvas = tk.Canvas(search_outer, bg=SURF, highlightthickness=0, height=180)
-        res_scroll = tk.Scrollbar(search_outer, orient="vertical",
-                                  command=res_canvas.yview)
-        res_scroll.pack(side="right", fill="y")
-        res_canvas.pack(fill="both", expand=True, padx=(0, 0))
-        res_canvas.configure(yscrollcommand=res_scroll.set)
-        res_frame = tk.Frame(res_canvas, bg=SURF)
-        res_canvas.create_window((0, 0), window=res_frame, anchor="nw")
-        res_frame.bind("<Configure>",
-                       lambda e: res_canvas.configure(
-                           scrollregion=res_canvas.bbox("all")))
-
-        no_results_lbl = tk.Label(res_frame, text="",
-                                  font=FB, bg=SURF, fg=SUB,
-                                  anchor="w", padx=16, pady=10)
-        no_results_lbl.pack(anchor="w")
-
-        def _do_search(*_):
-            term = search_var.get().strip().lower()
-            # Clear previous results
-            for w in list(res_frame.winfo_children()):
-                w.destroy()
-            no_results_lbl_inner = tk.Label(res_frame, text="",
-                                            font=FB, bg=SURF, fg=SUB,
-                                            anchor="w", padx=16, pady=10)
-            no_results_lbl_inner.pack(anchor="w")
-
-            path = _selected_file[0]
-            if not path:
-                no_results_lbl_inner.config(
-                    text="Select a transcribed file above to search.")
-                search_count_lbl.config(text="")
-                return
-            if not term:
-                no_results_lbl_inner.config(text="Type a word to search.")
-                search_count_lbl.config(text="")
-                return
-
-            words, _ = engines.pb_transcript_load(path)
-            if not words:
-                no_results_lbl_inner.config(
-                    text="No transcript found for this file. Transcribe it first.")
-                search_count_lbl.config(text="")
-                return
-
-            CONTEXT = 5   # words of context each side
-            hits = [i for i, w in enumerate(words)
-                    if term in w.get("word", "")]
-
-            search_count_lbl.config(
-                text="{} match{}".format(len(hits), "es" if len(hits) != 1 else "")
-                if hits else "no matches")
-
-            if not hits:
-                no_results_lbl_inner.config(
-                    text='No matches for "{}".'.format(term))
-                return
-
-            no_results_lbl_inner.destroy()
-
-            for idx in hits:
-                w      = words[idx]
-                ts     = _fmt_ts(w.get("start", 0))
-                before = " ".join(x["word"] for x in words[max(0, idx-CONTEXT):idx])
-                after  = " ".join(x["word"] for x in words[idx+1:idx+1+CONTEXT])
-                hit_w  = w.get("word", "")
-
-                row = tk.Frame(res_frame, bg=SURF)
-                row.pack(fill="x", padx=8, pady=2)
-
-                ts_lbl = tk.Label(row, text=ts, font=(_SANS, 11, "bold"),
-                                  bg=SURF, fg=ACCENT, width=11, anchor="w",
-                                  cursor="hand2")
-                ts_lbl.pack(side="left", padx=(4, 8))
-                self._tooltip(ts_lbl, "Click to copy timecode")
-
-                def _copy_ts(t=ts):
-                    self.clipboard_clear()
-                    self.clipboard_append(t)
-                ts_lbl.bind("<Button-1>", lambda e, t=ts: _copy_ts(t))
-
-                ctx_frame = tk.Frame(row, bg=SURF)
-                ctx_frame.pack(side="left", fill="x", expand=True)
-
-                if before:
-                    tk.Label(ctx_frame, text="…" + before + " ",
-                             font=FB, bg=SURF, fg=SUB,
-                             anchor="w").pack(side="left")
-                tk.Label(ctx_frame, text=hit_w,
-                         font=(_SANS, 12, "bold"), bg=SURF, fg=TEXT,
-                         anchor="w").pack(side="left")
-                if after:
-                    tk.Label(ctx_frame, text=" " + after + "…",
-                             font=FB, bg=SURF, fg=SUB,
-                             anchor="w").pack(side="left")
-
-                tk.Frame(res_frame, bg=BORDER, height=1).pack(fill="x", padx=8)
-
-        search_var.trace_add("write", _do_search)
-
-        def _select_file(path):
-            # Deselect previous
-            prev = _selected_file[0]
-            if prev and prev in _rows:
-                _rows[prev]["row"].config(
-                    highlightbackground=SURF, highlightthickness=0)
-
-            # Only allow selecting transcribed files
-            if path not in _rows:
-                return
-            status = _rows[path]["status"].cget("text")
-            has_pb, _ = engines.pb_transcript_load(path)
-            if not has_pb:
-                return
-
-            _selected_file[0] = path
-            _rows[path]["row"].config(
-                highlightbackground=ACCENT, highlightthickness=2)
-            search_file_lbl.config(text=os.path.basename(path))
-            _do_search()   # re-run with new file
-
-        def _add_files(paths):
-            for p in paths:
-                p = os.path.abspath(p)
-                if p in _rows:
-                    continue
-                if not is_media(p):
-                    continue
-                _files.append(p)
-                row = tk.Frame(list_frame, bg=SURF,
-                               highlightbackground=SURF, highlightthickness=0,
-                               cursor="hand2")
-                row.pack(fill="x", padx=4, pady=1)
-
-                # Check if a .pb_transcript.json already exists for this file
-                existing, _ = engines.pb_transcript_load(p)
-                init_status = "transcribed" if existing else "pending"
-                init_color  = SUCCESS if existing else SUB
-
-                name_lbl = tk.Label(row, text=os.path.basename(p), font=FB,
-                                    bg=SURF, fg=TEXT, anchor="w")
-                name_lbl.pack(side="left", fill="x", expand=True, padx=(8, 4))
-                status_lbl = tk.Label(row, text=init_status, font=FB,
-                                      bg=SURF, fg=init_color, anchor="e", padx=8)
-                status_lbl.pack(side="right")
-
-                _rows[p] = {"row": row, "status": status_lbl}
-
-                for w in (row, name_lbl, status_lbl):
-                    w.bind("<Button-1>", lambda e, path=p: _select_file(path))
-                    w.bind("<Enter>",
-                           lambda e, r=row, _p=p: r.config(bg=SURF2) if _selected_file[0] != _p else None)
-                    w.bind("<Leave>",
-                           lambda e, r=row, _p=p: r.config(bg=SURF)  if _selected_file[0] != _p else None)
-
-            _update_btn_state()
-
-        def _clear_list():
-            if _running[0]:
-                return
-            for w in list(list_frame.winfo_children()):
-                w.destroy()
-            _files.clear()
-            _rows.clear()
-            _selected_file[0] = None
-            search_file_lbl.config(text="— click a transcribed file above —")
-            _do_search()
-            _update_btn_state()
-
-        def _update_btn_state():
-            has_pending = any(
-                _rows[p]["status"].cget("text") in ("pending", "error")
-                for p in _files if p in _rows
-            )
-            can_tx  = has_pending and not _running[0]
-            can_clr = not _running[0]
-            _tx_cmd[0]  = _start       if can_tx  else None
-            _clr_cmd[0] = _clear_list  if can_clr else None
-            tx_btn.config( fg=TEXT if can_tx  else SUB)
-            clr_btn.config(fg=TEXT if can_clr else SUB)
-
-        def _set_prog(text, done=None, total=None):
-            def _upd():
-                prog_lbl.config(text=text)
-                if done is not None and total:
-                    prog_bar.set(done, total)
-            self._ui(_upd)
-
-        def _set_status(path, text):
-            def _upd():
-                if path not in _rows:
-                    return
-                _rows[path]["status"].config(
-                    text=text, fg=_status_color(text))
-                # Auto-select first newly-transcribed file for search
-                if text == "done" and _selected_file[0] is None:
-                    _select_file(path)
-            self._ui(_upd)
-
-        # ── Browse ────────────────────────────────────────────────────────────
-        def _browse(e=None):
-            paths = filedialog.askopenfilenames(
-                title="Select media files",
-                filetypes=[("Media files",
-                            " ".join("*" + x for x in sorted(MEDIA_EXTS))),
-                           ("All files", "*.*")])
-            if paths:
-                _add_files(paths)
-
-        drop_lbl.bind("<Button-1>", _browse)
-        drop_frame.bind("<Button-1>", _browse)
-
-        try:
-            drop_frame.drop_target_register("DND_Files")
-            drop_frame.dnd_bind("<<Drop>>",
-                lambda e: _add_files(
-                    [p.strip().strip("{}") for p in e.data.split()
-                     if os.path.isfile(p.strip().strip("{}"))]))
-            drop_lbl.drop_target_register("DND_Files")
-            drop_lbl.dnd_bind("<<Drop>>",
-                lambda e: _add_files(
-                    [p.strip().strip("{}") for p in e.data.split()
-                     if os.path.isfile(p.strip().strip("{}"))]))
-        except Exception:
-            pass
-
-        # ── Worker ────────────────────────────────────────────────────────────
-        def _run():
-            _running[0] = True
-            _cancel[0]  = False
-
-            def _confirm_cancel_transcribe():
-                if messagebox.askyesno("Cancel transcription?",
-                                       "Stop transcribing? Files already completed are saved.",
-                                       default="no"):
-                    _cancel.__setitem__(0, True)
-
-            def _enter_cancel_mode():
-                _tx_cmd[0] = _confirm_cancel_transcribe
-                tx_btn.config(text="CANCEL", fg=WARN)
-                _clr_cmd[0] = None
-                clr_btn.config(fg=SUB)
-
-            self._ui(_enter_cancel_mode)
-
-            pending = [p for p in _files
-                       if p in _rows
-                       and _rows[p]["status"].cget("text") in ("pending", "error")]
-
-            n_total = len(pending)
-            n_done  = [0]
-
-            # ── Condition-variable gate — supports live worker-count changes ──
-            import threading as _th
-
-            def _acquire():
-                """Block until a slot is free, then claim it."""
-                with _cond:
-                    while _active[0] >= _workers[0]:
-                        _cond.wait(timeout=0.3)
-                        if _cancel[0]:
-                            return False
-                    _active[0] += 1
-                    return True
-
-            def _release():
-                with _cond:
-                    _active[0] = max(0, _active[0] - 1)
-                    _cond.notify_all()
-
-            def _process_one(path):
-                if _cancel[0]:
-                    _release()
-                    return
-                name = os.path.basename(path)
-                _set_status(path, "transcribing")
-                _set_prog("\u23f3  Transcribing {} ({}/{})…".format(
-                    name, n_done[0] + 1, n_total),
-                    done=n_done[0], total=n_total)
-
-                def _progress_cb(frac, msg):
-                    _set_prog("\u23f3  {} — {} ({}/{})".format(
-                        msg, name, n_done[0] + 1, n_total),
-                        done=n_done[0], total=n_total)
-
-                try:
-                    words, blobs = engines.transcribe_file(
-                        path, progress_cb=_progress_cb)
-                    if words:
-                        engines.pb_transcript_save(path, words, blobs)
-                        n_done[0] += 1
-                        _set_status(path, "done")
-                        _set_prog("\u2713  {} done  ({}/{})".format(
-                            name, n_done[0], n_total),
-                            done=n_done[0], total=n_total)
-                    else:
-                        _set_status(path, "error")
-                        _set_prog("\u26a0  {} — no words detected".format(name),
-                                  done=n_done[0], total=n_total)
-                except Exception as exc:
-                    print("Transcribe error [{}]: {}".format(name, exc))
-                    _set_status(path, "error")
-                    _set_prog("\u26a0  Error on {}".format(name),
-                              done=n_done[0], total=n_total)
-                finally:
-                    _release()
-
-            # Dispatcher: iterate pending, acquire a slot, spin up a thread.
-            # When _workers[0] is 1 the gate allows only one through at a time;
-            # increasing it live wakes blocked iterations immediately.
-            dispatch_threads = []
-            for path in pending:
-                if _cancel[0]:
-                    break
-                if not _acquire():   # returns False on cancel
-                    break
-                t = _th.Thread(target=_process_one, args=(path,), daemon=True)
-                dispatch_threads.append(t)
-                t.start()
-
-            # Wait for all launched threads to finish
-            for t in dispatch_threads:
-                t.join()
-
-            _active[0] = 0
-
-            _running[0] = False
-            self._ui(_on_done)
-
-        def _on_done():
-            n_done = sum(1 for p in _files
-                         if p in _rows
-                         and _rows[p]["status"].cget("text") == "done")
-            n_err  = sum(1 for p in _files
-                         if p in _rows
-                         and _rows[p]["status"].cget("text") == "error")
-            summary = "\u2713  {} file{} transcribed".format(
-                n_done, "s" if n_done != 1 else "")
-            if n_err:
-                summary += "  \u00b7  \u26a0 {} error{}".format(
-                    n_err, "s" if n_err != 1 else "")
-            prog_lbl.config(text=summary, fg=SUCCESS if not n_err else WARN)
-            prog_bar.set(n_done, max(n_done + n_err, 1))
-            tx_btn.config(text="TRANSCRIBE")
-            _update_btn_state()
-
-        def _start():
-            import threading
-            threading.Thread(target=_run, daemon=True).start()
-
-        _update_btn_state()
-        _do_search()   # seed the search panel with its placeholder state
-
     # ── Script Formatter workflow ─────────────────────────────────────────────
 
     def _script_formatter(self):
@@ -9240,6 +8879,1936 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tok_text.bind("<<Paste>>",
                       lambda e: tok_text.after(10, _rebuild_tokens))
 
+    # ── Pull Quotes workflow ──────────────────────────────────────────────────
+    # Two-tier model:
+    #   • Episode Project (".pb_episode.json")        — list of session paths
+    #   • Interview Session (".pb_session.json")      — token + media + transcript
+    # Sessions self-save next to their first media file.  Projects are saved
+    # explicitly to a user-chosen path.
+
+    def _pq_open_home(self):
+        """Entry point: empty in-memory Episode Project workspace."""
+        self._pq_project = {
+            "title":     "Untitled Episode",
+            "sessions":  [],   # list of session dicts (each carries _file_path)
+            "file_path": None,
+        }
+        self._pq_render_project_view()
+
+    def _pq_load_project(self, data, file_path):
+        """Load an Episode Project JSON (already-parsed dict)."""
+        sessions, missing = [], []
+        for sp in data.get("sessions", []) or []:
+            loaded = self._pq_load_session_file(sp)
+            if loaded is None:
+                missing.append(sp)
+            else:
+                sessions.append(loaded)
+        self._pq_project = {
+            "title":     data.get("title") or os.path.splitext(
+                            os.path.basename(file_path))[0],
+            "sessions":  sessions,
+            "file_path": file_path,
+        }
+        if missing:
+            messagebox.showwarning(
+                "Missing sessions",
+                "{} session file(s) referenced by this project could not be "
+                "loaded:\n\n{}".format(
+                    len(missing),
+                    "\n".join("  • " + p for p in missing[:10])))
+        self._pq_render_project_view()
+
+    def _pq_open_standalone_session(self, data, file_path):
+        """Open a single Interview Session JSON without a project context.
+        Wraps it in an unsaved one-session project so the same view applies."""
+        session = dict(data)
+        session["_file_path"] = file_path
+        self._pq_project = {
+            "title":     "Untitled Episode",
+            "sessions":  [session],
+            "file_path": None,
+        }
+        self._pq_render_project_view()
+
+    def _pq_load_session_file(self, path):
+        """Load an Interview Session JSON; return dict or None on error."""
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("workflow") != "interview_session":
+                return None
+            data["_file_path"] = path
+            return data
+        except Exception:
+            return None
+
+    def _pq_save_session_file(self, session):
+        """Write a session dict to its `_file_path`."""
+        path = session.get("_file_path")
+        if not path:
+            return False
+        payload = {
+            "version":     2,
+            "workflow":    "interview_session",
+            "token":       session.get("token", ""),
+            "media":       list(session.get("media", [])),
+            "transcript":  session.get("transcript", []),
+        }
+        # Path to the playback cache (mix-of-all-sources WAV) is persisted
+        # only when it actually exists on disk.
+        ac = session.get("audio_cache")
+        if ac and os.path.isfile(ac):
+            payload["audio_cache"] = ac
+        # Optional per-source speaker label overrides (map of
+        # filename → display label).  Only saved when set.
+        speakers = session.get("speakers")
+        if speakers:
+            payload["speakers"] = dict(speakers)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            return True
+        except Exception as e:
+            messagebox.showerror("Save Session failed", str(e))
+            return False
+
+    def _pq_default_session_path(self, token, media_paths):
+        """`<first_media_dir>/<TOKEN>.pb_session.json`."""
+        if not media_paths:
+            return None
+        first = os.path.abspath(media_paths[0])
+        return os.path.join(os.path.dirname(first),
+                            "{}.pb_session.json".format(token))
+
+    def _pq_save_episode_project(self, prompt_path=False):
+        """Write the Episode Project JSON.  Prompts on first save."""
+        project = getattr(self, "_pq_project", None)
+        if not project:
+            return
+        # Refuse to save until the project actually has sessions on disk.
+        if not project["sessions"]:
+            messagebox.showinfo("Nothing to save",
+                "Add at least one Interview Session before saving the project.")
+            return
+        path = project.get("file_path")
+        if prompt_path or not path:
+            suggested = re.sub(r"[^A-Za-z0-9_\- ]+", "_",
+                               project.get("title", "Episode")) + ".pb_episode.json"
+            path = filedialog.asksaveasfilename(
+                title="Save Episode Project",
+                initialfile=suggested,
+                defaultextension=".json",
+                filetypes=[("Pull Quotes Episode Project", "*.pb_episode.json"),
+                           ("JSON", "*.json"),
+                           ("All", "*.*")])
+            if not path:
+                return
+        payload = {
+            "version":  1,
+            "workflow": "episode_project",
+            "title":    project.get("title", ""),
+            "sessions": [s["_file_path"] for s in project["sessions"]
+                         if s.get("_file_path")],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            project["file_path"] = path
+            self._pq_render_project_view()
+        except Exception as e:
+            messagebox.showerror("Save Episode Project failed", str(e))
+
+    # ── Project view ─────────────────────────────────────────────────────────
+
+    def _pq_render_project_view(self):
+        import re
+        self._clear()
+        # Stepping back into the project means we're no longer focused on a
+        # single session — clear the marker so background-completion
+        # callbacks know to refresh THIS view rather than the (gone) session
+        # view.
+        self._pq_current_session = None
+        # Reset the row-widget registry; rows will repopulate as we render.
+        self._pq_row_widgets = {}
+
+        project = self._pq_project
+
+        # Bottom nav (pinned) — only HOME.  SAVE / SAVE AS live in the
+        # persistent header bar (same as every other workflow).
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8, 0))
+        self._btn(nav, "← HOME", self._home).pack(side="left")
+
+        self._section("PULL QUOTES — EPISODE PROJECT")
+
+        # Title + file path metadata
+        title_row = tk.Frame(self.body, bg=BG)
+        title_row.pack(fill="x", pady=(0, 8))
+        tk.Label(title_row, text="EPISODE TITLE", font=FL,
+                 bg=BG, fg=SUB, width=18, anchor="w").pack(side="left")
+        title_var = tk.StringVar(value=project.get("title", ""))
+        title_entry = tk.Entry(title_row, textvariable=title_var, font=FB,
+                                bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                                relief="flat", bd=6)
+        title_entry.pack(side="left", fill="x", expand=True)
+        def _on_title_change(*_):
+            project["title"] = title_var.get().strip() or "Untitled Episode"
+        title_var.trace_add("write", _on_title_change)
+
+        fp_row = tk.Frame(self.body, bg=BG)
+        fp_row.pack(fill="x", pady=(0, 12))
+        tk.Label(fp_row, text="PROJECT FILE", font=FL,
+                 bg=BG, fg=SUB, width=18, anchor="w").pack(side="left")
+        fp = project.get("file_path") or "— unsaved (use SAVE in the header) —"
+        tk.Label(fp_row, text=fp, font=FB, bg=BG,
+                 fg=SUCCESS if project.get("file_path") else SUB,
+                 anchor="w").pack(side="left", fill="x", expand=True)
+
+        is_empty = not project["sessions"]
+
+        # Single panel that contains: column header (only when populated),
+        # one row per existing session, then the always-last "+ ADD
+        # INTERVIEW SESSION" affordance.  Putting the add button inside the
+        # panel keeps it visually anchored to the list while remaining the
+        # obvious next action — empty or full.
+        list_outer = tk.Frame(self.body, bg=SURF,
+                              highlightbackground=BORDER, highlightthickness=1)
+        list_outer.pack(fill="both", expand=True, pady=(0, 12))
+
+        if not is_empty:
+            hdr = tk.Frame(list_outer, bg=SURF3)
+            hdr.pack(fill="x")
+            for txt, w_ in [("TOKEN", 16), ("FILES", 8),
+                            ("WORDS", 12), ("STATUS", 28)]:
+                tk.Label(hdr, text=txt, font=FL, bg=SURF3, fg=SUB,
+                         anchor="w", padx=12, pady=6, width=w_
+                         ).pack(side="left")
+            for s in project["sessions"]:
+                self._pq_render_session_row(list_outer, s)
+        else:
+            # Empty-state copy — sits above the add affordance.
+            tk.Label(list_outer,
+                     text="\n  No interview sessions yet.",
+                     font=FBT, bg=SURF, fg=TEXT,
+                     anchor="w", padx=20).pack(anchor="w")
+            tk.Label(list_outer,
+                     text="  Drop interview media into a session, transcribe it,\n"
+                          "  and copy quotes as ready-to-paste @PULL blocks.\n",
+                     font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=20, justify="left",
+                     pady=(4)).pack(anchor="w")
+
+        # Always-last row inside the panel — uses self._btn so click +
+        # hover behaviour matches every other button in the app.
+        add_pad = tk.Frame(list_outer, bg=SURF2 if is_empty else SURF)
+        add_pad.pack(fill="x")
+        add_inner = tk.Frame(add_pad, bg=add_pad.cget("bg"))
+        add_inner.pack(padx=14, pady=14, anchor="w")
+        self._btn(add_inner,
+                  "+ ADD INTERVIEW SESSION",
+                  self._pq_add_session_dialog,
+                  color=ACCENT).pack(side="left")
+        if is_empty:
+            tk.Label(add_inner,
+                     text="    ← start here",
+                     font=FB, bg=add_pad.cget("bg"), fg=SUB
+                     ).pack(side="left")
+
+        # Incremental status-cell updates while any session is transcribing.
+        # No full re-render → no flicker.
+        if any(s.get("_progress", {}).get("active")
+               for s in project["sessions"]):
+            self.after(600, self._pq_tick_project_status)
+
+    def _pq_update_project_row(self, session):
+        """Surgical update of one session row's status + word count.
+        Falls back to a full re-render if the row widgets aren't around
+        (e.g. project view rebuilt under us)."""
+        rows = getattr(self, "_pq_row_widgets", None) or {}
+        refs = rows.get(id(session))
+        if not refs:
+            try:
+                self._pq_render_project_view()
+            except Exception:
+                pass
+            return
+        try:
+            text, fg = self._pq_status_for(session)
+            refs["status_lbl"].config(text=text, fg=fg)
+            refs["words_lbl"].config(
+                text="{:,}".format(len(session.get("transcript", []))))
+        except tk.TclError:
+            try:
+                self._pq_render_project_view()
+            except Exception:
+                pass
+
+    def _pq_tick_project_status(self):
+        """Incrementally refresh the status cell of every session row whose
+        progress dict says it's still active.  Avoids the twitch of a full
+        re-render under self.after."""
+        if getattr(self, "_pq_current_session", None) is not None:
+            return  # session view is open; project view isn't visible
+        if getattr(self, "_pq_project", None) is None:
+            return
+        rows = getattr(self, "_pq_row_widgets", None) or {}
+        any_active = False
+        for sess_id, refs in list(rows.items()):
+            try:
+                if not refs["status_lbl"].winfo_exists():
+                    continue
+            except Exception:
+                continue
+            session = refs["session"]
+            text, fg = self._pq_status_for(session)
+            try:
+                refs["status_lbl"].config(text=text, fg=fg)
+                refs["words_lbl"].config(
+                    text="{:,}".format(len(session.get("transcript", []))))
+            except tk.TclError:
+                continue
+            if session.get("_progress", {}).get("active"):
+                any_active = True
+
+        if any_active:
+            self.after(600, self._pq_tick_project_status)
+
+    def _pq_status_for(self, session):
+        """Return (status_text, fg_color) for a session row."""
+        n_media = len(session.get("media", []))
+        n_words = len(session.get("transcript", []))
+        prog    = session.get("_progress", {})
+        if prog.get("active"):
+            phase = prog.get("phase", "transcribing")
+            extra = prog.get("extra", "")
+            return "● {}{}".format(phase, extra), ACCENT
+        if n_media == 0:
+            return "no media", WARN
+        if n_words == 0:
+            return "needs transcription", WARN
+        return "✓ transcribed", SUCCESS
+
+    def _pq_render_session_row(self, parent, session):
+        """Render one row in the project's session list, storing widget
+        references in self._pq_row_widgets so tick updates don't rebuild
+        the whole tree."""
+        row = tk.Frame(parent, bg=SURF, cursor="hand2")
+        row.pack(fill="x")
+        n_media = len(session.get("media", []))
+        n_words = len(session.get("transcript", []))
+        status_text, status_fg = self._pq_status_for(session)
+
+        tok_lbl = tk.Label(row, text=session.get("token", "?"),
+                            font=FBT, bg=SURF, fg=ACCENT,
+                            anchor="w", padx=12, pady=8, width=16)
+        tok_lbl.pack(side="left")
+        files_lbl = tk.Label(row, text=str(n_media), font=FB,
+                              bg=SURF, fg=TEXT, anchor="w",
+                              padx=12, pady=8, width=8)
+        files_lbl.pack(side="left")
+        words_lbl = tk.Label(row, text="{:,}".format(n_words), font=FB,
+                              bg=SURF, fg=TEXT, anchor="w",
+                              padx=12, pady=8, width=12)
+        words_lbl.pack(side="left")
+
+        # Inline delete affordance (right-edge ✕).  Packed BEFORE the
+        # status label so the status fills the rest of the row width.
+        rm_lbl = tk.Label(row, text="✕", font=FBT, bg=SURF, fg=SUB,
+                           cursor="hand2", padx=12, pady=8)
+        rm_lbl.pack(side="right")
+
+        status_lbl = tk.Label(row, text=status_text, font=FB,
+                               bg=SURF, fg=status_fg, anchor="w",
+                               padx=12, pady=8)
+        status_lbl.pack(side="left", fill="x", expand=True)
+
+        if not hasattr(self, "_pq_row_widgets"):
+            self._pq_row_widgets = {}
+        self._pq_row_widgets[id(session)] = {
+            "row":         row,
+            "tok_lbl":     tok_lbl,
+            "files_lbl":   files_lbl,
+            "words_lbl":   words_lbl,
+            "status_lbl":  status_lbl,
+            "rm_lbl":      rm_lbl,
+            "session":     session,
+        }
+
+        def _open_handler(sess=session):
+            return lambda e: self._pq_open_session_view(sess)
+        handler = _open_handler()
+        # Click anywhere in the row except the ✕ → open the session.
+        row.bind("<Button-1>", handler)
+        for child in row.winfo_children():
+            if child is rm_lbl:
+                continue
+            child.bind("<Button-1>", handler)
+
+        def _on_remove(_e=None, sess=session):
+            self._pq_remove_session(sess)
+        rm_lbl.bind("<Button-1>", _on_remove)
+        rm_lbl.bind("<Enter>", lambda e: rm_lbl.config(fg=ERR))
+        rm_lbl.bind("<Leave>", lambda e: rm_lbl.config(fg=SUB))
+
+        def _hover_in(e, r=row, rm=rm_lbl):
+            r.config(bg=SURF2)
+            for c in r.winfo_children():
+                if c is rm:
+                    rm.config(bg=SURF2)
+                else:
+                    c.config(bg=SURF2)
+        def _hover_out(e, r=row, rm=rm_lbl):
+            r.config(bg=SURF)
+            for c in r.winfo_children():
+                if c is rm:
+                    rm.config(bg=SURF)
+                else:
+                    c.config(bg=SURF)
+        row.bind("<Enter>", _hover_in)
+        row.bind("<Leave>", _hover_out)
+
+    # ── Add Session dialog (chooser between New / Existing) ─────────────────
+
+    def _pq_add_session_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("Add Interview Session")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+
+        tk.Label(win, text="Add Interview Session", font=FH,
+                 bg=BG, fg=TEXT, pady=14, padx=24).pack()
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(padx=24, pady=(0, 16))
+
+        def _new():
+            win.destroy()
+            self._pq_new_session_dialog()
+
+        def _existing():
+            win.destroy()
+            path = filedialog.askopenfilename(
+                title="Pick Interview Session JSON",
+                filetypes=[("Pull Quotes Session", "*.pb_session.json"),
+                           ("JSON", "*.json"),
+                           ("All", "*.*")])
+            if not path:
+                return
+            loaded = self._pq_load_session_file(path)
+            if loaded is None:
+                messagebox.showerror(
+                    "Load failed",
+                    "Not a valid Interview Session JSON:\n\n" + path)
+                return
+            if any(s.get("_file_path") == path
+                   for s in self._pq_project["sessions"]):
+                messagebox.showinfo("Already added",
+                    "This session is already part of the project.")
+                return
+            self._pq_project["sessions"].append(loaded)
+            self._pq_render_project_view()
+
+        self._btn(body, "NEW INTERVIEW SESSION", _new,
+                  color=ACCENT).pack(side="left", padx=(0, 12))
+        self._btn(body, "ADD EXISTING SESSION", _existing).pack(side="left")
+
+        cancel_row = tk.Frame(win, bg=BG)
+        cancel_row.pack(pady=(0, 16))
+        self._btn(cancel_row, "CANCEL", win.destroy, small=True).pack()
+
+        win.update_idletasks()
+        # Centre on parent
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = win.winfo_width();  wh = win.winfo_height()
+        win.geometry("+{}+{}".format(px + (pw - ww) // 2, py + (ph - wh) // 2))
+        self.wait_window(win)
+
+    # ── New Session dialog ──────────────────────────────────────────────────
+
+    def _pq_new_session_dialog(self):
+        import re
+        win = tk.Toplevel(self)
+        win.title("New Interview Session")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.minsize(900, 700)
+
+        # Center on parent BEFORE wait_window blocks
+        def _center():
+            win.update_idletasks()
+            pw = self.winfo_width();  ph = self.winfo_height()
+            px = self.winfo_rootx(); py = self.winfo_rooty()
+            ww = max(900, win.winfo_reqwidth())
+            wh = max(700, win.winfo_reqheight())
+            win.geometry("{}x{}+{}+{}".format(
+                ww, wh,
+                px + max(0, (pw - ww) // 2),
+                py + max(0, (ph - wh) // 2)))
+        win.after(10, _center)
+
+        tk.Label(win, text="New Interview Session", font=FH,
+                 bg=BG, fg=TEXT, padx=24, pady=14).pack(anchor="w")
+
+        # Token entry
+        tok_row = tk.Frame(win, bg=BG)
+        tok_row.pack(fill="x", padx=24, pady=(0, 10))
+        tk.Label(tok_row, text="SESSION TOKEN", font=FL,
+                 bg=BG, fg=SUB, width=18, anchor="w").pack(side="left")
+        tok_var = tk.StringVar(value="")
+        tok_entry = tk.Entry(tok_row, textvariable=tok_var, font=FB,
+                              bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                              relief="flat", bd=6, width=24)
+        tok_entry.pack(side="left")
+        tk.Label(tok_row, text="(uppercase letters / digits / underscores)",
+                 font=FB, bg=BG, fg=SUB).pack(side="left", padx=(10, 0))
+
+        # Media drop zone
+        drop = tk.Frame(win, bg=SURF2,
+                        highlightbackground=BORDER, highlightthickness=1)
+        drop.pack(fill="both", expand=True, padx=24, pady=(0, 8))
+
+        hdr = tk.Frame(drop, bg=SURF3)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="MEDIA FILES", font=FL, bg=SURF3, fg=SUB,
+                 anchor="w", padx=12, pady=6).pack(side="left")
+        count_lbl = tk.Label(hdr, text="0 files", font=FB,
+                              bg=SURF3, fg=SUB, padx=12, pady=6)
+        count_lbl.pack(side="right")
+
+        list_canvas = tk.Canvas(drop, bg=SURF2, highlightthickness=0, height=180)
+        list_scroll = _SlimScrollbar(drop, command=list_canvas.yview)
+        list_scroll.pack(side="right", fill="y")
+        list_canvas.pack(fill="both", expand=True)
+        list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_inner = tk.Frame(list_canvas, bg=SURF2)
+        list_canvas.create_window((0, 0), window=list_inner, anchor="nw")
+        list_inner.bind("<Configure>",
+                        lambda e: list_canvas.configure(
+                            scrollregion=list_canvas.bbox("all")))
+
+        media_paths = []
+        _user_typed_token = [False]
+
+        def _refresh_list():
+            for w_ in list(list_inner.winfo_children()):
+                w_.destroy()
+            count_lbl.config(text="{} file{}".format(
+                len(media_paths), "s" if len(media_paths) != 1 else ""))
+            if not media_paths:
+                tk.Label(list_inner,
+                         text="  Drop files here or click + BROWSE below.",
+                         font=FB, bg=SURF2, fg=SUB,
+                         padx=8, pady=12).pack(anchor="w")
+            else:
+                for p in media_paths:
+                    rrow = tk.Frame(list_inner, bg=SURF2)
+                    rrow.pack(fill="x", padx=8, pady=2)
+                    kind = "VIDEO" if is_video(p) else "AUDIO"
+                    kc   = (("#1e3a1e","#5aab61") if kind == "VIDEO"
+                            else ("#1e2a3a","#5588cc"))
+                    tk.Label(rrow, text=kind, font=("Courier New", 9, "bold"),
+                             bg=kc[0], fg=kc[1], padx=5, pady=2
+                             ).pack(side="left")
+                    tk.Label(rrow, text="  " + os.path.basename(p),
+                             font=FB, bg=SURF2, fg=TEXT,
+                             anchor="w").pack(side="left",
+                                              fill="x", expand=True)
+                    rm = tk.Label(rrow, text="✕", font=FB,
+                                  bg=SURF2, fg=SUB, cursor="hand2", padx=8)
+                    rm.pack(side="right")
+                    def _remove(_e, _p=p):
+                        if _p in media_paths:
+                            media_paths.remove(_p)
+                        _refresh_list()
+                        if not _user_typed_token[0]:
+                            tok_var.set(self._pq_suggest_token(media_paths))
+                    rm.bind("<Button-1>", _remove)
+            if not _user_typed_token[0]:
+                tok_var.set(self._pq_suggest_token(media_paths))
+
+        def _add_paths(paths):
+            for p in paths:
+                p = os.path.abspath(str(p).strip().strip("{}"))
+                if not p or not is_media(p) or p in media_paths:
+                    continue
+                media_paths.append(p)
+            _refresh_list()
+
+        def _on_token_typed(*_):
+            _user_typed_token[0] = bool(tok_var.get().strip())
+        tok_var.trace_add("write", _on_token_typed)
+
+        def _browse():
+            files = filedialog.askopenfilenames(
+                title="Pick interview media",
+                filetypes=[("Media",
+                            "*.wav *.aif *.aiff *.bwf *.mp3 *.m4a *.flac "
+                            "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v"),
+                           ("All", "*.*")])
+            if files:
+                _add_paths(files)
+
+        if HAS_DND:
+            for w_ in (drop, list_canvas, list_inner):
+                w_.drop_target_register(DND_FILES)
+                w_.dnd_bind("<<Drop>>",
+                            lambda e: _add_paths(parse_dnd(e.data)))
+
+        ctl = tk.Frame(win, bg=BG)
+        ctl.pack(fill="x", padx=24, pady=(0, 16))
+        self._btn(ctl, "+ BROWSE", _browse, small=True).pack(side="left")
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=24, pady=(0, 16))
+
+        def _go():
+            token = tok_var.get().strip().upper()
+            token = re.sub(r"[^A-Z0-9_]+", "_", token).strip("_")
+            if not token:
+                messagebox.showwarning("Token required",
+                    "Enter a session token name.", parent=win)
+                return
+            if not media_paths:
+                messagebox.showwarning("No media",
+                    "Add at least one media file.", parent=win)
+                return
+            for s in self._pq_project["sessions"]:
+                if s.get("token") == token:
+                    messagebox.showwarning("Token already in use",
+                        "This Episode Project already has a session with "
+                        "token '{}'.  Pick a different token.".format(token),
+                        parent=win)
+                    return
+
+            session_path = self._pq_default_session_path(token, media_paths)
+            if not session_path:
+                messagebox.showerror("Save path",
+                    "Could not derive a session save path.", parent=win)
+                return
+            session = {
+                "version":    1,
+                "workflow":   "interview_session",
+                "token":      token,
+                "media":      list(media_paths),
+                "transcript": [],
+                "_file_path": session_path,
+            }
+            self._pq_project["sessions"].append(session)
+            self._pq_save_session_file(session)   # write empty-transcript shell
+            win.destroy()
+            self._pq_open_session_view(session, transcribe_now=True)
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "TRANSCRIBE  →", _go, color=ACCENT).pack(side="right")
+
+        _refresh_list()
+        tok_entry.focus_set()
+        self.wait_window(win)
+
+    def _pq_suggest_token(self, paths):
+        """Suggest a token name from filename common content."""
+        import re as _re
+        if not paths:
+            return ""
+        names = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+        SKIP = {"riverside", "raw", "audio", "video", "session", "interview",
+                "speaker", "take", "cfr", "v1", "v2", "v3"}
+        def _toks(n):
+            n = _re.sub(r"[_\-.]+", " ", n.lower())
+            n = _re.sub(r"[^a-z0-9 ]+", " ", n)
+            out = []
+            for w_ in n.split():
+                if w_ in SKIP:               continue
+                if w_.startswith("speaker"): continue
+                if _re.fullmatch(r"\d+", w_):  continue
+                out.append(w_)
+            return out
+        tok_lists = [_toks(n) for n in names]
+        if not any(tok_lists):
+            return _re.sub(r"[^A-Z0-9_]+", "_",
+                          names[0].upper()).strip("_")
+        # Words common to ALL files (in single-file case, that's all of them)
+        common = set(tok_lists[0])
+        for t in tok_lists[1:]:
+            common &= set(t)
+        if not common:
+            for t in tok_lists:
+                if t:
+                    return t[0].upper()
+            return ""
+        # Preserve order from first filename
+        ordered = [w_ for w_ in tok_lists[0] if w_ in common]
+        return "_".join(ordered).upper()
+
+    # ── Session view ────────────────────────────────────────────────────────
+
+    def _pq_open_session_view(self, session, transcribe_now=False):
+        self._clear()
+        self._pq_current_session = session
+
+        # Bottom nav
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8, 0))
+        self._btn(nav, "← BACK TO PROJECT",
+                  self._pq_render_project_view).pack(side="left")
+
+        self._section("INTERVIEW SESSION  —  {}".format(
+            session.get("token", "?")))
+
+        # Header info card
+        info = tk.Frame(self.body, bg=SURF,
+                        highlightbackground=BORDER, highlightthickness=1)
+        info.pack(fill="x", pady=(0, 12))
+        inner = tk.Frame(info, bg=SURF)
+        inner.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(inner, text="TOKEN", font=FL,
+                 bg=SURF, fg=SUB, width=10,
+                 anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(inner, text=session.get("token", ""),
+                 font=FBT, bg=SURF, fg=ACCENT,
+                 anchor="w").grid(row=0, column=1, sticky="w")
+
+        tk.Label(inner, text="MEDIA", font=FL,
+                 bg=SURF, fg=SUB, width=10,
+                 anchor="nw").grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        media_box = tk.Frame(inner, bg=SURF)
+        media_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self._pq_media_box = media_box
+        self._pq_render_media_list(session)
+
+        tk.Label(inner, text="FILE", font=FL,
+                 bg=SURF, fg=SUB, width=10,
+                 anchor="nw").grid(row=2, column=0, sticky="nw", pady=(8, 0))
+        tk.Label(inner, text=session.get("_file_path", "(unsaved)"),
+                 font=FB, bg=SURF, fg=SUB,
+                 anchor="w").grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+        btn_row = tk.Frame(inner, bg=SURF)
+        btn_row.grid(row=3, column=1, sticky="w", pady=(10, 0))
+        self._btn(btn_row, "+ ADD MEDIA",
+                  lambda s=session: self._pq_add_media_to_session(s),
+                  small=True).pack(side="left")
+        self._pq_retx_btn = self._btn(
+            btn_row,
+            ("⟳ RE-TRANSCRIBE" if session.get("transcript") else "⟳ TRANSCRIBE"),
+            lambda s=session: self._pq_run_transcription(s),
+            small=True, color=ACCENT)
+        self._pq_retx_btn.pack(side="left", padx=(8, 0))
+
+        # Background-mode checkbox — same intent as the script→session flow:
+        # opting in makes the whisper worker yield so the rest of the system
+        # stays responsive at the cost of slower decoding.
+        bg_frame = tk.Frame(btn_row, bg=SURF)
+        bg_frame.pack(side="left", padx=(16, 0))
+        if not hasattr(self, "_pq_bg_mode_var"):
+            self._pq_bg_mode_var = tk.BooleanVar(value=False)
+        bg_ck = tk.Label(bg_frame,
+                         text="☑" if self._pq_bg_mode_var.get() else "☐",
+                         font=(_SANS, 14),
+                         bg=SURF, fg=ACCENT if self._pq_bg_mode_var.get() else SUB,
+                         cursor="hand2", padx=4)
+        bg_ck.pack(side="left")
+        bg_lbl = tk.Label(bg_frame, text="Background mode", font=FB,
+                          bg=SURF, fg=SUB, cursor="hand2")
+        bg_lbl.pack(side="left")
+        def _toggle_bg():
+            new_val = not self._pq_bg_mode_var.get()
+            self._pq_bg_mode_var.set(new_val)
+            bg_ck.config(text="☑" if new_val else "☐",
+                         fg=ACCENT if new_val else SUB)
+        bg_ck.bind("<Button-1>",  lambda e: _toggle_bg())
+        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
+
+        # ── Transcript pane (header + search + text) ─────────────────────
+        tx_outer = tk.Frame(self.body, bg=SURF,
+                            highlightbackground=BORDER, highlightthickness=1)
+        tx_outer.pack(fill="both", expand=True, pady=(0, 8))
+
+        # Header row: TRANSCRIPT label + status (right)
+        tx_hdr = tk.Frame(tx_outer, bg=SURF3)
+        tx_hdr.pack(fill="x")
+        tk.Label(tx_hdr, text="TRANSCRIPT", font=FL,
+                 bg=SURF3, fg=SUB, anchor="w",
+                 padx=12, pady=6).pack(side="left")
+        self._pq_status_lbl = tk.Label(tx_hdr, text="", font=FB,
+                                        bg=SURF3, fg=SUB,
+                                        padx=12, pady=6)
+        self._pq_status_lbl.pack(side="right")
+
+        # Search row — Entry + match counter + ◀ ▶ navigation
+        sr = tk.Frame(tx_outer, bg=SURF, padx=12, pady=6)
+        sr.pack(fill="x")
+        tk.Label(sr, text="🔍", font=FB, bg=SURF, fg=SUB
+                 ).pack(side="left", padx=(0, 6))
+        self._pq_search_var = tk.StringVar()
+        sr_entry = tk.Entry(sr, textvariable=self._pq_search_var,
+                             font=FB, bg=SURF2, fg=TEXT,
+                             insertbackground=TEXT, relief="flat",
+                             bd=4, width=32)
+        sr_entry.pack(side="left", ipady=2)
+        self._pq_search_entry = sr_entry
+        self._pq_search_count_lbl = tk.Label(
+            sr, text="", font=FB, bg=SURF, fg=SUB)
+        self._pq_search_count_lbl.pack(side="left", padx=(8, 0))
+
+        self._btn(sr, "▶", lambda: self._pq_search_step(+1),
+                  small=True).pack(side="right", padx=(2, 0))
+        self._btn(sr, "◀", lambda: self._pq_search_step(-1),
+                  small=True).pack(side="right")
+        self._pq_search_var.trace_add(
+            "write", lambda *_: self._pq_search_apply())
+        sr_entry.bind("<Return>", lambda e: self._pq_search_step(+1))
+        sr_entry.bind("<Shift-Return>",
+                      lambda e: self._pq_search_step(-1))
+        sr_entry.bind("<Escape>", lambda e: self._pq_search_clear())
+
+        # Text widget — explicit padx/pady gives a uniform inset all the
+        # way down (the previous bd=8 + scrollbar packing produced the
+        # progressively-narrower-margin glitch).
+        tx_frame = tk.Frame(tx_outer, bg=SURF2)
+        tx_frame.pack(fill="both", expand=True)
+        tx_text = tk.Text(tx_frame, bg=SURF2, fg=TEXT,
+                           insertbackground=TEXT, wrap="word",
+                           relief="flat", bd=0, font=FB,
+                           padx=14, pady=12,
+                           spacing1=0, spacing2=0, spacing3=0,
+                           tabs="",
+                           selectbackground=ACCENT,
+                           selectforeground=TEXT,
+                           # Native undo as a safety net in case any
+                           # programmatic insert path slips through.
+                           undo=True, autoseparators=True, maxundo=-1)
+        # lmargin1/lmargin2/rmargin are tag-only options.  Pin all three
+        # to 0 — applied to every chunk of rendered text so wrapped lines
+        # stay flush left and right.  lmargincolor is also explicitly
+        # transparent (matches widget bg) to rule out any margin-band
+        # rendering quirk.
+        tx_text.tag_configure("body",
+                               lmargin1=0, lmargin2=0, rmargin=0,
+                               lmargincolor=SURF2, rmargincolor=SURF2)
+        # Diagnostic on Ctrl+Shift+D — fast version: samples up to 30
+        # logical lines spread evenly through the document and reports
+        # each one's first display-line dimensions.  Capped iterations
+        # so a giant transcript can't freeze the UI.
+        def _diag(event=None, t=tx_text):
+            try:
+                t.update_idletasks()
+                ww  = t.winfo_width()
+                wh  = t.winfo_height()
+                pad_l = int(t.cget("padx"))
+                content_w = ww - pad_l * 2
+                end_idx = t.index("end-1c")
+                last_line = int(end_idx.split('.')[0])
+                # Sample up to 30 lines evenly distributed
+                if last_line <= 30:
+                    sample = list(range(1, last_line + 1))
+                else:
+                    step = max(1, last_line // 30)
+                    sample = list(range(1, last_line + 1, step))[:30]
+                print("=" * 60)
+                print("PQ-DIAG widget={}x{}  padx={}  content_w={}  "
+                      "total_lines={}".format(ww, wh, pad_l,
+                                               content_w, last_line))
+                widths = []
+                for ln in sample:
+                    dli = t.dlineinfo("{}.0".format(ln))
+                    text = t.get("{}.0".format(ln),
+                                  "{}.end".format(ln))
+                    text_n = len(text)
+                    text_preview = (text[:50] + "…") if text_n > 50 else text
+                    if dli is None:
+                        print("  line {:>4}: (offscreen)  chars={}  {!r}".format(
+                            ln, text_n, text_preview))
+                        continue
+                    x, y, w, h, _ = dli
+                    widths.append(w)
+                    print("  line {:>4}: x={:3d} y={:5d} w={:4d}  "
+                          "chars={:3d}  {!r}".format(
+                              ln, x, y, w, text_n, text_preview))
+                if widths:
+                    print("  rendered widths — min={} max={} avg={}".format(
+                        min(widths), max(widths),
+                        round(sum(widths)/len(widths), 1)))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+            return "break"
+        tx_text.bind("<Control-D>", _diag)
+        tx_text.bind("<Control-d>", _diag)
+        tx_sb = _SlimScrollbar(tx_frame, command=tx_text.yview)
+        tx_sb.pack(side="right", fill="y")
+        tx_text.configure(yscrollcommand=tx_sb.set)
+        tx_text.pack(side="left", fill="both", expand=True)
+        self._pq_tx_text = tx_text
+
+        # Search match highlight tag
+        tx_text.tag_configure("pq_match", background="#5a3a10",
+                              foreground=TEXT)
+        tx_text.tag_configure("pq_match_current", background=ACCENT,
+                              foreground=TEXT)
+
+        # Reset search state on view rebuild
+        self._pq_search_hits = []      # list of (start_idx, end_idx)
+        self._pq_search_cur  = -1
+
+        self._pq_render_transcript_text(session)
+
+        # Bind copy → @PULL
+        for keyspec in ("<Control-c>", "<Control-C>",
+                        "<Command-c>", "<Command-C>"):
+            tx_text.bind(keyspec, self._pq_copy_as_pull)
+
+        # Undo / redo — Ctrl+Z is bound by Tk's Text class when undo=True,
+        # but we add explicit redo on Ctrl+Y AND Ctrl+Shift+Z so users
+        # get whichever convention they expect.
+        def _do_undo(event=None, t=tx_text):
+            try: t.edit_undo()
+            except tk.TclError: pass   # nothing to undo
+            return "break"
+        def _do_redo(event=None, t=tx_text):
+            try: t.edit_redo()
+            except tk.TclError: pass   # nothing to redo
+            return "break"
+        # Ctrl+Z is already wired by Tk class binding; bind it explicitly
+        # too so it always reaches our edit_undo even if some future
+        # bind_all swallows it.
+        tx_text.bind("<Control-z>",       _do_undo)
+        tx_text.bind("<Control-Z>",       _do_undo)
+        tx_text.bind("<Control-y>",       _do_redo)
+        tx_text.bind("<Control-Y>",       _do_redo)
+        tx_text.bind("<Control-Shift-z>", _do_redo)
+        tx_text.bind("<Control-Shift-Z>", _do_redo)
+
+        # Shift+Space → play / stop toggle.  Bound on the Text widget AND
+        # globally so it works whether the transcript or e.g. the search
+        # box has focus.  Returning "break" prevents the space character
+        # from being inserted into the widget.
+        def _shift_space(event=None):
+            self._pq_play_selection()
+            return "break"
+        tx_text.bind("<Shift-space>",          _shift_space)
+        tx_text.bind("<Shift-Key-space>",      _shift_space)
+        sr_entry.bind("<Shift-space>",         _shift_space)
+        sr_entry.bind("<Shift-Key-space>",     _shift_space)
+
+        # Ctrl+R / F5 → re-render the transcript from the same in-memory
+        # data.  Useful when iterating on rendering tweaks: change the
+        # constants in _pq_render_transcript_text, restart PostBridge once,
+        # open the session, then this binding lets us re-run the renderer
+        # without leaving the view.
+        def _rerender(event=None, sess=session):
+            self._pq_render_transcript_text(sess)
+            return "break"
+        tx_text.bind("<Control-r>", _rerender)
+        tx_text.bind("<Control-R>", _rerender)
+        tx_text.bind("<F5>",        _rerender)
+        self.bind("<F5>", _rerender)
+
+        # Action row beneath transcript: PLAY + COPY
+        act = tk.Frame(self.body, bg=BG)
+        act.pack(fill="x", pady=(0, 4))
+        self._btn(act, "COPY SELECTION AS @PULL",
+                  self._pq_copy_as_pull,
+                  color=ACCENT).pack(side="right")
+        self._pq_play_btn = self._btn(
+            act, "▶ PLAY SELECTION",
+            self._pq_play_selection)
+        self._pq_play_btn.pack(side="right", padx=(0, 8))
+        tk.Label(act,
+                 text="Highlight any passage — copy as @PULL or "
+                      "play it back.",
+                 font=FB, bg=BG, fg=SUB).pack(side="right", padx=(0, 12))
+
+        if transcribe_now:
+            self.after(80,
+                       lambda s=session: self._pq_run_transcription(s))
+        elif session.get("_progress", {}).get("active"):
+            # The user opened a session that's already mid-transcription
+            # (kicked off earlier and they navigated back).  Resume the
+            # animation and show the placeholder pane.
+            if (btn := getattr(self, "_pq_retx_btn", None)):
+                btn.config(text="TRANSCRIBING…", fg=SUB)
+            self._pq_render_progress_placeholder()
+            self._pq_animate_progress()
+
+    def _pq_render_media_list(self, session):
+        box = getattr(self, "_pq_media_box", None)
+        if not box:
+            return
+        for w_ in list(box.winfo_children()):
+            w_.destroy()
+        media = session.get("media", [])
+        if not media:
+            tk.Label(box, text="(no media)", font=FB,
+                     bg=SURF, fg=SUB).pack(anchor="w")
+            return
+        for p in media:
+            row = tk.Frame(box, bg=SURF)
+            row.pack(anchor="w")
+            ok = os.path.isfile(p)
+            tk.Label(row, text=("✓ " if ok else "✗ "),
+                     font=FB, bg=SURF,
+                     fg=SUCCESS if ok else ERR
+                     ).pack(side="left")
+            tk.Label(row, text=p,
+                     font=FB, bg=SURF,
+                     fg=TEXT if ok else ERR
+                     ).pack(side="left")
+
+    def _pq_render_transcript_text(self, session, placeholder=None):
+        """Re-render the transcript pane.
+
+        When `placeholder` is given (non-empty string), show it instead of
+        the transcript — used during transcription to display "loading
+        model…" / "transcribing…" without flashing a misleading
+        "click TRANSCRIBE" prompt.
+        """
+        tx = getattr(self, "_pq_tx_text", None)
+        if not tx:
+            return
+        words = session.get("transcript") or []
+        tx.configure(state="normal")
+        tx.delete("1.0", "end")
+        if placeholder:
+            tx.insert("1.0", placeholder)
+            self._pq_word_index = []
+        elif not words:
+            tx.insert("1.0",
+                      "(no transcript yet — click TRANSCRIBE to generate one)")
+            self._pq_word_index = []
+        else:
+            # ─── Render strategy ───────────────────────────────────────
+            # 1. Walk word entries in chronological order.  Whenever
+            #    the speaker changes, emit a visible "<SPEAKER>:\n"
+            #    label tagged with the "speaker_lbl" style.  Speaker
+            #    labels are excluded from word_index so they don't
+            #    appear in @PULL clipboard output.
+            # 2. Within each speaker run, concatenate words into a
+            #    continuous string and run the syntactic paragraph
+            #    detector — same logic that handled the single-speaker
+            #    case.
+            # 3. Insert breaks within speaker runs; speaker turns get a
+            #    full blank-line separation regardless.
+            tx.tag_configure("speaker_lbl",
+                              foreground=ACCENT, font=FBT,
+                              spacing1=10, spacing3=4,
+                              lmargin1=0, lmargin2=0, rmargin=0)
+
+            self._pq_word_index = []
+
+            # Group consecutive words by speaker
+            real_words = [w for w in words
+                          if not w.get("break") and (w.get("word") or "").strip()]
+
+            # Detect if any speakers are actually labelled (multi-track)
+            speakers_present = any(w.get("speaker") for w in real_words)
+
+            # Group into [(speaker, [words]), ...]
+            groups = []
+            cur_speaker = object()
+            cur_words   = []
+            for w in real_words:
+                sp = w.get("speaker") if speakers_present else None
+                if sp != cur_speaker:
+                    if cur_words:
+                        groups.append((cur_speaker, cur_words))
+                    cur_speaker = sp
+                    cur_words   = []
+                cur_words.append(w)
+            if cur_words:
+                groups.append((cur_speaker, cur_words))
+
+            # Render each group: optional speaker label + paragraphed prose
+            for gi, (sp, gwords) in enumerate(groups):
+                # Insert speaker label (only when we have speaker info)
+                if sp and speakers_present:
+                    if gi > 0:
+                        tx.insert("end", "\n\n")
+                    label_text = "{}:\n".format(self._pq_format_speaker(sp))
+                    tx.insert("end", label_text, "speaker_lbl")
+
+                # Build continuous text for this speaker's run
+                cont_buf  = []
+                cont_idx  = []   # (start_in_cont, end_in_cont, word)
+                cpos      = 0
+                first     = True
+                for w in gwords:
+                    wt = w.get("word") or ""
+                    if not wt.strip():
+                        continue
+                    if first:
+                        wt = wt.lstrip()
+                        first = False
+                    cont_idx.append((cpos, cpos + len(wt), w))
+                    cont_buf.append(wt)
+                    cpos += len(wt)
+                continuous = "".join(cont_buf)
+                if not continuous:
+                    continue
+
+                # Syntactic paragraph breaks within this speaker's run
+                break_positions = self._pq_detect_paragraph_breaks(continuous)
+                parts = []
+                last = 0
+                for bp in break_positions:
+                    parts.append(continuous[last:bp])
+                    parts.append("\n\n")
+                    last = bp
+                parts.append(continuous[last:])
+                run_text = "".join(parts)
+
+                # Position in the Text widget where this run starts
+                run_start = tx.index("end-1c")
+                tx.insert("end", run_text, "body")
+
+                # Record word_index char positions in widget coords.
+                # `run_start` is "<line>.<col>" — convert each cont
+                # offset into a widget index relative to that.  Use Tk
+                # math: run_start + Nc.
+                sorted_bps = sorted(break_positions)
+                # Convert run_start to absolute char count from "1.0"
+                run_start_abs = int(tx.count("1.0", run_start, "chars")[0])
+                for s, e, w in cont_idx:
+                    # Add 2 chars for each break before this word in run
+                    n_before = sum(1 for bp in sorted_bps if bp <= s)
+                    shift = n_before * 2
+                    self._pq_word_index.append(
+                        (run_start_abs + s + shift,
+                         run_start_abs + e + shift, w))
+
+            # Reset undo history — programmatic render is not a user
+            # edit, so Ctrl+Z shouldn't revert to "before render".
+            try:
+                tx.edit_reset()
+            except tk.TclError:
+                pass
+        self._pq_update_status_lbl(session)
+
+    def _pq_format_speaker(self, raw):
+        """Tidy a raw speaker tag (filename basename) into a display
+        label.  Strips known boilerplate and uppercases."""
+        if not raw:
+            return ""
+        s = str(raw)
+        s = re.sub(r"\.[a-zA-Z0-9]+$", "", s)        # ext if any
+        s = re.sub(r"^riverside[_\- ]+", "", s, flags=re.I)
+        s = re.sub(r"raw[\-_ ]?audio[\-_ ]?", "", s, flags=re.I)
+        s = re.sub(r"raw[\-_ ]?video[\-_ ]?", "", s, flags=re.I)
+        s = re.sub(r"_blood[_\- ]trails[_\- ]\d+", "", s, flags=re.I)
+        s = re.sub(r"[_\-]+", " ", s).strip()
+        return s.upper() if s else "?"
+
+    def _pq_detect_paragraph_breaks(self, text):
+        """Syntactic paragraph-break detection on already-rendered text.
+
+        Returns a sorted list of character positions in `text`.  At each
+        position the renderer should insert a "\\n\\n" — i.e. break the
+        paragraph BEFORE the character at that position.
+
+        Heuristics, in order of precedence (any one triggers a break):
+          • The sentence we just finished ended with "?"
+                — questions in interview prose almost always sit at a
+                  paragraph boundary (interviewer asks → interviewee
+                  answers, or vice versa).
+          • The next sentence starts with a discourse marker
+                — "So,", "Well,", "Now,", "Okay,", "Right,", "Anyway,"
+                  are reliable paragraph openers in spoken interviews.
+          • Length cap: after `SENTENCES_PER_PARA` consecutive sentences
+            without any other trigger, force a break so we never end up
+            with one runaway paragraph.
+
+        Knobs are exposed as instance attrs (`_pq_sentences_per_para`,
+        `_pq_discourse_starters`) so they can be tweaked from a Python
+        REPL launched with `python -i` without re-transcribing.
+        """
+        if not text:
+            return []
+
+        SENTENCES_PER_PARA = int(getattr(self, "_pq_sentences_per_para", 4))
+        MIN_SENTENCES_BEFORE_BREAK = int(
+            getattr(self, "_pq_min_sentences_before_break", 2))
+        # Hard char fallback: if we ever go this far without any break,
+        # force one at the next sentence boundary regardless of triggers.
+        # Catches the "last third runs on" failure mode where Whisper's
+        # capitalisation drifts and our other signals stop firing.
+        MAX_CHARS_PER_PARA = int(
+            getattr(self, "_pq_max_chars_per_para", 700))
+        # Only the strong topic-shifters.  "right", "yeah", "alright"
+        # were too common as acknowledgments and produced 1-sentence
+        # filler paragraphs.
+        DEFAULT_STARTERS = {
+            "so", "well", "now", "okay", "anyway",
+        }
+        starters = set(getattr(self, "_pq_discourse_starters",
+                                DEFAULT_STARTERS))
+
+        positions = []
+        n = len(text)
+        i = 0
+        sentences_since_break = 0
+        last_break_pos = 0
+        while i < n:
+            ch = text[i]
+            if ch in ".?!":
+                # Walk past any trailing punctuation cluster (e.g. "?!")
+                j = i + 1
+                while j < n and text[j] in ".?!":
+                    j += 1
+                # Skip whitespace
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                # Sentence boundary if next char is alphabetic (any case).
+                # Relaxed from upper-only because Whisper's capitalisation
+                # gets unreliable in long transcripts and we'd otherwise
+                # stop detecting boundaries entirely.
+                if k < n and text[k].isalpha():
+                    sentences_since_break += 1
+                    # Read the next leading word(s) (up to 2)
+                    m = k
+                    while m < n and (text[m].isalpha() or text[m] == "'"):
+                        m += 1
+                    first_word = text[k:m].lower()
+                    # Optional second word for compound starters
+                    p = m
+                    while p < n and text[p].isspace():
+                        p += 1
+                    q = p
+                    while q < n and (text[q].isalpha() or text[q] == "'"):
+                        q += 1
+                    second_word = text[p:q].lower()
+                    two_word = (first_word + " " + second_word).strip()
+
+                    was_question  = (ch == "?")
+                    is_starter    = (first_word in starters
+                                     or two_word in starters)
+                    para_full     = sentences_since_break >= SENTENCES_PER_PARA
+                    long_enough   = sentences_since_break >= MIN_SENTENCES_BEFORE_BREAK
+                    char_overflow = (k - last_break_pos) > MAX_CHARS_PER_PARA
+
+                    # `para_full` and `char_overflow` are unconditional
+                    # caps (length and character).  Question/discourse
+                    # breaks only fire if the paragraph we'd be closing
+                    # has at least MIN_SENTENCES_BEFORE_BREAK sentences
+                    # — avoids fragmenting prose into 1-sentence filler.
+                    if (para_full or char_overflow
+                        or ((was_question or is_starter) and long_enough)):
+                        positions.append(k)
+                        sentences_since_break = 0
+                        last_break_pos = k
+                    i = k
+                    continue
+            i += 1
+
+        # Final safety net: if any span between consecutive breaks is
+        # still > 2× MAX_CHARS (because no sentence boundaries were
+        # detected at all in that region), force breaks at the nearest
+        # whitespace to the midpoint.  This handles transcripts where
+        # Whisper produced a long stretch with no punctuation.
+        TOO_LONG = 2 * MAX_CHARS_PER_PARA
+        boundaries = [0] + positions + [n]
+        forced = []
+        for idx in range(len(boundaries) - 1):
+            start = boundaries[idx]
+            end   = boundaries[idx + 1]
+            span  = end - start
+            if span <= TOO_LONG:
+                continue
+            # Bisect: insert breaks every MAX_CHARS_PER_PARA at nearest spaces
+            cur = start + MAX_CHARS_PER_PARA
+            while cur < end - MAX_CHARS_PER_PARA // 2:
+                bp = cur
+                # Find nearest whitespace within ±200 chars
+                for off in range(200):
+                    if cur - off > start and text[cur - off].isspace():
+                        bp = cur - off + 1
+                        break
+                    if cur + off < end and text[cur + off].isspace():
+                        bp = cur + off + 1
+                        break
+                forced.append(bp)
+                cur = bp + MAX_CHARS_PER_PARA
+        if forced:
+            positions = sorted(set(positions + forced))
+
+        return positions
+
+    def _pq_update_status_lbl(self, session):
+        lbl = getattr(self, "_pq_status_lbl", None)
+        if not lbl:
+            return
+        n_words = len(session.get("transcript") or [])
+        if not n_words:
+            lbl.config(text="not transcribed", fg=WARN)
+            return
+        last  = session["transcript"][-1]
+        dur_s = float(last.get("end", 0))
+        h = int(dur_s // 3600)
+        m = int((dur_s % 3600) // 60)
+        s = int(dur_s % 60)
+        lbl.config(text="{:,} words · {:02d}:{:02d}:{:02d}".format(
+                       n_words, h, m, s), fg=SUB)
+
+    def _pq_remove_session(self, session):
+        if not messagebox.askyesno(
+                "Remove from project",
+                "Remove '{}' from this Episode Project?\n\n"
+                "The session JSON on disk will not be deleted.".format(
+                    session.get("token", "?"))):
+            return
+        self._pq_project["sessions"] = [
+            s for s in self._pq_project["sessions"] if s is not session]
+        self._pq_render_project_view()
+
+    def _pq_add_media_to_session(self, session):
+        files = filedialog.askopenfilenames(
+            title="Add media to session",
+            filetypes=[("Media",
+                        "*.wav *.aif *.aiff *.bwf *.mp3 *.m4a *.flac "
+                        "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v"),
+                       ("All", "*.*")])
+        added = 0
+        media = list(session.get("media", []))
+        for f in files:
+            f = os.path.abspath(f)
+            if f not in media and is_media(f):
+                media.append(f)
+                added += 1
+        if not added:
+            return
+        session["media"] = media
+        # Adding new media invalidates the existing transcript
+        session["transcript"] = []
+        self._pq_save_session_file(session)
+        self._pq_render_media_list(session)
+        self._pq_render_transcript_text(session)
+        if getattr(self, "_pq_retx_btn", None):
+            self._pq_retx_btn.config(text="⟳ TRANSCRIBE")
+
+    def _pq_run_transcription(self, session):
+        """Kick off (or refuse to start) a transcription for `session`.
+
+        State lives on the session dict (`session["_progress"]`) so multiple
+        sessions can be transcribing at once — start one, navigate back to
+        the project, start the next, etc.  The animation timer reads from
+        the *currently visible* session's progress dict.
+        """
+        # Refuse to start a duplicate run for the same session.
+        if session.get("_progress", {}).get("active"):
+            return
+
+        media = list(session.get("media", []))
+        if not media:
+            messagebox.showwarning("No media",
+                "Add at least one media file before transcribing.")
+            return
+        missing = [p for p in media if not os.path.isfile(p)]
+        if missing:
+            messagebox.showerror("Missing files",
+                "These files no longer exist:\n\n" +
+                "\n".join("  • " + p for p in missing))
+            return
+
+        if not HAS_WHISPER:
+            messagebox.showerror("Not installed",
+                "faster-whisper is not installed.\n\n"
+                "Run:  pip install faster-whisper")
+            return
+
+        bg_mode = bool(getattr(self, "_pq_bg_mode_var",
+                               tk.BooleanVar(value=False)).get())
+
+        # Per-session progress state — concurrent-safe: each session has its
+        # own dict, the animation timer reads only the current session's.
+        session["_progress"] = {
+            "phase":      "starting",
+            "extra":      "",
+            "active":     True,
+            "elapsed":    0,
+            "started":    time.perf_counter(),
+            "total_secs": 0.0,   # filled in by the worker once it probes
+        }
+
+        # Update UI for THIS session only if it's the one on screen.
+        is_current = (getattr(self, "_pq_current_session", None) is session)
+        if is_current:
+            btn = getattr(self, "_pq_retx_btn", None)
+            lbl = getattr(self, "_pq_status_lbl", None)
+            if btn: btn.config(text="TRANSCRIBING…", fg=SUB)
+            if lbl: lbl.config(text="starting…", fg=ACCENT)
+            self._pq_render_progress_placeholder()
+            self._pq_animate_progress()
+
+        # Background-mode → lower process priority for the duration.
+        # Track per-thread so concurrent runs don't fight over priority.
+        prev_priority = self._pq_apply_priority(low=bg_mode)
+
+        def _set_phase(phase, extra=""):
+            prog = session.get("_progress")
+            if not prog or not prog.get("active"):
+                return
+            prog["phase"] = phase
+            prog["extra"] = extra
+
+        def _fmt_dur(secs):
+            secs = max(0, int(secs))
+            h, r = divmod(secs, 3600)
+            m, s = divmod(r, 60)
+            return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+
+        def _worker():
+            t0 = time.perf_counter()
+            try:
+                # Probe total duration upfront so the progress display has
+                # context — "of 01:32:15" rather than just "decoded".
+                _set_phase("preparing")
+                try:
+                    durs = []
+                    for p in media:
+                        d = engines.get_media_duration(p) or 0.0
+                        if d:
+                            durs.append(float(d))
+                    # mix_for_transcript pads to the longest input; for a
+                    # single source the duration is just the source itself.
+                    total = max(durs) if durs else 0.0
+                    if (prog := session.get("_progress")):
+                        prog["total_secs"] = total
+                except Exception:
+                    pass
+
+                _set_phase("loading model")
+                engines.get_model()
+
+                audios = [p for p in media if not is_video(p)]
+                if not audios:
+                    audios = list(media)
+
+                tmp_paths = []
+                try:
+                    def _on_seg_end(audio_s, **kw):
+                        prog = session.get("_progress")
+                        if not prog or not prog.get("active"):
+                            return
+                        total = prog.get("total_secs", 0)
+                        track_name = kw.get("track_name")
+                        n_tracks   = kw.get("n_tracks", 1)
+                        idx        = (kw.get("track_index", 0) or 0) + 1
+                        prefix = ""
+                        if track_name and n_tracks > 1:
+                            prefix = " [track {}/{}]".format(idx, n_tracks)
+                        if total > 0:
+                            pct = max(0, min(100, audio_s * 100.0 / total))
+                            prog["extra"] = "{} · {} of {} ({:.0f}%)".format(
+                                prefix, _fmt_dur(audio_s),
+                                _fmt_dur(total), pct)
+                        else:
+                            prog["extra"] = "{} · {} decoded".format(
+                                prefix, _fmt_dur(audio_s))
+
+                    if len(audios) == 1:
+                        # Single source — existing fast path.
+                        with tempfile.NamedTemporaryFile(
+                                suffix=".wav", delete=False) as _tf:
+                            mix_path = _tf.name
+                        tmp_paths.append(mix_path)
+                        _set_phase("extracting audio")
+                        ok, err = engines.extract_window(
+                            audios[0], 0, 9999, mix_path)
+                        if not ok:
+                            raise RuntimeError(
+                                "audio extract failed: " + (err or ""))
+                        _set_phase("transcribing", "")
+                        words = engines.transcribe_clip_verbatim(
+                            mix_path, progress_cb=_on_seg_end)
+                    else:
+                        # Multi-track — transcribe each independently so
+                        # we know who said what (speaker = source file).
+                        # Speaker labels can be customised via
+                        # session["speakers"] = {basename: label}.
+                        speaker_labels = session.get("speakers") or {}
+                        _set_phase("transcribing {} tracks".format(
+                            len(audios)))
+                        words = engines.transcribe_session_per_track(
+                            audios, speaker_labels=speaker_labels,
+                            progress_cb=_on_seg_end)
+                        # Build a mix purely for the playback cache so
+                        # the user can hear both speakers when auditioning
+                        # transcript regions.
+                        _set_phase("building playback mix")
+                        mix_path = engines.mix_for_transcript(audios)
+                        tmp_paths.append(mix_path)
+
+                    # Persist the mix (or single extracted WAV) as the
+                    # session's playback cache.
+                    cache_dest = self._pq_audio_cache_path(session)
+                    if cache_dest and os.path.isfile(mix_path):
+                        try:
+                            import shutil as _sh
+                            os.makedirs(os.path.dirname(cache_dest),
+                                        exist_ok=True)
+                            _sh.copyfile(mix_path, cache_dest)
+                            session["audio_cache"] = cache_dest
+                        except Exception:
+                            pass
+                finally:
+                    for tp in tmp_paths:
+                        try: os.unlink(tp)
+                        except Exception: pass
+
+                session["transcript"] = list(words or [])
+                self._pq_save_session_file(session)
+
+                elapsed = round(time.perf_counter() - t0, 1)
+                def _done():
+                    prog = session.get("_progress")
+                    if prog is not None:
+                        prog["active"] = False
+                    # If the user is still looking at this session, refresh
+                    # its view.  Otherwise update the project row in place
+                    # (if it's on screen) — no full re-render, no twitch.
+                    if getattr(self, "_pq_current_session", None) is session:
+                        self._pq_render_transcript_text(session)
+                        if (btn := getattr(self, "_pq_retx_btn", None)):
+                            btn.config(text="⟳ RE-TRANSCRIBE", fg=TEXT)
+                        if (lbl := getattr(self, "_pq_status_lbl", None)):
+                            lbl.config(text="✓ done in {}s".format(elapsed),
+                                        fg=SUCCESS)
+                            self.after(2500,
+                                       lambda: self._pq_update_status_lbl(session))
+                    elif (getattr(self, "_pq_current_session", None) is None
+                          and getattr(self, "_pq_project", None) is not None):
+                        self._pq_update_project_row(session)
+                self._ui(_done)
+            except Exception as e:
+                err = str(e)
+                def _err():
+                    prog = session.get("_progress")
+                    if prog is not None:
+                        prog["active"] = False
+                    if getattr(self, "_pq_current_session", None) is session:
+                        if (btn := getattr(self, "_pq_retx_btn", None)):
+                            btn.config(text="⟳ TRANSCRIBE", fg=TEXT)
+                        if (lbl := getattr(self, "_pq_status_lbl", None)):
+                            lbl.config(text="error", fg=ERR)
+                        self._pq_render_transcript_text(session)
+                    elif getattr(self, "_pq_current_session", None) is None:
+                        self._pq_update_project_row(session)
+                    messagebox.showerror(
+                        "Transcription failed ({})".format(
+                            session.get("token", "?")), err)
+                self._ui(_err)
+            finally:
+                self._pq_apply_priority(low=False, prev=prev_priority)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _pq_render_progress_placeholder(self):
+        """Show an animated 'transcription in progress' message in the
+        transcript pane, replacing both the static placeholder and any
+        prior transcript text.  Reads progress from the currently-visible
+        session.  Silently no-ops if the widget has been destroyed (user
+        navigated away) or this session isn't running."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if not tx or session is None:
+            return
+        prog = session.get("_progress") or {}
+        if not prog.get("active"):
+            return
+        try:
+            if not tx.winfo_exists():
+                return
+            dots = "." * (1 + (prog.get("elapsed", 0) % 3))
+            msg = ("  {}{}{}\n\n  (transcription continues in the background "
+                   "— feel free to navigate away or transcribe other "
+                   "sessions; results save automatically.)").format(
+                       prog.get("phase", "working"),
+                       prog.get("extra", ""), dots)
+            tx.configure(state="normal")
+            tx.delete("1.0", "end")
+            tx.insert("1.0", msg)
+            self._pq_word_index = []
+        except tk.TclError:
+            return
+
+    def _pq_animate_progress(self):
+        """Tick the dots animation every 600 ms while the currently-visible
+        session is transcribing.  Stops automatically when active=False or
+        when the user navigates away."""
+        session = getattr(self, "_pq_current_session", None)
+        if session is None:
+            return
+        prog = session.get("_progress") or {}
+        if not prog.get("active"):
+            return
+        prog["elapsed"] = prog.get("elapsed", 0) + 1
+        lbl = getattr(self, "_pq_status_lbl", None)
+        if lbl:
+            try:
+                if lbl.winfo_exists():
+                    phase = prog.get("phase", "working")
+                    extra = prog.get("extra", "")
+                    lbl.config(text="{}{}{}".format(
+                        phase, extra, "." * (1 + (prog["elapsed"] % 3))),
+                        fg=ACCENT)
+            except tk.TclError:
+                pass
+        self._pq_render_progress_placeholder()
+        self.after(600, self._pq_animate_progress)
+
+    def _pq_apply_priority(self, low, prev=None):
+        """Lower (or restore) the host process priority.
+
+        Returns the previous priority handle so it can be restored from a
+        finally clause.  Failures are swallowed — priority is best-effort.
+        """
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                BELOW_NORMAL = 0x00004000
+                NORMAL       = 0x00000020
+                handle = k32.GetCurrentProcess()
+                if prev is not None:
+                    k32.SetPriorityClass(handle, prev)
+                    return prev
+                cur = k32.GetPriorityClass(handle)
+                target = BELOW_NORMAL if low else NORMAL
+                if cur != target:
+                    k32.SetPriorityClass(handle, target)
+                return cur
+            elif hasattr(os, "nice"):
+                # POSIX: relative niceness; we apply +10 when entering low
+                # mode, then -10 when restoring.
+                if prev is not None:
+                    try:
+                        os.nice(-int(prev))
+                    except Exception:
+                        pass
+                    return None
+                if low:
+                    try:
+                        os.nice(10)
+                        return 10
+                    except Exception:
+                        return None
+                return None
+        except Exception:
+            return None
+        return None
+
+    # ── Search ────────────────────────────────────────────────────────────
+    def _pq_search_apply(self):
+        """Recompute matches for the current query and refresh highlights.
+
+        Wrapped in a top-level try/except so a malformed query (or any
+        Tk quirk) can never crash the app — search just reports the
+        error and bails.
+        """
+        tx = getattr(self, "_pq_tx_text", None)
+        var = getattr(self, "_pq_search_var", None)
+        lbl = getattr(self, "_pq_search_count_lbl", None)
+        if tx is None or var is None:
+            return
+        try:
+            tx.tag_remove("pq_match",         "1.0", "end")
+            tx.tag_remove("pq_match_current", "1.0", "end")
+        except tk.TclError:
+            return
+        self._pq_search_hits = []
+        self._pq_search_cur  = -1
+
+        term = var.get().strip()
+        if not term:
+            if lbl: lbl.config(text="", fg=SUB)
+            return
+
+        try:
+            idx       = "1.0"
+            term_len  = len(term)
+            count_var = tk.IntVar(self)   # populated by Tk on each match
+            # Hard upper bound on iterations so we cannot pathologically
+            # loop on a degenerate query — 5000 hits is far more than
+            # any user would ever need to see.
+            for _ in range(5000):
+                pos = tx.search(term, idx, stopindex="end",
+                                 nocase=True, count=count_var)
+                if not pos:
+                    break
+                # `count_var` reports the actual match length (handy if
+                # we add regex mode later); for plain text it equals
+                # `term_len` but reading the var is the safer path.
+                hit_len = count_var.get() or term_len
+                end = "{}+{}c".format(pos, hit_len)
+                tx.tag_add("pq_match", pos, end)
+                self._pq_search_hits.append((pos, end))
+                # Always advance — if the search returns the same
+                # position twice (shouldn't, but be paranoid) we still
+                # break the loop.
+                new_idx = end
+                if new_idx == idx:
+                    break
+                idx = new_idx
+        except (tk.TclError, ValueError) as exc:
+            if lbl:
+                lbl.config(text="search error: {}".format(str(exc)[:32]),
+                           fg=ERR)
+            return
+
+        n = len(self._pq_search_hits)
+        if lbl:
+            lbl.config(
+                text=("{} match{}".format(n, "es" if n != 1 else "")
+                      if n else "no matches"),
+                fg=SUCCESS if n else WARN)
+        if n:
+            self._pq_search_cur = 0
+            self._pq_search_focus_current()
+
+    def _pq_search_step(self, delta):
+        n = len(getattr(self, "_pq_search_hits", []))
+        if not n:
+            # Re-run the search if user hits Enter on a fresh query
+            self._pq_search_apply()
+            return
+        cur = (self._pq_search_cur + delta) % n
+        self._pq_search_cur = cur
+        self._pq_search_focus_current()
+
+    def _pq_search_focus_current(self):
+        tx = getattr(self, "_pq_tx_text", None)
+        hits = getattr(self, "_pq_search_hits", [])
+        cur  = getattr(self, "_pq_search_cur", -1)
+        lbl  = getattr(self, "_pq_search_count_lbl", None)
+        if tx is None or not hits or cur < 0:
+            return
+        try:
+            tx.tag_remove("pq_match_current", "1.0", "end")
+            start, end = hits[cur]
+            tx.tag_add("pq_match_current", start, end)
+            tx.see(start)
+        except tk.TclError:
+            return
+        if lbl:
+            lbl.config(text="{} of {}".format(cur + 1, len(hits)),
+                       fg=SUCCESS)
+
+    def _pq_search_clear(self):
+        var = getattr(self, "_pq_search_var", None)
+        if var is not None:
+            var.set("")
+
+    # ── Audio playback ────────────────────────────────────────────────────
+    def _pq_audio_cache_path(self, session):
+        """Return the path where the playback cache for this session lives."""
+        media = session.get("media") or []
+        token = session.get("token") or "SESSION"
+        if not media:
+            return None
+        return os.path.join(os.path.dirname(os.path.abspath(media[0])),
+                            "{}.pb_audio.wav".format(token))
+
+    def _pq_play_selection(self):
+        """Extract the time range under the current selection (or word at
+        cursor) from the persisted session audio and play it via winsound."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return
+
+        # If currently playing, the play button doubles as STOP.
+        if getattr(self, "_pq_playing", False):
+            self._pq_stop_playback()
+            return
+
+        # Resolve selected words → time range
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            messagebox.showinfo("Nothing to play",
+                "Transcribe this session first.")
+            return
+
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            sel_first = sel_last = None
+
+        play_to_end = False
+        if sel_first and sel_last:
+            try:
+                c0 = tx.count("1.0", sel_first, "chars")[0]
+                c1 = tx.count("1.0", sel_last,  "chars")[0]
+            except Exception:
+                return
+            picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
+        else:
+            # No selection — play indefinitely from the cursor word to the
+            # end of the audio (Shift+Space toggles stop).
+            try:
+                c0 = tx.count("1.0", tx.index("insert"), "chars")[0]
+            except Exception:
+                return
+            picked = [w for (s, e, w) in word_idx if s <= c0 < e]
+            if not picked:
+                # Cursor is past the last word — start at the next word
+                picked = [w for (s, e, w) in word_idx if s >= c0][:1]
+            if not picked and word_idx:
+                picked = [word_idx[0][2]]
+            play_to_end = True
+
+        if not picked:
+            messagebox.showinfo("Nothing to play",
+                "Click inside a word or select a passage first.")
+            return
+
+        in_s = float(picked[0].get("start", 0))
+        if play_to_end:
+            # Use the cached audio's full duration as the end so we play
+            # to the very end without arbitrary truncation.
+            out_s = None   # signals open-ended below
+        else:
+            out_s = float(picked[-1].get("end", in_s))
+            if out_s <= in_s:
+                out_s = in_s + 5.0
+
+        # Prefer the persisted session audio (matches what was transcribed);
+        # fall back to the first source file.
+        cache = session.get("audio_cache") or self._pq_audio_cache_path(session)
+        if cache and not os.path.isfile(cache):
+            cache = None
+        src = cache or (session.get("media") or [None])[0]
+        if not src or not os.path.isfile(src):
+            messagebox.showerror("No audio",
+                "Cannot find audio for this session.")
+            return
+
+        # Resolve the duration to extract.  For open-ended playback (no
+        # selection), probe the audio file once to get its full length.
+        if out_s is None:
+            try:
+                total = engines.get_media_duration(src) or (in_s + 7200)
+            except Exception:
+                total = in_s + 7200
+            duration_s = max(1.0, total - in_s)
+        else:
+            duration_s = max(0.5, out_s - in_s)
+
+        # Extract → temp WAV → play
+        try:
+            tf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tf.close()
+            engines.extract_audio_segment(
+                src, in_s, duration_s, tf.name,
+                sample_rate=22050)
+        except Exception as e:
+            messagebox.showerror("Playback failed", str(e))
+            return
+
+        # Clean up any prior temp first
+        if (prev := getattr(self, "_pq_play_tmp", None)):
+            try: os.unlink(prev)
+            except Exception: pass
+        self._pq_play_tmp = tf.name
+
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.PlaySound(tf.name,
+                                   winsound.SND_FILENAME | winsound.SND_ASYNC)
+                self._pq_playing = True
+                if (b := getattr(self, "_pq_play_btn", None)):
+                    b.config(text="■ STOP")
+                # Schedule auto-restore of button text once playback ends
+                dur_ms = int(max(500, duration_s * 1000) + 300)
+                self.after(dur_ms, self._pq_stop_playback)
+            except Exception as e:
+                messagebox.showerror("Playback failed", str(e))
+        else:
+            messagebox.showinfo("Playback unsupported",
+                "Audio playback is only wired up for Windows in this build.")
+
+    def _pq_stop_playback(self):
+        if not getattr(self, "_pq_playing", False):
+            return
+        self._pq_playing = False
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        if (b := getattr(self, "_pq_play_btn", None)):
+            try:
+                b.config(text="▶ PLAY SELECTION")
+            except tk.TclError:
+                pass
+
+    def _pq_copy_as_pull(self, event=None):
+        """Convert the current transcript selection into a @PULL block."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return None
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            return None   # no selection — let default copy run
+
+        # Convert tk indices to character offsets from "1.0".
+        try:
+            c0 = tx.count("1.0", sel_first, "chars")[0]
+            c1 = tx.count("1.0", sel_last,  "chars")[0]
+        except Exception:
+            return "break"
+
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            return "break"
+
+        # All words whose character range overlaps the selection.
+        selected = [w for (s_, e_, w) in word_idx if e_ > c0 and s_ < c1]
+        if not selected:
+            return "break"
+
+        in_s  = float(selected[0].get("start", 0))
+        out_s = float(selected[-1].get("end", in_s))
+        # Reconstruct the quote text from the SELECTED WORD entries,
+        # not from the widget — this way the visible speaker labels
+        # ("JORDAN:" headers) stay out of the clipboard automatically.
+        text = "".join(w.get("word") or "" for w in selected)
+        text = re.sub(r"\s+", " ", text).strip()
+        block = "@PULL {} [{}-{}]\n{}\n".format(
+            session.get("token", "?"),
+            secs_tc(in_s).split(".")[0],
+            secs_tc(out_s).split(".")[0],
+            text)
+        self.clipboard_clear()
+        self.clipboard_append(block)
+        self.update()
+
+        # Brief flash on the status label
+        lbl = getattr(self, "_pq_status_lbl", None)
+        if lbl:
+            prev_text = lbl.cget("text")
+            prev_fg   = lbl.cget("fg")
+            lbl.config(
+                text="✓ @PULL copied  [{}–{}]".format(
+                    secs_tc(in_s).split(".")[0],
+                    secs_tc(out_s).split(".")[0]),
+                fg=SUCCESS)
+            self.after(2000,
+                       lambda: lbl.config(text=prev_text, fg=prev_fg))
+        return "break"
+
     def _reset(self):
         self.workflow=None; self.tokens=[]; self.parts=[]; self.pulls=[]
         self.results=[]; self.doc_title=""; self.bins={}; self._pool=None
@@ -9257,4 +10826,19 @@ if __name__ == "__main__":
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
-    App().mainloop()
+
+    # ── Optional CLI arg: a session JSON to auto-open ─────────────────────────
+    # When PostBridge is launched from a Windows file association
+    # ("PostBridge.exe %1" or "python main.py %1"), the session path arrives
+    # as sys.argv[1].  We schedule the open after the mainloop starts so the
+    # window is already visible when any error dialog appears.
+    _autoload_path = None
+    if len(sys.argv) > 1:
+        _candidate = sys.argv[1]
+        if os.path.isfile(_candidate):
+            _autoload_path = _candidate
+
+    _app = App()
+    if _autoload_path:
+        _app.after(0, lambda p=_autoload_path: _app._open_session(p))
+    _app.mainloop()

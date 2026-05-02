@@ -1,6 +1,7 @@
 import os
 import tkinter as tk
 import re
+import threading
 from tkinter import filedialog
 
 try:
@@ -62,6 +63,42 @@ def _pool_norm(path):
     plain    = ' '.join(re.sub(r'[_\-\.]+', ' ', base.lower()).split())
     stripped = ' '.join(re.sub(r'[_\-\.]+', ' ', _strip_media_type(base)).split())
     return plain, stripped
+
+def _get_dur_key(path):
+    """Return file duration rounded to nearest second as a string key, or None.
+    Used to identify duration-matched files for auto-linking.  Called in a
+    background thread so blocking subprocess calls are fine."""
+    import subprocess as _sp
+    import json as _json
+    ext = os.path.splitext(path)[1].lower()
+    # Fast path: native Python for WAV files
+    if ext == '.wav':
+        try:
+            import wave as _wave
+            with _wave.open(path, 'rb') as wf:
+                dur = wf.getnframes() / float(wf.getframerate())
+                return str(round(dur))
+        except Exception:
+            pass  # fall through to ffprobe
+    # General path: ffprobe for everything else (including AIFF, MP4, MOV…)
+    try:
+        try:
+            from engines import _ffprobe_cmd
+            probe = _ffprobe_cmd()
+        except Exception:
+            probe = ['ffprobe']
+        res = _sp.run(
+            probe + ['-v', 'quiet', '-print_format', 'json',
+                     '-show_entries', 'format=duration', path],
+            capture_output=True, timeout=10)
+        if res.returncode == 0:
+            data = _json.loads(res.stdout)
+            dur = float(data['format']['duration'])
+            return str(round(dur))
+    except Exception:
+        pass
+    return None
+
 
 # ── Slim scrollbar ────────────────────────────────────────────────────────────
 class _SlimScrollbar(tk.Canvas):
@@ -541,11 +578,9 @@ class MediaPool(tk.Frame):
         self._parts   = parts
         self._rows         = []
         self._auto_assigned = set()
-        self._src_vars = {tok: tk.StringVar(value="") for tok in tokens}
         self._aaf_mode          = aaf_mode
         self._prune_scheduled   = False
         self._sort_scheduled    = False   # deferred _sort_rows flag
-        self._src_dd_scheduled  = False   # deferred _rebuild_src_dropdowns flag
         self._bulk_loading      = False   # suppresses trace-driven rebuild during restore
         self._user_unassigned   = set()   # paths the user explicitly cleared
 
@@ -604,18 +639,6 @@ class MediaPool(tk.Frame):
                 w.dnd_bind("<<Drop>>",
                            lambda e: [self._add(p) for p in parse_dnd(e.data)])
 
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=12, pady=(8,0))
-        src_hdr = tk.Frame(self, bg=SURF)
-        src_hdr.pack(fill="x", padx=12, pady=(6,2))
-        tk.Label(src_hdr, text="TRANSCRIPT SOURCES  ",
-                 font=FL, bg=SURF, fg=ACCENT).pack(side="left")
-        tk.Label(src_hdr,
-                 text="(which file Whisper reads for each session — choose guest audio)",
-                 font=FB, bg=SURF, fg=SUB).pack(side="left")
-        self._src_frame = tk.Frame(self, bg=SURF)
-        self._src_frame.pack(fill="x", padx=12, pady=(0,10))
-        self._src_dropdowns = {}
-        self._rebuild_src_dropdowns()
 
     def _browse_files(self):
         paths = filedialog.askopenfilenames(
@@ -652,8 +675,7 @@ class MediaPool(tk.Frame):
                     if os.path.splitext(fn)[1].lower() in EXTS:
                         paths.append(os.path.join(root, fn))
             self.after(0, lambda ps=paths: [self._add(p) for p in ps])
-        import threading as _threading
-        _threading.Thread(target=_walk, daemon=True).start()
+        threading.Thread(target=_walk, daemon=True).start()
 
     def _add(self, path):
         if not path: return
@@ -701,9 +723,12 @@ class MediaPool(tk.Frame):
                 else:
                     self._user_unassigned.discard(_p)
             _apply_token_style(_v.get())
-            self._mirror_assignment(_p, _v.get())
-            if not self._bulk_loading:
-                self._rebuild_src_dropdowns()
+            if not getattr(self, "_link_propagating", False):
+                self._mirror_assignment(_p, _v.get())
+            if (not getattr(self, "_in_mirror", False)
+                    and not getattr(self, "_link_propagating", False)
+                    and not self._bulk_loading):
+                self._handle_link_change(_p, _v.get())
         var.trace_add("write", _on_token_change)
 
         initial_bg = _token_row_bg(tok)
@@ -789,13 +814,21 @@ class MediaPool(tk.Frame):
         )
         om.pack(fill="both", expand=True)
 
+        # Link indicator — packed by _update_link_visuals when row is in a group
+        link_lbl = tk.Label(row, text="↔", font=("Courier New", 9, "bold"),
+                            bg=initial_bg, fg=ACCENT, padx=4, pady=2)
+        tint_refs.append(link_lbl)
+        # (not packed here — _update_link_visuals inserts it before rm when needed)
+
         rm = tk.Label(row, text="✕", font=FB, bg=initial_bg, fg=SUB,
                       cursor="hand2", padx=6)
         rm.pack(side="left")
         tint_refs.append(rm)
 
         rec = {"path": path, "var": var, "row": row, "fn_frame": fn_frame,
-               "fn_lbl": fn_lbl, "dd_frame": dd_frame, "sash": sash}
+               "fn_lbl": fn_lbl, "dd_frame": dd_frame, "sash": sash,
+               "link_id": None, "link_mirrored": False,
+               "link_lbl": link_lbl, "rm_lbl": rm}
         self._rows.append(rec)
         rm.bind("<Button-1>", lambda e, r=rec: self._remove(r))
 
@@ -804,14 +837,17 @@ class MediaPool(tk.Frame):
         if not self._sort_scheduled:
             self._sort_scheduled = True
             self.after(50, self._deferred_sort)
-        if not self._src_dd_scheduled:
-            self._src_dd_scheduled = True
-            self.after(60, self._deferred_src_dd)
-
         # In AAF mode, schedule a deferred video-prune once after bulk imports
         if self._aaf_mode and not self._prune_scheduled:
             self._prune_scheduled = True
             self.after(80, self._deferred_prune)
+
+        # Background: detect duration and assign to a link group
+        def _fetch_dur(_p=path):
+            dk = _get_dur_key(_p)
+            if dk is not None:
+                self.after(0, lambda: self._set_link_group(_p, dk))
+        threading.Thread(target=_fetch_dur, daemon=True).start()
 
     def _sort_rows(self):
         """Re-pack pool rows alphabetically; auto-size columns unless user has
@@ -913,10 +949,6 @@ class MediaPool(tk.Frame):
         self._sort_scheduled = False
         self._sort_rows()
 
-    def _deferred_src_dd(self):
-        self._src_dd_scheduled = False
-        self._rebuild_src_dropdowns()
-
     def _deferred_prune(self):
         self._prune_scheduled = False
         self.prune_redundant_videos()
@@ -1011,44 +1043,90 @@ class MediaPool(tk.Frame):
         finally:
             self._in_mirror = False
 
+    def _set_link_group(self, path, dur_key):
+        """Called on the main thread after the background duration fetch.
+        Assigns link_id to the row and refreshes the link indicators."""
+        for r in self._rows:
+            if r["path"] == path:
+                r["link_id"] = dur_key
+                break
+        self._update_link_visuals()
+
+    def _handle_link_change(self, path, new_token):
+        """Called when the user changes a token (not via mirror or propagation).
+        If the row was passively mirrored, break its link so it can diverge.
+        Otherwise propagate the new token to all files in the same duration group."""
+        for r in self._rows:
+            if r["path"] == path:
+                if r.get("link_mirrored"):
+                    # User overrode a passively-linked row → unlink it completely
+                    r["link_id"] = None
+                    r["link_mirrored"] = False
+                    self._update_link_visuals()
+                else:
+                    self._propagate_link_change(path, new_token)
+                return
+
+    def _propagate_link_change(self, path, new_token):
+        """Mirror new_token to all rows sharing the same link_id as path."""
+        src_link_id = None
+        for r in self._rows:
+            if r["path"] == path:
+                src_link_id = r.get("link_id")
+                break
+        if not src_link_id:
+            return
+        self._link_propagating = True
+        try:
+            for r in self._rows:
+                if r["path"] == path:
+                    continue
+                if r.get("link_id") == src_link_id:
+                    r["link_mirrored"] = True
+                    r["var"].set(new_token)
+        finally:
+            self._link_propagating = False
+        self._update_link_visuals()
+
+    def _update_link_visuals(self):
+        """Show or hide the ↔ link indicator on each pool row.
+        Active (source) rows show it in ACCENT; passively-mirrored rows in SUB."""
+        # Count rows per link_id
+        counts: dict = {}
+        for r in self._rows:
+            lid = r.get("link_id")
+            if lid:
+                counts[lid] = counts.get(lid, 0) + 1
+
+        for r in self._rows:
+            lbl = r.get("link_lbl")
+            rm  = r.get("rm_lbl")
+            if lbl is None or rm is None:
+                continue
+            lid     = r.get("link_id")
+            visible = lid is not None and counts.get(lid, 0) >= 2
+            if visible:
+                color = SUB if r.get("link_mirrored") else ACCENT
+                lbl.config(fg=color)
+                try:
+                    lbl.pack(side="left", before=rm)
+                except Exception:
+                    pass
+            else:
+                try:
+                    lbl.pack_forget()
+                except Exception:
+                    pass
+
     def _remove(self, rec):
         self._rows = [r for r in self._rows if r is not rec]
         rec["row"].destroy()
         self._refresh_count()
-        self._rebuild_src_dropdowns()
+        self._update_link_visuals()
 
     def _refresh_count(self):
         n = len(self._rows)
         self._count_lbl.config(text="{} file{}".format(n, "s" if n!=1 else ""))
-
-    def _rebuild_src_dropdowns(self):
-        for w in self._src_frame.winfo_children():
-            w.destroy()
-        self._src_dropdowns = {}
-        asgn = self.get_assignments()
-        for tok in sorted(self._tokens):
-            audio_paths = [p for p in asgn.get(tok, []) if not is_video(p)]
-            if not audio_paths:
-                continue
-            options = [basename(p) for p in audio_paths]
-            if tok not in self._src_vars:
-                self._src_vars[tok] = tk.StringVar()
-            sv = self._src_vars[tok]
-            if sv.get() not in options:
-                sv.set(options[0])
-            row = tk.Frame(self._src_frame, bg=SURF); row.pack(anchor="w", pady=1)
-            tk.Label(row, text="[{}]".format(tok), font=FB,
-                     bg=SURF, fg=ACCENT, width=14, anchor="w").pack(side="left")
-            om = _FlatDropdown(
-                row,
-                textvariable=sv,
-                values=options,
-                state="readonly",
-                font=FB,
-                width=52,
-            )
-            om.pack(side="left")
-            self._src_dropdowns[tok] = (sv, audio_paths)
 
     def get_assignments(self):
         out = {}
@@ -1058,16 +1136,10 @@ class MediaPool(tk.Frame):
             out.setdefault(tok, []).append(r["path"])
         return out
 
-    def get_transcript_source(self, token):
-        sv_tuple = self._src_dropdowns.get(token)
-        if not sv_tuple:
-            return None
-        sv, audio_paths = sv_tuple
-        sel = sv.get()
-        for p in audio_paths:
-            if basename(p) == sel:
-                return p
-        return audio_paths[0] if audio_paths else None
+    def get_audio_paths(self, token):
+        """Return all non-video file paths assigned to token."""
+        asgn = self.get_assignments()
+        return [p for p in asgn.get(token, []) if not is_video(p)]
 
     def get_interview_assets(self):
         asgn = self.get_assignments()

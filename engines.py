@@ -519,6 +519,320 @@ def transcribe_clip(wav_path):
     return [w for w in words if w["word"]]
 
 
+def transcribe_clip_verbatim(wav_path, progress_cb=None):
+    """Whisper transcription that preserves the model's natural punctuation,
+    casing, and segment boundaries — for human-readable display (Pull Quotes).
+
+    Returns a flat list of entries:
+        {"word": "<text>", "start": float, "end": float}
+        {"word": "\\n\\n",   "start": ts,    "end": ts, "break": True}
+
+    The "break" entries are paragraph separators inserted between Whisper
+    segments so the rendered transcript reads as paragraphed prose.
+
+    `progress_cb`, if provided, receives one floating-point seconds value per
+    segment as decoding progresses (the end time of the last segment seen).
+    """
+    model = get_model()
+    segments, info = model.transcribe(
+        wav_path,
+        word_timestamps=True,
+        language="en",
+        beam_size=5,
+        # condition_on_previous_text=True biases each segment with the prior
+        # text — gives noticeably better punctuation and capitalisation in
+        # exchange for slightly higher hallucination risk.  For a finished
+        # interview that's a good trade.
+        condition_on_previous_text=True,
+        vad_filter=True,
+        no_speech_threshold=0.6,
+    )
+    out = []
+    first_segment = True
+    prev_end = 0.0
+    for seg in segments:
+        if not first_segment:
+            # Record the silence gap so the renderer can choose between a
+            # within-paragraph line break (short gap) and a paragraph break
+            # (long gap).
+            gap = max(0.0, float(seg.start) - prev_end)
+            out.append({
+                "word":  "\n",   # placeholder; renderer decides single vs double
+                "start": float(seg.start),
+                "end":   float(seg.start),
+                "break": True,
+                "gap":   gap,
+            })
+        first_segment = False
+
+        if seg.words:
+            for w in seg.words:
+                # Whisper's per-word `.word` includes the natural leading
+                # whitespace (e.g. " Hello,") — keep it verbatim so direct
+                # concatenation reproduces the segment text without
+                # heuristic spacing.
+                wt = w.word
+                if wt is None or not wt.strip():
+                    continue
+                out.append({
+                    "word":  wt,
+                    "start": float(w.start),
+                    "end":   float(w.end),
+                })
+        else:
+            # Fall back to segment text if word-level timing is missing.
+            text = (seg.text or "").strip()
+            if text:
+                out.append({
+                    "word":  (" " if out and not out[-1].get("break") else "") + text,
+                    "start": float(seg.start),
+                    "end":   float(seg.end),
+                })
+
+        prev_end = float(seg.end)
+        if callable(progress_cb):
+            try:
+                progress_cb(prev_end)
+            except Exception:
+                pass
+
+    return out
+
+
+def transcribe_session_per_track(audio_paths, speaker_labels=None,
+                                   progress_cb=None):
+    """Transcribe each audio file separately and merge by timestamp.
+
+    Each track is transcribed in isolation with `transcribe_clip_verbatim`,
+    then every word is tagged with its source-file basename (or with the
+    matching label from `speaker_labels` if provided) and the union of
+    all tracks' words is sorted chronologically.
+
+    Returns a flat list of word dicts:
+        {"word": "...", "start": float, "end": float, "speaker": "..."}
+
+    Whisper's per-track break entries are dropped — speaker turns are
+    a stronger structural signal than within-track silence gaps, and
+    the renderer derives layout from speaker changes + syntactic cues.
+
+    `speaker_labels`: optional dict mapping basename → display label.
+    Falls back to the basename (without extension) for any file not
+    explicitly mapped.
+    """
+    speaker_labels = speaker_labels or {}
+    all_words = []
+    n = len(audio_paths)
+    for i, src in enumerate(audio_paths):
+        if not src or not os.path.isfile(src):
+            continue
+        # Tag for this track
+        base = os.path.splitext(os.path.basename(src))[0]
+        speaker = speaker_labels.get(os.path.basename(src),
+                                       speaker_labels.get(base, base))
+
+        # Extract a 16 kHz mono WAV (Whisper's preferred input).  Each
+        # track is a single mic, so the source itself is mono-ish; we
+        # still run extract_window to normalise format and trim.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp = tf.name
+        try:
+            ok, err = extract_window(src, 0, 9999, tmp)
+            if not ok:
+                raise RuntimeError(
+                    "audio extract failed for {}: {}".format(
+                        os.path.basename(src), err or "unknown"))
+
+            # Per-track callback wraps the global one with a track-aware
+            # progress message via a closure.
+            def _wrap_cb(audio_s, _i=i, _n=n, _src=src):
+                if callable(progress_cb):
+                    progress_cb(audio_s, track_index=_i, n_tracks=_n,
+                                track_name=os.path.basename(_src))
+
+            words = transcribe_clip_verbatim(tmp, progress_cb=_wrap_cb)
+        finally:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+        for w in words:
+            if w.get("break"):
+                continue
+            w["speaker"] = speaker
+            all_words.append(w)
+
+    # Merge by start time.  Stable sort preserves intra-track order
+    # when timestamps are identical.
+    all_words.sort(key=lambda w: float(w.get("start", 0.0)))
+    return all_words
+
+
+# ── Multi-track mix-for-transcript ────────────────────────────────────────────
+#
+# When a token has more than one audio file, we mix them to a single temp WAV
+# before handing off to Whisper.  Each track gets its own adaptive noise gate
+# (threshold derived from its own noise floor), speech-weighted level matching
+# so both participants are roughly equal in the mix, then a dynaudnorm pass to
+# smooth out dynamic speakers.  The caller receives a temp file path and is
+# responsible for deleting it after reconciliation.
+
+_MIX_SR              = 16_000
+_MIX_FRAME_SAMP      = _MIX_SR * 20 // 1000   # 20 ms frames = 320 samples
+_MIX_NOISE_PCT       = 10
+_MIX_THR_MULT        = 3.0
+_MIX_THR_MIN         = 0.002
+_MIX_THR_MAX         = 0.30
+_MIX_GATE_CLOSED     = 0.005
+_MIX_ATTACK_FR       = 5
+_MIX_HOLD_FR         = 15
+_MIX_RELEASE_FR      = 40
+_MIX_PEAK_TARGET     = 0.90
+_MIX_MAX_BOOST_DB    = 20.0
+_MIX_DYN_FRAME_MS    = 500
+_MIX_DYN_GAUSS      = 31
+_MIX_DYN_PEAK        = 0.95
+_MIX_DYN_MAX_GAIN    = 5.0
+
+
+def _mix_decode(path):
+    """Decode any audio file to 16 kHz mono float32 PCM via ffmpeg pipe."""
+    import numpy as np
+    cmd = _ffmpeg_cmd() + [
+        "-y", "-i", path,
+        "-ar", str(_MIX_SR), "-ac", "1", "-f", "s16le", "pipe:1",
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "mix decode failed for {!r}: {}".format(
+                os.path.basename(path), r.stderr.decode(errors="replace"))
+        )
+    return np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _mix_frame_rms(pcm):
+    import numpy as np
+    n = len(pcm) // _MIX_FRAME_SAMP
+    if n == 0:
+        return np.array([0.0], dtype=np.float32)
+    return np.sqrt(
+        np.mean(pcm[: n * _MIX_FRAME_SAMP].reshape(n, _MIX_FRAME_SAMP) ** 2, axis=1)
+    ).astype(np.float32)
+
+
+def _mix_gate_envelope(pcm, threshold):
+    import numpy as np
+    rms  = _mix_frame_rms(pcm)
+    n    = len(rms)
+    fg   = np.empty(n, dtype=np.float32)
+    g, hold = 0.0, 0
+    for i, r in enumerate(rms):
+        if r >= threshold:
+            hold = _MIX_HOLD_FR
+            g    = min(1.0, g + 1.0 / _MIX_ATTACK_FR)
+        elif hold > 0:
+            hold -= 1
+            g    = min(1.0, g + 1.0 / _MIX_ATTACK_FR)
+        else:
+            g    = max(_MIX_GATE_CLOSED, g - 1.0 / _MIX_RELEASE_FR)
+        fg[i] = g
+    body = np.repeat(fg, _MIX_FRAME_SAMP)
+    tail = len(pcm) - len(body)
+    if tail > 0:
+        body = np.concatenate([body, np.full(tail, fg[-1], dtype=np.float32)])
+    return body
+
+
+def _mix_speech_rms(pcm, envelope):
+    """RMS measured only over frames where the gate is substantially open."""
+    import numpy as np
+    n = len(pcm) // _MIX_FRAME_SAMP
+    if n == 0:
+        return 1e-9
+    p    = pcm[:n * _MIX_FRAME_SAMP].reshape(n, _MIX_FRAME_SAMP)
+    e    = envelope[:n * _MIX_FRAME_SAMP].reshape(n, _MIX_FRAME_SAMP)
+    mask = e.mean(axis=1) > 0.5
+    if not np.any(mask):
+        return 1e-9
+    return float(np.sqrt(np.mean(p[mask] ** 2)))
+
+
+def _mix_dynaudnorm(path):
+    """Apply dynaudnorm to path in-place via ffmpeg."""
+    tmp = path + "._mix_tmp.wav"
+    cmd = _ffmpeg_cmd() + [
+        "-y", "-i", path,
+        "-af", "dynaudnorm=f={}:g={}:p={}:m={}".format(
+            _MIX_DYN_FRAME_MS, _MIX_DYN_GAUSS, _MIX_DYN_PEAK, _MIX_DYN_MAX_GAIN),
+        tmp,
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "dynaudnorm failed: " + r.stderr.decode(errors="replace")
+        )
+    os.replace(tmp, path)
+
+
+def mix_for_transcript(paths):
+    """
+    Mix a list of audio file paths into a single temp 16 kHz mono WAV
+    suitable for Whisper transcription.
+
+    Each track receives:
+      1. An adaptive noise gate keyed to its own measured noise floor.
+      2. Speech-weighted level matching so all participants are roughly equal.
+      3. A dynaudnorm pass on the final mix to even out dynamic speakers.
+
+    Returns the path of the temp file.  The caller must delete it after use.
+    Single-element lists are supported (still gated + normed for consistency).
+    """
+    import numpy as np
+
+    track_data = []
+    for path in paths:
+        pcm      = _mix_decode(path)
+        nf_rms   = float(np.percentile(_mix_frame_rms(pcm), _MIX_NOISE_PCT))
+        thr      = float(np.clip(nf_rms * _MIX_THR_MULT, _MIX_THR_MIN, _MIX_THR_MAX))
+        envelope = _mix_gate_envelope(pcm, thr)
+        sp_rms   = _mix_speech_rms(pcm, envelope)
+        track_data.append({"pcm": pcm, "envelope": envelope, "sp_rms": sp_rms})
+
+    # Level matching: scale each track so speech RMS matches the median
+    valid   = [td["sp_rms"] for td in track_data if td["sp_rms"] > 1e-6]
+    target  = float(np.median(valid)) if valid else 1.0
+    max_sc  = 10.0 ** (_MIX_MAX_BOOST_DB / 20.0)
+    for td in track_data:
+        sp = td["sp_rms"]
+        td["scale"] = min(target / sp, max_sc) if sp > 1e-6 else 1.0
+
+    # Apply gate + scale, then mix
+    maxlen  = max(len(td["pcm"]) for td in track_data)
+    gated   = []
+    for td in track_data:
+        g = (td["pcm"] * td["envelope"] * td["scale"]).astype(np.float32)
+        gated.append(np.pad(g, (0, maxlen - len(g))))
+
+    mixed = np.sum(gated, axis=0).astype(np.float32)
+    peak  = np.max(np.abs(mixed))
+    if peak > 1e-9:
+        mixed *= _MIX_PEAK_TARGET / peak
+
+    # Write to a temp file
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="_pb_mix_")
+    os.close(fd)
+    pcm16 = (np.clip(mixed, -1.0, 1.0) * 32767).astype(np.int16)
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(_MIX_SR)
+        wf.writeframes(pcm16.tobytes())
+
+    # Dynamic normalization pass
+    _mix_dynaudnorm(tmp_path)
+
+    return tmp_path
+
+
 def detect_sync_via_whisper(video_path, audio_path, probe_duration=120.0):
     """
     Find the sync offset between a video file's embedded camera audio and a
@@ -1607,8 +1921,17 @@ def reconcile_vo_part(vo_blocks, takes):
                 merged.append(list(seg))
         best_segs = merged
 
-        # Advance cursor for the winning take so the next block starts here
+        # Advance cursor for the winning take so the next block starts here.
+        # Cursor is advanced to the actual last word end — before the tail —
+        # so the next block doesn't search unnecessarily far ahead.
         cursors[best_take_index] = best_segs[-1][1]
+
+        # Extend the last segment by VO_TAIL_SECS so Whisper's last-word
+        # timestamp doesn't abruptly cut off natural decay / room tone.
+        # Doing this at reconcile time (rather than silently at export) means
+        # the tail is visible and editable in the waveform editor, so manual
+        # adjustments are respected absolutely at export.
+        best_segs[-1][1] += VO_TAIL_SECS
 
         abs_in  = best_segs[0][0]
         abs_out = best_segs[-1][1]
@@ -2036,6 +2359,20 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     defined = set()
     ctr     = 0
 
+    # ── Defensive filter: strip transient mix-for-transcript files ────────────
+    # mix_for_transcript() writes temp WAVs (prefix "_pb_mix_") used solely as
+    # the Whisper input for multi-track tokens.  They must never reach the XML.
+    def _is_temp_mix_path(p):
+        return bool(p) and os.path.basename(p).startswith("_pb_mix_")
+    int_assets = {
+        _tok: [p for p in _paths if not _is_temp_mix_path(p)]
+        for _tok, _paths in (int_assets or {}).items()
+    }
+    for _r in (results or []):
+        for _td in (_r.get("takes_data") or []):
+            if isinstance(_td, dict) and _is_temp_mix_path(_td.get("apath")):
+                _td["apath"] = None
+
     from collections import defaultdict
     clip_pos = defaultdict(int)
 
@@ -2053,7 +2390,22 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             max_vo_takes = max(max_vo_takes, len(takes))
 
     HOST_LC  = HOST_NAME.lower()
-    max_iv   = max_ia = 2
+
+    # Allocate enough interview tracks to fit the largest per-token source
+    # count.  Slot 0 is reserved for the host across all tokens; subsequent
+    # slots hold non-host files, one track per file.  Default is 2 (host +
+    # 1 guest) for the typical Riverside duo.
+    def _is_host_file(p):
+        return HOST_LC in os.path.basename(p).lower()
+    _max_guest_v = 1
+    _max_guest_a = 1
+    for _paths in (int_assets or {}).values():
+        _gvps = [p for p in _paths if p and is_video(p) and not _is_host_file(p)]
+        _gaps = [p for p in _paths if p and not is_video(p) and not _is_host_file(p)]
+        _max_guest_v = max(_max_guest_v, len(_gvps))
+        _max_guest_a = max(_max_guest_a, len(_gaps))
+    max_iv = 1 + _max_guest_v   # 1 host slot + N guest slots
+    max_ia = 1 + _max_guest_a
 
     total_v = max_iv + max(max_vo_takes, 1)
     total_a = max_ia + max(max_vo_takes, 1)
@@ -2240,18 +2592,28 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             tok    = res["token"]
             paths  = int_assets.get(tok, [])
 
-            def _is_host_file(p):
-                return HOST_LC in os.path.basename(p).lower()
-
             host_vpaths  = [p for p in paths if p and is_video(p)     and _is_host_file(p)]
             guest_vpaths = [p for p in paths if p and is_video(p)     and not _is_host_file(p)]
             host_apaths  = [p for p in paths if p and not is_video(p) and _is_host_file(p)]
             guest_apaths = [p for p in paths if p and not is_video(p) and not _is_host_file(p)]
 
-            participants = [
-                (0, host_vpaths,  host_apaths),
-                (1, guest_vpaths, guest_apaths),
-            ]
+            # Slot 0 holds the host (if any).  Each non-host file gets its own
+            # slot (1, 2, 3, …) so multi-source tokens (3+ files, or anonymised
+            # speaker-0 / speaker-1 Riverside exports) export every track.
+            participants = []
+            if host_vpaths or host_apaths:
+                participants.append((
+                    0,
+                    host_vpaths[0] if host_vpaths else None,
+                    host_apaths[0] if host_apaths else None,
+                ))
+            _n_guests = max(len(guest_vpaths), len(guest_apaths))
+            for _gi in range(_n_guests):
+                participants.append((
+                    1 + _gi,
+                    guest_vpaths[_gi] if _gi < len(guest_vpaths) else None,
+                    guest_apaths[_gi] if _gi < len(guest_apaths) else None,
+                ))
 
             iv_st     = res.get("status", "ok")
             iv_prefix = "[~] " if iv_st == "low_confidence" else ""
@@ -2269,9 +2631,8 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 is_last    = (si == len(segments) - 1)
                 group      = []
 
-                for slot, vps, aps in participants:
-                    if vps and slot < max_iv:
-                        vp    = vps[0]
+                for slot, vp, ap in participants:
+                    if vp and slot < max_iv:
                         fid   = "file-v-{}-{}".format(tok, slot)
                         cid   = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
@@ -2286,8 +2647,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                                       "track_idx":slot+1,
                                       "clip_pos":clip_pos[("v",slot+1)]})
 
-                    if aps and slot < max_ia:
-                        ap    = aps[0]
+                    if ap and slot < max_ia:
                         fid   = "file-a-{}-{}".format(tok, slot)
                         cid   = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
@@ -2860,6 +3220,52 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     def s2sa(secs):
         return round(secs * sr)
 
+    # ── Defensive filter: strip transient mix-for-transcript files ────────────
+    # mix_for_transcript() writes temp WAVs (prefix "_pb_mix_") used solely as
+    # the Whisper input for multi-track tokens.  They are 16 kHz mono and may
+    # be windowed/cleaned up by the time export runs, so they must NEVER appear
+    # in the AAF.  Filter them out of int_assets and any takes_data.apath here.
+    def _is_temp_mix_path(p):
+        if not p:
+            return False
+        return os.path.basename(p).startswith("_pb_mix_")
+
+    _filtered_int_assets = {}
+    _stripped_count = 0
+    for _tok, _paths in (int_assets or {}).items():
+        _kept = [p for p in _paths if not _is_temp_mix_path(p)]
+        _stripped_count += len(_paths) - len(_kept)
+        _filtered_int_assets[_tok] = _kept
+    int_assets = _filtered_int_assets
+    if _stripped_count:
+        _prog("WARNING: stripped {} transient mix WAV path(s) from int_assets — "
+              "AAF will use original assets only".format(_stripped_count))
+
+    # Same defensive filter for VO takes_data on each interview/VO result
+    _vo_stripped = 0
+    for _r in (results or []):
+        for _td in (_r.get("takes_data") or []):
+            if isinstance(_td, dict) and _is_temp_mix_path(_td.get("apath")):
+                _td["apath"] = None
+                _vo_stripped += 1
+    if _vo_stripped:
+        _prog("WARNING: cleared {} transient mix WAV path(s) from "
+              "takes_data.apath — VO export will skip these takes".format(_vo_stripped))
+
+    # Diagnostic: list each token's audio sources going into the build
+    _src_lines = []
+    for _tok in sorted(int_assets):
+        _aps = [p for p in int_assets[_tok] if p and not is_video(p)]
+        _vps = [p for p in int_assets[_tok] if p and is_video(p)]
+        _src_lines.append("  [{}] {} audio + {} video".format(
+            _tok, len(_aps), len(_vps)))
+        for _p in _aps:
+            _src_lines.append("       audio: {}".format(os.path.basename(_p)))
+        for _p in _vps:
+            _src_lines.append("       video: {}".format(os.path.basename(_p)))
+    if _src_lines:
+        _prog("AAF source manifest:\n" + "\n".join(_src_lines))
+
     vo_takes_by_part = {}
     if vo_takes_with_offset:
         for pi, takes_list in vo_takes_with_offset.items():
@@ -2945,14 +3351,17 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             # Use the take that produced the best match, not necessarily [0].
             best_i  = res.get("best_take_index", 0)
             td      = takes_data[best_i] if best_i < len(takes_data) else takes_data[0]
-            td_segs = td.get("segments") or segments
+            # Prefer the top-level segments — these reflect any waveform-editor
+            # edits the user made in Step 4.  The take's own segments are the
+            # original Whisper output and would override manual adjustments.
+            # VO_TAIL_SECS is already baked into top-level segments at reconcile
+            # time, so no additional buffer is added here.
+            td_segs = segments or td.get("segments")
             ap      = td.get("apath")
             if ap:
                 for seg_in_s, seg_out_s in td_segs:
                     if seg_in_s >= seg_out_s: continue
-                    # Add a short tail so Whisper's last-word timestamp doesn't
-                    # abruptly cut off natural decay / room tone.
-                    dur_sa = s2sa(seg_out_s - seg_in_s + VO_TAIL_SECS)
+                    dur_sa = s2sa(seg_out_s - seg_in_s)
                     slots.append((ap, cursor, dur_sa, s2sa(seg_in_s), track))
                     cursor += dur_sa
             _vo_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
@@ -2968,8 +3377,12 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             if not apaths:
                 skipped.append(res); continue
 
-            # Riverside recordings come as pairs: one guest mic, one host mic.
             # Identify the host side by HOST_NAME appearing in the filename.
+            # Host files share a single track across all tokens; every other
+            # file gets its own dedicated track so no source is ever dropped
+            # — important for setups where Riverside exports anonymised
+            # "speaker-0" / "speaker-1" filenames or where a token has 3+
+            # parallel sources.
             host_paths  = [p for p in apaths
                            if HOST_LC in os.path.basename(p).lower()]
             guest_paths = [p for p in apaths
@@ -2981,12 +3394,14 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 is_last = (si == len(segments) - 1)
                 src_in  = s2sa(seg_in_s)
 
-                # Guest audio → token's own track
-                if guest_paths:
-                    slots.append((guest_paths[0], cursor, dur_sa, src_in, track))
-                # Host audio → Jordan's shared track, same timeline position
-                if host_paths:
-                    slots.append((host_paths[0], cursor, dur_sa, src_in,
+                # Each non-host file → its own track.  Primary file uses the
+                # token name; additional files spill to TOKEN_2, TOKEN_3, …
+                for gi, gp in enumerate(guest_paths):
+                    track_name = track if gi == 0 else "{}_{}".format(track, gi + 1)
+                    slots.append((gp, cursor, dur_sa, src_in, track_name))
+                # All host-named files → shared JORDAN track
+                for hp in host_paths:
+                    slots.append((hp, cursor, dur_sa, src_in,
                                   HOST_NAME.upper()))
 
                 _int_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
