@@ -282,7 +282,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for w in self.body.winfo_children(): w.destroy()
 
     def _home(self):
-        # Reset session-specific state so a new workflow starts clean
+        # Reset session-specific state so a new workflow starts clean.
+        # Halt any Pull Quotes playback before tearing down.
+        try:
+            self._pq_stop_playback()
+        except Exception:
+            pass
         self._current_session_file = None
         self._export_fmt           = None
         self._restore_s4           = False
@@ -8967,6 +8972,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         speakers = session.get("speakers")
         if speakers:
             payload["speakers"] = dict(speakers)
+        # Margin notes (Pull Quotes mode = margin)
+        notes = session.get("notes")
+        if notes:
+            payload["notes"] = list(notes)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -9026,6 +9035,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _pq_render_project_view(self):
         import re
+        # Stop any session-view playback before tearing the view down,
+        # otherwise the audio keeps going while the user is browsing.
+        try:
+            self._pq_stop_playback()
+        except Exception:
+            pass
         self._clear()
         # Stepping back into the project means we're no longer focused on a
         # single session — clear the marker so background-completion
@@ -9067,6 +9082,41 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(fp_row, text=fp, font=FB, bg=BG,
                  fg=SUCCESS if project.get("file_path") else SUB,
                  anchor="w").pack(side="left", fill="x", expand=True)
+
+        # Project-level controls row: bg-mode + manage-speakers
+        ctrl_row = tk.Frame(self.body, bg=BG)
+        ctrl_row.pack(fill="x", pady=(0, 12))
+        tk.Label(ctrl_row, text="OPTIONS", font=FL,
+                 bg=BG, fg=SUB, width=18, anchor="w").pack(side="left")
+
+        # Background-mode checkbox — shared with the session view via
+        # self._pq_bg_mode_var (created here if absent), so flipping
+        # either keeps the other in sync.
+        if not hasattr(self, "_pq_bg_mode_var"):
+            self._pq_bg_mode_var = tk.BooleanVar(value=False)
+        bg_frame = tk.Frame(ctrl_row, bg=BG)
+        bg_frame.pack(side="left")
+        bg_ck = tk.Label(bg_frame,
+                          text="☑" if self._pq_bg_mode_var.get() else "☐",
+                          font=(_SANS, 14), bg=BG,
+                          fg=ACCENT if self._pq_bg_mode_var.get() else SUB,
+                          cursor="hand2", padx=4)
+        bg_ck.pack(side="left")
+        bg_lbl = tk.Label(bg_frame, text="Background mode (all sessions)",
+                          font=FB, bg=BG, fg=SUB, cursor="hand2")
+        bg_lbl.pack(side="left")
+        def _toggle_bg_proj():
+            new_val = not self._pq_bg_mode_var.get()
+            self._pq_bg_mode_var.set(new_val)
+            bg_ck.config(text="☑" if new_val else "☐",
+                         fg=ACCENT if new_val else SUB)
+        bg_ck.bind("<Button-1>",  lambda e: _toggle_bg_proj())
+        bg_lbl.bind("<Button-1>", lambda e: _toggle_bg_proj())
+
+        # Manage-speakers button
+        self._btn(ctrl_row, "MANAGE SPEAKERS",
+                  self._pq_manage_speakers_dialog,
+                  small=True).pack(side="right")
 
         is_empty = not project["sessions"]
 
@@ -9551,6 +9601,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _pq_open_session_view(self, session, transcribe_now=False):
         self._clear()
         self._pq_current_session = session
+        # Mode is per-app, defaulting to EDIT.  Persists across session
+        # opens so the user's preferred mode sticks.
+        if not hasattr(self, "_pq_mode"):
+            self._pq_mode = "edit"
 
         # Bottom nav
         nav = tk.Frame(self.body, bg=BG)
@@ -9786,17 +9840,78 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<Control-Shift-z>", _do_redo)
         tx_text.bind("<Control-Shift-Z>", _do_redo)
 
-        # Shift+Space → play / stop toggle.  Bound on the Text widget AND
-        # globally so it works whether the transcript or e.g. the search
-        # box has focus.  Returning "break" prevents the space character
-        # from being inserted into the widget.
+        # ── Mode dispatch ─────────────────────────────────────────────
+        # Three mutually-exclusive modes drive what the transcript pane
+        # responds to:
+        #   EDIT   (Ctrl+E, default) — full editing, undo/redo, no
+        #                              spacebar-as-transport.
+        #   PLAY   (Ctrl+P)          — read-only.  Spacebar plays/stops
+        #                              the current selection (or from
+        #                              cursor to end if no selection).
+        #   MARGIN (Ctrl+M)          — read-only.  Selection + Enter
+        #                              opens a margin-note editor; notes
+        #                              live in a side panel and never
+        #                              make it into copied @PULL blocks.
+        def _set_mode(new_mode, event=None):
+            self._pq_mode = new_mode
+            self._pq_apply_mode()
+            return "break"
+
+        tx_text.bind("<Control-e>", lambda e: _set_mode("edit",   e))
+        tx_text.bind("<Control-E>", lambda e: _set_mode("edit",   e))
+        tx_text.bind("<Control-p>", lambda e: _set_mode("play",   e))
+        tx_text.bind("<Control-P>", lambda e: _set_mode("play",   e))
+        tx_text.bind("<Control-m>", lambda e: _set_mode("margin", e))
+        tx_text.bind("<Control-M>", lambda e: _set_mode("margin", e))
+        # Also bind app-level so the same shortcuts work from any focus.
+        for kc, m in [("<Control-e>", "edit"),  ("<Control-E>", "edit"),
+                      ("<Control-p>", "play"),  ("<Control-P>", "play"),
+                      ("<Control-m>", "margin"),("<Control-M>", "margin")]:
+            self.bind(kc, lambda e, mm=m: _set_mode(mm, e))
+
+        # Spacebar transport — only fires in PLAY mode (suppressed
+        # otherwise so it doesn't fight typing in EDIT mode).  Also keep
+        # Shift+Space as a back-compat alias that always plays.
+        def _space_play(event=None):
+            if getattr(self, "_pq_mode", "edit") != "play":
+                return None  # let normal space handling proceed
+            self._pq_play_selection()
+            return "break"
         def _shift_space(event=None):
             self._pq_play_selection()
             return "break"
-        tx_text.bind("<Shift-space>",          _shift_space)
-        tx_text.bind("<Shift-Key-space>",      _shift_space)
-        sr_entry.bind("<Shift-space>",         _shift_space)
-        sr_entry.bind("<Shift-Key-space>",     _shift_space)
+        tx_text.bind("<space>",               _space_play)
+        tx_text.bind("<Key-space>",           _space_play)
+        tx_text.bind("<Shift-space>",         _shift_space)
+        tx_text.bind("<Shift-Key-space>",     _shift_space)
+        sr_entry.bind("<Shift-space>",        _shift_space)
+        sr_entry.bind("<Shift-Key-space>",    _shift_space)
+
+        # Read-only enforcement — when mode is play or margin, block any
+        # keypress that would modify the buffer (printable chars, return,
+        # delete, backspace).  We also allow nav + the explicit shortcuts
+        # bound above.
+        ALLOWED_KEYSYMS = {
+            "Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next",
+            "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R",
+            "Alt_L", "Alt_R", "Meta_L", "Meta_R", "Caps_Lock",
+            "Num_Lock", "Scroll_Lock",
+        }
+        def _maybe_block_edit(event):
+            if getattr(self, "_pq_mode", "edit") == "edit":
+                return None
+            if event.keysym in ALLOWED_KEYSYMS:
+                return None
+            ctrl_pressed = (event.state & 0x4) != 0
+            if ctrl_pressed:
+                return None   # Ctrl+anything is one of our shortcuts
+            if event.keysym == "Return" and getattr(self, "_pq_mode", "edit") == "margin":
+                # Margin mode: Enter opens the note dialog for the
+                # current selection.
+                self._pq_add_margin_note()
+                return "break"
+            return "break"
+        tx_text.bind("<KeyPress>", _maybe_block_edit)
 
         # Ctrl+R / F5 → re-render the transcript from the same in-memory
         # data.  Useful when iterating on rendering tweaks: change the
@@ -9811,9 +9926,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<F5>",        _rerender)
         self.bind("<F5>", _rerender)
 
-        # Action row beneath transcript: PLAY + COPY
+        # Action row: mode badge (left) + PLAY/COPY (right)
         act = tk.Frame(self.body, bg=BG)
         act.pack(fill="x", pady=(0, 4))
+
+        # Mode badge — three buttons that toggle EDIT / PLAY / MARGIN
+        mode_frame = tk.Frame(act, bg=BG)
+        mode_frame.pack(side="left")
+        tk.Label(mode_frame, text="MODE", font=FL,
+                 bg=BG, fg=SUB).pack(side="left", padx=(0, 8))
+        self._pq_mode_btns = {}
+        for label, key, hotkey in [
+            ("Edit",   "edit",   "Ctrl+E"),
+            ("Play",   "play",   "Ctrl+P"),
+            ("Margin", "margin", "Ctrl+M"),
+        ]:
+            b = tk.Label(mode_frame, text="{}  {}".format(label, hotkey),
+                          font=FB, bg=SURF3, fg=TEXT, padx=10, pady=4,
+                          cursor="hand2")
+            b.pack(side="left", padx=(0, 4))
+            def _click(e=None, k=key):
+                self._pq_mode = k
+                self._pq_apply_mode()
+            b.bind("<Button-1>", _click)
+            self._pq_mode_btns[key] = b
+
         self._btn(act, "COPY SELECTION AS @PULL",
                   self._pq_copy_as_pull,
                   color=ACCENT).pack(side="right")
@@ -9821,10 +9958,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             act, "▶ PLAY SELECTION",
             self._pq_play_selection)
         self._pq_play_btn.pack(side="right", padx=(0, 8))
-        tk.Label(act,
-                 text="Highlight any passage — copy as @PULL or "
-                      "play it back.",
-                 font=FB, bg=BG, fg=SUB).pack(side="right", padx=(0, 12))
+
+        # Apply current mode to update badge styling + key behaviour
+        self._pq_apply_mode()
 
         if transcribe_now:
             self.after(80,
@@ -9931,7 +10067,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if sp and speakers_present:
                     if gi > 0:
                         tx.insert("end", "\n\n")
-                    label_text = "{}:\n".format(self._pq_format_speaker(sp))
+                    # Honour per-session speaker-label overrides
+                    sess_speakers = session.get("speakers") or {}
+                    display = (sess_speakers.get(sp)
+                               or sess_speakers.get(os.path.basename(sp))
+                               or self._pq_format_speaker(sp))
+                    label_text = "{}:\n".format(display)
                     tx.insert("end", label_text, "speaker_lbl")
 
                 # Build continuous text for this speaker's run
@@ -9990,6 +10131,277 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except tk.TclError:
                 pass
         self._pq_update_status_lbl(session)
+
+    # ── Mode helpers ──────────────────────────────────────────────────────
+
+    def _pq_apply_mode(self):
+        """Push the current self._pq_mode through to the visual badge,
+        the Text widget cursor, and (if in margin mode) the side panel."""
+        mode = getattr(self, "_pq_mode", "edit")
+        btns = getattr(self, "_pq_mode_btns", None) or {}
+        for key, b in btns.items():
+            try:
+                if key == mode:
+                    b.config(bg=ACCENT, fg=TEXT)
+                else:
+                    b.config(bg=SURF3, fg=TEXT)
+            except tk.TclError:
+                pass
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is not None:
+            try:
+                if mode == "edit":
+                    tx.config(cursor="xterm")
+                elif mode == "play":
+                    tx.config(cursor="arrow")
+                elif mode == "margin":
+                    tx.config(cursor="plus")
+            except tk.TclError:
+                pass
+
+    def _pq_add_margin_note(self):
+        """Margin-mode action: prompt for a note tied to the current
+        selection (or to the cursor word if no selection).  Notes are
+        persisted on session["notes"] and rendered as small inline
+        markers — they never appear in @PULL clipboard output."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return
+
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            return
+
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            sel_first = sel_last = None
+
+        if sel_first and sel_last:
+            try:
+                c0 = tx.count("1.0", sel_first, "chars")[0]
+                c1 = tx.count("1.0", sel_last,  "chars")[0]
+            except Exception:
+                return
+            picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
+        else:
+            try:
+                c0 = tx.count("1.0", tx.index("insert"), "chars")[0]
+            except Exception:
+                return
+            picked = [w for (s, e, w) in word_idx if s <= c0 < e]
+
+        if not picked:
+            return
+
+        # Use the start time of the first selected word as the anchor —
+        # notes survive transcript re-renders that way.
+        anchor_start = float(picked[0].get("start", 0))
+        anchor_end   = float(picked[-1].get("end", anchor_start))
+
+        # Preview shows a snippet of the anchored quote
+        snippet = "".join(w.get("word") or "" for w in picked).strip()[:80]
+
+        win = tk.Toplevel(self)
+        win.title("Margin Note")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.geometry("520x260")
+
+        tk.Label(win, text="Add Margin Note", font=FH,
+                 bg=BG, fg=TEXT, padx=20, pady=14).pack(anchor="w")
+        tk.Label(win, text="Anchored to:", font=FL,
+                 bg=BG, fg=SUB, padx=20).pack(anchor="w")
+        tk.Label(win, text='"{}"'.format(snippet),
+                 font=FB, bg=BG, fg=ACCENT, padx=20,
+                 wraplength=480, justify="left").pack(anchor="w", pady=(0, 12))
+
+        note_var = tk.StringVar()
+        ent = tk.Text(win, font=FB, bg=SURF2, fg=TEXT,
+                       insertbackground=TEXT, relief="flat",
+                       bd=8, height=4, wrap="word")
+        ent.pack(fill="x", padx=20)
+        ent.focus_set()
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=14)
+        def _save():
+            text = ent.get("1.0", "end-1c").strip()
+            if not text:
+                win.destroy(); return
+            notes = list(session.get("notes") or [])
+            notes.append({
+                "anchor_start": anchor_start,
+                "anchor_end":   anchor_end,
+                "snippet":      snippet,
+                "text":         text,
+                "ts":           __import__("datetime").datetime.now()
+                                  .isoformat(timespec="seconds"),
+            })
+            session["notes"] = notes
+            self._pq_save_session_file(session)
+            win.destroy()
+            self._pq_render_notes_panel()
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "SAVE NOTE", _save, color=ACCENT).pack(side="right")
+        win.bind("<Control-Return>", lambda e: _save())
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = win.winfo_width();  wh = win.winfo_height()
+        win.geometry("+{}+{}".format(
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
+
+    def _pq_render_notes_panel(self):
+        """Lightweight stub — currently just refreshes the status label
+        with a count.  Future: dedicated side panel listing each note,
+        click-to-jump-to-anchor, edit/delete actions."""
+        session = getattr(self, "_pq_current_session", None)
+        lbl     = getattr(self, "_pq_status_lbl", None)
+        if session is None or lbl is None:
+            return
+        notes = session.get("notes") or []
+        if notes:
+            try:
+                lbl.config(text="✎ {} margin note{}".format(
+                    len(notes), "s" if len(notes) != 1 else ""),
+                    fg=ACCENT)
+                self.after(2500,
+                           lambda s=session: self._pq_update_status_lbl(s))
+            except tk.TclError:
+                pass
+
+    def _pq_manage_speakers_dialog(self):
+        """List every speaker raw-tag found across the project's sessions
+        and let the user rename any of them.  Renames apply to all
+        sessions and persist to disk."""
+        project = getattr(self, "_pq_project", None)
+        if project is None or not project.get("sessions"):
+            messagebox.showinfo("Manage Speakers",
+                "No sessions in this project yet.")
+            return
+
+        # Gather unique raw speaker tags + their current display labels
+        # across every session.  raw → set of sessions that reference it.
+        raw_to_sessions = {}
+        raw_to_label    = {}
+        for sess in project["sessions"]:
+            speakers_map = sess.get("speakers") or {}
+            for w in (sess.get("transcript") or []):
+                raw = w.get("speaker")
+                if not raw:
+                    continue
+                raw_to_sessions.setdefault(raw, []).append(sess)
+                # Resolve current label: per-session override OR
+                # filename-derived default.
+                label = (speakers_map.get(raw)
+                         or speakers_map.get(os.path.basename(raw))
+                         or self._pq_format_speaker(raw))
+                raw_to_label[raw] = label
+
+        if not raw_to_sessions:
+            messagebox.showinfo("Manage Speakers",
+                "No speaker tags found.  Multi-track sessions get speaker\n"
+                "tags automatically when they're transcribed.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Manage Speakers")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.minsize(640, 360)
+
+        tk.Label(win, text="Manage Speakers", font=FH,
+                 bg=BG, fg=TEXT, padx=24, pady=14).pack(anchor="w")
+        tk.Label(win,
+                 text=("Rename any speaker.  Changes apply to every session\n"
+                       "in this project that references the same source."),
+                 font=FB, bg=BG, fg=SUB, padx=24, justify="left"
+                 ).pack(anchor="w", pady=(0, 12))
+
+        # Table: raw-tag (read-only) + current label (editable)
+        body = tk.Frame(win, bg=SURF,
+                        highlightbackground=BORDER, highlightthickness=1)
+        body.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+
+        hdr = tk.Frame(body, bg=SURF3)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="SOURCE", font=FL, bg=SURF3, fg=SUB,
+                 anchor="w", padx=12, pady=6, width=44).pack(side="left")
+        tk.Label(hdr, text="DISPLAY LABEL", font=FL, bg=SURF3, fg=SUB,
+                 anchor="w", padx=12, pady=6).pack(side="left")
+        tk.Label(hdr, text="USED IN", font=FL, bg=SURF3, fg=SUB,
+                 anchor="e", padx=12, pady=6).pack(side="right")
+
+        entries = {}   # raw → StringVar
+        for raw in sorted(raw_to_sessions.keys()):
+            row = tk.Frame(body, bg=SURF)
+            row.pack(fill="x")
+            tk.Label(row, text=raw, font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=12, pady=6, width=44
+                     ).pack(side="left")
+            var = tk.StringVar(value=raw_to_label.get(raw, raw))
+            entries[raw] = var
+            entry = tk.Entry(row, textvariable=var, font=FB,
+                              bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                              relief="flat", bd=4, width=32)
+            entry.pack(side="left", padx=(0, 8), ipady=2)
+            n_sessions = len(raw_to_sessions[raw])
+            tk.Label(row,
+                     text="{} session{}".format(
+                         n_sessions, "s" if n_sessions != 1 else ""),
+                     font=FB, bg=SURF, fg=SUB,
+                     anchor="e", padx=12, pady=6
+                     ).pack(side="right")
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=24, pady=(0, 16))
+
+        def _save():
+            renamed = 0
+            for raw, var in entries.items():
+                new_label = var.get().strip()
+                if not new_label:
+                    continue
+                if new_label == raw_to_label.get(raw):
+                    continue
+                # Apply across every session that references this raw tag
+                for sess in raw_to_sessions.get(raw, []):
+                    speakers_map = dict(sess.get("speakers") or {})
+                    speakers_map[raw] = new_label
+                    # Also key by basename in case the renderer falls
+                    # back to that lookup form.
+                    speakers_map[os.path.basename(raw)] = new_label
+                    sess["speakers"] = speakers_map
+                    self._pq_save_session_file(sess)
+                renamed += 1
+            win.destroy()
+            # Re-render whatever view we're in so the new labels show.
+            if getattr(self, "_pq_current_session", None) is not None:
+                self._pq_render_transcript_text(self._pq_current_session)
+            else:
+                self._pq_render_project_view()
+            messagebox.showinfo("Speakers updated",
+                "Renamed {} speaker label{}.".format(
+                    renamed, "s" if renamed != 1 else ""))
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "SAVE",   _save, color=ACCENT).pack(side="right")
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = win.winfo_width();  wh = win.winfo_height()
+        win.geometry("+{}+{}".format(
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
 
     def _pq_format_speaker(self, raw):
         """Tidy a raw speaker tag (filename basename) into a display
