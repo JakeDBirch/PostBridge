@@ -10048,6 +10048,48 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<F5>",        _rerender)
         self.bind("<F5>", _rerender)
 
+        # ── Margin notes panel — shown whenever notes exist or the user
+        # is in MARGIN mode.  Hidden otherwise.  Lives above the action
+        # row so it doesn't push the action bar off-screen.
+        self._pq_notes_outer = tk.Frame(self.body, bg=SURF,
+                                          highlightbackground=BORDER,
+                                          highlightthickness=1)
+        notes_hdr = tk.Frame(self._pq_notes_outer, bg=SURF3)
+        notes_hdr.pack(fill="x")
+        tk.Label(notes_hdr, text="MARGIN NOTES", font=FL,
+                 bg=SURF3, fg=SUB, anchor="w",
+                 padx=12, pady=6).pack(side="left")
+        self._pq_notes_count_lbl = tk.Label(
+            notes_hdr, text="", font=FB, bg=SURF3, fg=SUB,
+            padx=12, pady=6)
+        self._pq_notes_count_lbl.pack(side="right")
+        tk.Label(notes_hdr,
+                 text="In MARGIN mode, select text + Enter to add.  "
+                      "Click any anchor below to jump.",
+                 font=FB, bg=SURF3, fg=SUB,
+                 padx=12, pady=6).pack(side="right")
+
+        notes_body = tk.Frame(self._pq_notes_outer, bg=SURF)
+        notes_body.pack(fill="x")
+        self._pq_notes_canvas = tk.Canvas(
+            notes_body, bg=SURF, highlightthickness=0, height=140)
+        notes_sb = _SlimScrollbar(notes_body,
+                                   command=self._pq_notes_canvas.yview)
+        notes_sb.pack(side="right", fill="y")
+        self._pq_notes_canvas.pack(side="left", fill="both", expand=True)
+        self._pq_notes_canvas.configure(yscrollcommand=notes_sb.set)
+        self._pq_notes_inner = tk.Frame(self._pq_notes_canvas, bg=SURF)
+        self._pq_notes_canvas.create_window(
+            (0, 0), window=self._pq_notes_inner, anchor="nw")
+        self._pq_notes_inner.bind(
+            "<Configure>",
+            lambda e: self._pq_notes_canvas.configure(
+                scrollregion=self._pq_notes_canvas.bbox("all")))
+
+        # Initial state: hidden if no notes and not in margin mode.
+        # _pq_apply_mode + _pq_render_notes_panel control visibility.
+        self._pq_render_notes_panel()
+
         # Action row: mode badge (left) + PLAY/COPY (right)
         act = tk.Frame(self.body, bg=BG)
         act.pack(fill="x", pady=(0, 4))
@@ -10158,6 +10200,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                               foreground=ACCENT, font=FBT,
                               spacing1=10, spacing3=4,
                               lmargin1=0, lmargin2=0, rmargin=0)
+            # Double-clicking any speaker label opens an inline rename
+            # dialog that updates the label across every session row in
+            # the project — the global rename Jordan asked for.
+            tx.tag_bind(
+                "speaker_lbl", "<Double-Button-1>",
+                lambda e, t=tx: self._pq_inline_rename_speaker(e, t))
 
             self._pq_word_index = []
 
@@ -10167,6 +10215,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             # Detect if any speakers are actually labelled (multi-track)
             speakers_present = any(w.get("speaker") for w in real_words)
+
+            # Filter out cross-track filler/bleed: when one speaker says
+            # something brief (e.g. "yeah", "mm-hmm", "right") sandwiched
+            # between long stretches of another speaker, that's almost
+            # always either bleed picked up by the wrong mic or a
+            # listening filler.  Removed at render time so the original
+            # transcript is preserved on disk.
+            if speakers_present:
+                real_words = self._pq_filter_filler_interjections(real_words)
 
             # Group into [(speaker, [words]), ...]
             groups = []
@@ -10195,7 +10252,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                or sess_speakers.get(os.path.basename(sp))
                                or self._pq_format_speaker(sp))
                     label_text = "{}:\n".format(display)
-                    tx.insert("end", label_text, "speaker_lbl")
+                    # Insert with both the visual style tag AND a
+                    # per-speaker tag carrying the raw key so the
+                    # rename handler knows which speaker was clicked.
+                    raw_tag = "speaker_raw:{}".format(sp)
+                    if raw_tag not in tx.tag_names():
+                        tx.tag_configure(raw_tag)   # invisible marker tag
+                    tx.insert("end", label_text,
+                              ("speaker_lbl", raw_tag))
 
                 # Build continuous text for this speaker's run
                 cont_buf  = []
@@ -10258,7 +10322,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _pq_apply_mode(self):
         """Push the current self._pq_mode through to the visual badge,
-        the Text widget cursor, and (if in margin mode) the side panel."""
+        the Text widget cursor, and the margin notes panel visibility."""
         mode = getattr(self, "_pq_mode", "edit")
         btns = getattr(self, "_pq_mode_btns", None) or {}
         for key, b in btns.items():
@@ -10280,6 +10344,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     tx.config(cursor="plus")
             except tk.TclError:
                 pass
+        # Refresh notes panel — visibility tracks margin mode + presence
+        # of any saved notes.
+        try:
+            self._pq_render_notes_panel()
+        except Exception:
+            pass
 
     def _pq_add_margin_note(self):
         """Margin-mode action: prompt for a note tied to the current
@@ -10381,23 +10451,145 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.wait_window(win)
 
     def _pq_render_notes_panel(self):
-        """Lightweight stub — currently just refreshes the status label
-        with a count.  Future: dedicated side panel listing each note,
-        click-to-jump-to-anchor, edit/delete actions."""
+        """Refresh the MARGIN NOTES side panel.  Shows one row per note
+        with snippet (clickable to jump to anchor) + body + delete.
+        Hidden when there are no notes AND we're not in MARGIN mode."""
+        outer = getattr(self, "_pq_notes_outer", None)
+        inner = getattr(self, "_pq_notes_inner", None)
+        cnt   = getattr(self, "_pq_notes_count_lbl", None)
         session = getattr(self, "_pq_current_session", None)
-        lbl     = getattr(self, "_pq_status_lbl", None)
-        if session is None or lbl is None:
+        if outer is None or inner is None or session is None:
             return
+
         notes = session.get("notes") or []
-        if notes:
+        mode  = getattr(self, "_pq_mode", "edit")
+
+        # Visibility: only show when there are notes OR in MARGIN mode.
+        try:
+            if notes or mode == "margin":
+                outer.pack(fill="x", pady=(0, 8),
+                           before=getattr(self, "_pq_notes_pack_before", None))
+            else:
+                outer.pack_forget()
+        except tk.TclError:
+            pass
+
+        # Repopulate
+        for w in list(inner.winfo_children()):
+            w.destroy()
+
+        if cnt is not None:
             try:
-                lbl.config(text="✎ {} margin note{}".format(
-                    len(notes), "s" if len(notes) != 1 else ""),
-                    fg=ACCENT)
-                self.after(2500,
-                           lambda s=session: self._pq_update_status_lbl(s))
+                cnt.config(text="{} note{}".format(
+                    len(notes), "s" if len(notes) != 1 else ""))
             except tk.TclError:
                 pass
+
+        if not notes:
+            tk.Label(inner,
+                     text=("  No notes yet.  In MARGIN mode (Ctrl+M), "
+                           "select text in the transcript and press Enter "
+                           "to add one."),
+                     font=FB, bg=SURF, fg=SUB, padx=8, pady=12,
+                     wraplength=900, justify="left").pack(anchor="w")
+            return
+
+        # Sort by anchor_start so notes appear in transcript order
+        for note_idx, n in enumerate(sorted(
+                notes, key=lambda x: float(x.get("anchor_start", 0)))):
+            row = tk.Frame(inner, bg=SURF,
+                            highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", padx=6, pady=4)
+            inner_row = tk.Frame(row, bg=SURF)
+            inner_row.pack(fill="x", padx=8, pady=6)
+
+            ts_s = float(n.get("anchor_start", 0))
+            tc_str = secs_tc(ts_s).split(".")[0]
+
+            # Header: timecode + snippet (clickable) + delete
+            hdr = tk.Frame(inner_row, bg=SURF)
+            hdr.pack(fill="x")
+            tc_lbl = tk.Label(hdr, text="▸ " + tc_str, font=FB,
+                               bg=SURF, fg=ACCENT, cursor="hand2")
+            tc_lbl.pack(side="left")
+            snippet = (n.get("snippet") or "").strip()
+            if snippet:
+                snip_lbl = tk.Label(hdr,
+                                     text='  "{}"'.format(snippet[:80]),
+                                     font=FB, bg=SURF, fg=SUB,
+                                     cursor="hand2", anchor="w")
+                snip_lbl.pack(side="left", fill="x", expand=True)
+            else:
+                snip_lbl = None
+
+            del_lbl = tk.Label(hdr, text="✕", font=FB,
+                                bg=SURF, fg=SUB, cursor="hand2",
+                                padx=4)
+            del_lbl.pack(side="right")
+            del_lbl.bind("<Enter>", lambda e, w=del_lbl: w.config(fg=ERR))
+            del_lbl.bind("<Leave>", lambda e, w=del_lbl: w.config(fg=SUB))
+            def _delete(_e=None, target=n):
+                cur = list(session.get("notes") or [])
+                # Remove by identity-equivalence on a tuple key
+                key = (target.get("anchor_start"),
+                       target.get("text"),
+                       target.get("ts"))
+                session["notes"] = [
+                    nn for nn in cur
+                    if (nn.get("anchor_start"),
+                        nn.get("text"),
+                        nn.get("ts")) != key
+                ]
+                self._pq_save_session_file(session)
+                self._pq_render_notes_panel()
+            del_lbl.bind("<Button-1>", _delete)
+
+            # Body: the note text
+            body_lbl = tk.Label(inner_row, text=(n.get("text") or "").strip(),
+                                 font=FB, bg=SURF, fg=TEXT,
+                                 anchor="w", justify="left",
+                                 wraplength=900)
+            body_lbl.pack(anchor="w", fill="x", pady=(4, 0))
+
+            # Click-to-jump: scroll the transcript pane to this note's anchor
+            def _jump(_e=None, t_s=ts_s):
+                self._pq_jump_to_time(t_s)
+            tc_lbl.bind("<Button-1>", _jump)
+            if snip_lbl is not None:
+                snip_lbl.bind("<Button-1>", _jump)
+
+    def _pq_jump_to_time(self, time_s):
+        """Scroll the transcript Text widget so the word nearest
+        `time_s` is visible.  Used by the notes panel click-to-jump."""
+        tx = getattr(self, "_pq_tx_text", None)
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if tx is None or not word_idx:
+            return
+        # Find nearest word by start time
+        best = None
+        best_dist = float("inf")
+        for s, e, w in word_idx:
+            ws = float(w.get("start", 0))
+            d = abs(ws - time_s)
+            if d < best_dist:
+                best_dist = d
+                best = s
+        if best is None:
+            return
+        try:
+            idx = "1.0+{}c".format(best)
+            tx.see(idx)
+            tx.mark_set("insert", idx)
+            tx.focus_set()
+            # Brief flash highlight
+            end_idx = "1.0+{}c".format(best + 30)
+            tx.tag_configure("pq_jump_flash",
+                              background="#5a3a10")
+            tx.tag_add("pq_jump_flash", idx, end_idx)
+            self.after(1200,
+                       lambda: tx.tag_remove("pq_jump_flash", "1.0", "end"))
+        except tk.TclError:
+            pass
 
     def _pq_manage_speakers_dialog(self):
         """List every speaker raw-tag found across the project's sessions
@@ -10524,6 +10716,170 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             px + max(0, (pw - ww) // 2),
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
+
+    def _pq_inline_rename_speaker(self, event, tx):
+        """Double-click on a speaker label → rename it everywhere in
+        the current Episode Project.  Same effect as the MANAGE
+        SPEAKERS dialog, but one-click for the visible label."""
+        # Find the raw speaker tag at the click position
+        pos = tx.index("@{},{}".format(event.x, event.y))
+        raw = None
+        for tname in tx.tag_names(pos):
+            if tname.startswith("speaker_raw:"):
+                raw = tname.split(":", 1)[1]
+                break
+        if not raw:
+            return "break"
+
+        project = getattr(self, "_pq_project", None)
+        session = getattr(self, "_pq_current_session", None)
+        if not project or not session:
+            return "break"
+
+        # Resolve current display label
+        sess_speakers = session.get("speakers") or {}
+        cur_label = (sess_speakers.get(raw)
+                     or sess_speakers.get(os.path.basename(raw))
+                     or self._pq_format_speaker(raw))
+
+        # Inline dialog
+        win = tk.Toplevel(self)
+        win.title("Rename Speaker")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+        tk.Label(win, text="Rename speaker", font=FH,
+                 bg=BG, fg=TEXT, padx=20, pady=14).pack(anchor="w")
+        tk.Label(win, text="Source: {}".format(raw), font=FB,
+                 bg=BG, fg=SUB, padx=20).pack(anchor="w")
+        tk.Label(win,
+                 text="(Renaming applies to every session in this "
+                      "project that references the same source.)",
+                 font=FB, bg=BG, fg=SUB, padx=20, wraplength=420,
+                 justify="left").pack(anchor="w", pady=(0, 8))
+
+        var = tk.StringVar(value=cur_label)
+        ent = tk.Entry(win, textvariable=var, font=FB,
+                        bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                        relief="flat", bd=4, width=32)
+        ent.pack(padx=20, ipady=2)
+        ent.select_range(0, "end")
+        ent.focus_set()
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=14)
+
+        def _apply():
+            new = var.get().strip()
+            if not new or new == cur_label:
+                win.destroy(); return
+            n_changed = 0
+            for s in project["sessions"]:
+                # Apply only if this session has any word with this raw tag
+                touches = any(
+                    w.get("speaker") == raw
+                    for w in (s.get("transcript") or []))
+                if not touches:
+                    continue
+                m = dict(s.get("speakers") or {})
+                m[raw] = new
+                m[os.path.basename(raw)] = new
+                s["speakers"] = m
+                self._pq_save_session_file(s)
+                n_changed += 1
+            win.destroy()
+            # Re-render the open session view
+            self._pq_render_transcript_text(session)
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "RENAME", _apply, color=ACCENT).pack(side="right")
+        win.bind("<Return>", lambda e: _apply())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = win.winfo_width();  wh = win.winfo_height()
+        win.geometry("+{}+{}".format(
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
+        return "break"
+
+    def _pq_filter_filler_interjections(self, words):
+        """Drop cross-track filler interjections.
+
+        A "filler turn" is a short run (≤ FILLER_MAX_WORDS) of one
+        speaker's words that's sandwiched between same-speaker turns of
+        a *different* speaker, AND the run consists only of common
+        backchannel words ("yeah", "mm-hmm", "right", etc.).  These
+        almost always come from cross-mic bleed or listener filler that
+        adds noise to the read.  Removed at render time only — the raw
+        transcript on disk is unchanged so the user can adjust the
+        threshold or disable filtering without re-transcribing.
+
+        Configurable knobs:
+          self._pq_filler_words      → set of lowercase backchannels
+          self._pq_filler_max_words  → max length for a candidate run
+        """
+        DEFAULT_FILLERS = {
+            "yeah", "yep", "yup", "yes", "no", "right", "okay", "ok",
+            "sure", "totally", "exactly", "absolutely",
+            "mm", "mmm", "mhm", "mm-hmm", "mmhmm", "uhhuh", "uh-huh",
+            "uhuh", "huh", "hm", "hmm", "wow", "oh", "ah", "uh", "um",
+            "i", "i'm", "well",
+        }
+        fillers = set(getattr(self, "_pq_filler_words", DEFAULT_FILLERS))
+        max_w   = int(getattr(self, "_pq_filler_max_words", 2))
+
+        if not words:
+            return words
+
+        # Group into consecutive same-speaker runs
+        runs = []
+        cur_speaker = object()
+        cur_words   = []
+        for w in words:
+            sp = w.get("speaker")
+            if sp != cur_speaker:
+                if cur_words:
+                    runs.append((cur_speaker, cur_words))
+                cur_speaker = sp
+                cur_words   = []
+            cur_words.append(w)
+        if cur_words:
+            runs.append((cur_speaker, cur_words))
+
+        def _is_filler_run(run_words):
+            if len(run_words) > max_w:
+                return False
+            for w in run_words:
+                # Strip punctuation when checking against the filler set.
+                clean = re.sub(r"[^a-z'\-]", "",
+                                (w.get("word") or "").lower())
+                if not clean:
+                    continue
+                if clean not in fillers:
+                    return False
+            return True
+
+        keep = [True] * len(runs)
+        for i in range(1, len(runs) - 1):
+            sp, rw = runs[i]
+            prev_sp = runs[i - 1][0]
+            next_sp = runs[i + 1][0]
+            # Drop only if the run is sandwiched between same-other-speaker
+            # turns AND every word is a filler.
+            if (prev_sp == next_sp and prev_sp != sp
+                    and prev_sp is not None
+                    and _is_filler_run(rw)):
+                keep[i] = False
+
+        out = []
+        for kept, (_, rw) in zip(keep, runs):
+            if kept:
+                out.extend(rw)
+        return out
 
     def _pq_format_speaker(self, raw):
         """Tidy a raw speaker tag (filename basename) into a display
@@ -11315,45 +11671,93 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         in_s  = float(selected[0].get("start", 0))
         out_s = float(selected[-1].get("end", in_s))
-        # Reconstruct the quote text from the SELECTED WORD entries,
-        # not from the widget — this way the visible speaker labels
-        # ("JORDAN:" headers) stay out of the clipboard automatically.
-        # We also rebuild paragraph structure: any selected word that
-        # was preceded by a paragraph break ("\n\n") in the rendered
-        # text starts a new paragraph in the copied output.
+        # Reconstruct the body text from the SELECTED WORD ENTRIES (not
+        # the widget) so the visible "JORDAN:" / "JENA:" headers in the
+        # transcript view stay out of the clipboard.  We then re-emit
+        # speaker prefixes inline at every speaker change so the human
+        # reader gets the dialogue context — the parser ignores those
+        # prefixes during reconcile.
+        sess_speakers = session.get("speakers") or {}
+        def _label_for(sp):
+            if not sp:
+                return ""
+            return (sess_speakers.get(sp)
+                    or sess_speakers.get(os.path.basename(sp))
+                    or self._pq_format_speaker(sp))
+
+        # Group selected words into consecutive same-speaker runs
+        # within paragraphs.  Paragraph breaks come from "\n\n" gaps
+        # between words in the rendered text (same convention the
+        # renderer used to insert them).
         word_idx_map = {id(w): (s, e) for (s, e, w) in word_idx}
+        # paragraph = list of (speaker, [word strings])
         paragraphs   = []
         cur_para     = []
+        cur_speaker  = object()
+        cur_run      = []
         prev_end_pos = None
+
+        def _flush_run():
+            nonlocal cur_run
+            if cur_run:
+                cur_para.append((cur_speaker, " ".join(cur_run)))
+                cur_run = []
+
+        def _flush_para():
+            nonlocal cur_para
+            _flush_run()
+            if cur_para:
+                paragraphs.append(cur_para)
+                cur_para = []
+
         for w in selected:
             wt = (w.get("word") or "").strip()
             if not wt:
                 continue
+            sp = w.get("speaker")
             s_pos, e_pos = word_idx_map.get(id(w), (None, None))
-            # Detect a paragraph break before this word: the preceding
-            # word's end position is followed by 2+ newlines before this
-            # word starts.  We approximate by reading the gap from the
-            # widget text.
+
+            # Paragraph break detection: 2+ newlines in the gap between
+            # the previous word and this one in the rendered widget.
             if prev_end_pos is not None and s_pos is not None:
                 try:
                     gap_text = tx.get(
                         "1.0+{}c".format(prev_end_pos),
                         "1.0+{}c".format(s_pos))
                     if "\n\n" in gap_text:
-                        if cur_para:
-                            paragraphs.append(" ".join(cur_para))
-                            cur_para = []
+                        _flush_para()
+                        cur_speaker = object()   # force speaker label
                 except tk.TclError:
                     pass
-            cur_para.append(wt)
+
+            if sp != cur_speaker:
+                _flush_run()
+                cur_speaker = sp
+            cur_run.append(wt)
             if e_pos is not None:
                 prev_end_pos = e_pos
-        if cur_para:
-            paragraphs.append(" ".join(cur_para))
 
-        # Body text: blank lines between paragraphs.  Quote chars stripped.
-        body = "\n\n".join(
-            p.strip().strip("“”‘’\"\'") for p in paragraphs if p.strip())
+        _flush_para()
+
+        # Render paragraphs.  Within a paragraph, each speaker run
+        # becomes its own line prefixed with "SPEAKER: ".  Paragraphs
+        # separated by blank lines.
+        para_strs = []
+        for runs in paragraphs:
+            lines = []
+            for sp, run_text in runs:
+                run_text = run_text.strip().strip("“”‘’\"\'")
+                if not run_text:
+                    continue
+                label = _label_for(sp)
+                if label:
+                    lines.append("{}: {}".format(label, run_text))
+                else:
+                    lines.append(run_text)
+            if lines:
+                para_strs.append("\n".join(lines))
+        body = "\n\n".join(para_strs)
+
         block = "[{} {}-{}]\n{}\n".format(
             session.get("token", "?"),
             secs_tc(in_s).split(".")[0],
