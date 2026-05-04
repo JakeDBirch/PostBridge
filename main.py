@@ -10129,6 +10129,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "<Configure>",
             lambda e: self._pq_update_notes_wraplength(e.width))
 
+        # Mouse-wheel routing: a global bind_all handler from
+        # _scroll_frame steals wheel events meant for this panel, so
+        # bind directly on the panel widgets and return "break" to
+        # short-circuit the global chain.  _pq_bind_wheel_to is
+        # called again inside _pq_render_notes_panel to cover the
+        # row widgets that get rebuilt every refresh.
+        self._pq_bind_wheel_to(self._pq_notes_outer)
+
         # Add panes to the PanedWindow.  Transcript first (it gets the
         # leading position regardless of orient), notes second when any
         # exist.  The notes pane is added/removed dynamically by
@@ -10775,6 +10783,47 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._pq_layout_resize_stash = stash
         self._pq_open_session_view(sess)
 
+    def _pq_wheel_notes(self, event):
+        """MouseWheel handler that scrolls the margin-notes canvas.
+        Returns "break" so the global bind_all wheel handler from
+        _scroll_frame doesn't also fire."""
+        canvas = getattr(self, "_pq_notes_canvas", None)
+        if canvas is None:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        # macOS reports raw notch counts (1/-1); X11 uses Button-4/5;
+        # Windows uses delta multiples of 120.
+        if sys.platform == "darwin":
+            units = int(-1 * event.delta)
+        else:
+            units = int(-1 * (event.delta / 120)) if event.delta else 0
+        if units:
+            canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _pq_bind_wheel_to(self, widget):
+        """Recursively bind MouseWheel events on widget + every
+        descendant to the notes-canvas scroller.  Idempotent: re-binding
+        the same widget just replaces the handler."""
+        if widget is None:
+            return
+        try:
+            widget.bind("<MouseWheel>", self._pq_wheel_notes)
+            widget.bind("<Button-4>",
+                lambda e: (self._pq_notes_canvas.yview_scroll(-3, "units"),
+                           "break")[1])
+            widget.bind("<Button-5>",
+                lambda e: (self._pq_notes_canvas.yview_scroll( 3, "units"),
+                           "break")[1])
+        except tk.TclError:
+            return
+        for c in widget.winfo_children():
+            self._pq_bind_wheel_to(c)
+
     def _pq_render_notes_panel(self):
         """Refresh the MARGIN NOTES side panel.  Shows one row per note
         with snippet (clickable to jump to anchor) + body + delete.
@@ -10928,6 +10977,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            lambda: self._pq_update_notes_wraplength(
                                self._pq_notes_canvas.winfo_width()))
         except tk.TclError:
+            pass
+
+        # Re-bind wheel events on every freshly-created row widget so
+        # scrolling works regardless of which child the cursor hovers.
+        try:
+            self._pq_bind_wheel_to(self._pq_notes_outer)
+        except Exception:
             pass
 
     def _pq_jump_to_time(self, time_s):
