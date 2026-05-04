@@ -9727,6 +9727,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # opens so the user's preferred mode sticks.
         if not hasattr(self, "_pq_mode"):
             self._pq_mode = "edit"
+        # Restore any state stashed by an orientation-driven rebuild.
+        _stash = getattr(self, "_pq_layout_resize_stash", None)
+        self._pq_layout_resize_stash = None
 
         # Bottom nav
         nav = tk.Frame(self.body, bg=BG)
@@ -9802,10 +9805,33 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         bg_ck.bind("<Button-1>",  lambda e: _toggle_bg())
         bg_lbl.bind("<Button-1>", lambda e: _toggle_bg())
 
+        # ── Resizable layout: transcript + notes ─────────────────────────
+        # PanedWindow holds the transcript pane and the margin-notes
+        # panel.  Orientation flips with the window width:
+        #   ≥ PQ_LAYOUT_THRESHOLD px → horizontal (side-by-side)
+        #   below                    → vertical (stacked)
+        # The user can drag the sash freely between them.
+        PQ_LAYOUT_THRESHOLD = 1100
+        self.update_idletasks()
+        cur_w = self.winfo_width() or 1200
+        orient = "horizontal" if cur_w >= PQ_LAYOUT_THRESHOLD else "vertical"
+        self._pq_layout_orient = orient
+        self._pq_layout_pw = tk.PanedWindow(
+            self.body, orient=orient, bg=BG,
+            sashwidth=8, sashrelief="flat",
+            sashpad=0, bd=0, opaqueresize=False,
+            handlepad=0, showhandle=False)
+        self._pq_layout_pw.pack(fill="both", expand=True, pady=(0, 8))
+
+        # Drag the sash → glow.  Bind on the PanedWindow so we don't
+        # have to know the sash widget id; Tk routes the events.
+        self._pq_layout_pw.config(sashrelief="flat")
+
         # ── Transcript pane (header + search + text) ─────────────────────
-        tx_outer = tk.Frame(self.body, bg=SURF,
+        tx_outer = tk.Frame(self._pq_layout_pw, bg=SURF,
                             highlightbackground=BORDER, highlightthickness=1)
-        tx_outer.pack(fill="both", expand=True, pady=(0, 8))
+        # tx_outer is added to the PanedWindow at the bottom of this
+        # function once the notes panel has been built too.
 
         # Header row: TRANSCRIPT label + status (right)
         tx_hdr = tk.Frame(tx_outer, bg=SURF3)
@@ -10044,10 +10070,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<F5>",        _rerender)
         self.bind("<F5>", _rerender)
 
-        # ── Margin notes panel — shown whenever notes exist or the user
-        # is in MARGIN mode.  Hidden otherwise.  Lives above the action
-        # row so it doesn't push the action bar off-screen.
-        self._pq_notes_outer = tk.Frame(self.body, bg=SURF,
+        # ── Margin notes panel ───────────────────────────────────────
+        # Lives inside the PanedWindow alongside the transcript.  When
+        # notes exist, the pane is visible; collapse via the ⇲ button
+        # in the header (forgets the pane); a 📝 button in the action
+        # row brings it back.
+        self._pq_notes_outer = tk.Frame(self._pq_layout_pw, bg=SURF,
                                           highlightbackground=BORDER,
                                           highlightthickness=1)
         notes_hdr = tk.Frame(self._pq_notes_outer, bg=SURF3)
@@ -10055,20 +10083,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(notes_hdr, text="MARGIN NOTES", font=FL,
                  bg=SURF3, fg=SUB, anchor="w",
                  padx=12, pady=6).pack(side="left")
+        # Collapse button — removes the pane from the PanedWindow.
+        self._pq_notes_collapse_btn = tk.Label(
+            notes_hdr, text="✕", font=FBT, bg=SURF3, fg=SUB,
+            cursor="hand2", padx=10, pady=6)
+        self._pq_notes_collapse_btn.pack(side="right")
+        self._pq_notes_collapse_btn.bind(
+            "<Enter>", lambda e: self._pq_notes_collapse_btn.config(fg=ERR))
+        self._pq_notes_collapse_btn.bind(
+            "<Leave>", lambda e: self._pq_notes_collapse_btn.config(fg=SUB))
+        self._pq_notes_collapse_btn.bind(
+            "<Button-1>", lambda e: self._pq_toggle_notes_pane(False))
         self._pq_notes_count_lbl = tk.Label(
             notes_hdr, text="", font=FB, bg=SURF3, fg=SUB,
-            padx=12, pady=6)
+            padx=8, pady=6)
         self._pq_notes_count_lbl.pack(side="right")
-        tk.Label(notes_hdr,
-                 text="In MARGIN mode, select text + Enter to add.  "
-                      "Click any anchor below to jump.",
-                 font=FB, bg=SURF3, fg=SUB,
-                 padx=12, pady=6).pack(side="right")
 
         notes_body = tk.Frame(self._pq_notes_outer, bg=SURF)
-        notes_body.pack(fill="x")
+        notes_body.pack(fill="both", expand=True)
         self._pq_notes_canvas = tk.Canvas(
-            notes_body, bg=SURF, highlightthickness=0, height=140)
+            notes_body, bg=SURF, highlightthickness=0)
         notes_sb = _SlimScrollbar(notes_body,
                                    command=self._pq_notes_canvas.yview)
         notes_sb.pack(side="right", fill="y")
@@ -10082,8 +10116,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             lambda e: self._pq_notes_canvas.configure(
                 scrollregion=self._pq_notes_canvas.bbox("all")))
 
-        # Initial state: hidden if no notes and not in margin mode.
-        # _pq_apply_mode + _pq_render_notes_panel control visibility.
+        # Add panes to the PanedWindow.  Transcript first (it gets the
+        # leading position regardless of orient), notes second when any
+        # exist.  The notes pane is added/removed dynamically by
+        # _pq_render_notes_panel based on note presence.
+        self._pq_layout_pw.add(tx_outer, minsize=320, stretch="always")
         self._pq_render_notes_panel()
 
         # Action row: mode badge (left) + PLAY/COPY (right)
@@ -10114,6 +10151,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  text="    Ctrl+M to add margin note",
                  font=FB, bg=BG, fg=SUB).pack(side="left")
 
+        # Toggle notes-pane visibility.  Useful when the user has
+        # collapsed it via the ✕ in the panel header and wants it back.
+        self._pq_notes_toggle_btn = tk.Label(
+            mode_frame, text="📝", font=FB, bg=SURF3, fg=TEXT,
+            cursor="hand2", padx=10, pady=4)
+        self._pq_notes_toggle_btn.pack(side="left", padx=(16, 0))
+        self._pq_notes_toggle_btn.bind(
+            "<Button-1>",
+            lambda e: self._pq_toggle_notes_pane(None))
+        self._pq_refresh_notes_toggle_btn()
+
         self._btn(act, "COPY SELECTION AS @PULL",
                   self._pq_copy_as_pull,
                   color=ACCENT).pack(side="right")
@@ -10124,6 +10172,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Apply current mode to update badge styling + key behaviour
         self._pq_apply_mode()
+
+        # Restore stashed state from an orient-rebuild, if any.
+        if _stash:
+            try:
+                if "search" in _stash and _stash["search"]:
+                    self._pq_search_var.set(_stash["search"])
+                if "collapsed" in _stash:
+                    self._pq_notes_user_collapsed = bool(_stash["collapsed"])
+                    self._pq_render_notes_panel()
+                    self._pq_refresh_notes_toggle_btn()
+                if "yview" in _stash and _stash["yview"]:
+                    self.after(50, lambda y=_stash["yview"]:
+                               self._pq_tx_text.yview_moveto(y[0])
+                               if hasattr(self, "_pq_tx_text") else None)
+            except Exception:
+                pass
+
+        # Layout-driven orient switching: when the window is resized
+        # across PQ_LAYOUT_THRESHOLD, rebuild the view with the other
+        # orient.  Debounced inside _pq_on_layout_resize.
+        # Bind on the toplevel root so we catch every Configure event.
+        if not getattr(self, "_pq_layout_resize_bound", False):
+            self.bind("<Configure>", self._pq_on_layout_resize, add="+")
+            self._pq_layout_resize_bound = True
 
         if transcribe_now:
             self.after(80,
@@ -10466,6 +10538,87 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
 
+    def _pq_toggle_notes_pane(self, force=None):
+        """Show/hide the margin-notes pane.
+
+        force=True  → show.  force=False → hide.  force=None → toggle.
+        Tracked via self._pq_notes_user_collapsed so a redraw of the
+        notes panel honours the user's preference.
+        """
+        if force is None:
+            cur = bool(getattr(self, "_pq_notes_user_collapsed", False))
+            self._pq_notes_user_collapsed = not cur
+        else:
+            self._pq_notes_user_collapsed = not bool(force)
+        self._pq_render_notes_panel()
+        self._pq_refresh_notes_toggle_btn()
+
+    def _pq_refresh_notes_toggle_btn(self):
+        """Update the 📝 button label + colour based on current state."""
+        btn = getattr(self, "_pq_notes_toggle_btn", None)
+        session = getattr(self, "_pq_current_session", None)
+        if btn is None or session is None:
+            return
+        try:
+            notes = session.get("notes") or []
+            collapsed = bool(getattr(self, "_pq_notes_user_collapsed", False))
+            if not notes:
+                btn.config(text="📝 0 notes", fg=SUB, bg=SURF3)
+            elif collapsed:
+                btn.config(
+                    text="📝 {} note{} ▸".format(
+                        len(notes), "s" if len(notes) != 1 else ""),
+                    fg=TEXT, bg=SURF3)
+            else:
+                btn.config(
+                    text="📝 {} note{}".format(
+                        len(notes), "s" if len(notes) != 1 else ""),
+                    fg=ACCENT, bg=SURF3)
+        except tk.TclError:
+            pass
+
+    def _pq_on_layout_resize(self, event=None):
+        """Debounced window-resize callback.  When the window crosses
+        the layout threshold, switch PanedWindow orientation by
+        rebuilding the session view (cheap; only fires on threshold
+        crossings, not on every resize tick)."""
+        if getattr(self, "_pq_current_session", None) is None:
+            return
+        # Debounce: cancel any pending check, schedule fresh one.
+        prev = getattr(self, "_pq_layout_resize_after", None)
+        if prev is not None:
+            try: self.after_cancel(prev)
+            except Exception: pass
+        self._pq_layout_resize_after = self.after(
+            220, self._pq_check_layout_orient)
+
+    def _pq_check_layout_orient(self):
+        """If the current window width crosses the threshold for the
+        opposite orientation, rebuild the session view with that
+        orient."""
+        sess = getattr(self, "_pq_current_session", None)
+        if sess is None:
+            return
+        cur_w = self.winfo_width()
+        desired = "horizontal" if cur_w >= 1100 else "vertical"
+        cur_orient = getattr(self, "_pq_layout_orient", desired)
+        if desired == cur_orient:
+            return
+        # Stash transient state we want to preserve across rebuild
+        try:
+            stash = {
+                "search": (self._pq_search_var.get()
+                           if hasattr(self, "_pq_search_var") else ""),
+                "yview":  (self._pq_tx_text.yview()
+                           if hasattr(self, "_pq_tx_text") else None),
+                "collapsed": bool(getattr(
+                    self, "_pq_notes_user_collapsed", False)),
+            }
+        except Exception:
+            stash = {}
+        self._pq_layout_resize_stash = stash
+        self._pq_open_session_view(sess)
+
     def _pq_render_notes_panel(self):
         """Refresh the MARGIN NOTES side panel.  Shows one row per note
         with snippet (clickable to jump to anchor) + body + delete.
@@ -10479,14 +10632,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         notes = session.get("notes") or []
 
-        # Visibility: show whenever notes exist.  No more margin-mode
-        # gating — notes are always reachable via Ctrl+M and the panel
-        # is the always-on home for them.
+        # Visibility: notes_outer is a pane in the layout PanedWindow.
+        # Add it when notes exist + not user-collapsed; remove when no
+        # notes or user collapsed it.
+        pw = getattr(self, "_pq_layout_pw", None)
         try:
-            if notes:
-                outer.pack(fill="x", pady=(0, 8))
-            else:
-                outer.pack_forget()
+            if pw is not None and pw.winfo_exists():
+                in_panes = str(outer) in [str(p) for p in pw.panes()]
+                user_collapsed = bool(getattr(
+                    self, "_pq_notes_user_collapsed", False))
+                want_visible = bool(notes) and not user_collapsed
+                if want_visible and not in_panes:
+                    # Add as second pane with a sane minimum.  Stretch
+                    # "never" so it stays at its preferred width unless
+                    # the user explicitly drags the sash.
+                    pw.add(outer, minsize=240, stretch="never",
+                            sticky="nsew")
+                elif not want_visible and in_panes:
+                    pw.forget(outer)
         except tk.TclError:
             pass
 
@@ -10500,6 +10663,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     len(notes), "s" if len(notes) != 1 else ""))
             except tk.TclError:
                 pass
+        # Keep the action-row toggle button in sync as notes are
+        # added/deleted.
+        try:
+            self._pq_refresh_notes_toggle_btn()
+        except Exception:
+            pass
 
         if not notes:
             tk.Label(inner,
