@@ -9723,10 +9723,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _pq_open_session_view(self, session, transcribe_now=False):
         self._clear()
         self._pq_current_session = session
-        # Mode is per-app, defaulting to EDIT.  Persists across session
-        # opens so the user's preferred mode sticks.
-        if not hasattr(self, "_pq_mode"):
-            self._pq_mode = "edit"
         # Restore any state stashed by an orientation-driven rebuild.
         _stash = getattr(self, "_pq_layout_resize_stash", None)
         self._pq_layout_resize_stash = None
@@ -9988,58 +9984,34 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<Control-Shift-z>", _do_redo)
         tx_text.bind("<Control-Shift-Z>", _do_redo)
 
-        # ── Mode dispatch ─────────────────────────────────────────────
-        # Two mutually-exclusive modes:
-        #   EDIT   (Ctrl+E, default) — full editing, undo/redo.
-        #                              Ctrl+M adds a margin note from
-        #                              the current selection without
-        #                              leaving EDIT mode.
-        #   PLAY   (Ctrl+P)          — read-only.  Spacebar plays/stops
-        #                              the current selection (or from
-        #                              cursor to end if no selection).
-        # Margin notes panel is always visible whenever any notes exist.
-        def _set_mode(new_mode, event=None):
-            self._pq_mode = new_mode
-            self._pq_apply_mode()
-            return "break"
-
-        tx_text.bind("<Control-e>", lambda e: _set_mode("edit", e))
-        tx_text.bind("<Control-E>", lambda e: _set_mode("edit", e))
-        tx_text.bind("<Control-p>", lambda e: _set_mode("play", e))
-        tx_text.bind("<Control-P>", lambda e: _set_mode("play", e))
-        # Ctrl+M — quick "add margin note" without leaving EDIT mode.
+        # ── Always-on read-only with right-click context menu ─────────
+        # The transcript is permanently read-only.  Editing happens via
+        # right-click → "Edit text…" on a selection.  Spacebar always
+        # plays the current selection (or cursor-to-end).  Ctrl+M still
+        # adds a margin note for the current selection.
         def _add_note(event=None):
             self._pq_add_margin_note()
             return "break"
         tx_text.bind("<Control-m>", _add_note)
         tx_text.bind("<Control-M>", _add_note)
-        # Also bind app-level so the shortcuts work from any focus.
-        for kc, m in [("<Control-e>", "edit"), ("<Control-E>", "edit"),
-                      ("<Control-p>", "play"), ("<Control-P>", "play")]:
-            self.bind(kc, lambda e, mm=m: _set_mode(mm, e))
         self.bind("<Control-m>", _add_note)
         self.bind("<Control-M>", _add_note)
 
-        # Spacebar transport — only fires in PLAY mode (suppressed
-        # otherwise so it doesn't fight typing in EDIT mode).  Also keep
-        # Shift+Space as a back-compat alias that always plays.
+        # Spacebar plays the current selection.  Shift+Space stays as a
+        # convenience alias.
         def _space_play(event=None):
-            if getattr(self, "_pq_mode", "edit") != "play":
-                return None  # let normal space handling proceed
-            self._pq_play_selection()
-            return "break"
-        def _shift_space(event=None):
             self._pq_play_selection()
             return "break"
         tx_text.bind("<space>",               _space_play)
         tx_text.bind("<Key-space>",           _space_play)
-        tx_text.bind("<Shift-space>",         _shift_space)
-        tx_text.bind("<Shift-Key-space>",     _shift_space)
-        sr_entry.bind("<Shift-space>",        _shift_space)
-        sr_entry.bind("<Shift-Key-space>",    _shift_space)
+        tx_text.bind("<Shift-space>",         _space_play)
+        tx_text.bind("<Shift-Key-space>",     _space_play)
+        sr_entry.bind("<Shift-space>",        _space_play)
+        sr_entry.bind("<Shift-Key-space>",    _space_play)
 
-        # Read-only enforcement — when mode is play, block any keypress
-        # that would modify the buffer.  Allow nav + explicit shortcuts.
+        # Read-only enforcement — block any keypress that would modify
+        # the buffer.  Allow navigation, modifier keys, and Ctrl+key
+        # shortcuts (which we wire explicitly elsewhere).
         ALLOWED_KEYSYMS = {
             "Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next",
             "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R",
@@ -10047,15 +10019,50 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "Num_Lock", "Scroll_Lock",
         }
         def _maybe_block_edit(event):
-            if getattr(self, "_pq_mode", "edit") == "edit":
-                return None
             if event.keysym in ALLOWED_KEYSYMS:
                 return None
             ctrl_pressed = (event.state & 0x4) != 0
             if ctrl_pressed:
-                return None   # Ctrl+anything is one of our shortcuts
+                return None
             return "break"
         tx_text.bind("<KeyPress>", _maybe_block_edit)
+
+        # Right-click context menu — the only way to mutate the
+        # transcript.  Always offers the actions that make sense on
+        # the current selection (or graceful no-op when there isn't
+        # one).
+        def _show_ctx(event):
+            try:
+                has_sel = bool(tx_text.tag_ranges("sel"))
+            except tk.TclError:
+                has_sel = False
+            menu = tk.Menu(tx_text, tearoff=0,
+                            bg=SURF2, fg=TEXT,
+                            activebackground=ACCENT,
+                            activeforeground=TEXT,
+                            bd=0)
+            menu.add_command(
+                label="Copy as @PULL",
+                command=self._pq_copy_as_pull,
+                state="normal" if has_sel else "disabled")
+            menu.add_command(
+                label="Play selection (Space)",
+                command=self._pq_play_selection,
+                state="normal" if has_sel else "disabled")
+            menu.add_command(
+                label="Add margin note (Ctrl+M)",
+                command=self._pq_add_margin_note,
+                state="normal" if has_sel else "disabled")
+            menu.add_separator()
+            menu.add_command(
+                label="Edit selected text…",
+                command=self._pq_edit_selection,
+                state="normal" if has_sel else "disabled")
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+        tx_text.bind("<Button-3>", _show_ctx)
 
         # Ctrl+R / F5 → re-render the transcript from the same in-memory
         # data.  Useful when iterating on rendering tweaks: change the
@@ -10133,34 +10140,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         act = tk.Frame(self.body, bg=BG)
         act.pack(fill="x", pady=(0, 4))
 
-        # Mode badge — three buttons that toggle EDIT / PLAY / MARGIN
-        mode_frame = tk.Frame(act, bg=BG)
-        mode_frame.pack(side="left")
-        tk.Label(mode_frame, text="MODE", font=FL,
-                 bg=BG, fg=SUB).pack(side="left", padx=(0, 8))
-        self._pq_mode_btns = {}
-        for label, key, hotkey in [
-            ("Edit",   "edit",   "Ctrl+E"),
-            ("Play",   "play",   "Ctrl+P"),
-        ]:
-            b = tk.Label(mode_frame, text="{}  {}".format(label, hotkey),
-                          font=FB, bg=SURF3, fg=TEXT, padx=10, pady=4,
-                          cursor="hand2")
-            b.pack(side="left", padx=(0, 4))
-            def _click(e=None, k=key):
-                self._pq_mode = k
-                self._pq_apply_mode()
-            b.bind("<Button-1>", _click)
-            self._pq_mode_btns[key] = b
-
-        tk.Label(mode_frame,
-                 text="    Ctrl+M to add margin note",
+        # Left side: hint + notes toggle.  No more Edit/Play modes —
+        # the transcript is permanently read-only; right-click on a
+        # selection to edit, copy, play, or annotate.
+        left_row = tk.Frame(act, bg=BG)
+        left_row.pack(side="left")
+        tk.Label(left_row,
+                 text="Right-click selection for actions   ·   "
+                      "Space plays   ·   Ctrl+M adds note",
                  font=FB, bg=BG, fg=SUB).pack(side="left")
 
-        # Toggle notes-pane visibility.  Useful when the user has
-        # collapsed it via the ✕ in the panel header and wants it back.
+        # Toggle the notes pane visibility from the action row.  Useful
+        # when the user has collapsed it via the ✕ in the panel header.
         self._pq_notes_toggle_btn = tk.Label(
-            mode_frame, text="📝", font=FB, bg=SURF3, fg=TEXT,
+            left_row, text="📝", font=FB, bg=SURF3, fg=TEXT,
             cursor="hand2", padx=10, pady=4)
         self._pq_notes_toggle_btn.pack(side="left", padx=(16, 0))
         self._pq_notes_toggle_btn.bind(
@@ -10395,38 +10388,182 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
         self._pq_update_status_lbl(session)
 
-    # ── Mode helpers ──────────────────────────────────────────────────────
+    # ── Selection actions ─────────────────────────────────────────────────
 
     def _pq_apply_mode(self):
-        """Push the current self._pq_mode through to the visual badge,
-        the Text widget cursor, and the margin notes panel visibility."""
-        mode = getattr(self, "_pq_mode", "edit")
-        btns = getattr(self, "_pq_mode_btns", None) or {}
-        for key, b in btns.items():
-            try:
-                if key == mode:
-                    b.config(bg=ACCENT, fg=TEXT)
-                else:
-                    b.config(bg=SURF3, fg=TEXT)
-            except tk.TclError:
-                pass
+        """Vestigial entry point kept so existing callers don't error.
+        Edit/Play modes were collapsed into perpetual read-only with a
+        right-click context menu — the only remaining responsibility is
+        making sure the notes panel is rendered after view setup."""
         tx = getattr(self, "_pq_tx_text", None)
         if tx is not None:
             try:
-                if mode == "edit":
-                    tx.config(cursor="xterm")
-                elif mode == "play":
-                    tx.config(cursor="arrow")
-                elif mode == "margin":
-                    tx.config(cursor="plus")
+                tx.config(cursor="xterm")
             except tk.TclError:
                 pass
-        # Refresh notes panel — visibility tracks margin mode + presence
-        # of any saved notes.
         try:
             self._pq_render_notes_panel()
         except Exception:
             pass
+
+    def _pq_edit_selection(self):
+        """Open a dialog letting the user rewrite the words under the
+        current selection.  On save, replaces those word entries in
+        ``session["transcript"]`` with new entries whose timestamps are
+        distributed proportionally across the original time range, then
+        re-renders the transcript and persists the session."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return
+
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            return
+
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            return
+
+        try:
+            c0 = tx.count("1.0", sel_first, "chars")[0]
+            c1 = tx.count("1.0", sel_last,  "chars")[0]
+        except Exception:
+            return
+
+        picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
+        if not picked:
+            return
+
+        # Locate the picked words in session["transcript"] by identity
+        # — they're the same dict objects the renderer captured.  Find
+        # the contiguous slice [span_start, span_end) covering them so
+        # we can splice in the replacement entries while preserving
+        # any non-word entries (breaks, etc.) before/after.
+        transcript = session.get("transcript") or []
+        picked_ids = {id(w) for w in picked}
+        span_start = None
+        span_end   = None
+        for i, w in enumerate(transcript):
+            if id(w) in picked_ids:
+                if span_start is None:
+                    span_start = i
+                span_end = i + 1
+        if span_start is None:
+            return
+
+        orig_words = transcript[span_start:span_end]
+        real_orig  = [w for w in orig_words
+                      if (w.get("word") or "").strip() and not w.get("break")]
+        if not real_orig:
+            return
+
+        range_start = float(real_orig[0].get("start", 0))
+        range_end   = float(real_orig[-1].get("end", range_start))
+        if range_end <= range_start:
+            range_end = range_start + max(0.5, len(real_orig) * 0.3)
+
+        # Most-common speaker among picked words wins (in mixed-track
+        # selections this beats arbitrarily picking the first one).
+        from collections import Counter
+        sp_counter = Counter(w.get("speaker") for w in real_orig
+                             if w.get("speaker"))
+        common_speaker = (sp_counter.most_common(1)[0][0]
+                          if sp_counter else None)
+
+        orig_text = "".join(w.get("word") or "" for w in real_orig).strip()
+
+        win = tk.Toplevel(self)
+        win.title("Edit Selection")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.minsize(560, 320)
+
+        # Bottom buttons first so they survive minimum-height dialogs.
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(side="bottom", fill="x", padx=20, pady=(8, 14))
+
+        tk.Label(win, text="Edit Transcript Text", font=FH,
+                 bg=BG, fg=TEXT, padx=20, pady=14).pack(anchor="w")
+        tk.Label(win, text="Time range: {} – {}".format(
+                    secs_tc(range_start).split(".")[0],
+                    secs_tc(range_end).split(".")[0]),
+                 font=FL, bg=BG, fg=SUB, padx=20).pack(anchor="w")
+        tk.Label(win,
+                 text=("Edited words inherit the original time span; "
+                       "timestamps are distributed proportionally.  "
+                       "Ctrl+Enter to save · Esc to cancel."),
+                 font=FB, bg=BG, fg=SUB, padx=20,
+                 wraplength=520, justify="left"
+                 ).pack(anchor="w", pady=(0, 8))
+
+        ent = tk.Text(win, font=FB, bg=SURF2, fg=TEXT,
+                       insertbackground=TEXT, relief="flat",
+                       bd=8, height=6, wrap="word", undo=True)
+        ent.pack(fill="both", expand=True, padx=20, pady=(8, 0))
+        ent.insert("1.0", orig_text)
+        ent.tag_add("sel", "1.0", "end-1c")
+        ent.focus_set()
+
+        def _save(_e=None):
+            new_text = ent.get("1.0", "end-1c").strip()
+            if not new_text:
+                win.destroy(); return "break"
+            toks = new_text.split()
+            if not toks:
+                win.destroy(); return "break"
+
+            # Whisper convention: a leading-space prefix on every word
+            # except the first.  Matches the renderer's concatenation
+            # logic so the resulting transcript reads naturally.
+            n     = len(toks)
+            total = max(0.05, range_end - range_start)
+            per   = total / n
+            new_entries = []
+            for i, tok in enumerate(toks):
+                wt = (" " if i > 0 else "") + tok
+                entry = {
+                    "word":  wt,
+                    "start": range_start + i * per,
+                    "end":   range_start + (i + 1) * per,
+                }
+                if common_speaker:
+                    entry["speaker"] = common_speaker
+                new_entries.append(entry)
+
+            transcript[span_start:span_end] = new_entries
+            session["transcript"] = transcript
+            try:
+                self._pq_save_session_file(session)
+            except Exception:
+                pass
+            win.destroy()
+            try:
+                self._pq_render_transcript_text(session)
+            except Exception:
+                pass
+            return "break"
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "SAVE",   _save, color=ACCENT).pack(side="right")
+        win.bind("<Control-Return>",   _save)
+        win.bind("<Control-KP_Enter>", _save)
+        ent.bind("<Control-Return>",   _save)
+        ent.bind("<Control-KP_Enter>", _save)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = max(560, win.winfo_reqwidth())
+        wh = max(320, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
 
     def _pq_add_margin_note(self):
         """Margin-mode action: prompt for a note tied to the current
@@ -10720,8 +10857,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             tc_lbl.pack(side="left")
             snippet = (n.get("snippet") or "").strip()
             if snippet:
+                # Snippet (quoted anchor text) stays single-line and
+                # never wraps — only the note BODY reflows with panel
+                # width.  Truncate to 60 chars; the full anchor lives
+                # in the underlying word entries anyway.
+                snip_text = snippet[:60] + ("…" if len(snippet) > 60 else "")
                 snip_lbl = tk.Label(hdr,
-                                     text='  "{}"'.format(snippet[:80]),
+                                     text='  "{}"'.format(snip_text),
                                      font=FB, bg=SURF, fg=SUB,
                                      cursor="hand2", anchor="w")
                 snip_lbl.pack(side="left", fill="x", expand=True)
@@ -10759,13 +10901,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                  anchor="w", justify="left",
                                  wraplength=400)
             body_lbl.pack(anchor="w", fill="x", pady=(4, 0))
-            # Tag for the wraplength updater
+            # Only the BODY label wraps with the panel.  The snippet
+            # stays single-line (truncated above) — it's a quote
+            # reference, not the user's content.
             self._pq_notes_body_lbls = getattr(
                 self, "_pq_notes_body_lbls", [])
             self._pq_notes_body_lbls.append(body_lbl)
-            # Snippet labels also benefit from wrap updates
-            if snip_lbl is not None:
-                self._pq_notes_body_lbls.append(snip_lbl)
 
             # Click-to-jump: scroll the transcript pane to this note's anchor
             def _jump(_e=None, t_s=ts_s):
