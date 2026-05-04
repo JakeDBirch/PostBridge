@@ -9235,10 +9235,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         bg_ck.bind("<Button-1>",  lambda e: _toggle_bg_proj())
         bg_lbl.bind("<Button-1>", lambda e: _toggle_bg_proj())
 
-        # Manage-speakers button
-        self._btn(ctrl_row, "MANAGE SPEAKERS",
-                  self._pq_manage_speakers_dialog,
-                  small=True).pack(side="right")
+        # (MANAGE SPEAKERS removed — speaker labels are renamed inline
+        # by double-clicking any "JORDAN:" / "JENA:" header in the
+        # transcript view.  The bulk dialog implementation is kept on
+        # the App object as `_pq_manage_speakers_dialog` for future use.)
 
         is_empty = not project["sessions"]
 
@@ -9963,33 +9963,36 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.bind("<Control-Shift-Z>", _do_redo)
 
         # ── Mode dispatch ─────────────────────────────────────────────
-        # Three mutually-exclusive modes drive what the transcript pane
-        # responds to:
-        #   EDIT   (Ctrl+E, default) — full editing, undo/redo, no
-        #                              spacebar-as-transport.
+        # Two mutually-exclusive modes:
+        #   EDIT   (Ctrl+E, default) — full editing, undo/redo.
+        #                              Ctrl+M adds a margin note from
+        #                              the current selection without
+        #                              leaving EDIT mode.
         #   PLAY   (Ctrl+P)          — read-only.  Spacebar plays/stops
         #                              the current selection (or from
         #                              cursor to end if no selection).
-        #   MARGIN (Ctrl+M)          — read-only.  Selection + Enter
-        #                              opens a margin-note editor; notes
-        #                              live in a side panel and never
-        #                              make it into copied @PULL blocks.
+        # Margin notes panel is always visible whenever any notes exist.
         def _set_mode(new_mode, event=None):
             self._pq_mode = new_mode
             self._pq_apply_mode()
             return "break"
 
-        tx_text.bind("<Control-e>", lambda e: _set_mode("edit",   e))
-        tx_text.bind("<Control-E>", lambda e: _set_mode("edit",   e))
-        tx_text.bind("<Control-p>", lambda e: _set_mode("play",   e))
-        tx_text.bind("<Control-P>", lambda e: _set_mode("play",   e))
-        tx_text.bind("<Control-m>", lambda e: _set_mode("margin", e))
-        tx_text.bind("<Control-M>", lambda e: _set_mode("margin", e))
-        # Also bind app-level so the same shortcuts work from any focus.
-        for kc, m in [("<Control-e>", "edit"),  ("<Control-E>", "edit"),
-                      ("<Control-p>", "play"),  ("<Control-P>", "play"),
-                      ("<Control-m>", "margin"),("<Control-M>", "margin")]:
+        tx_text.bind("<Control-e>", lambda e: _set_mode("edit", e))
+        tx_text.bind("<Control-E>", lambda e: _set_mode("edit", e))
+        tx_text.bind("<Control-p>", lambda e: _set_mode("play", e))
+        tx_text.bind("<Control-P>", lambda e: _set_mode("play", e))
+        # Ctrl+M — quick "add margin note" without leaving EDIT mode.
+        def _add_note(event=None):
+            self._pq_add_margin_note()
+            return "break"
+        tx_text.bind("<Control-m>", _add_note)
+        tx_text.bind("<Control-M>", _add_note)
+        # Also bind app-level so the shortcuts work from any focus.
+        for kc, m in [("<Control-e>", "edit"), ("<Control-E>", "edit"),
+                      ("<Control-p>", "play"), ("<Control-P>", "play")]:
             self.bind(kc, lambda e, mm=m: _set_mode(mm, e))
+        self.bind("<Control-m>", _add_note)
+        self.bind("<Control-M>", _add_note)
 
         # Spacebar transport — only fires in PLAY mode (suppressed
         # otherwise so it doesn't fight typing in EDIT mode).  Also keep
@@ -10009,10 +10012,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         sr_entry.bind("<Shift-space>",        _shift_space)
         sr_entry.bind("<Shift-Key-space>",    _shift_space)
 
-        # Read-only enforcement — when mode is play or margin, block any
-        # keypress that would modify the buffer (printable chars, return,
-        # delete, backspace).  We also allow nav + the explicit shortcuts
-        # bound above.
+        # Read-only enforcement — when mode is play, block any keypress
+        # that would modify the buffer.  Allow nav + explicit shortcuts.
         ALLOWED_KEYSYMS = {
             "Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next",
             "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R",
@@ -10027,11 +10028,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             ctrl_pressed = (event.state & 0x4) != 0
             if ctrl_pressed:
                 return None   # Ctrl+anything is one of our shortcuts
-            if event.keysym == "Return" and getattr(self, "_pq_mode", "edit") == "margin":
-                # Margin mode: Enter opens the note dialog for the
-                # current selection.
-                self._pq_add_margin_note()
-                return "break"
             return "break"
         tx_text.bind("<KeyPress>", _maybe_block_edit)
 
@@ -10103,7 +10099,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for label, key, hotkey in [
             ("Edit",   "edit",   "Ctrl+E"),
             ("Play",   "play",   "Ctrl+P"),
-            ("Margin", "margin", "Ctrl+M"),
         ]:
             b = tk.Label(mode_frame, text="{}  {}".format(label, hotkey),
                           font=FB, bg=SURF3, fg=TEXT, padx=10, pady=4,
@@ -10114,6 +10109,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._pq_apply_mode()
             b.bind("<Button-1>", _click)
             self._pq_mode_btns[key] = b
+
+        tk.Label(mode_frame,
+                 text="    Ctrl+M to add margin note",
+                 font=FB, bg=BG, fg=SUB).pack(side="left")
 
         self._btn(act, "COPY SELECTION AS @PULL",
                   self._pq_copy_as_pull,
@@ -10400,7 +10399,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         win.title("Margin Note")
         win.configure(bg=BG)
         win.transient(self); win.grab_set()
-        win.geometry("520x260")
+        win.minsize(560, 380)
+
+        # Pack the bottom button row FIRST (side="bottom") so it's
+        # guaranteed to be visible even when the dialog is the
+        # minimum height — otherwise the editor pushes it off-screen.
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(side="bottom", fill="x", padx=20, pady=(8, 14))
 
         tk.Label(win, text="Add Margin Note", font=FH,
                  bg=BG, fg=TEXT, padx=20, pady=14).pack(anchor="w")
@@ -10408,21 +10413,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  bg=BG, fg=SUB, padx=20).pack(anchor="w")
         tk.Label(win, text='"{}"'.format(snippet),
                  font=FB, bg=BG, fg=ACCENT, padx=20,
-                 wraplength=480, justify="left").pack(anchor="w", pady=(0, 12))
+                 wraplength=520, justify="left"
+                 ).pack(anchor="w", pady=(0, 8))
+        tk.Label(win,
+                 text="Ctrl+Enter to save · Esc to cancel",
+                 font=FB, bg=BG, fg=SUB, padx=20).pack(anchor="w")
 
-        note_var = tk.StringVar()
         ent = tk.Text(win, font=FB, bg=SURF2, fg=TEXT,
                        insertbackground=TEXT, relief="flat",
-                       bd=8, height=4, wrap="word")
-        ent.pack(fill="x", padx=20)
+                       bd=8, height=6, wrap="word")
+        ent.pack(fill="both", expand=True, padx=20, pady=(8, 0))
         ent.focus_set()
 
-        nav = tk.Frame(win, bg=BG)
-        nav.pack(fill="x", padx=20, pady=14)
-        def _save():
+        def _save(_e=None):
             text = ent.get("1.0", "end-1c").strip()
             if not text:
-                win.destroy(); return
+                win.destroy(); return "break"
             notes = list(session.get("notes") or [])
             notes.append({
                 "anchor_start": anchor_start,
@@ -10436,16 +10442,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._pq_save_session_file(session)
             win.destroy()
             self._pq_render_notes_panel()
+            return "break"
 
         self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
         self._btn(nav, "SAVE NOTE", _save, color=ACCENT).pack(side="right")
-        win.bind("<Control-Return>", lambda e: _save())
+        # Ctrl+Enter from anywhere in the dialog (incl. inside the Text
+        # widget where Tk's class binding for <Return> would normally
+        # eat the event).  Bind on both the window and the editor.
+        win.bind("<Control-Return>",       _save)
+        win.bind("<Control-KP_Enter>",     _save)
+        ent.bind("<Control-Return>",       _save)
+        ent.bind("<Control-KP_Enter>",     _save)
+        win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
         pw = self.winfo_width(); ph = self.winfo_height()
         px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = win.winfo_width();  wh = win.winfo_height()
-        win.geometry("+{}+{}".format(
+        ww = max(560, win.winfo_reqwidth())
+        wh = max(380, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
             px + max(0, (pw - ww) // 2),
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
@@ -10462,13 +10478,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
 
         notes = session.get("notes") or []
-        mode  = getattr(self, "_pq_mode", "edit")
 
-        # Visibility: only show when there are notes OR in MARGIN mode.
+        # Visibility: show whenever notes exist.  No more margin-mode
+        # gating — notes are always reachable via Ctrl+M and the panel
+        # is the always-on home for them.
         try:
-            if notes or mode == "margin":
-                outer.pack(fill="x", pady=(0, 8),
-                           before=getattr(self, "_pq_notes_pack_before", None))
+            if notes:
+                outer.pack(fill="x", pady=(0, 8))
             else:
                 outer.pack_forget()
         except tk.TclError:
@@ -10823,14 +10839,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
           self._pq_filler_max_words  → max length for a candidate run
         """
         DEFAULT_FILLERS = {
-            "yeah", "yep", "yup", "yes", "no", "right", "okay", "ok",
-            "sure", "totally", "exactly", "absolutely",
-            "mm", "mmm", "mhm", "mm-hmm", "mmhmm", "uhhuh", "uh-huh",
-            "uhuh", "huh", "hm", "hmm", "wow", "oh", "ah", "uh", "um",
-            "i", "i'm", "well",
+            # Affirmative / negative backchannels
+            "yeah", "yep", "yup", "yes", "no", "nope",
+            # Approval / agreement
+            "right", "okay", "ok", "sure", "totally", "exactly",
+            "absolutely", "true", "definitely", "certainly",
+            # Vocalisations / hesitations
+            "mm", "mmm", "mhm", "mhmm", "mmhmm", "hmm", "hm",
+            "uhhuh", "uhuh", "huh", "wow", "oh", "ah", "uh", "um",
+            "ugh", "er", "eh", "oof",
+            # Single-word filler
+            "i", "well", "so", "like",
         }
         fillers = set(getattr(self, "_pq_filler_words", DEFAULT_FILLERS))
-        max_w   = int(getattr(self, "_pq_filler_max_words", 2))
+        max_w   = int(getattr(self, "_pq_filler_max_words", 3))
 
         if not words:
             return words
@@ -10850,18 +10872,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if cur_words:
             runs.append((cur_speaker, cur_words))
 
+        def _normalise(wt):
+            """Lowercase + strip ALL non-alpha (including hyphens like
+            in '-hmm.', dashes, periods).  Apostrophes preserved for
+            'i'm' / 'don't' style fillers."""
+            return re.sub(r"[^a-z']", "", (wt or "").lower())
+
         def _is_filler_run(run_words):
             if len(run_words) > max_w:
                 return False
+            saw_text = False
             for w in run_words:
-                # Strip punctuation when checking against the filler set.
-                clean = re.sub(r"[^a-z'\-]", "",
-                                (w.get("word") or "").lower())
+                clean = _normalise(w.get("word") or "")
                 if not clean:
                     continue
-                if clean not in fillers:
-                    return False
-            return True
+                saw_text = True
+                # Accept hyphenated compounds like "uh-huh" / "mm-hmm"
+                # by also testing each piece against the filler set.
+                if clean in fillers:
+                    continue
+                # Try splitting on internal hyphens that survived stripping
+                # (shouldn't happen post-_normalise, but defensive).
+                parts = [p for p in clean.split("-") if p]
+                if parts and all(p in fillers for p in parts):
+                    continue
+                return False
+            return saw_text
 
         keep = [True] * len(runs)
         for i in range(1, len(runs) - 1):
