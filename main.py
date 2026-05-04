@@ -10115,6 +10115,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "<Configure>",
             lambda e: self._pq_notes_canvas.configure(
                 scrollregion=self._pq_notes_canvas.bbox("all")))
+        # When the canvas resizes (panel sash drag, window resize, or
+        # layout flip), reflow each note's body text + snippet so the
+        # wraplength matches the new available width.
+        self._pq_notes_canvas.bind(
+            "<Configure>",
+            lambda e: self._pq_update_notes_wraplength(e.width))
 
         # Add panes to the PanedWindow.  Transcript first (it gets the
         # leading position regardless of orient), notes second when any
@@ -10538,6 +10544,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
 
+    def _pq_update_notes_wraplength(self, canvas_width):
+        """Set wraplength on every note row's body / snippet label so
+        the text reflows when the user resizes the notes pane."""
+        # Subtract margins: row padding (12) + delete button (~24) +
+        # bullet (~20) + safety (~8) ≈ 64 px reserved.
+        new_w = max(180, int(canvas_width) - 64)
+        for lbl in (getattr(self, "_pq_notes_body_lbls", []) or []):
+            try:
+                if lbl.winfo_exists():
+                    lbl.config(wraplength=new_w)
+            except tk.TclError:
+                pass
+
     def _pq_toggle_notes_pane(self, force=None):
         """Show/hide the margin-notes pane.
 
@@ -10653,9 +10672,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except tk.TclError:
             pass
 
-        # Repopulate
+        # Repopulate — also clear out the body-label registry so we
+        # can rebuild it as new note rows are created.
         for w in list(inner.winfo_children()):
             w.destroy()
+        self._pq_notes_body_lbls = []
 
         if cnt is not None:
             try:
@@ -10729,12 +10750,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._pq_render_notes_panel()
             del_lbl.bind("<Button-1>", _delete)
 
-            # Body: the note text
+            # Body: the note text.  wraplength is updated dynamically
+            # via _pq_update_notes_wraplength based on the current
+            # canvas width so the text reflows when the user resizes
+            # the panel.
             body_lbl = tk.Label(inner_row, text=(n.get("text") or "").strip(),
                                  font=FB, bg=SURF, fg=TEXT,
                                  anchor="w", justify="left",
-                                 wraplength=900)
+                                 wraplength=400)
             body_lbl.pack(anchor="w", fill="x", pady=(4, 0))
+            # Tag for the wraplength updater
+            self._pq_notes_body_lbls = getattr(
+                self, "_pq_notes_body_lbls", [])
+            self._pq_notes_body_lbls.append(body_lbl)
+            # Snippet labels also benefit from wrap updates
+            if snip_lbl is not None:
+                self._pq_notes_body_lbls.append(snip_lbl)
 
             # Click-to-jump: scroll the transcript pane to this note's anchor
             def _jump(_e=None, t_s=ts_s):
@@ -10742,6 +10773,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             tc_lbl.bind("<Button-1>", _jump)
             if snip_lbl is not None:
                 snip_lbl.bind("<Button-1>", _jump)
+
+        # After the rows are built, push the current canvas width into
+        # each body label so the new rows wrap correctly without
+        # waiting for the next <Configure> event.
+        try:
+            cw = self._pq_notes_canvas.winfo_width()
+            if cw > 1:
+                self._pq_update_notes_wraplength(cw)
+            else:
+                # First render before the canvas has a width — defer.
+                self.after(50,
+                           lambda: self._pq_update_notes_wraplength(
+                               self._pq_notes_canvas.winfo_width()))
+        except tk.TclError:
+            pass
 
     def _pq_jump_to_time(self, time_s):
         """Scroll the transcript Text widget so the word nearest
@@ -11876,92 +11922,41 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         in_s  = float(selected[0].get("start", 0))
         out_s = float(selected[-1].get("end", in_s))
-        # Reconstruct the body text from the SELECTED WORD ENTRIES (not
-        # the widget) so the visible "JORDAN:" / "JENA:" headers in the
-        # transcript view stay out of the clipboard.  We then re-emit
-        # speaker prefixes inline at every speaker change so the human
-        # reader gets the dialogue context — the parser ignores those
-        # prefixes during reconcile.
-        sess_speakers = session.get("speakers") or {}
-        def _label_for(sp):
-            if not sp:
-                return ""
-            return (sess_speakers.get(sp)
-                    or sess_speakers.get(os.path.basename(sp))
-                    or self._pq_format_speaker(sp))
 
-        # Group selected words into consecutive same-speaker runs
-        # within paragraphs.  Paragraph breaks come from "\n\n" gaps
-        # between words in the rendered text (same convention the
-        # renderer used to insert them).
+        # Pull body verbatim from the rendered transcript so what the
+        # user copies matches what they see — speaker labels, paragraph
+        # breaks, line breaks, all preserved.  We expand the selection
+        # to whole words at both edges so a partial-word click doesn't
+        # truncate mid-token.
         word_idx_map = {id(w): (s, e) for (s, e, w) in word_idx}
-        # paragraph = list of (speaker, [word strings])
-        paragraphs   = []
-        cur_para     = []
-        cur_speaker  = object()
-        cur_run      = []
-        prev_end_pos = None
+        first_s = word_idx_map.get(id(selected[0]),  (None, None))[0]
+        last_e  = word_idx_map.get(id(selected[-1]), (None, None))[1]
 
-        def _flush_run():
-            nonlocal cur_run
-            if cur_run:
-                cur_para.append((cur_speaker, " ".join(cur_run)))
-                cur_run = []
+        if first_s is not None and last_e is not None:
+            try:
+                # Walk back to include the speaker label that introduces
+                # the first selected word (if there is one).  A speaker
+                # label sits at the start of a logical line and ends in
+                # ":\n" — easiest: extend selection start to the line
+                # start of the previous newline-separated speaker block.
+                # In practice, we just extend to the start of the line
+                # that contains the first word.  If a speaker label
+                # appears at column 0 of that line, it'll come along.
+                start_idx = "1.0+{}c".format(first_s)
+                end_idx   = "1.0+{}c".format(last_e)
+                # Snap start back to the beginning of its line so a
+                # leading speaker label is included.
+                start_idx = tx.index(start_idx + " linestart")
+                body = tx.get(start_idx, end_idx)
+            except tk.TclError:
+                body = tx.get(sel_first, sel_last)
+        else:
+            body = tx.get(sel_first, sel_last)
 
-        def _flush_para():
-            nonlocal cur_para
-            _flush_run()
-            if cur_para:
-                paragraphs.append(cur_para)
-                cur_para = []
-
-        for w in selected:
-            wt = (w.get("word") or "").strip()
-            if not wt:
-                continue
-            sp = w.get("speaker")
-            s_pos, e_pos = word_idx_map.get(id(w), (None, None))
-
-            # Paragraph break detection: 2+ newlines in the gap between
-            # the previous word and this one in the rendered widget.
-            if prev_end_pos is not None and s_pos is not None:
-                try:
-                    gap_text = tx.get(
-                        "1.0+{}c".format(prev_end_pos),
-                        "1.0+{}c".format(s_pos))
-                    if "\n\n" in gap_text:
-                        _flush_para()
-                        cur_speaker = object()   # force speaker label
-                except tk.TclError:
-                    pass
-
-            if sp != cur_speaker:
-                _flush_run()
-                cur_speaker = sp
-            cur_run.append(wt)
-            if e_pos is not None:
-                prev_end_pos = e_pos
-
-        _flush_para()
-
-        # Render paragraphs.  Within a paragraph, each speaker run
-        # becomes its own line prefixed with "SPEAKER: ".  Paragraphs
-        # separated by blank lines.
-        para_strs = []
-        for runs in paragraphs:
-            lines = []
-            for sp, run_text in runs:
-                run_text = run_text.strip().strip("“”‘’\"\'")
-                if not run_text:
-                    continue
-                label = _label_for(sp)
-                if label:
-                    lines.append("{}: {}".format(label, run_text))
-                else:
-                    lines.append(run_text)
-            if lines:
-                para_strs.append("\n".join(lines))
-        body = "\n\n".join(para_strs)
+        # Tidy: rstrip every line, strip outer whitespace.  Internal
+        # blank lines (paragraph breaks) and speaker-label line breaks
+        # are preserved.
+        body = "\n".join(line.rstrip() for line in body.split("\n")).strip()
 
         block = "[{} {}-{}]\n{}\n".format(
             session.get("token", "?"),
