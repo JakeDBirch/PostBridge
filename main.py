@@ -426,33 +426,49 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _ai_prompt_text(self):
         """Return the AI reformatting prompt as a string (used by Script Formatter)."""
         return (
-            "Reformat the following script for PostBridge. Follow these rules exactly.\n\n"
-            "TOKEN DECLARATION BLOCKS — place at the top of the file:\n\n"
-            "--- INTERVIEW SESSIONS START ---\n"
-            "[TOKEN_NAME]\n"
-            "--- INTERVIEW SESSIONS END ---\n\n"
-            "--- EPISODE ASSETS START ---\n"
-            "[PART_0_NARRATOR]\n"
-            "--- EPISODE ASSETS END ---\n\n"
-            "  \u2022 Token names: UPPERCASE letters, digits, and underscores only (e.g. JOHN_SMITH)\n"
-            "  \u2022 One token per interview speaker\n"
-            "  \u2022 PART_N_NARRATOR tokens for narrator VO tracks (PART_0_NARRATOR, PART_1_NARRATOR, etc.)\n\n"
-            "BODY DIRECTIVES (in document order):\n\n"
-            "@PART  Part Name\n"
-            "  \u2014 marks a new section/segment\n\n"
-            "@PULL  TOKEN_NAME [HH:MM:SS-HH:MM:SS]\n"
-            "Quote text goes here.\n"
-            "No blank lines within the quote \u2014 a blank line ends the quote.\n\n"
-            "@VO  PART_N_LABEL\n"
-            "Narrator voice-over text here.\n"
-            "Ends at the next @, //, or blank line.\n\n"
-            "// This is a comment \u2014 ignored by the parser.\n\n"
-            "RULES:\n"
-            "  \u2022 Each token in the declaration block MUST be wrapped in square brackets: [TOKEN_NAME]\n"
-            "  \u2022 Timecodes must be HH:MM:SS (zero-padded). Prepend 00: to any MM:SS timecodes.\n"
-            "  \u2022 No blank lines inside @PULL quote text.\n"
-            "  \u2022 Multiple @VO blocks with the same ID are fine \u2014 collected in order.\n"
-            "  \u2022 Plain text not inside an @VO or @PULL block is ignored.\n\n"
+            "Reformat the following script for PostBridge.  Follow these "
+            "rules exactly.\n\n"
+            "ALL HEADERS USE BRACKETS AT COLUMN 0.  THREE TYPES:\n\n"
+            "  [PART <name>]                          ← section marker\n"
+            "  [VO <vo_id>]                           ← voice-over block\n"
+            "  [<TOKEN> HH:MM:SS-HH:MM:SS]            ← interview pull\n\n"
+            "OPTIONAL TOKEN DECLARATION BLOCK at the top of the script:\n\n"
+            "  [TOKENS]\n"
+            "  JENA\n"
+            "  DON\n"
+            "  [/TOKENS]\n\n"
+            "  • Token names: UPPERCASE letters, digits, underscores "
+            "(e.g. JOHN_SMITH).\n"
+            "  • Tokens are auto-registered the first time they "
+            "appear in a `[…]` header — the [TOKENS] block is optional.\n"
+            "  • VO ids: PART_N_NARRATOR (e.g. PART_0_NARRATOR, "
+            "PART_1_NARRATOR).\n\n"
+            "BODY RULES:\n\n"
+            "  • Header lines (anything in `[…]`) MUST be at column 0.\n"
+            "  • The text under each header is the block's content.\n"
+            "  • BLANK LINES inside a block ARE preserved as paragraph "
+            "breaks — feel free to use them.\n"
+            "  • The next block starts only when another `[…]` header "
+            "appears at column 0.  Indented or non-header text is body.\n"
+            "  • Timecodes must be HH:MM:SS (zero-padded).  Use a "
+            "single hyphen between in/out (no space).\n"
+            "  • Comments: `// comment` from a whitespace-prefixed "
+            "`//` to end-of-line is ignored.\n"
+            "  • Speaker prefixes like `JORDAN:` inside a pull's body "
+            "are decorative — they don't change parsing.\n\n"
+            "EXAMPLE:\n\n"
+            "Episode Title\n\n"
+            "[PART Cold Open]\n\n"
+            "[VO PART_0_NARRATOR]\n"
+            "Narrator's lead-in.  Standard prose.\n\n"
+            "Second paragraph still in the same VO block.\n\n"
+            "[JENA 00:01:23-00:01:45]\n"
+            "JORDAN: Tell me about the trip.\n"
+            "JENA: We went out at four in the morning.  The water was glass.\n\n"
+            "Second paragraph still in the same pull, separated by a blank "
+            "line.\n\n"
+            "[JENA 00:02:14-00:02:30]\n"
+            "Next pull from the same session.\n\n"
             "Please reformat the following script:\n\n"
             "[PASTE YOUR SCRIPT HERE]"
         )
@@ -2907,8 +2923,52 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception:
                 pass
         self._temp_mix_files = []
+
+        # ── Pull Quotes fast path: discover pre-transcribed sessions ────────
+        # If the script lives inside a recognised editorial project layout
+        # (`02_MEDIA` + `03_AUDIO` siblings somewhere up the tree), we walk
+        # for `*.pb_session.json` files.  Any pull whose token matches a
+        # discovered session skips the mix-and-transcribe step entirely
+        # — its precise Whisper-derived timecodes from Pull Quotes are
+        # used directly.  Tokens without a session fall through to the
+        # existing Whisper-on-mix path.
+        try:
+            from parsers import discover_pq_sessions as _discover_pq
+        except Exception:
+            _discover_pq = None
+        pq_session_map = {}        # token → session file path
+        pq_session_data = {}       # token → loaded session dict
+        if _discover_pq is not None:
+            try:
+                pq_session_map = _discover_pq(getattr(self, "_script_path", "")) or {}
+            except Exception:
+                pq_session_map = {}
+            for _w in (pq_session_map.pop("__warnings__", []) or []):
+                self._log_line("  ! " + _w, WARN)
+            for _tok, _sp in pq_session_map.items():
+                try:
+                    with open(_sp, encoding="utf-8") as _f:
+                        _data = json.load(_f)
+                    if (_data.get("workflow") == "interview_session"
+                            and _data.get("transcript")):
+                        _data["_file_path"] = _sp
+                        pq_session_data[_tok] = _data
+                        self._log_line(
+                            "  [{}] using Pull Quotes transcript ({} words) — "
+                            "skipping mix/transcribe".format(
+                                _tok, len(_data["transcript"])), SUCCESS)
+                except Exception as _exc:
+                    self._log_line(
+                        "  [{}] failed to load session JSON: {}".format(
+                            _tok, _exc), WARN)
+        self._pq_session_data = pq_session_data   # used by process_token_pulls
+
         transcript_sources   = {}
         for tok, paths in token_audio_paths.items():
+            # Tokens with a pre-transcribed session don't need a mix.
+            if tok in pq_session_data:
+                transcript_sources[tok] = None
+                continue
             if not paths:
                 transcript_sources[tok] = None
             elif len(paths) == 1:
@@ -3249,8 +3309,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _effective_cursor = (cursor
                                      if _pull_in_s >= cursor - engines._PULL_ORDERING_LOOKBACK
                                      else 0.0)
-                r = engines.reconcile_interview_pull(pull, tsrc, pad=pad,
-                                                     min_start_s=_effective_cursor)
+
+                # Fast path: a Pull Quotes session JSON exists for this
+                # token — script timecodes are already Whisper-precise,
+                # so we just look up the words in the cached transcript.
+                _pq_data = (getattr(self, "_pq_session_data", None) or {}).get(token)
+                if _pq_data is not None:
+                    r = engines.reconcile_pull_from_session(pull, _pq_data)
+                else:
+                    r = engines.reconcile_interview_pull(
+                        pull, tsrc, pad=pad,
+                        min_start_s=_effective_cursor)
                 # source_audio is set to tsrc (the mix WAV) inside
                 # reconcile_interview_pull.  We keep it pointing there — the mix
                 # file stays alive through Step 4 so the waveform editor shows the
@@ -8571,13 +8640,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                                                   pady=(0, 8))
 
         tk.Label(ref_inner,
-                 text=("--- INTERVIEW SESSIONS START ---    @PART  Part Name\n"
-                       "[TOKEN_NAME]                        @PULL  TOKEN [HH:MM:SS-HH:MM:SS]\n"
-                       "--- INTERVIEW SESSIONS END ---        Quote text \u2014 no blank lines inside\n"
-                       "                                    @VO  PART_N_LABEL\n"
-                       "--- EPISODE ASSETS START ---          VO text \u2014 ends at next @, //, or blank\n"
-                       "[PART_0_NARRATOR]                   // comment\n"
-                       "--- EPISODE ASSETS END ---"),
+                 text=("[PART Cold Open]                    \u2190 section header\n"
+                       "[VO PART_0_NARRATOR]                \u2190 voice-over block\n"
+                       "Body text on the next line(s).\n"
+                       "Blank lines preserved as paragraph breaks.\n"
+                       "\n"
+                       "[JENA 00:01:23-00:01:45]            \u2190 interview pull\n"
+                       "Quote text below.  Blank lines preserved.\n"
+                       "\n"
+                       "Second paragraph still in the same pull.\n"
+                       "\n"
+                       "[JENA 00:02:14-00:02:30]            \u2190 next pull"),
                  font=("Courier New", 10), bg=SURF, fg=SUB,
                  justify="left", anchor="w").pack(anchor="w", pady=(0, 8))
 
@@ -8613,17 +8686,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              padx=10, pady=8)
         asset_lbl.pack(fill="x", pady=(4, 0))
 
-        _copy_row(tok_inner, "Copy Asset Block",
+        _copy_row(tok_inner, "Copy [TOKENS] Block",
                   lambda: asset_var.get() if self._sf_tokens else "")
         tk.Label(tok_inner,
-                 text="Paste this block into the doc once, near the top, "
-                      "before any @PART lines.",
-                 font=FB, bg=SURF, fg=SUB).pack(anchor="w", pady=(6, 0))
+                 text="Paste this block once near the top of the doc.  "
+                      "Tokens are also auto-registered the first time "
+                      "they appear in a [TOKEN tc-tc] header, so the "
+                      "block is optional.",
+                 font=FB, bg=SURF, fg=SUB,
+                 wraplength=900, justify="left"
+                 ).pack(anchor="w", pady=(6, 0))
 
-        # ═════════════════════════════════════════════════════════════════════
-        # SECTION 2 — @PART
-        # ═════════════════════════════════════════════════════════════════════
-        part_inner = _card("@PART \u2014 Insert a Part Marker")
+        # ── Section 2: [PART name] ────────────────────────────────────
+        part_inner = _card("[PART ...] - Insert a Section Header")
 
         tk.Label(part_inner, text="Part title",
                  font=FB, bg=SURF, fg=SUB).pack(anchor="w")
@@ -8634,38 +8709,57 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  highlightbackground=BORDER, highlightthickness=1,
                  insertbackground=TEXT).pack(fill="x", pady=(4, 8))
 
-        part_preview = tk.Label(part_inner, text="\u2014",
+        part_preview = tk.Label(part_inner, text="-",
                                 font=("Courier New", 12),
-                                bg=SURF2, fg=SUB, anchor="w", padx=10, pady=8)
+                                bg=SURF2, fg=SUB, anchor="w",
+                                padx=10, pady=8)
         part_preview.pack(fill="x")
 
         def _update_part(*_):
             t = part_var.get().strip()
             part_preview.config(
-                text="@PART " + t if t else "\u2014",
+                text=("[PART " + t + "]") if t else "-",
                 fg=TEXT if t else SUB)
 
         part_var.trace_add("write", _update_part)
-        _copy_row(part_inner, "Copy @PART",
-                  lambda: ("@PART " + part_var.get().strip())
+        _copy_row(part_inner, "Copy [PART ...]",
+                  lambda: ("[PART " + part_var.get().strip() + "]")
                   if part_var.get().strip() else "")
 
-        # ═════════════════════════════════════════════════════════════════════
-        # SECTION 3 — @VO
-        # ═════════════════════════════════════════════════════════════════════
-        vo_inner = _card("@VO \u2014 Insert a Voice-Over Marker")
+        # ── Section 3: [VO id] ────────────────────────────────────────
+        vo_inner = _card("[VO ...] - Insert a Voice-Over Header")
 
-        tk.Label(vo_inner,
-                 text=("Copies @VO to your clipboard \u2014 paste it into the doc, "
-                       "then type your VO copy on the line below it."),
-                 font=FB, bg=SURF, fg=SUB, justify="left").pack(anchor="w",
-                                                                pady=(0, 6))
-        _copy_row(vo_inner, "Copy @VO", lambda: "@VO")
+        tk.Label(vo_inner, text="VO id (e.g. PART_0_NARRATOR)",
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w")
+        vo_var = tk.StringVar(value="PART_0_NARRATOR")
+        tk.Entry(vo_inner, textvariable=vo_var,
+                 font=(_SANS, 13),
+                 bg=SURF2, fg=TEXT, bd=0, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1,
+                 insertbackground=TEXT).pack(fill="x", pady=(4, 8))
+        vo_preview = tk.Label(vo_inner, text="[VO PART_0_NARRATOR]",
+                              font=("Courier New", 12),
+                              bg=SURF2, fg=TEXT, anchor="w",
+                              padx=10, pady=8)
+        vo_preview.pack(fill="x")
 
-        # ═════════════════════════════════════════════════════════════════════
-        # SECTION 4 — @PULL
-        # ═════════════════════════════════════════════════════════════════════
-        pull_inner = _card("@PULL \u2014 Insert a Pull Marker")
+        def _upd_vo(*_):
+            v = vo_var.get().strip().upper()
+            v = re.sub(r"[^A-Z0-9_]+", "_", v).strip("_")
+            vo_preview.config(
+                text=("[VO " + v + "]") if v else "-",
+                fg=TEXT if v else SUB)
+
+        vo_var.trace_add("write", _upd_vo)
+
+        def _copy_vo():
+            v = vo_var.get().strip().upper()
+            v = re.sub(r"[^A-Z0-9_]+", "_", v).strip("_")
+            return ("[VO " + v + "]") if v else ""
+        _copy_row(vo_inner, "Copy [VO ...]", _copy_vo)
+
+        # ── Section 4: [TOKEN tc-tc] ──────────────────────────────────
+        pull_inner = _card("[TOKEN tc-tc] - Insert an Interview Pull")
 
         tk.Label(pull_inner, text="Token",
                  font=FB, bg=SURF, fg=SUB).pack(anchor="w")
@@ -8787,7 +8881,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pull_msg.config(text=";  ".join(errs), fg=ERR)
                 return
 
-            line = "@PULL {} [{}-{}]".format(tok, in_tc, out_tc)
+            line = "[{} {}-{}]".format(tok, in_tc, out_tc)
             pull_preview.config(text=line, fg=TEXT)
             _pull_text[0] = line
 
@@ -8824,7 +8918,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             pull_cb.set("\u2014 select token \u2014")
             _build_pull()
 
-        self._btn(pull_btn_row, "Copy @PULL", _copy_pull, small=True).pack(side="left")
+        self._btn(pull_btn_row, "Copy [TOKEN tc-tc]", _copy_pull,
+                  small=True).pack(side="left")
         tk.Frame(pull_btn_row, bg=SURF, width=8).pack(side="left")
         self._btn(pull_btn_row, "Clear", _clear_pull, small=True).pack(side="left")
 
@@ -8867,11 +8962,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              highlightbackground="#3a6090",
                              highlightthickness=1).pack(side="left", padx=(0, 5))
 
-            # Rebuild asset block
+            # Rebuild [TOKENS] declaration block
             if toks:
-                block = ("--- EPISODE ASSETS START ---\n"
-                         + "\n".join("[{}]".format(t) for t in toks)
-                         + "\n--- EPISODE ASSETS END ---")
+                block = "[TOKENS]\n" + "\n".join(toks) + "\n[/TOKENS]"
                 asset_var.set(block)
                 asset_lbl.config(fg=TEXT)
             else:
@@ -8955,9 +9048,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         path = session.get("_file_path")
         if not path:
             return False
+        # Stable session ID — generated once per session, future-proof
+        # against ambiguous tokens across projects.
+        if not session.get("id"):
+            import uuid as _uuid
+            session["id"] = "ses_" + _uuid.uuid4().hex[:12]
         payload = {
-            "version":     2,
+            "version":     3,
             "workflow":    "interview_session",
+            "id":          session["id"],
             "token":       session.get("token", ""),
             "media":       list(session.get("media", [])),
             "transcript":  session.get("transcript", []),
@@ -8986,10 +9085,33 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return False
 
     def _pq_default_session_path(self, token, media_paths):
-        """`<first_media_dir>/<TOKEN>.pb_session.json`."""
+        """Pick the canonical save path for a session JSON.
+
+        Preference order:
+          1. `<project_root>/03_AUDIO/00_RAW AUDIO/<TOKEN>.pb_session.json`
+             — the editorial template's interview-audio folder.  Walks
+             up from the first media file looking for `02_MEDIA` +
+             `03_AUDIO` siblings (project root marker).
+          2. `<first_media_dir>/<TOKEN>.pb_session.json` — fallback when
+             the layout isn't recognised.
+        """
         if not media_paths:
             return None
         first = os.path.abspath(media_paths[0])
+
+        # Walk up looking for project root.
+        cur = os.path.dirname(first)
+        for _ in range(8):
+            raw = os.path.join(cur, "03_AUDIO", "00_RAW AUDIO")
+            if (os.path.isdir(os.path.join(cur, "02_MEDIA"))
+                    and os.path.isdir(os.path.join(cur, "03_AUDIO"))
+                    and os.path.isdir(raw)):
+                return os.path.join(raw, "{}.pb_session.json".format(token))
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+
         return os.path.join(os.path.dirname(first),
                             "{}.pb_session.json".format(token))
 
@@ -11196,13 +11318,47 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Reconstruct the quote text from the SELECTED WORD entries,
         # not from the widget — this way the visible speaker labels
         # ("JORDAN:" headers) stay out of the clipboard automatically.
-        text = "".join(w.get("word") or "" for w in selected)
-        text = re.sub(r"\s+", " ", text).strip()
-        block = "@PULL {} [{}-{}]\n{}\n".format(
+        # We also rebuild paragraph structure: any selected word that
+        # was preceded by a paragraph break ("\n\n") in the rendered
+        # text starts a new paragraph in the copied output.
+        word_idx_map = {id(w): (s, e) for (s, e, w) in word_idx}
+        paragraphs   = []
+        cur_para     = []
+        prev_end_pos = None
+        for w in selected:
+            wt = (w.get("word") or "").strip()
+            if not wt:
+                continue
+            s_pos, e_pos = word_idx_map.get(id(w), (None, None))
+            # Detect a paragraph break before this word: the preceding
+            # word's end position is followed by 2+ newlines before this
+            # word starts.  We approximate by reading the gap from the
+            # widget text.
+            if prev_end_pos is not None and s_pos is not None:
+                try:
+                    gap_text = tx.get(
+                        "1.0+{}c".format(prev_end_pos),
+                        "1.0+{}c".format(s_pos))
+                    if "\n\n" in gap_text:
+                        if cur_para:
+                            paragraphs.append(" ".join(cur_para))
+                            cur_para = []
+                except tk.TclError:
+                    pass
+            cur_para.append(wt)
+            if e_pos is not None:
+                prev_end_pos = e_pos
+        if cur_para:
+            paragraphs.append(" ".join(cur_para))
+
+        # Body text: blank lines between paragraphs.  Quote chars stripped.
+        body = "\n\n".join(
+            p.strip().strip("“”‘’\"\'") for p in paragraphs if p.strip())
+        block = "[{} {}-{}]\n{}\n".format(
             session.get("token", "?"),
             secs_tc(in_s).split(".")[0],
             secs_tc(out_s).split(".")[0],
-            text)
+            body)
         self.clipboard_clear()
         self.clipboard_append(block)
         self.update()

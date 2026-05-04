@@ -1220,6 +1220,114 @@ def _base_result(pull):
 
 _PULL_ORDERING_LOOKBACK = 10.0  # seconds of slack before the cursor for interview pulls
 
+def reconcile_pull_from_session(pull, session_data):
+    """Pull-Quotes fast path: use a pre-transcribed Interview Session
+    JSON to resolve a pull *without* running Whisper.
+
+    The script timecodes are precise (Whisper word-level start/end —
+    exactly what Pull Quotes wrote), so we just look up the words that
+    fall in [in_seconds, out_seconds] in the cached transcript and
+    build the result directly.
+
+    `session_data`: parsed contents of a `*.pb_session.json` (dict).
+    Must contain a `transcript` list of word dicts with `start` / `end`.
+
+    Returns the same result-dict shape as `reconcile_interview_pull`
+    so callers (build_aaf / build_xml) can treat both paths identically.
+    """
+    in_s   = float(pull.get("in_seconds", 0.0))
+    out_s  = float(pull.get("out_seconds", in_s))
+    result = _base_result(pull)
+
+    transcript = session_data.get("transcript") or []
+    if not transcript:
+        result["status"] = "no_transcript"
+        result["_diag"]  = "session JSON had no transcript"
+        return result
+
+    # Resolve a "primary" media path on the session for downstream
+    # waveform-editor use.  Prefer the audio_cache (mix WAV next to the
+    # session JSON) so the waveform editor opens to the same audio
+    # Pull Quotes used.  Fall back to the first non-video file.
+    primary_audio = session_data.get("audio_cache") or ""
+    if not primary_audio or not _safe_isfile(primary_audio):
+        for p in session_data.get("media") or []:
+            if p and _safe_isfile(p) and not is_video(p):
+                primary_audio = p
+                break
+    result["source_audio"] = primary_audio
+
+    # Pick the words whose [start, end] overlaps the pull's range.
+    # We're forgiving on edges: a word counts if its midpoint falls
+    # inside the range, or if it overlaps either edge.
+    overlapping = []
+    for w in transcript:
+        if w.get("break"):
+            continue
+        ws = float(w.get("start", 0.0))
+        we = float(w.get("end",   ws))
+        if we < in_s or ws > out_s:
+            continue
+        overlapping.append(w)
+
+    if not overlapping:
+        result["status"] = "no_match"
+        result["_diag"]  = "no words in [{:.2f}, {:.2f}]".format(in_s, out_s)
+        return result
+
+    # Snap to the actual word boundaries we found — gives Whisper-precise
+    # in/out points instead of the (possibly rounded) script timecodes.
+    snapped_in  = float(overlapping[0].get("start", in_s))
+    snapped_out = float(overlapping[-1].get("end",   out_s))
+
+    # Build segments — one per editorial paragraph from the script.
+    # `pull["quote_paragraphs"]` carries the user's paragraph structure.
+    # If it's missing/empty, fall back to a single segment spanning the
+    # whole pull range.
+    paragraphs = pull.get("quote_paragraphs") or []
+    if len(paragraphs) >= 2:
+        # Distribute words evenly across the paragraph count.  Each
+        # paragraph gets a roughly equal time window inside the pull.
+        # This is approximate (we don't have per-paragraph timecodes
+        # from the script), but reflects the script's structure in the
+        # eventual AAF output as adjacent segments rather than one long
+        # blob.  The user can fine-tune in Step 4.
+        n_para = len(paragraphs)
+        seg_dur = (snapped_out - snapped_in) / n_para
+        segments = [(round(snapped_in + i * seg_dur, 4),
+                     round(snapped_in + (i + 1) * seg_dur, 4))
+                    for i in range(n_para)]
+        # Snap the final out to the actual snapped_out (avoids rounding
+        # drift on very long pulls).
+        segments[-1] = (segments[-1][0], snapped_out)
+    else:
+        segments = [(snapped_in, snapped_out)]
+
+    # Synthesise the matched-text and store the words on the result so
+    # the Step-4 waveform editor has them.
+    matched_text = " ".join(
+        (w.get("word") or "").strip() for w in overlapping
+    ).strip()
+
+    result.update({
+        "segments":        segments,
+        "rec_in_s":        snapped_in,
+        "rec_out_s":       snapped_out,
+        "rec_in_tc":       secs_tc(snapped_in),
+        "rec_out_tc":      secs_tc(snapped_out),
+        "delta_in":        round(snapped_in  - in_s,  3),
+        "delta_out":       round(snapped_out - out_s, 3),
+        "confidence":      1.0,    # Pull-Quotes timecodes ARE the truth
+        "matched_text":    matched_text,
+        "n_internal_cuts": max(0, len(segments) - 1),
+        "n_gap_cuts":      0,
+        "status":          "ok",
+        "words":           list(overlapping),
+        "_pq_session":     session_data.get("id") or session_data.get("_file_path"),
+    })
+    return result
+
+
 def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.0):
     """
     Reconcile a single @PULL against its source transcript.

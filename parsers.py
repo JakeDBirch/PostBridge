@@ -5,166 +5,299 @@ import tempfile
 import json
 from utils import tc_secs, basename
 
-# ── Script parser ──────────────────────────────────────────────────────────────
+# ── Script parser ───────────────────────────────────────────────────────────────────────────
+#
+# Bracketed syntax (the only supported form):
+#
+#     [PART Cold Open]                         ← section header
+#
+#     [VO PART_0_NARRATOR]                     ← VO block
+#     Standard prose.  Blank lines preserved as paragraph breaks.
+#
+#     [JENA 00:01:23-00:01:45]                 ← interview pull
+#     Quote text.  Blank lines preserved.
+#
+#     Second paragraph still in the same pull.
+#
+# Token names: uppercase letters, digits, underscores.  The optional
+#     [TOKENS]
+#     JENA
+#     DON
+#     [/TOKENS]
+# block at the top of the script enumerates them; otherwise tokens are
+# auto-registered the first time they appear in a `[…]` header.
+#
+# Comments: anything from a whitespace-prefixed `//` to end of line is ignored.
+
+# Header line, three forms:
+#   [PART <name>]
+#   [VO <id>]
+#   [<TOKEN> HH:MM:SS-HH:MM:SS]
+_HEADER_RE = re.compile(
+    r"^\[(?:"
+    r"(?:PART\s+(?P<part>[^\]]+))"
+    r"|(?:VO\s+(?P<void>[A-Z0-9_]+))"
+    r"|(?P<tok>[A-Z][A-Z0-9_]*)\s+"
+    r"(?P<intc>\d{1,2}:\d{2}:\d{2})-(?P<outtc>\d{1,2}:\d{2}:\d{2})"
+    r")\]$"
+)
+
+
+def _strip_comment(s):
+    """Strip a trailing '// comment' but only when '//' is at line start
+    or preceded by whitespace (so URLs containing // survive)."""
+    if "//" not in s:
+        return s
+    idx = 0
+    while True:
+        k = s.find("//", idx)
+        if k < 0:
+            return s
+        if k == 0 or s[k - 1].isspace():
+            return s[:k].rstrip()
+        idx = k + 2
+
+
+def _normalize_tc(s):
+    """Pad single-digit hours: '1:23:45' → '01:23:45'."""
+    parts = s.split(":")
+    if len(parts) == 3 and len(parts[0]) == 1:
+        return "0" + s
+    return s
+
+
 def parse_script(text):
-    """
+    """Parse a script in the bracketed syntax.
+
     Returns:
       tokens   : [str]
       parts    : [{index, name}]
       pulls    : [{order, token, in_tc, out_tc, in_seconds, out_seconds,
-                   part_index, quote_text}]
+                   part_index, quote_text, quote_paragraphs, gap_after}]
+      vo_blocks: [{order, id, part_index, text, paragraphs, gap_after}]
       doc_title: str
       warnings : [str]
     """
     tokens, parts, pulls, vo_blocks, warnings = [], [], [], [], []
+
+    # Doc title: first non-empty, non-header, non-comment, non-[TOKENS] line.
     doc_title = "PostBridge Episode"
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("//"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            continue
+        if s.upper() in ("[TOKENS]", "[/TOKENS]"):
+            continue
+        doc_title = s
+        break
 
-    for mk in ["--- INTERVIEW SESSIONS START ---", "--- EPISODE ASSETS START ---"]:
-        idx = text.find(mk)
-        if idx != -1:
-            doc_title = next(
-                (l.strip() for l in text[:idx].strip().split("\n") if l.strip()),
-                doc_title)
-            break
+    # Optional [TOKENS] … [/TOKENS] block (case-insensitive)
+    m = re.search(r"\[TOKENS\](.*?)\[/TOKENS\]", text,
+                   re.DOTALL | re.IGNORECASE)
+    if m:
+        for ln in m.group(1).split("\n"):
+            clean = _strip_comment(ln).strip().strip("[]")
+            tm = re.match(r"^([A-Z][A-Z0-9_]*)$", clean)
+            if tm and tm.group(1) not in tokens:
+                tokens.append(tm.group(1))
 
-    for sm, em in [
-        ("--- INTERVIEW SESSIONS START ---", "--- INTERVIEW SESSIONS END ---"),
-        ("--- EPISODE ASSETS START ---",     "--- EPISODE ASSETS END ---"),
-    ]:
-        m = re.search(re.escape(sm) + r'(.*?)' + re.escape(em), text, re.DOTALL)
-        if m:
-            for ln in m.group(1).split("\n"):
-                clean = re.sub(r'//.*$', '', ln).strip()
-                # Accept both [TOKEN] and bare TOKEN (no brackets)
-                tm = re.match(r'^\[?([A-Z0-9_]+)\]?$', clean)
-                if tm and tm.group(1) not in tokens:
-                    tokens.append(tm.group(1))
-            break
-
-    # Single pass — shared global order counter for both @PULL and @VO blocks
-    # so that build_xml sorts them in true script order.
     lines    = text.split("\n")
     cur_part = 0
-    order    = 1        # global sequence counter shared by pulls + VO blocks
+    order    = 1
     seen     = set()
     i        = 0
+    n        = len(lines)
 
-    PULL_RE = re.compile(
-        r'^@PULL\s+([A-Z0-9_]+)\s+\[(\d{2}:\d{2}:\d{2})-(\d{2}:\d{2}:\d{2})\]')
-    VO_RE   = re.compile(r'^@VO\s+(PART_\d+_[A-Z]+)\s*$')
+    def _collect_paragraphs(start):
+        paragraphs = []
+        cur_lines  = []
+        last_blank = False
+        j          = start
+        while j < n:
+            raw      = lines[j]
+            stripped = _strip_comment(raw).strip()
+            # Header at column 0 ends the block
+            if raw and not raw[:1].isspace() and _HEADER_RE.match(stripped):
+                break
+            if not stripped:
+                if cur_lines:
+                    paragraphs.append(" ".join(cur_lines))
+                    cur_lines = []
+                last_blank = True
+                j += 1
+                continue
+            last_blank = False
+            cur_lines.append(stripped)
+            j += 1
+        if cur_lines:
+            paragraphs.append(" ".join(cur_lines))
+        return paragraphs, j, last_blank
 
-    while i < len(lines):
-        ln = lines[i].strip()
+    while i < n:
+        raw = lines[i]
+        ln  = _strip_comment(raw).strip()
 
-        # @PART
-        pm = re.match(r'^@PART\s+(.+)$', ln)
-        if pm:
-            cur_part += 1
-            parts.append({"index": cur_part, "name": pm.group(1).strip()})
-            i += 1; continue
-
-        # @PULL
-        qm = PULL_RE.match(ln)
-        if qm:
-            tok, in_tc, out_tc = qm.group(1), qm.group(2), qm.group(3)
-            in_s, out_s = tc_secs(in_tc), tc_secs(out_tc)
-            key = (tok, in_s, out_s)
-            if key not in seen:
-                seen.add(key)
-                if tok not in tokens:
-                    warnings.append("Unknown token '{}' in @PULL".format(tok))
-                i += 1
-                quote_lines     = []
-                _last_was_blank = False
-                while i < len(lines):
-                    nxt = lines[i].strip()
-                    if not nxt:
-                        _last_was_blank = True
-                        if quote_lines: break   # blank after text → end of quote
-                        i += 1; continue        # blank before text → skip
-                    if nxt.startswith("@") or nxt.startswith("//"):
-                        break
-                    _last_was_blank = False     # reset when text resumes
-                    quote_lines.append(nxt)
-                    i += 1
-                quote_text = " ".join(quote_lines).strip()
-                quote_text = quote_text.strip('\u201c\u201d\u2018\u2019"\'')
-                # gap_after=False only when the next @PULL/@VO immediately follows
-                # with NO blank line.  _last_was_blank catches the case where the
-                # loop consumed blank lines before arriving at the next token.
-                _next_ln  = lines[i].strip() if i < len(lines) else ""
-                gap_after = _last_was_blank or not (
-                    _next_ln.startswith("@PULL") or _next_ln.startswith("@VO"))
-                pulls.append({
-                    "order":      order,
-                    "token":      tok,
-                    "in_tc":      in_tc,
-                    "out_tc":     out_tc,
-                    "in_seconds": in_s,
-                    "out_seconds":out_s,
-                    "part_index": cur_part,
-                    "quote_text": quote_text,
-                    "gap_after":  gap_after,
-                })
-                order += 1
-            else:
-                i += 1
+        # Headers must be at column 0
+        if not ln or (raw and raw[:1].isspace()):
+            i += 1
             continue
 
-        # @VO
-        vm = VO_RE.match(ln)
-        if vm:
-            vo_id = vm.group(1)
+        m = _HEADER_RE.match(ln)
+        if not m:
             i += 1
-            paragraphs      = []   # completed paragraph strings
-            para_lines      = []   # lines in the paragraph being built
-            _last_was_blank = False
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt:
-                    # Blank line → end of current paragraph
-                    if para_lines:
-                        paragraphs.append(" ".join(para_lines))
-                        para_lines = []
-                    _last_was_blank = True
-                    i += 1; continue
-                if nxt.startswith("@") or nxt.startswith("//"):
-                    break
-                _last_was_blank = False   # text resumes after blank lines
-                para_lines.append(nxt)
-                i += 1
-            if para_lines:
-                paragraphs.append(" ".join(para_lines))
-            # Join paragraphs with " ... " so match_segments treats each
-            # paragraph as an independent chunk when searching the transcript.
-            # A single-paragraph block produces no separators (no change from
-            # previous behaviour).
-            vo_text = " ... ".join(paragraphs).strip()
-            if vo_text:
-                _next_ln  = lines[i].strip() if i < len(lines) else ""
-                gap_after = _last_was_blank or not (
-                    _next_ln.startswith("@PULL") or _next_ln.startswith("@VO"))
+            continue
+
+        # ── PART ─────────────────────────────────────────────────────────
+        if m.group("part") is not None:
+            cur_part += 1
+            parts.append({"index": cur_part, "name": m.group("part").strip()})
+            i += 1
+            continue
+
+        # ── VO ───────────────────────────────────────────────────────────
+        if m.group("void") is not None:
+            vo_id = m.group("void")
+            paragraphs, end_i, last_blank = _collect_paragraphs(i + 1)
+            i = end_i
+            text_joined = " ... ".join(p for p in paragraphs if p).strip()
+            if text_joined:
+                _next_ln  = lines[i].strip() if i < n else ""
+                gap_after = last_blank or not _HEADER_RE.match(_next_ln)
                 vo_blocks.append({
                     "order":      order,
                     "id":         vo_id,
                     "part_index": cur_part,
-                    "text":       vo_text,
+                    "text":       text_joined,
+                    "paragraphs": list(paragraphs),
                     "gap_after":  gap_after,
                 })
                 order += 1
             continue
 
-        i += 1
+        # ── PULL ─────────────────────────────────────────────────────────
+        tok    = m.group("tok")
+        in_tc  = _normalize_tc(m.group("intc"))
+        out_tc = _normalize_tc(m.group("outtc"))
+        try:
+            in_s  = tc_secs(in_tc)
+            out_s = tc_secs(out_tc)
+        except Exception:
+            warnings.append("Bad timecodes in pull header: {}".format(ln))
+            i += 1
+            continue
 
-    # ── Robustness: if VO blocks exist but no @PART was declared, auto-create a
-    # default part so the MediaPool always offers a "VO: …" assignment option
-    # and reconciliation can proceed without requiring @PART in the script. ────
+        key = (tok, in_s, out_s)
+        if key in seen:
+            i += 1
+            continue
+        seen.add(key)
+        if tok not in tokens:
+            tokens.append(tok)
+
+        paragraphs, end_i, last_blank = _collect_paragraphs(i + 1)
+        i = end_i
+
+        # Strip surrounding quote chars from each paragraph
+        cleaned = []
+        for p in paragraphs:
+            p2 = p.strip().strip("“”‘’\"\'")
+            if p2:
+                cleaned.append(p2)
+        quote_text = " ... ".join(cleaned).strip()
+
+        _next_ln  = lines[i].strip() if i < n else ""
+        gap_after = last_blank or not _HEADER_RE.match(_next_ln)
+        pulls.append({
+            "order":            order,
+            "token":            tok,
+            "in_tc":            in_tc,
+            "out_tc":           out_tc,
+            "in_seconds":       in_s,
+            "out_seconds":      out_s,
+            "part_index":       cur_part,
+            "quote_text":       quote_text,
+            "quote_paragraphs": cleaned,
+            "gap_after":        gap_after,
+        })
+        order += 1
+
     if vo_blocks and not parts:
         parts.append({"index": 1, "name": "Episode VO"})
         for vb in vo_blocks:
             vb["part_index"] = 1
 
     return tokens, parts, pulls, vo_blocks, doc_title, warnings
+
+
+# ── Pull Quotes session discovery ───────────────────────────────────────────────────────────────────
+def discover_pq_sessions(script_path, max_walk_up=6):
+    """Locate Pull Quotes session JSONs in the script's project folder.
+
+    Walks UP from `script_path` looking for a project root — a directory
+    that has both `02_MEDIA` and `03_AUDIO` siblings (the editorial
+    template marker).  Once found, recursively globs for
+    `*.pb_session.json` and returns a dict of `{token: abs_path}`.
+
+    If the project root isn't recognised, scans the script's containing
+    folder + parents up to `max_walk_up` levels.
+
+    Duplicate-token sessions are listed under the special key
+    `__warnings__` in the returned dict so the caller can surface them.
+    """
+    if not script_path or not os.path.isfile(script_path):
+        return {}
+
+    def _is_project_root(d):
+        return (os.path.isdir(os.path.join(d, "02_MEDIA"))
+                and os.path.isdir(os.path.join(d, "03_AUDIO")))
+
+    cur = os.path.dirname(os.path.abspath(script_path))
+    project_root = None
+    for _ in range(max_walk_up):
+        if _is_project_root(cur):
+            project_root = cur
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    scan_root = project_root or os.path.dirname(os.path.abspath(script_path))
+    result   = {}
+    warnings = []
+    for dirpath, dirnames, filenames in os.walk(scan_root):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".")
+                       and d.lower() not in
+                       ("__pycache__", "node_modules", "build", "dist")]
+        for fn in filenames:
+            if not fn.endswith(".pb_session.json"):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                with open(full, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("workflow") != "interview_session":
+                    continue
+                tok = data.get("token")
+                if not tok:
+                    continue
+                if tok in result and result[tok] != full:
+                    warnings.append(
+                        "Duplicate session for token '{}': {} vs {}".format(
+                            tok, result[tok], full))
+                    continue
+                result[tok] = full
+            except Exception:
+                continue
+    if warnings:
+        result["__warnings__"] = warnings
+    return result
+
 
 # ── Pro Tools Session Text parser ──────────────────────────────────────────────
 def parse_pt_session_text(text):
