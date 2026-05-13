@@ -2474,6 +2474,88 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return messagebox.askyesno(
             "Low Memory Warning", msg, icon="warning")
 
+    def _show_resource_help(self):
+        """Open a small popup explaining what the resource-monitor numbers
+        mean and how to act on them.  Triggered by the ⓘ icon in Step 3."""
+        win = tk.Toplevel(self)
+        win.title("Resource Monitor — Key")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+
+        hdr = tk.Frame(win, bg=ACCENT, padx=16, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Resource Monitor — Key",
+                 font=FBT, bg=ACCENT, fg="#1c1c1c").pack(anchor="w")
+
+        body = tk.Frame(win, bg=BG, padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+
+        rows = [
+            ("GPU 0–5% (steady)",
+             "CUDA isn't engaged.  faster-whisper has fallen back to "
+             "CPU mode — usually means torch isn't installed or the "
+             "CUDA build is wrong for your GPU.  Reconcile still works "
+             "but is 5–15× slower."),
+            ("GPU 30–100%",
+             "Whisper is actively transcribing on the GPU.  The number "
+             "tracks how busy the compute units are.  Higher = better "
+             "throughput."),
+            ("GPU jumps between idle and 90%",
+             "Normal.  Audio decoding / chunk boundary work happens "
+             "between Whisper calls.  Average matters more than any "
+             "single tick."),
+            ("VRAM ~600 MB",
+             "One Whisper transcribe in flight (small model)."),
+            ("VRAM ~1.2 GB",
+             "Two parallel transcribes "
+             "(FULL_TRANSCRIBE_CONCURRENCY=2)."),
+            ("VRAM near total",
+             "Out of GPU memory.  Drop FULL_TRANSCRIBE_CONCURRENCY in "
+             "config.py, or switch to a smaller Whisper model."),
+            ("RAM (amber, <4 GB free)",
+             "Memory pressure.  Reconcile + Pro Tools / browser / "
+             "Premiere together can crash ffmpeg subprocesses with "
+             "MemoryError.  Close something heavy or toggle Background "
+             "mode."),
+            ("RAM stays high & steady",
+             "Fine.  Whisper holds the model + audio buffers in RAM "
+             "throughout — total RAM doesn't drop until the run ends."),
+        ]
+        for sig, meaning in rows:
+            row = tk.Frame(body, bg=BG, pady=4)
+            row.pack(fill="x")
+            tk.Label(row, text=sig, font=FBT, bg=BG, fg=ACCENT,
+                     width=30, anchor="nw", justify="left"
+                     ).pack(side="left", anchor="n")
+            tk.Label(row, text=meaning, font=FB, bg=BG, fg=TEXT,
+                     anchor="w", justify="left", wraplength=420
+                     ).pack(side="left", anchor="n")
+
+        # Tuning footnote
+        foot = tk.Label(body,
+            text=("\nTuning: bump FULL_TRANSCRIBE_CONCURRENCY in "
+                  "config.py if the GPU sits below ~60% during long "
+                  "transcribes.  Drop it if VRAM is tight or you see "
+                  "contention warnings."),
+            font=FB, bg=BG, fg=SUB, justify="left", wraplength=720)
+        foot.pack(anchor="w", pady=(8, 0))
+
+        nav = tk.Frame(win, bg=BG, padx=20, pady=(0, 14))
+        nav.pack(fill="x")
+        self._btn(nav, "CLOSE", win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = max(760, win.winfo_reqwidth())
+        wh = max(480, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+
     def _get_gpu_stats(self):
         """Return (utilization_pct, vram_used_gb, vram_total_gb) for the
         primary NVIDIA GPU, or None if unavailable.
@@ -2931,12 +3013,36 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # and whether RAM pressure is climbing — all the things a user
         # would otherwise have to alt-tab to Task Manager to learn.
         res_row = tk.Frame(prog_outer, bg=SURF)
-        res_row.pack(fill="x", padx=12, pady=(0, 8))
+        res_row.pack(fill="x", padx=12, pady=(0, 2))
         tk.Label(res_row, text="RESOURCES", font=FB,
                  bg=SURF, fg=SUB).pack(side="left")
         self._res_lbl = tk.Label(res_row, text="…", font=FL,
                                   bg=SURF, fg=TEXT, anchor="w")
         self._res_lbl.pack(side="left", padx=(6, 0))
+
+        # "?" help affordance opens an inline reference of what the
+        # numbers mean — easier than the user having to remember the
+        # signal table we walked through over chat.
+        help_lbl = tk.Label(res_row, text=" ⓘ ", font=FB,
+                             bg=SURF, fg=SUB, cursor="hand2")
+        help_lbl.pack(side="right")
+        help_lbl.bind("<Enter>",
+                       lambda e, w=help_lbl: w.config(fg=ACCENT))
+        help_lbl.bind("<Leave>",
+                       lambda e, w=help_lbl: w.config(fg=SUB))
+        help_lbl.bind("<Button-1>", lambda e: self._show_resource_help())
+
+        # One-line interpretive hint below the readout — keeps the meaning
+        # of the headline numbers visible at a glance without burying the
+        # reading itself.  Tap the ⓘ for the full reference.
+        hint_lbl = tk.Label(
+            prog_outer,
+            text=("GPU >30% = CUDA active  ·  "
+                  "RAM turns amber below 4 GB free  ·  "
+                  "tap ⓘ for full key"),
+            font=FB, bg=SURF, fg=SUB, anchor="w", padx=12)
+        hint_lbl.pack(fill="x", pady=(0, 8))
+
         self._res_monitor_running = True
 
         def _tick_resources():
