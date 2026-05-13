@@ -45,6 +45,24 @@ import engines
 from sync_preview import SyncPreviewDialog
 from match_review import MatchReviewDialog
 
+
+def _tx_count_chars(tx, a, b):
+    """Wrap Text.count(a, b, 'chars') so callers always get an int.
+
+    Python 3.14's Tk shipped a behaviour change: Text.count() returns
+    None instead of (0,) when the two indices are equal (empty range).
+    Older releases returned a 1-tuple unconditionally.  Treat None as
+    zero and unwrap the tuple form."""
+    try:
+        r = tx.count(a, b, "chars")
+    except tk.TclError:
+        return 0
+    if r is None:
+        return 0
+    if isinstance(r, (tuple, list)):
+        return int(r[0]) if r else 0
+    return int(r)
+
 # Sequence preset table: (display_name, width, height, fps)
 # width/height/fps = None means "detect from media" or "custom — leave fields as-is"
 _AAF_SEQ_PRESETS = [
@@ -10379,7 +10397,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # math: run_start + Nc.
                 sorted_bps = sorted(break_positions)
                 # Convert run_start to absolute char count from "1.0"
-                run_start_abs = int(tx.count("1.0", run_start, "chars")[0])
+                run_start_abs = _tx_count_chars(tx, "1.0", run_start)
                 for s, e, w in cont_idx:
                     # Add 2 chars for each break before this word in run
                     n_before = sum(1 for bp in sorted_bps if bp <= s)
@@ -10435,11 +10453,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except tk.TclError:
             return
 
-        try:
-            c0 = tx.count("1.0", sel_first, "chars")[0]
-            c1 = tx.count("1.0", sel_last,  "chars")[0]
-        except Exception:
-            return
+        c0 = _tx_count_chars(tx, "1.0", sel_first)
+        c1 = _tx_count_chars(tx, "1.0", sel_last)
 
         picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
         if not picked:
@@ -10594,17 +10609,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             sel_first = sel_last = None
 
         if sel_first and sel_last:
-            try:
-                c0 = tx.count("1.0", sel_first, "chars")[0]
-                c1 = tx.count("1.0", sel_last,  "chars")[0]
-            except Exception:
-                return
+            c0 = _tx_count_chars(tx, "1.0", sel_first)
+            c1 = _tx_count_chars(tx, "1.0", sel_last)
             picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
         else:
-            try:
-                c0 = tx.count("1.0", tx.index("insert"), "chars")[0]
-            except Exception:
-                return
+            c0 = _tx_count_chars(tx, "1.0", tx.index("insert"))
             picked = [w for (s, e, w) in word_idx if s <= c0 < e]
 
         if not picked:
@@ -11981,19 +11990,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         play_to_end = False
         if sel_first and sel_last:
-            try:
-                c0 = tx.count("1.0", sel_first, "chars")[0]
-                c1 = tx.count("1.0", sel_last,  "chars")[0]
-            except Exception:
-                return
+            c0 = _tx_count_chars(tx, "1.0", sel_first)
+            c1 = _tx_count_chars(tx, "1.0", sel_last)
             picked = [w for (s, e, w) in word_idx if e > c0 and s < c1]
         else:
             # No selection — play indefinitely from the cursor word to the
             # end of the audio (Shift+Space toggles stop).
-            try:
-                c0 = tx.count("1.0", tx.index("insert"), "chars")[0]
-            except Exception:
-                return
+            c0 = _tx_count_chars(tx, "1.0", tx.index("insert"))
             picked = [w for (s, e, w) in word_idx if s <= c0 < e]
             if not picked:
                 # Cursor is past the last word — start at the next word
@@ -12102,11 +12105,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return None   # no selection — let default copy run
 
         # Convert tk indices to character offsets from "1.0".
-        try:
-            c0 = tx.count("1.0", sel_first, "chars")[0]
-            c1 = tx.count("1.0", sel_last,  "chars")[0]
-        except Exception:
-            return "break"
+        c0 = _tx_count_chars(tx, "1.0", sel_first)
+        c1 = _tx_count_chars(tx, "1.0", sel_last)
 
         word_idx = getattr(self, "_pq_word_index", []) or []
         if not word_idx:
