@@ -4,6 +4,7 @@ import re
 import json
 import threading
 import queue
+import subprocess
 import tempfile
 import time
 from concurrent.futures import (ThreadPoolExecutor,
@@ -2473,6 +2474,37 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         return messagebox.askyesno(
             "Low Memory Warning", msg, icon="warning")
 
+    def _get_gpu_stats(self):
+        """Return (utilization_pct, vram_used_gb, vram_total_gb) for the
+        primary NVIDIA GPU, or None if unavailable.
+
+        Shells out to nvidia-smi (always present with the driver).  The
+        call typically completes in 50-200 ms — fine for a 2 s poll."""
+        try:
+            kwargs = {"timeout": 2.0}
+            if sys.platform == "win32":
+                # Hide the console window the subprocess would otherwise flash
+                kwargs["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
+            out = subprocess.check_output(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                **kwargs,
+            ).decode("utf-8", errors="ignore").strip()
+            # nvidia-smi can emit multiple lines for multi-GPU boxes — take
+            # the first line (primary GPU).
+            first = out.splitlines()[0]
+            parts = [p.strip() for p in first.split(",")]
+            if len(parts) >= 3:
+                util       = int(parts[0])
+                used_mb    = int(parts[1])
+                total_mb   = int(parts[2])
+                return util, used_mb / 1024.0, total_mb / 1024.0
+        except Exception:
+            return None
+        return None
+
     def _available_ram_bytes(self):
         """Return available RAM in bytes, or None if we can't measure.
         Uses the Windows GlobalMemoryStatusEx API directly so no extra
@@ -2891,6 +2923,65 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.after(300, _pulse_dots, step + 1)
 
         self._ui(_pulse_dots)
+
+        # ── Live resource monitor ──────────────────────────────────────────
+        # Polls GPU utilisation/VRAM via nvidia-smi and available RAM via
+        # the Windows GlobalMemoryStatusEx API every 2 seconds.  Surfaces
+        # whether CUDA is actually engaged, whether the GPU is saturated,
+        # and whether RAM pressure is climbing — all the things a user
+        # would otherwise have to alt-tab to Task Manager to learn.
+        res_row = tk.Frame(prog_outer, bg=SURF)
+        res_row.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(res_row, text="RESOURCES", font=FB,
+                 bg=SURF, fg=SUB).pack(side="left")
+        self._res_lbl = tk.Label(res_row, text="…", font=FL,
+                                  bg=SURF, fg=TEXT, anchor="w")
+        self._res_lbl.pack(side="left", padx=(6, 0))
+        self._res_monitor_running = True
+
+        def _tick_resources():
+            if not self._res_monitor_running:
+                return
+            try:
+                if not self._res_lbl.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+
+            parts = []
+            gpu = self._get_gpu_stats()
+            if gpu is not None:
+                util, vused, vtotal = gpu
+                # Highlight in ACCENT when GPU is engaged so the user can
+                # see at a glance that CUDA is working.
+                gpu_color = ACCENT if util >= 30 else SUB
+                parts.append(("GPU {}%".format(util), gpu_color))
+                parts.append((" · VRAM {:.1f} / {:.1f} GB".format(
+                    vused, vtotal), TEXT))
+            else:
+                parts.append(("GPU n/a", SUB))
+
+            ram = self._available_ram_bytes()
+            if ram is not None:
+                ram_gb = ram / (1024 ** 3)
+                ram_color = WARN if ram_gb < 4.0 else TEXT
+                parts.append(("  ·  RAM {:.1f} GB free".format(ram_gb),
+                              ram_color))
+
+            # Single label, multi-color via... actually we can't mix colors
+            # in one Label.  Render as plain text with the first segment
+            # color (GPU) since that's the most diagnostic.
+            try:
+                text = "".join(p[0] for p in parts)
+                fg   = parts[0][1] if parts else SUB
+                self._res_lbl.config(text=text, fg=fg)
+            except tk.TclError:
+                return
+            self.after(2000, _tick_resources)
+
+        # First tick fires immediately so the user doesn't see "..." for
+        # 2 seconds; subsequent ticks fire every 2s via the after loop.
+        self.after(100, _tick_resources)
 
         log_frame = tk.Frame(self.body, bg=SURF3,
                              highlightbackground=BORDER, highlightthickness=1)
@@ -4034,6 +4125,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         Appends the pre-computed summary lines to the log widget then
         transitions to Step 4.  All Tk operations happen here, safely."""
         self._dot_running = False   # stop the animated dots
+        self._res_monitor_running = False   # stop the resource poller
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
