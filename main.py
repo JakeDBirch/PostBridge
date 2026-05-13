@@ -595,10 +595,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._last_scroll_canvas = canvas
 
         def _on_wheel(e):
-            # Don't scroll when focus is in a popup (e.g. combobox dropdown)
-            w = self.focus_get()
-            if w is not None and w.winfo_toplevel() != self:
-                return
+            # Don't scroll when focus is in a popup (e.g. combobox dropdown).
+            # Wrapped in try/except: Tk's focus_get() raises KeyError on
+            # internal helper widgets like a ttk.Combobox's "popdown" — the
+            # widget name exists in Tk-land but isn't registered in Python
+            # children mappings.  We treat that as "not in our toplevel".
+            try:
+                w = self.focus_get()
+                if w is not None and w.winfo_toplevel() != self:
+                    return
+            except (KeyError, tk.TclError):
+                pass
             # macOS uses delta 1/-1 per notch; Windows uses 120/-120
             units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
             canvas.yview_scroll(units, "units")
@@ -1856,7 +1863,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         """X key — toggle IGNORE on the most-recently-clicked Step 4 card."""
         # Ignore key presses that originate inside a text-entry widget so
         # that typing 'x' in a search box or entry field is never hijacked.
-        focused = self.focus_get()
+        # focus_get() can raise KeyError on Tk internal subwidgets (e.g. a
+        # ttk.Combobox popdown); treat that as "no entry focused".
+        try:
+            focused = self.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
         if isinstance(focused, (tk.Entry, tk.Text)):
             return
         fn = getattr(self, "_s4_active_toggle", None)
