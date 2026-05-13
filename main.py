@@ -944,6 +944,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._apply_setup_data(self._pending_setup)
             del self._pending_setup
 
+        # Snapshot the freshly-applied assignments into _redo_setup so that a
+        # future ← REDO from Step 4 can restore them — without this, opening
+        # a session that has cached results would jump straight to Step 4,
+        # bypass the usual reconcile-time snapshot at line 2622, and lose
+        # every token/asset assignment on REDO.
+        if (self._pool and self._pool._rows
+                and not getattr(self, "_redo_setup", None)):
+            self._redo_setup = {
+                "assignments": [(r["path"], r["var"].get())
+                                for r in self._pool._rows],
+            }
+
         # If results were saved and loaded, skip straight to Step 4
         if getattr(self, "_pending_results", None) is not None:
             self.results = self._pending_results
