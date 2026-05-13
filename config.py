@@ -8,6 +8,13 @@ MAX_EXTRACT_S    = 600        # max extraction window (seconds) per interview pu
                               # causing Whisper to transcribe an entire recording
 MAX_ITEM_STALL_S = 300        # seconds before a stalled future is force-abandoned
 MAX_WORKERS      = 4          # parallel transcription workers
+AUTO_FULL_TRANSCRIBE_THRESHOLD = 5  # if a token has this many pulls or more AND no
+                              # cached transcript, transcribe the whole audio
+                              # source once rather than running per-pull Whisper.
+                              # Per-pull has high fixed overhead (model warmup,
+                              # audio load), so full-audio almost always wins
+                              # at 5+ pulls.  Set to a very high number to
+                              # disable the auto-promotion.
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # seconds between parts in the sequence

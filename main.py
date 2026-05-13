@@ -3306,6 +3306,65 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if _carryover else ""),
                 SUB)
 
+            # ── Pick the fastest available path for this whole token ──────────
+            # Per-pull Whisper has high fixed overhead (model warmup, audio
+            # decode, VAD).  When a token has many pulls, transcribing the
+            # full audio once + looking up word ranges is dramatically faster
+            # AND produces a cached transcript that subsequent runs reuse for
+            # free.  Three sources, in priority order:
+            #   1. A Pull Quotes session JSON registered for this token —
+            #      best, includes speaker diarisation
+            #   2. A .pb_transcript.json sitting next to the audio (from any
+            #      prior run, VO transcription, or PQ session)
+            #   3. Auto-promote: transcribe the full audio now if pulls ≥
+            #      AUTO_FULL_TRANSCRIBE_THRESHOLD and the source exists
+            _pq_data = (getattr(self, "_pq_session_data", None) or {}).get(token)
+            if _pq_data is None and tsrc:
+                _pb_words, _ = engines.pb_transcript_load(tsrc)
+                if _pb_words:
+                    _pq_data = {
+                        "transcript":  _pb_words,
+                        "audio_cache": tsrc,
+                        "media":       [tsrc],
+                        "id":          token,
+                        "_file_path":  tsrc,
+                    }
+                    self._log_line(
+                        "  [{}] using cached full-audio transcript ({} words)".format(
+                            token, len(_pb_words)),
+                        SUCCESS)
+                elif (len(token_pulls) >= AUTO_FULL_TRANSCRIBE_THRESHOLD
+                      and not self._cancel.is_set()):
+                    self._log_line(
+                        "  [{}] {} pulls + no cached transcript — transcribing full "
+                        "audio once (much faster than {} per-pull calls)".format(
+                            token, len(token_pulls), len(token_pulls)),
+                        INFO)
+                    _t_full = time.perf_counter()
+                    try:
+                        _full_words, _full_blobs = engines.transcribe_file(tsrc)
+                        if _full_words:
+                            engines.pb_transcript_save(
+                                tsrc, _full_words, blobs=_full_blobs)
+                            _pq_data = {
+                                "transcript":  _full_words,
+                                "audio_cache": tsrc,
+                                "media":       [tsrc],
+                                "id":          token,
+                                "_file_path":  tsrc,
+                            }
+                            self._log_line(
+                                "  [{}] full transcript ready ({} words, {:.1f}s) "
+                                "— cached as .pb_transcript.json".format(
+                                    token, len(_full_words),
+                                    time.perf_counter() - _t_full),
+                                SUCCESS)
+                    except Exception as e:
+                        self._log_line(
+                            "  [{}] full-audio transcribe failed ({}); falling back "
+                            "to per-pull Whisper".format(token, e),
+                            WARN)
+
             # Log pull result cache status for this token on first pull
             # (checked AFTER reconcile_interview_pull so we don't double-call
             # os.path.getmtime — which can hang indefinitely on inaccessible files)
@@ -3335,10 +3394,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                      if _pull_in_s >= cursor - engines._PULL_ORDERING_LOOKBACK
                                      else 0.0)
 
-                # Fast path: a Pull Quotes session JSON exists for this
-                # token — script timecodes are already Whisper-precise,
-                # so we just look up the words in the cached transcript.
-                _pq_data = (getattr(self, "_pq_session_data", None) or {}).get(token)
+                # Fast path: a full transcript is available for this token
+                # (Pull Quotes session, cached .pb_transcript.json, or auto-
+                # promoted earlier in process_token_pulls).  Script timecodes
+                # are precise enough to use directly — just look up the words
+                # in the cached transcript.  Otherwise fall back to per-pull
+                # Whisper on a padded window.
                 if _pq_data is not None:
                     r = engines.reconcile_pull_from_session(pull, _pq_data)
                 else:
