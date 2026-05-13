@@ -15,14 +15,15 @@ AUTO_FULL_TRANSCRIBE_THRESHOLD = 5  # if a token has this many pulls or more AND
                               # audio load), so full-audio almost always wins
                               # at 5+ pulls.  Set to a very high number to
                               # disable the auto-promotion.
-FULL_TRANSCRIBE_CONCURRENCY = 1  # how many auto-promoted full-audio transcribes
+FULL_TRANSCRIBE_CONCURRENCY = 2  # how many auto-promoted full-audio transcribes
                               # may run simultaneously.  faster-whisper shares
                               # one global model and CTranslate2 serializes
                               # internally on the GPU — running many in
                               # parallel just causes contention and makes
-                              # each one orders of magnitude slower.  1 is
-                              # the safe default; bump to 2 if you've
-                              # measured headroom on your specific hardware.
+                              # each one orders of magnitude slower.  2 is
+                              # safe on an 8 GB GPU with the small model
+                              # (~600 MB VRAM × 2 = 1.2 GB used).  Set to 1
+                              # on CPU-only systems or low-VRAM GPUs.
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # seconds between parts in the sequence
