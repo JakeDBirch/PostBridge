@@ -3296,6 +3296,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # making per-pull progress.  Mutable list so closures share the int.
         _pull_progress = [0]
 
+        # Auto-promoted full-audio transcribes need to be serialised: the
+        # shared WhisperModel + CTranslate2 GPU backend can only really run
+        # one transcription at a time, and dispatching 7+ in parallel just
+        # causes pathological contention (15+ min with no completions).
+        # Pair with the heartbeat thread inside process_token_pulls so
+        # tokens waiting on the semaphore don't trip the stall watchdog.
+        _full_transcribe_sem = threading.BoundedSemaphore(
+            max(1, FULL_TRANSCRIBE_CONCURRENCY))
+
         _t_rec_start = time.perf_counter()
 
         def process_token_pulls(token, token_pulls):
@@ -3352,12 +3361,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         "audio once (much faster than {} per-pull calls)".format(
                             token, len(token_pulls), len(token_pulls)),
                         INFO)
-                    _t_full = time.perf_counter()
                     # Heartbeat: a full-audio transcribe can take 5-15 minutes,
-                    # during which zero pulls complete.  Without a heartbeat the
-                    # stall watchdog would mark this future abandoned at the
-                    # 300s timeout.  Bump _pull_progress every 30s so the
-                    # watchdog sees the future is alive and working.
+                    # AND tokens queued waiting on _full_transcribe_sem can sit
+                    # idle even longer.  Without a heartbeat the stall watchdog
+                    # would mark this future abandoned at the 300s timeout.
+                    # Bump _pull_progress every 30s so the watchdog sees the
+                    # future is alive (whether transcribing or queued).
                     _hb_stop = threading.Event()
                     def _heartbeat():
                         while not _hb_stop.wait(30.0):
@@ -3366,23 +3375,34 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         target=_heartbeat, daemon=True)
                     _hb_thread.start()
                     try:
-                        _full_words, _full_blobs = engines.transcribe_file(tsrc)
-                        if _full_words:
-                            engines.pb_transcript_save(
-                                tsrc, _full_words, blobs=_full_blobs)
-                            _pq_data = {
-                                "transcript":  _full_words,
-                                "audio_cache": tsrc,
-                                "media":       [tsrc],
-                                "id":          token,
-                                "_file_path":  tsrc,
-                            }
-                            self._log_line(
-                                "  [{}] full transcript ready ({} words, {:.1f}s) "
-                                "— cached as .pb_transcript.json".format(
-                                    token, len(_full_words),
-                                    time.perf_counter() - _t_full),
-                                SUCCESS)
+                        # Serialise full-audio transcribes: see comment on
+                        # _full_transcribe_sem above for why this matters.
+                        _t_wait = time.perf_counter()
+                        with _full_transcribe_sem:
+                            _wait_s = time.perf_counter() - _t_wait
+                            if _wait_s > 5.0:
+                                self._log_line(
+                                    "  [{}] starting full transcribe after {:.0f}s "
+                                    "waiting in queue".format(token, _wait_s),
+                                    SUB)
+                            _t_full = time.perf_counter()
+                            _full_words, _full_blobs = engines.transcribe_file(tsrc)
+                            if _full_words:
+                                engines.pb_transcript_save(
+                                    tsrc, _full_words, blobs=_full_blobs)
+                                _pq_data = {
+                                    "transcript":  _full_words,
+                                    "audio_cache": tsrc,
+                                    "media":       [tsrc],
+                                    "id":          token,
+                                    "_file_path":  tsrc,
+                                }
+                                self._log_line(
+                                    "  [{}] full transcript ready ({} words, "
+                                    "{:.1f}s) — cached as .pb_transcript.json".format(
+                                        token, len(_full_words),
+                                        time.perf_counter() - _t_full),
+                                    SUCCESS)
                     except Exception as e:
                         self._log_line(
                             "  [{}] full-audio transcribe failed ({}); falling back "
