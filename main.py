@@ -3277,6 +3277,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # their reconcile future as soon as transcription completes (pipelining).
         _new_recon_q = queue.Queue()   # VO reconcile futures added mid-run
 
+        # Shared progress counter: each individual pull bumps this when it
+        # completes.  The stall watchdog (below) treats counter advancement
+        # as "alive" so a long-running token batch (e.g. 26 pulls × ~100s)
+        # doesn't trip the 5-minute future-level timeout while it's still
+        # making per-pull progress.  Mutable list so closures share the int.
+        _pull_progress = [0]
+
         _t_rec_start = time.perf_counter()
 
         def process_token_pulls(token, token_pulls):
@@ -3377,6 +3384,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if vid and not r.get("source_audio"):
                         r["source_video"] = vid
                 results.append(r)
+                # Bump the shared progress counter so the stall watchdog
+                # in the main reconcile loop knows we're still making
+                # progress even though this token's future hasn't returned.
+                _pull_progress[0] += 1
                 if r.get("status") in ("ok", "low_confidence", "snapped") \
                         and r.get("rec_out_s", 0.0) > 0.0:
                     cursor = max(cursor, r["rec_out_s"])
@@ -3504,6 +3515,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         pending       = set(futures.keys())
         _stall_t      = time.perf_counter()
         _stall_logged = set()
+        _last_pull_n  = _pull_progress[0]   # baseline for sub-future progress
 
         try:
             while pending or not _vo_done_event.is_set() or not _new_recon_q.empty():
@@ -3537,6 +3549,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                 # ── Still no completions? log stall milestones ───────────────
                 if not done_set:
+                    # Sub-future progress also counts as "alive": if any
+                    # individual pull inside a still-pending token batch
+                    # completed since the last loop, reset the stall clock
+                    # so a long-running token doesn't trip the hard timeout
+                    # while it's actually making progress one pull at a time.
+                    if _pull_progress[0] != _last_pull_n:
+                        _last_pull_n  = _pull_progress[0]
+                        _stall_t      = time.perf_counter()
+                        _stall_logged = set()
+                        continue
+
                     stall_s = time.perf_counter() - _stall_t
                     n_left  = len(pending)
 
@@ -3597,6 +3620,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # ── Progress resumed — reset stall clock ────────────────────
                 _stall_t      = time.perf_counter()
                 _stall_logged = set()
+                _last_pull_n  = _pull_progress[0]
 
                 # ── Process completed futures ────────────────────────────────
                 for fut in done_set:
