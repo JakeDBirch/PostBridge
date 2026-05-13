@@ -2440,6 +2440,69 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             messagebox.showinfo("Pool Refresh", "\n".join(parts))
 
+    def _preflight_memory_check(self):
+        """Return True to proceed, False to abort.
+
+        Checks available system RAM and warns the user if it's low enough
+        that Whisper + ffmpeg subprocesses might run out of memory.
+        Specifically targets the MemoryError-in-subprocess-_readerthread
+        crash that fires when a parallel app (Pro Tools, browsers, etc.)
+        squeezes the available pool below ~4 GB during reconcile."""
+        free_bytes = self._available_ram_bytes()
+        if free_bytes is None:
+            return True   # can't measure — don't block the user
+        free_gb = free_bytes / (1024 ** 3)
+        # 4 GB is the empirically derived "danger zone" — below this,
+        # parallel ffmpeg processes start losing their output buffers
+        # mid-read.
+        if free_gb >= 4.0:
+            return True
+
+        msg = (
+            "Only {:.1f} GB of RAM is currently free.\n\n"
+            "Reconcile loads the Whisper model plus per-token ffmpeg "
+            "subprocesses; on a tight memory budget those can fail with "
+            "a MemoryError mid-run (especially if Pro Tools, Premiere, a "
+            "browser, etc. are also open).\n\n"
+            "Recommended:\n"
+            "  •  Quit other memory-hungry apps before continuing\n"
+            "  •  Or toggle Background mode on the next screen to "
+            "serialise the workload\n\n"
+            "Continue anyway?"
+        ).format(free_gb)
+        return messagebox.askyesno(
+            "Low Memory Warning", msg, icon="warning")
+
+    def _available_ram_bytes(self):
+        """Return available RAM in bytes, or None if we can't measure.
+        Uses the Windows GlobalMemoryStatusEx API directly so no extra
+        dependency is required.  Returns None on non-Windows platforms
+        (caller treats that as 'skip the check')."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            class _MEMSTATUS(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength",                ctypes.c_ulong),
+                    ("dwMemoryLoad",            ctypes.c_ulong),
+                    ("ullTotalPhys",            ctypes.c_ulonglong),
+                    ("ullAvailPhys",            ctypes.c_ulonglong),
+                    ("ullTotalPageFile",        ctypes.c_ulonglong),
+                    ("ullAvailPageFile",        ctypes.c_ulonglong),
+                    ("ullTotalVirtual",         ctypes.c_ulonglong),
+                    ("ullAvailVirtual",         ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = _MEMSTATUS()
+            stat.dwLength = ctypes.sizeof(_MEMSTATUS)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(stat)):
+                return None
+            return int(stat.ullAvailPhys)
+        except Exception:
+            return None
+
     def _warn_large_windows(self, suspicious):
         """Pre-flight modal for pulls whose extraction window exceeds MAX_EXTRACT_S.
 
@@ -2753,6 +2816,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         suspicious = [p for p in self.pulls
                       if p.get("out_seconds", 0) - p.get("in_seconds", 0) > MAX_EXTRACT_S]
         if suspicious and not self._warn_large_windows(suspicious):
+            return
+
+        # ── Pre-flight: warn about low available memory ──────────────────────
+        # Reconcile spins up Whisper (~1 GB) plus per-token ffmpeg processes
+        # and audio buffers; a parallel Pro Tools session can easily push the
+        # box past its RAM ceiling and crash subprocess output readers with
+        # MemoryError.  Surface this BEFORE the long-running run starts.
+        if not self._preflight_memory_check():
             return
 
         self._clear()
