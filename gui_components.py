@@ -1091,6 +1091,15 @@ class MediaPool(tk.Frame):
     def _update_link_visuals(self):
         """Show or hide the ↔ link indicator on each pool row.
         Active (source) rows show it in ACCENT; passively-mirrored rows in SUB."""
+        # Bail early if the pool itself has been destroyed — background
+        # duration-fetch threads can fire after the user has navigated past
+        # Step 2 and the widgets are gone.
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
         # Count rows per link_id
         counts: dict = {}
         for r in self._rows:
@@ -1103,11 +1112,21 @@ class MediaPool(tk.Frame):
             rm  = r.get("rm_lbl")
             if lbl is None or rm is None:
                 continue
+            # Skip rows whose widgets were destroyed between scheduling
+            # and execution of this deferred update.
+            try:
+                if not lbl.winfo_exists() or not rm.winfo_exists():
+                    continue
+            except tk.TclError:
+                continue
             lid     = r.get("link_id")
             visible = lid is not None and counts.get(lid, 0) >= 2
             if visible:
                 color = SUB if r.get("link_mirrored") else ACCENT
-                lbl.config(fg=color)
+                try:
+                    lbl.config(fg=color)
+                except tk.TclError:
+                    continue
                 try:
                     lbl.pack(side="left", before=rm)
                 except Exception:
