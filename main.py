@@ -3353,6 +3353,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             token, len(token_pulls), len(token_pulls)),
                         INFO)
                     _t_full = time.perf_counter()
+                    # Heartbeat: a full-audio transcribe can take 5-15 minutes,
+                    # during which zero pulls complete.  Without a heartbeat the
+                    # stall watchdog would mark this future abandoned at the
+                    # 300s timeout.  Bump _pull_progress every 30s so the
+                    # watchdog sees the future is alive and working.
+                    _hb_stop = threading.Event()
+                    def _heartbeat():
+                        while not _hb_stop.wait(30.0):
+                            _pull_progress[0] += 1
+                    _hb_thread = threading.Thread(
+                        target=_heartbeat, daemon=True)
+                    _hb_thread.start()
                     try:
                         _full_words, _full_blobs = engines.transcribe_file(tsrc)
                         if _full_words:
@@ -3376,6 +3388,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             "  [{}] full-audio transcribe failed ({}); falling back "
                             "to per-pull Whisper".format(token, e),
                             WARN)
+                    finally:
+                        _hb_stop.set()
 
             # Log pull result cache status for this token on first pull
             # (checked AFTER reconcile_interview_pull so we don't double-call
