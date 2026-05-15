@@ -24,6 +24,22 @@ FULL_TRANSCRIBE_CONCURRENCY = 2  # how many auto-promoted full-audio transcribes
                               # safe on an 8 GB GPU with the small model
                               # (~600 MB VRAM × 2 = 1.2 GB used).  Set to 1
                               # on CPU-only systems or low-VRAM GPUs.
+# ── Script-conform editing ──────────────────────────────────────────────────
+# When a pull has a full transcript available (PQ session or .pb_transcript
+# .json sidecar), reconcile aligns the script's quote_text against the
+# transcript and generates internal cuts where Whisper found words the
+# script didn't.  These auto-conformed segments appear in Step 4 with the
+# normal multi-segment review UI.
+SCRIPT_CONFORM_ENABLED = True   # master switch
+SCRIPT_CONFORM_MIN_RATIO   = 0.70  # minimum fraction of script tokens that must
+                                  # align before auto-cuts are trusted; below
+                                  # this we fall back to a single-segment match
+SCRIPT_CONFORM_MIN_RUN     = 2     # ignore matching blocks shorter than this
+                                  # (1-token "matches" are usually coincidental
+                                  # — "the", "and", "I" turn up everywhere)
+SCRIPT_CONFORM_MERGE_GAP_S = 0.4   # merge segments whose inter-cut gap is
+                                  # shorter than this; Whisper's natural pauses
+                                  # within a sentence shouldn't become cuts
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # seconds between parts in the sequence

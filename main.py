@@ -3816,6 +3816,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         )
                 # Per-pull timing log — helps identify which specific pulls are slow
                 _diag = r.get("_diag", "")
+                # Surface script-conform success: when alignment produced
+                # internal cuts, mention the cut count + alignment ratio.
+                if r.get("_script_conformed"):
+                    _cuts  = r.get("n_internal_cuts", 0)
+                    _ratio = r.get("_conform_ratio")
+                    _suffix = (" · script-conformed {:.0%} match, "
+                               "{} cut{}".format(
+                                   _ratio or 0.0,
+                                   _cuts, "" if _cuts == 1 else "s"))
+                    _diag = (_diag + _suffix) if _diag else _suffix.lstrip(" ·")
                 self._log_line(
                     "    pull #{} '{}' → {}{}  ({:.1f}s)".format(
                         pull.get("order", "?"), token,

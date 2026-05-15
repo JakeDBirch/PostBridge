@@ -1318,6 +1318,104 @@ def fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5):
     return start_s, end_s, ratio, matched_dicts
 
 
+def script_conform_segments(transcript_words, quote_text,
+                              min_run=None, merge_gap_s=None,
+                              min_ratio=None):
+    """Align a script ``quote_text`` against a list of ``transcript_words``
+    (the dicts that fall inside the matched range) and return a list of
+    ``(start_s, end_s)`` segments representing what the editor should
+    *keep* — gaps in the script that exist in the tape become cuts.
+
+    Returns ``(segments, ratio, n_cuts, matched_dicts)`` or ``None`` when
+    the alignment is too poor to trust (caller should fall back to the
+    single-segment match instead of producing nonsense cuts).
+
+    The algorithm:
+      1. Tokenize both inputs (lowercase, alphanumeric only) preserving
+         a parallel array of source dicts for the transcript side
+      2. SequenceMatcher.get_matching_blocks() — runs of consecutive
+         matching tokens
+      3. Drop blocks shorter than ``min_run`` (coincidental matches)
+      4. Sort by transcript position; emit one segment per surviving
+         block using the first/last transcript word's timestamps
+      5. Merge segments whose inter-cut gap < ``merge_gap_s`` — those
+         are just natural pauses, not real cuts to make
+      6. Sanity-check: total aligned ratio must clear ``min_ratio``,
+         otherwise return None
+    """
+    if min_run is None:
+        min_run = SCRIPT_CONFORM_MIN_RUN
+    if merge_gap_s is None:
+        merge_gap_s = SCRIPT_CONFORM_MERGE_GAP_S
+    if min_ratio is None:
+        min_ratio = SCRIPT_CONFORM_MIN_RATIO
+
+    if not quote_text or not transcript_words:
+        return None
+
+    script_tokens = re.findall(r"[a-z']+", quote_text.lower())
+    if len(script_tokens) < 4:
+        return None
+
+    # Parallel arrays: clean tokens + source dicts.  Skip "break" markers.
+    trans = []
+    for w in transcript_words:
+        if w.get("break"):
+            continue
+        tok = re.sub(r"[^a-z']", "", (w.get("word") or "").lower())
+        if tok:
+            trans.append((tok, w))
+    if len(trans) < min_run:
+        return None
+    trans_tokens = [t[0] for t in trans]
+
+    from difflib import SequenceMatcher
+    sm = SequenceMatcher(None, script_tokens, trans_tokens, autojunk=False)
+    blocks = [b for b in sm.get_matching_blocks()
+              if b.size >= min_run]
+    if not blocks:
+        return None
+
+    # Total aligned ratio drives the trust gate.
+    matched = sum(b.size for b in blocks)
+    ratio   = matched / float(len(script_tokens))
+    if ratio < min_ratio:
+        return None
+
+    # Sort by transcript position so segments come out in playback order.
+    blocks.sort(key=lambda b: b.b)
+
+    # Build raw segments + the matched-word dicts that make them up.
+    raw_segments = []
+    matched_dicts = []
+    for b in blocks:
+        first = trans[b.b][1]
+        last  = trans[b.b + b.size - 1][1]
+        seg_start = float(first.get("start", 0.0))
+        seg_end   = float(last.get("end", seg_start))
+        if seg_end <= seg_start:
+            continue
+        raw_segments.append([seg_start, seg_end])
+        matched_dicts.extend(trans[i][1] for i in range(b.b, b.b + b.size))
+
+    if not raw_segments:
+        return None
+
+    # Merge segments whose inter-cut gap is shorter than merge_gap_s —
+    # Whisper's natural sentence pauses shouldn't become cuts.
+    merged = [raw_segments[0]]
+    for seg in raw_segments[1:]:
+        gap = seg[0] - merged[-1][1]
+        if gap < merge_gap_s:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+
+    segments = [(round(s[0], 4), round(s[1], 4)) for s in merged]
+    n_cuts   = max(0, len(segments) - 1)
+    return segments, ratio, n_cuts, matched_dicts
+
+
 def reconcile_pull_from_session(pull, session_data):
     """Pull-Quotes fast path: use a pre-transcribed Interview Session
     JSON to resolve a pull *without* running Whisper.
@@ -1407,38 +1505,104 @@ def reconcile_pull_from_session(pull, session_data):
     snapped_in  = float(overlapping[0].get("start", in_s))
     snapped_out = float(overlapping[-1].get("end",   out_s))
 
-    # Build segments — one per editorial paragraph from the script.
-    # `pull["quote_paragraphs"]` carries the user's paragraph structure.
-    # If it's missing/empty, fall back to a single segment spanning the
-    # whole pull range.
-    paragraphs = pull.get("quote_paragraphs") or []
-    if len(paragraphs) >= 2:
-        # Distribute words evenly across the paragraph count.  Each
-        # paragraph gets a roughly equal time window inside the pull.
-        # This is approximate (we don't have per-paragraph timecodes
-        # from the script), but reflects the script's structure in the
-        # eventual AAF output as adjacent segments rather than one long
-        # blob.  The user can fine-tune in Step 4.
-        n_para = len(paragraphs)
-        seg_dur = (snapped_out - snapped_in) / n_para
-        segments = [(round(snapped_in + i * seg_dur, 4),
-                     round(snapped_in + (i + 1) * seg_dur, 4))
-                    for i in range(n_para)]
-        # Snap the final out to the actual snapped_out (avoids rounding
-        # drift on very long pulls).
-        segments[-1] = (segments[-1][0], snapped_out)
-    else:
-        segments = [(snapped_in, snapped_out)]
+    # ── Script-conform: align the script text against the matched range
+    # and emit one segment per aligned block, with gaps in the script
+    # that exist in the tape becoming cuts.  Falls back to the paragraph-
+    # distribution scheme below when alignment is too poor to trust.
+    paragraphs   = pull.get("quote_paragraphs") or []
+    quote_text   = pull.get("quote_text") or " ".join(paragraphs)
+    conform_used = False
+    conform_ratio = None
+    segments     = None
+    conform_words = None
 
-    # Synthesise the matched-text and store the words on the result so
-    # the Step-4 waveform editor has them.
+    if SCRIPT_CONFORM_ENABLED and quote_text:
+        if len(paragraphs) >= 2:
+            # Per-paragraph: align each paragraph independently within a
+            # rough time slice of the matched range.  This honours the
+            # user's editorial paragraph structure AND keeps coincidental
+            # token matches inside one paragraph from locking onto the
+            # wrong place in another.
+            n_para     = len(paragraphs)
+            range_dur  = max(0.001, snapped_out - snapped_in)
+            slice_dur  = range_dur / n_para
+            all_segs   = []
+            all_words  = []
+            ratios     = []
+            ok         = True
+            for i, para in enumerate(paragraphs):
+                slice_in  = snapped_in + i       * slice_dur
+                slice_out = snapped_in + (i + 1) * slice_dur
+                # Generous edges: take everything in the slice + a small
+                # overlap into adjacent slices so a word straddling the
+                # boundary still aligns.
+                pad = min(2.0, 0.5 * slice_dur)
+                para_words = [
+                    w for w in overlapping
+                    if (float(w.get("end", 0)) > slice_in - pad
+                        and float(w.get("start", 0)) < slice_out + pad)
+                ]
+                conf = script_conform_segments(para_words, para)
+                if conf is None:
+                    ok = False
+                    break
+                segs, r, _cuts, mwords = conf
+                all_segs.extend(segs)
+                all_words.extend(mwords)
+                ratios.append(r)
+            if ok and all_segs:
+                segments      = all_segs
+                conform_words = all_words
+                conform_ratio = sum(ratios) / max(1, len(ratios))
+                conform_used  = True
+        else:
+            conf = script_conform_segments(overlapping, quote_text)
+            if conf is not None:
+                segs, r, _cuts, mwords = conf
+                segments      = segs
+                conform_words = mwords
+                conform_ratio = r
+                conform_used  = True
+
+    if not conform_used:
+        # Existing behaviour: one paragraph = one even time slice within
+        # the matched range.  Approximate but matches the script
+        # structure.  Single-paragraph pulls collapse to one segment.
+        if len(paragraphs) >= 2:
+            n_para  = len(paragraphs)
+            seg_dur = (snapped_out - snapped_in) / n_para
+            segments = [(round(snapped_in + i * seg_dur, 4),
+                         round(snapped_in + (i + 1) * seg_dur, 4))
+                        for i in range(n_para)]
+            segments[-1] = (segments[-1][0], snapped_out)
+        else:
+            segments = [(snapped_in, snapped_out)]
+
+    # Re-derive snapped_in/out from segments so any conform-driven
+    # trim is reflected in the headline rec_in/out timecodes.
+    if segments:
+        snapped_in  = segments[0][0]
+        snapped_out = segments[-1][1]
+
+    # Words to attach to the result — use the conform-matched subset
+    # when available (those are the words actually inside segments),
+    # otherwise the full overlapping range.
+    words_for_result = conform_words if conform_used else overlapping
+
+    # Synthesise the matched-text from the words we kept.
     matched_text = " ".join(
-        (w.get("word") or "").strip() for w in overlapping
+        (w.get("word") or "").strip() for w in words_for_result
     ).strip()
 
-    # Confidence: 1.0 for direct TC matches, lower for text-fallback so
-    # those land in NEEDS ATTENTION and the user can review.
-    confidence = 0.75 if result.get("_text_fallback") else 1.0
+    # Confidence: 1.0 for direct TC matches, 0.75 for text-fallback so
+    # those land in NEEDS ATTENTION.  Script-conformed cuts get a small
+    # bonus toward 1.0 based on alignment ratio (still ≥0.75 floor).
+    if result.get("_text_fallback"):
+        confidence = 0.75
+    elif conform_used and conform_ratio is not None:
+        confidence = min(1.0, 0.85 + 0.15 * conform_ratio)
+    else:
+        confidence = 1.0
 
     result.update({
         "segments":        segments,
@@ -1453,8 +1617,10 @@ def reconcile_pull_from_session(pull, session_data):
         "n_internal_cuts": max(0, len(segments) - 1),
         "n_gap_cuts":      0,
         "status":          "ok",
-        "words":           list(overlapping),
+        "words":           list(words_for_result),
         "_pq_session":     session_data.get("id") or session_data.get("_file_path"),
+        "_script_conformed": conform_used,
+        "_conform_ratio":  conform_ratio,
     })
     return result
 
