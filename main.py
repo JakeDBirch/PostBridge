@@ -10244,15 +10244,58 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "← BACK TO PROJECT",
                   self._pq_render_project_view).pack(side="left")
 
-        self._section("INTERVIEW SESSION  —  {}".format(
-            session.get("token", "?")))
+        # ── Section title (clickable to collapse the info card) ──────────
+        # The section row carries a chevron showing the collapse state of
+        # the info card below it.  Clicking either the title or chevron
+        # toggles the info card's visibility — gives the transcript more
+        # vertical room on short windows without losing access to the
+        # MEDIA list / TRANSCRIBE controls.  Match _section's visual
+        # treatment (3 px ACCENT stripe on the left).
+        section_row = tk.Frame(self.body, bg=BG)
+        section_row.pack(fill="x", pady=(20, 6))
+        tk.Frame(section_row, bg=ACCENT, width=3, height=20).pack(
+            side="left", padx=(0, 10))
+        # Persist collapse state across re-renders of the same session.
+        # On the very first open, auto-collapse the info card when the
+        # window is too short to comfortably show it + transcript + the
+        # bottom action bar.  Below ~720 px the info card is the first
+        # thing worth hiding to keep the COPY / PLAY buttons visible.
+        if not hasattr(self, "_pq_info_collapsed"):
+            self.update_idletasks()
+            cur_h = self.winfo_height() or 800
+            self._pq_info_collapsed = cur_h < 720
+        self._pq_info_chevron = tk.Label(
+            section_row,
+            text="▼" if not self._pq_info_collapsed else "▶",
+            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=4)
+        self._pq_info_chevron.pack(side="left")
+        section_lbl = tk.Label(
+            section_row,
+            text="INTERVIEW SESSION  —  {}".format(session.get("token", "?")),
+            font=FL, bg=BG, fg=TEXT, cursor="hand2")
+        section_lbl.pack(side="left", padx=(2, 0))
 
-        # Header info card
+        # Header info card — can be collapsed by clicking the chevron
         info = tk.Frame(self.body, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
-        info.pack(fill="x", pady=(0, 12))
+        self._pq_info_card = info
+        if not self._pq_info_collapsed:
+            info.pack(fill="x", pady=(0, 12))
         inner = tk.Frame(info, bg=SURF)
         inner.pack(fill="x", padx=16, pady=12)
+
+        def _toggle_info(_e=None):
+            self._pq_info_collapsed = not self._pq_info_collapsed
+            if self._pq_info_collapsed:
+                info.pack_forget()
+                self._pq_info_chevron.config(text="▶")
+            else:
+                # Re-pack BEFORE the PanedWindow so it appears above it.
+                info.pack(fill="x", pady=(0, 12),
+                          before=self._pq_layout_pw)
+                self._pq_info_chevron.config(text="▼")
+        self._pq_info_chevron.bind("<Button-1>", _toggle_info)
+        section_lbl.bind("<Button-1>", _toggle_info)
 
         tk.Label(inner, text="TOKEN", font=FL,
                  bg=SURF, fg=SUB, width=10,
@@ -10340,12 +10383,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # tx_outer is added to the PanedWindow at the bottom of this
         # function once the notes panel has been built too.
 
-        # Header row: TRANSCRIPT label + status (right)
+        # Header row: TRANSCRIPT label + search toggle + status
         tx_hdr = tk.Frame(tx_outer, bg=SURF3)
         tx_hdr.pack(fill="x")
         tk.Label(tx_hdr, text="TRANSCRIPT", font=FL,
                  bg=SURF3, fg=SUB, anchor="w",
                  padx=12, pady=6).pack(side="left")
+        # Search toggle — the search row consumes a 40-50 px strip;
+        # collapse-by-default lets the user reclaim that for the
+        # transcript and pop it open with Ctrl+F or this icon.
+        if not hasattr(self, "_pq_search_visible"):
+            self._pq_search_visible = True   # default to shown
+        self._pq_search_toggle = tk.Label(
+            tx_hdr, text="🔍", font=FB,
+            bg=SURF3, fg=ACCENT if self._pq_search_visible else SUB,
+            cursor="hand2", padx=10, pady=6)
+        self._pq_search_toggle.pack(side="right")
         self._pq_status_lbl = tk.Label(tx_hdr, text="", font=FB,
                                         bg=SURF3, fg=SUB,
                                         padx=12, pady=6)
@@ -10353,7 +10406,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Search row — Entry + match counter + ◀ ▶ navigation
         sr = tk.Frame(tx_outer, bg=SURF, padx=12, pady=6)
-        sr.pack(fill="x")
+        if self._pq_search_visible:
+            sr.pack(fill="x")
+        self._pq_search_row = sr
         tk.Label(sr, text="🔍", font=FB, bg=SURF, fg=SUB
                  ).pack(side="left", padx=(0, 6))
         self._pq_search_var = tk.StringVar()
@@ -10377,6 +10432,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         sr_entry.bind("<Shift-Return>",
                       lambda e: self._pq_search_step(-1))
         sr_entry.bind("<Escape>", lambda e: self._pq_search_clear())
+
+        def _toggle_search(_e=None):
+            self._pq_search_visible = not self._pq_search_visible
+            if self._pq_search_visible:
+                self._pq_search_row.pack(fill="x", before=tx_frame)
+                self._pq_search_toggle.config(fg=ACCENT)
+                try:
+                    self._pq_search_entry.focus_set()
+                except tk.TclError:
+                    pass
+            else:
+                self._pq_search_row.pack_forget()
+                self._pq_search_toggle.config(fg=SUB)
+                # Clear any active search highlights when hidden.
+                try:
+                    self._pq_search_clear()
+                except Exception:
+                    pass
+            return "break"
+        self._pq_search_toggle.bind("<Button-1>", _toggle_search)
+        # Ctrl+F focuses the search box, opening it if collapsed.
+        def _focus_search(_e=None):
+            if not self._pq_search_visible:
+                _toggle_search()
+            else:
+                try:
+                    self._pq_search_entry.focus_set()
+                    self._pq_search_entry.selection_range(0, "end")
+                except tk.TclError:
+                    pass
+            return "break"
+        # Bind at top-level so it works from anywhere in the session view.
+        self.bind("<Control-f>", _focus_search)
+        self.bind("<Control-F>", _focus_search)
 
         # Text widget — explicit padx/pady gives a uniform inset all the
         # way down (the previous bd=8 + scrollbar packing produced the
@@ -10655,9 +10744,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._pq_layout_pw.add(tx_outer, minsize=320, stretch="always")
         self._pq_render_notes_panel()
 
-        # Action row: mode badge (left) + PLAY/COPY (right)
+        # Action row: PLAY/COPY (right) + hint/notes toggle (left).
+        # Pin to the BOTTOM (above the back-nav row) so the expanding
+        # PanedWindow can never push these buttons off-screen on short
+        # windows — the bug Jordan was hitting where COPY / PLAY were
+        # invisible on smaller displays.
         act = tk.Frame(self.body, bg=BG)
-        act.pack(fill="x", pady=(0, 4))
+        act.pack(side="bottom", fill="x", pady=(8, 4))
 
         # Left side: hint + notes toggle.  No more Edit/Play modes —
         # the transcript is permanently read-only; right-click on a
