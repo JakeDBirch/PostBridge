@@ -10238,11 +10238,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _stash = getattr(self, "_pq_layout_resize_stash", None)
         self._pq_layout_resize_stash = None
 
-        # Bottom nav
+        # ── Bottom bar — consolidates BACK / hints / 📝 notes / PLAY / COPY
+        # onto one persistent row, so even short windows never lose the
+        # action buttons.  Left side: navigation + hint text.  Right side:
+        # primary actions.  No separate action row.
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8, 0))
         self._btn(nav, "← BACK TO PROJECT",
                   self._pq_render_project_view).pack(side="left")
+        # Hint text — small enough to share the row, drops first if cramped.
+        tk.Label(nav,
+                 text="  Right-click for actions  ·  Space plays  ·  Ctrl+M note",
+                 font=FB, bg=BG, fg=SUB).pack(side="left", padx=(12, 0))
 
         # ── Section title (clickable to collapse the info card) ──────────
         # The section row carries a chevron showing the collapse state of
@@ -10257,13 +10264,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             side="left", padx=(0, 10))
         # Persist collapse state across re-renders of the same session.
         # On the very first open, auto-collapse the info card when the
-        # window is too short to comfortably show it + transcript + the
-        # bottom action bar.  Below ~720 px the info card is the first
-        # thing worth hiding to keep the COPY / PLAY buttons visible.
+        # window is too short to comfortably show it + transcript.  With
+        # the unified bottom bar this only fires on really small windows
+        # — the user can always toggle it back manually.
         if not hasattr(self, "_pq_info_collapsed"):
             self.update_idletasks()
             cur_h = self.winfo_height() or 800
-            self._pq_info_collapsed = cur_h < 720
+            self._pq_info_collapsed = cur_h < 620
         self._pq_info_chevron = tk.Label(
             section_row,
             text="▼" if not self._pq_info_collapsed else "▶",
@@ -10744,42 +10751,26 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._pq_layout_pw.add(tx_outer, minsize=320, stretch="always")
         self._pq_render_notes_panel()
 
-        # Action row: PLAY/COPY (right) + hint/notes toggle (left).
-        # Pin to the BOTTOM (above the back-nav row) so the expanding
-        # PanedWindow can never push these buttons off-screen on short
-        # windows — the bug Jordan was hitting where COPY / PLAY were
-        # invisible on smaller displays.
-        act = tk.Frame(self.body, bg=BG)
-        act.pack(side="bottom", fill="x", pady=(8, 4))
+        # Primary actions live on the same bottom row as BACK TO PROJECT.
+        # Right-anchored so they hug the right edge regardless of how much
+        # the hint text on the left consumes.
+        self._btn(nav, "COPY SELECTION AS @PULL",
+                  self._pq_copy_as_pull,
+                  color=ACCENT).pack(side="right")
+        self._pq_play_btn = self._btn(
+            nav, "▶ PLAY SELECTION",
+            self._pq_play_selection)
+        self._pq_play_btn.pack(side="right", padx=(0, 8))
 
-        # Left side: hint + notes toggle.  No more Edit/Play modes —
-        # the transcript is permanently read-only; right-click on a
-        # selection to edit, copy, play, or annotate.
-        left_row = tk.Frame(act, bg=BG)
-        left_row.pack(side="left")
-        tk.Label(left_row,
-                 text="Right-click selection for actions   ·   "
-                      "Space plays   ·   Ctrl+M adds note",
-                 font=FB, bg=BG, fg=SUB).pack(side="left")
-
-        # Toggle the notes pane visibility from the action row.  Useful
-        # when the user has collapsed it via the ✕ in the panel header.
+        # 📝 notes-pane toggle sits between hint text and PLAY/COPY.
         self._pq_notes_toggle_btn = tk.Label(
-            left_row, text="📝", font=FB, bg=SURF3, fg=TEXT,
+            nav, text="📝", font=FB, bg=SURF3, fg=TEXT,
             cursor="hand2", padx=10, pady=4)
-        self._pq_notes_toggle_btn.pack(side="left", padx=(16, 0))
+        self._pq_notes_toggle_btn.pack(side="right", padx=(0, 12))
         self._pq_notes_toggle_btn.bind(
             "<Button-1>",
             lambda e: self._pq_toggle_notes_pane(None))
         self._pq_refresh_notes_toggle_btn()
-
-        self._btn(act, "COPY SELECTION AS @PULL",
-                  self._pq_copy_as_pull,
-                  color=ACCENT).pack(side="right")
-        self._pq_play_btn = self._btn(
-            act, "▶ PLAY SELECTION",
-            self._pq_play_selection)
-        self._pq_play_btn.pack(side="right", padx=(0, 8))
 
         # Apply current mode to update badge styling + key behaviour
         self._pq_apply_mode()
