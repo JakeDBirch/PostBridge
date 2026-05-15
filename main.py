@@ -2573,8 +2573,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             font=FB, bg=BG, fg=SUB, justify="left", wraplength=720)
         foot.pack(anchor="w", pady=(8, 0))
 
-        nav = tk.Frame(win, bg=BG, padx=20, pady=(0, 14))
-        nav.pack(fill="x")
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(0, 14))
         self._btn(nav, "CLOSE", win.destroy).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
 
@@ -12077,8 +12077,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  wraplength=520).pack(anchor="w", pady=(0, 14))
 
         result = {"choice": "cancel"}
-        nav = tk.Frame(win, bg=BG, padx=20, pady=(0, 14))
-        nav.pack(fill="x")
+        # NOTE: widget-level pady expects a single screen distance — tuples
+        # are only valid on pack().  Put the asymmetric padding on pack.
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(0, 14))
 
         def _pick(c):
             result["choice"] = c
