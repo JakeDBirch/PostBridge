@@ -2456,33 +2456,53 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _preflight_memory_check(self):
         """Return True to proceed, False to abort.
 
-        Checks available system RAM and warns the user if it's low enough
-        that Whisper + ffmpeg subprocesses might run out of memory.
-        Specifically targets the MemoryError-in-subprocess-_readerthread
-        crash that fires when a parallel app (Pro Tools, browsers, etc.)
-        squeezes the available pool below ~4 GB during reconcile."""
-        free_bytes = self._available_ram_bytes()
-        if free_bytes is None:
+        Checks the smaller of (physical RAM free, commit charge headroom)
+        and warns the user when allocations are likely to fail.  On
+        Windows, commit charge (physical + page file) is the actual
+        ceiling for new allocations — it's common to have 15 GB physical
+        free while the page file is full and a 300 MB malloc fails."""
+        budget = self._available_alloc_bytes()
+        if budget is None:
             return True   # can't measure — don't block the user
-        free_gb = free_bytes / (1024 ** 3)
+        budget_gb = budget / (1024 ** 3)
         # 4 GB is the empirically derived "danger zone" — below this,
-        # parallel ffmpeg processes start losing their output buffers
-        # mid-read.
-        if free_gb >= 4.0:
+        # Whisper feature buffers or parallel ffmpeg subprocesses start
+        # hitting MemoryError on contiguous allocations.
+        if budget_gb >= 4.0:
             return True
 
+        # Build a diagnostic that distinguishes "physical full" from
+        # "commit charge exhausted" — they call for different fixes.
+        phys = self._available_ram_bytes()
+        page = self._available_pagefile_bytes()
+        diag = []
+        if phys is not None:
+            diag.append("Physical RAM free: {:.1f} GB".format(
+                phys / (1024 ** 3)))
+        if page is not None:
+            diag.append("Commit headroom:   {:.1f} GB".format(
+                page / (1024 ** 3)))
+            if page < 2 * (1024 ** 3):
+                diag.append("(commit charge near limit — Windows will "
+                            "refuse allocations regardless of physical "
+                            "RAM free)")
+
         msg = (
-            "Only {:.1f} GB of RAM is currently free.\n\n"
-            "Reconcile loads the Whisper model plus per-token ffmpeg "
-            "subprocesses; on a tight memory budget those can fail with "
-            "a MemoryError mid-run (especially if Pro Tools, Premiere, a "
-            "browser, etc. are also open).\n\n"
+            "Memory budget is tight — only {:.1f} GB available for new "
+            "allocations.\n\n"
+            "{}\n\n"
+            "Whisper + ffmpeg need contiguous blocks of several hundred "
+            "MB at a time.  When commit charge or physical RAM runs low, "
+            "those allocations fail with MemoryError mid-run.\n\n"
             "Recommended:\n"
-            "  •  Quit other memory-hungry apps before continuing\n"
-            "  •  Or toggle Background mode on the next screen to "
-            "serialise the workload\n\n"
+            "  •  Quit other memory-hungry apps (Pro Tools, browsers, "
+            "Premiere, Photoshop)\n"
+            "  •  If commit charge is the bottleneck, a Windows restart "
+            "is the quickest fix\n"
+            "  •  Toggle Background mode on the next screen to serialise "
+            "the workload\n\n"
             "Continue anyway?"
-        ).format(free_gb)
+        ).format(budget_gb, "\n".join("  " + d for d in diag))
         return messagebox.askyesno(
             "Low Memory Warning", msg, icon="warning")
 
@@ -2599,11 +2619,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return None
         return None
 
-    def _available_ram_bytes(self):
-        """Return available RAM in bytes, or None if we can't measure.
-        Uses the Windows GlobalMemoryStatusEx API directly so no extra
-        dependency is required.  Returns None on non-Windows platforms
-        (caller treats that as 'skip the check')."""
+    def _memory_status(self):
+        """Return a Windows MEMORYSTATUSEX struct or None.  Used by the
+        physical-RAM, commit-charge, and combined-budget helpers below."""
         if sys.platform != "win32":
             return None
         try:
@@ -2625,9 +2643,37 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
                     ctypes.byref(stat)):
                 return None
-            return int(stat.ullAvailPhys)
+            return stat
         except Exception:
             return None
+
+    def _available_ram_bytes(self):
+        """Physical RAM available (idle) in bytes, or None.
+        NOTE: physical RAM free is NOT the cap on new allocations — the
+        commit charge ceiling is.  Use _available_alloc_bytes() to know
+        whether an allocation will actually succeed."""
+        stat = self._memory_status()
+        return int(stat.ullAvailPhys) if stat else None
+
+    def _available_pagefile_bytes(self):
+        """Commit charge headroom in bytes (physical + page file backed),
+        or None.  This is the real cap on new allocations on Windows."""
+        stat = self._memory_status()
+        return int(stat.ullAvailPageFile) if stat else None
+
+    def _available_alloc_bytes(self):
+        """Minimum of physical-free and commit-headroom — the largest
+        contiguous block that could plausibly succeed.  Returns None if
+        memory state can't be measured."""
+        phys = self._available_ram_bytes()
+        page = self._available_pagefile_bytes()
+        if phys is None and page is None:
+            return None
+        if phys is None:
+            return page
+        if page is None:
+            return phys
+        return min(phys, page)
 
     def _warn_large_windows(self, suspicious):
         """Pre-flight modal for pulls whose extraction window exceeds MAX_EXTRACT_S.
@@ -12082,6 +12128,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Run:  pip install faster-whisper")
             return
 
+        # Memory pre-flight — same Windows commit-charge check used by
+        # Script→Session reconcile.  Catches the case where 15 GB of
+        # physical RAM is free but the page file is exhausted and a
+        # 300 MB feature buffer allocation will fail.
+        if not self._preflight_memory_check():
+            return
+
         # Pre-transcribe alert: existing transcript data on this session OR
         # a .pb_transcript.json sidecar next to any of the media files means
         # the user may not realise they're about to throw work away.  Ask
@@ -12282,6 +12335,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._ui(_done)
             except Exception as e:
                 err = str(e)
+                is_mem = isinstance(e, MemoryError) or "allocate" in err.lower()
                 def _err():
                     prog = session.get("_progress")
                     if prog is not None:
@@ -12294,9 +12348,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         self._pq_render_transcript_text(session)
                     elif getattr(self, "_pq_current_session", None) is None:
                         self._pq_update_project_row(session)
-                    messagebox.showerror(
-                        "Transcription failed ({})".format(
-                            session.get("token", "?")), err)
+                    if is_mem:
+                        # MemoryError mid-transcribe — almost always a
+                        # Windows commit-charge exhaustion.  Pull live
+                        # numbers so the user sees what's tight.
+                        phys = self._available_ram_bytes()
+                        page = self._available_pagefile_bytes()
+                        diag = [err, ""]
+                        if phys is not None:
+                            diag.append("Physical RAM free:  {:.1f} GB".format(
+                                phys / (1024 ** 3)))
+                        if page is not None:
+                            diag.append("Commit headroom:    {:.1f} GB".format(
+                                page / (1024 ** 3)))
+                            if page < 2 * (1024 ** 3):
+                                diag.append("")
+                                diag.append("Commit charge is near the limit — "
+                                            "Windows refuses allocations even "
+                                            "when physical RAM is free.")
+                        diag.append("")
+                        diag.append("Try:")
+                        diag.append("  •  Quit Pro Tools / Premiere / browsers")
+                        diag.append("  •  If commit headroom is low, a Windows "
+                                    "restart is the fastest fix")
+                        diag.append("  •  Use a shorter source clip or split "
+                                    "the audio")
+                        messagebox.showerror(
+                            "Out of Memory ({})".format(
+                                session.get("token", "?")),
+                            "\n".join(diag))
+                    else:
+                        messagebox.showerror(
+                            "Transcription failed ({})".format(
+                                session.get("token", "?")), err)
                 self._ui(_err)
             finally:
                 self._pq_apply_priority(low=False, prev=prev_priority)
