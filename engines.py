@@ -332,12 +332,35 @@ def transcribe_file(media_path, progress_cb=None):
     words = None
     blobs = None
 
+    # Probe total duration so the segment-level progress callback can
+    # report "X% (HH:MM:SS of HH:MM:SS)" to the caller's UI.
+    total_audio_s = 0.0
+    try:
+        total_audio_s = float(get_media_duration(media_path) or 0.0)
+    except Exception:
+        pass
+
+    def _seg_cb(audio_s):
+        if progress_cb is None:
+            return
+        try:
+            if total_audio_s > 0:
+                frac = max(0.0, min(0.95, 0.10 + 0.75 * (audio_s / total_audio_s)))
+                pct  = int(round(audio_s * 100.0 / total_audio_s))
+                progress_cb(frac, "Transcribing — {:.0f}s of {:.0f}s ({}%)".format(
+                    audio_s, total_audio_s, pct))
+            else:
+                progress_cb(0.5, "Transcribing — {:.0f}s decoded".format(audio_s))
+        except Exception:
+            pass
+
     if WAVEFORM_CONFORM:
         _prog(0.05, "Detecting silence splits…")
         chunks = detect_silence_splits(media_path)
         if chunks:
             _prog(0.10, "Transcribing ({} chunks)…".format(len(chunks)))
-            words = transcribe_in_chunks(media_path, chunks)
+            words = transcribe_in_chunks(media_path, chunks,
+                                          progress_cb=_seg_cb)
 
     if words is None:
         # Either WAVEFORM_CONFORM is off or silence split failed — full-file path
@@ -350,7 +373,7 @@ def transcribe_file(media_path, progress_cb=None):
                 _prog(1.0, "Audio extraction failed")
                 return None, None
             _prog(0.30, "Transcribing…")
-            words = transcribe_clip(tmp_a)
+            words = transcribe_clip(tmp_a, progress_cb=_seg_cb)
         finally:
             try: os.unlink(tmp_a)
             except Exception: pass
@@ -487,7 +510,13 @@ def _transcribe_raw(wav_path):
     except Exception as e:
         return "error: {}".format(e)
 
-def transcribe_clip(wav_path):
+def transcribe_clip(wav_path, progress_cb=None):
+    """Transcribe a WAV file into a flat list of word dicts (lowercase,
+    alphanumeric-stripped).  Used by the reconcile / matching path.
+
+    ``progress_cb``, if provided, is called once per Whisper segment with
+    the audio offset (seconds) of that segment's end — same shape as
+    ``transcribe_clip_verbatim`` so the same UI hook works for both."""
     model = get_model()
     # condition_on_previous_text=False  — each segment decoded independently;
     #   prevents cascading hallucination loops (the #1 cause of infinite hangs).
@@ -516,6 +545,11 @@ def transcribe_clip(wav_path):
         else:
             for w in re.findall(r"[a-z']+", seg.text.lower()):
                 words.append({"word": w, "start": seg.start, "end": seg.end})
+        if progress_cb is not None:
+            try:
+                progress_cb(float(seg.end))
+            except Exception:
+                pass
     return [w for w in words if w["word"]]
 
 
@@ -1220,6 +1254,70 @@ def _base_result(pull):
 
 _PULL_ORDERING_LOOKBACK = 10.0  # seconds of slack before the cursor for interview pulls
 
+def fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5):
+    """Find where ``quote_text`` lives inside ``transcript`` (a list of
+    word dicts) using fuzzy word-sequence matching.  Returns
+    ``(start_s, end_s, confidence, matched_word_dicts)`` or ``None`` if
+    no acceptable match is found.
+
+    Used as a fallback when a pull's timecodes are wrong/missing but the
+    script still carries the quoted text — Whisper's wording can drift
+    from the script (filler words, punctuation, contractions), so this
+    is intentionally forgiving.
+
+    ``min_ratio`` is the fraction of target words that must appear in
+    the matched region for the match to count.  0.5 means "at least
+    half the words line up" — tight enough to avoid false positives,
+    loose enough to handle script paraphrasing.
+    """
+    if not quote_text or not transcript:
+        return None
+    # Clean target: lowercase, alphanum (matches transcribe_clip's word format)
+    target = re.findall(r"[a-z']+", quote_text.lower())
+    # Strip very short tokens that produce noise (single letters, common stopwords
+    # contribute little signal at this scale).  Below 4 tokens is too short
+    # to fuzzy-match safely.
+    if len(target) < 4:
+        return None
+
+    # Build a parallel array of clean transcript words + their source dicts.
+    clean = []
+    for w in transcript:
+        if w.get("break"):
+            continue
+        tok = re.sub(r"[^a-z']", "", (w.get("word") or "").lower())
+        if tok:
+            clean.append((tok, w))
+    if len(clean) < len(target):
+        return None
+    clean_words = [c[0] for c in clean]
+
+    # difflib finds the longest contiguous block of matches; combined matches
+    # across blocks give us the full match span.
+    from difflib import SequenceMatcher
+    sm = SequenceMatcher(None, target, clean_words, autojunk=False)
+    blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
+    if not blocks:
+        return None
+    matched_words = sum(b.size for b in blocks)
+    ratio = matched_words / float(len(target))
+    if ratio < min_ratio:
+        return None
+
+    # Span the transcript region from the first to last matched position.
+    b_start = min(b.b for b in blocks)
+    b_end   = max(b.b + b.size for b in blocks)
+    if b_end <= b_start:
+        return None
+
+    matched_dicts = [clean[i][1] for i in range(b_start, b_end)]
+    start_s = float(matched_dicts[0].get("start", 0.0))
+    end_s   = float(matched_dicts[-1].get("end",   start_s))
+    if end_s <= start_s:
+        return None
+    return start_s, end_s, ratio, matched_dicts
+
+
 def reconcile_pull_from_session(pull, session_data):
     """Pull-Quotes fast path: use a pre-transcribed Interview Session
     JSON to resolve a pull *without* running Whisper.
@@ -1270,10 +1368,39 @@ def reconcile_pull_from_session(pull, session_data):
             continue
         overlapping.append(w)
 
-    if not overlapping:
-        result["status"] = "no_match"
-        result["_diag"]  = "no words in [{:.2f}, {:.2f}]".format(in_s, out_s)
-        return result
+    # Detect invalid timecodes (in > out, or out unreasonably far past audio
+    # end) so we can fall back to the text-search path instead of silently
+    # returning no_match.
+    invalid_tcs = (out_s <= in_s)
+
+    if invalid_tcs or not overlapping:
+        # Text-fallback: a full transcript is available — try to locate the
+        # quote by its words alone.  Tolerates script vs. Whisper wording
+        # drift (filler words, contractions, light paraphrasing).
+        quote_text = pull.get("quote_text") or ""
+        fb = fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5)
+        if fb is not None:
+            fb_start, fb_end, ratio, matched_dicts = fb
+            overlapping = matched_dicts
+            in_s, out_s = fb_start, fb_end
+            result["_diag"] = (
+                "TC-fallback text match ({:.0%} word overlap; "
+                "ignored bad TCs in={:.1f} out={:.1f})".format(
+                    ratio,
+                    float(pull.get("in_seconds", 0.0)),
+                    float(pull.get("out_seconds", 0.0)))
+            )
+            result["_text_fallback"] = True
+        else:
+            result["status"] = "no_match"
+            if invalid_tcs:
+                result["_diag"] = (
+                    "invalid TCs (in={:.1f} > out={:.1f}) and quote text "
+                    "didn't fuzzy-match the transcript".format(in_s, out_s))
+            else:
+                result["_diag"] = "no words in [{:.2f}, {:.2f}]".format(
+                    in_s, out_s)
+            return result
 
     # Snap to the actual word boundaries we found — gives Whisper-precise
     # in/out points instead of the (possibly rounded) script timecodes.
@@ -1309,6 +1436,10 @@ def reconcile_pull_from_session(pull, session_data):
         (w.get("word") or "").strip() for w in overlapping
     ).strip()
 
+    # Confidence: 1.0 for direct TC matches, lower for text-fallback so
+    # those land in NEEDS ATTENTION and the user can review.
+    confidence = 0.75 if result.get("_text_fallback") else 1.0
+
     result.update({
         "segments":        segments,
         "rec_in_s":        snapped_in,
@@ -1317,7 +1448,7 @@ def reconcile_pull_from_session(pull, session_data):
         "rec_out_tc":      secs_tc(snapped_out),
         "delta_in":        round(snapped_in  - in_s,  3),
         "delta_out":       round(snapped_out - out_s, 3),
-        "confidence":      1.0,    # Pull-Quotes timecodes ARE the truth
+        "confidence":      confidence,
         "matched_text":    matched_text,
         "n_internal_cuts": max(0, len(segments) - 1),
         "n_gap_cuts":      0,
@@ -1786,7 +1917,7 @@ def detect_silence_splits(audio_path, silence_db=None,
     return final if final else None
 
 
-def transcribe_in_chunks(audio_path, chunks):
+def transcribe_in_chunks(audio_path, chunks, progress_cb=None):
     """
     Transcribe audio_path in independent segments defined by `chunks`
     (list of (start_s, end_s) pairs from detect_silence_splits).
@@ -1794,6 +1925,10 @@ def transcribe_in_chunks(audio_path, chunks):
     Each chunk is extracted to a temp WAV and transcribed by Whisper
     separately, then word timestamps are offset back to absolute file
     position.  Returns a complete, gap-free word list for the whole file.
+
+    ``progress_cb``, if provided, is called as ``progress_cb(audio_s)``
+    where ``audio_s`` is the absolute audio offset of the last completed
+    segment.  Used by the Script→Session UI to show "of HH:MM:SS (NN%)".
     """
     all_words = []
     for chunk_start, chunk_end in chunks:
@@ -1804,7 +1939,16 @@ def transcribe_in_chunks(audio_path, chunks):
             ok, _ = extract_window(audio_path, chunk_start, chunk_end, tmp)
             if not ok:
                 continue
-            words = transcribe_clip(tmp)
+            # Wrap the inner callback so absolute audio offset is reported
+            # (transcribe_clip emits offsets relative to its chunk only).
+            inner_cb = None
+            if progress_cb is not None:
+                def inner_cb(seg_end_local, _co=chunk_start):
+                    try:
+                        progress_cb(seg_end_local + _co)
+                    except Exception:
+                        pass
+            words = transcribe_clip(tmp, progress_cb=inner_cb)
             for w in words:
                 all_words.append({
                     "word":  w["word"],

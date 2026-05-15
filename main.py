@@ -3666,7 +3666,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                     "waiting in queue".format(token, _wait_s),
                                     SUB)
                             _t_full = time.perf_counter()
-                            _full_words, _full_blobs = engines.transcribe_file(tsrc)
+                            # Throttled progress logger — every 10s emit a
+                            # progress line so the user sees "[TOKEN]
+                            # transcribing 5:23 of 32:45 (16%)" rather than
+                            # silence for 5+ minutes per token.
+                            _last_prog_log = [0.0]
+                            def _prog_cb(frac, msg, _tok=token):
+                                now = time.perf_counter()
+                                if now - _last_prog_log[0] < 10.0:
+                                    return
+                                _last_prog_log[0] = now
+                                self._log_line(
+                                    "  [{}] {}".format(_tok, msg), SUB)
+                            _full_words, _full_blobs = engines.transcribe_file(
+                                tsrc, progress_cb=_prog_cb)
                             if _full_words:
                                 engines.pb_transcript_save(
                                     tsrc, _full_words, blobs=_full_blobs)
@@ -9509,6 +9522,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
+            # Mirror the word list as a .pb_transcript.json sidecar next
+            # to each source audio file so the Script→Session reconcile
+            # workflow can re-use this transcript without re-running
+            # Whisper.  No-op if the transcript is empty.
+            words = session.get("transcript") or []
+            if words:
+                for media_path in session.get("media", []):
+                    try:
+                        if os.path.isfile(media_path):
+                            engines.pb_transcript_save(media_path, words)
+                    except Exception:
+                        pass
             return True
         except Exception as e:
             messagebox.showerror("Save Session failed", str(e))
@@ -11951,6 +11976,82 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if getattr(self, "_pq_retx_btn", None):
             self._pq_retx_btn.config(text="⟳ TRANSCRIBE")
 
+    def _pq_confirm_retranscribe(self, session, has_session_transcript,
+                                  sidecar_paths):
+        """Ask the user what to do when transcript data already exists.
+
+        Returns one of:
+            "transcribe"   — proceed with a fresh transcription (overwrite)
+            "use_cached"   — load the existing sidecar transcript instead
+            "cancel"       — abort
+        """
+        win = tk.Toplevel(self)
+        win.title("Transcript Already Exists")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+
+        hdr = tk.Frame(win, bg=WARN, padx=16, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="⚠   Transcript Already Exists",
+                 font=FBT, bg=WARN, fg="#1c1c1c").pack(anchor="w")
+
+        body = tk.Frame(win, bg=BG, padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+
+        lines = []
+        if has_session_transcript:
+            wc = len([w for w in session.get("transcript", [])
+                      if (w.get("word") or "").strip()])
+            lines.append(
+                "This session already has a transcript ({:,} words).".format(wc))
+        if sidecar_paths:
+            n = len(sidecar_paths)
+            lines.append(
+                "{} cached transcript{} found next to the source audio "
+                "(.pb_transcript.json from a prior run).".format(
+                    n, "s" if n != 1 else ""))
+        lines.append("")
+        lines.append(
+            "Re-transcribing will overwrite any edits you've made and "
+            "burn GPU time you've already paid.")
+
+        tk.Label(body, text="\n".join(lines), font=FB,
+                 bg=BG, fg=TEXT, justify="left",
+                 wraplength=520).pack(anchor="w", pady=(0, 14))
+
+        result = {"choice": "cancel"}
+        nav = tk.Frame(win, bg=BG, padx=20, pady=(0, 14))
+        nav.pack(fill="x")
+
+        def _pick(c):
+            result["choice"] = c
+            win.destroy()
+
+        self._btn(nav, "CANCEL", lambda: _pick("cancel"),
+                  small=True).pack(side="left")
+        # "Use cached" only makes sense when there's a sidecar to load from.
+        if sidecar_paths:
+            self._btn(nav, "USE EXISTING",
+                      lambda: _pick("use_cached"),
+                      color=ACCENT).pack(side="right", padx=(8, 0))
+        self._btn(nav, "RE-TRANSCRIBE (overwrite)",
+                  lambda: _pick("transcribe")).pack(side="right")
+
+        win.bind("<Escape>", lambda e: _pick("cancel"))
+
+        win.update_idletasks()
+        pw = self.winfo_width(); ph = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = max(580, win.winfo_reqwidth())
+        wh = max(240, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
+        return result["choice"]
+
     def _pq_run_transcription(self, session):
         """Kick off (or refuse to start) a transcription for `session`.
 
@@ -11980,6 +12081,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "faster-whisper is not installed.\n\n"
                 "Run:  pip install faster-whisper")
             return
+
+        # Pre-transcribe alert: existing transcript data on this session OR
+        # a .pb_transcript.json sidecar next to any of the media files means
+        # the user may not realise they're about to throw work away.  Ask
+        # them to confirm overwrite, with a "use cached" option to pull
+        # the sidecar transcript into this session without re-running
+        # Whisper.
+        has_session_transcript = bool(session.get("transcript"))
+        sidecar_paths = []
+        for p in media:
+            try:
+                if engines.pb_transcript_load(p)[0] is not None:
+                    sidecar_paths.append(p)
+            except Exception:
+                pass
+
+        if has_session_transcript or sidecar_paths:
+            choice = self._pq_confirm_retranscribe(
+                session, has_session_transcript, sidecar_paths)
+            if choice == "cancel":
+                return
+            if choice == "use_cached":
+                # Pull the most-recent sidecar transcript onto the session
+                # and skip the Whisper run entirely.
+                src = sidecar_paths[0] if sidecar_paths else None
+                if src:
+                    words, _ = engines.pb_transcript_load(src)
+                    if words:
+                        session["transcript"] = list(words)
+                        self._pq_save_session_file(session)
+                        if (getattr(self, "_pq_current_session", None)
+                                is session):
+                            self._pq_render_transcript_text(session)
+                        return
 
         bg_mode = bool(getattr(self, "_pq_bg_mode_var",
                                tk.BooleanVar(value=False)).get())
