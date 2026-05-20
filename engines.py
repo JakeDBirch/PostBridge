@@ -737,7 +737,7 @@ class TranscriptionCancelled(Exception):
 
 
 def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
-                              model_size=None):
+                              model_size=None, segment_cb=None):
     """Whisper transcription that preserves the model's natural punctuation,
     casing, and segment boundaries — for human-readable display (Pull Quotes).
 
@@ -767,6 +767,14 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
     `model_size`, if provided, forces a specific Whisper size (e.g. "tiny"
     for a fast draft pass) and stamps every emitted word with that size
     in the `_src` field.  When None, uses the active model.
+
+    `segment_cb`, if provided, fires once per decoded segment with a
+    single argument: the list of new word dicts produced by THAT segment
+    (the same dicts that have been appended to the return value).  The
+    callback can use these for streaming UI updates — appending words
+    to a visible transcript as they're decoded.  The break-marker
+    entry inserted before each non-first segment is NOT included in
+    the segment_cb payload; only "real" words.
     """
     effective_size = model_size or get_active_model_size()
     model = get_model(size=effective_size)
@@ -807,6 +815,10 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
             })
         first_segment = False
 
+        # Track this segment's words so we can hand them to segment_cb
+        # at end-of-segment as a discrete payload.
+        seg_words = []
+
         if seg.words:
             for w in seg.words:
                 # Whisper's per-word `.word` includes the natural leading
@@ -816,22 +828,33 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
                 wt = w.word
                 if wt is None or not wt.strip():
                     continue
-                out.append({
+                entry = {
                     "word":  wt,
                     "start": float(w.start),
                     "end":   float(w.end),
                     "_src":  effective_size,
-                })
+                }
+                out.append(entry)
+                seg_words.append(entry)
         else:
             # Fall back to segment text if word-level timing is missing.
             text = (seg.text or "").strip()
             if text:
-                out.append({
+                entry = {
                     "word":  (" " if out and not out[-1].get("break") else "") + text,
                     "start": float(seg.start),
                     "end":   float(seg.end),
                     "_src":  effective_size,
-                })
+                }
+                out.append(entry)
+                seg_words.append(entry)
+
+        if callable(segment_cb) and seg_words:
+            try:
+                segment_cb(seg_words)
+            except Exception:
+                # Streaming UI hook should never break decoding.
+                pass
 
         prev_end = float(seg.end)
         if callable(progress_cb):
@@ -845,7 +868,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
 
 def transcribe_session_per_track(audio_paths, speaker_labels=None,
                                    progress_cb=None, cancel_event=None,
-                                   model_size=None):
+                                   model_size=None, segment_cb=None):
     """Transcribe each audio file separately and merge by timestamp.
 
     Each track is transcribed in isolation with `transcribe_clip_verbatim`,
@@ -898,11 +921,21 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
                     progress_cb(audio_s, track_index=_i, n_tracks=_n,
                                 track_name=os.path.basename(_src))
 
+            # Wrap segment_cb so the per-track speaker label rides
+            # along with each streamed word — the PQ render layer
+            # uses speaker tags to group/colorise paragraphs.
+            inner_segcb = None
+            if callable(segment_cb):
+                def inner_segcb(seg_words, _sp=speaker):
+                    for w in seg_words:
+                        w["speaker"] = _sp
+                    segment_cb(seg_words)
             try:
                 words = transcribe_clip_verbatim(
                     tmp, progress_cb=_wrap_cb,
                     cancel_event=cancel_event,
-                    model_size=model_size)
+                    model_size=model_size,
+                    segment_cb=inner_segcb)
             except TranscriptionCancelled as _tc:
                 # Propagate, but include words gathered from any
                 # previously-completed tracks plus the partial words

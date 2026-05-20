@@ -12919,6 +12919,46 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             prog["extra"] = "{} · {} decoded".format(
                                 prefix, _fmt_dur(audio_s))
 
+                    # ── Streaming word emission ─────────────────────
+                    # Fires once per decoded Whisper segment with the
+                    # words from THAT segment.  Appends them to a
+                    # streaming accumulator and triggers a throttled
+                    # main-thread render so the user sees text appear
+                    # progressively instead of waiting for the entire
+                    # pass to finish.  Throttled to ~1.2 s between
+                    # renders so we don't redraw on every short
+                    # segment of a busy file.
+                    streaming_words = []
+                    streaming_last_render = [0.0]
+                    streaming_render_pending = [False]
+
+                    def _do_stream_render(s=session):
+                        streaming_render_pending[0] = False
+                        # Only render if this session is still on screen
+                        # AND no full transcript has overwritten the
+                        # streaming buffer (which would happen at the
+                        # very end of the pass when the worker assigns
+                        # the final word list).
+                        if getattr(self, "_pq_current_session",
+                                   None) is s:
+                            s["transcript"] = list(streaming_words)
+                            try:
+                                self._pq_render_transcript_text(s)
+                            except Exception:
+                                pass
+
+                    def _stream_seg_cb(seg_words):
+                        streaming_words.extend(seg_words)
+                        now = time.perf_counter()
+                        if (now - streaming_last_render[0] < 1.2
+                                or streaming_render_pending[0]):
+                            return
+                        streaming_last_render[0] = now
+                        streaming_render_pending[0] = True
+                        # Schedule the render on the Tk main thread —
+                        # this callback runs in the worker thread.
+                        self._ui(_do_stream_render)
+
                     # ── Decide whether (and how) to run a tiny draft pass
                     # When the user is actively viewing this session and
                     # their configured model isn't already 'tiny', do a
@@ -12950,26 +12990,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                     def _run_tiny_pass(audios=audios, mix_path_ref=None):
                         """Tiny draft worker.  Writes to tiny_words_box,
-                        renders the preview on the main thread, and
-                        catches its own exceptions so a tiny crash never
-                        kills the parent worker's configured run."""
+                        streams each segment's words into the live
+                        transcript pane, and catches its own exceptions
+                        so a tiny crash never kills the parent worker's
+                        configured run."""
                         try:
                             if len(audios) == 1:
                                 tw = engines.transcribe_clip_verbatim(
                                     mix_path_ref, progress_cb=_on_seg_end,
                                     cancel_event=cancel_event,
-                                    model_size="tiny")
+                                    model_size="tiny",
+                                    segment_cb=_stream_seg_cb)
                             else:
                                 speaker_labels = session.get("speakers") or {}
                                 tw = engines.transcribe_session_per_track(
                                     audios, speaker_labels=speaker_labels,
                                     progress_cb=_on_seg_end,
                                     cancel_event=cancel_event,
-                                    model_size="tiny")
+                                    model_size="tiny",
+                                    segment_cb=_stream_seg_cb)
                             tiny_words_box[0] = tw
                             if tw and getattr(
                                     self, "_pq_current_session", None
                                     ) is session:
+                                # Final render with the complete tiny
+                                # output (streaming may have rendered a
+                                # slightly stale view at last throttle).
                                 session["transcript"] = list(tw)
                                 self._ui(lambda s=session:
                                           self._pq_preview_ready(s))
@@ -13018,10 +13064,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 mix_path, progress_cb=_on_seg_end,
                                 cancel_event=cancel_event)
                         else:
+                            # Non-progressive: stream the configured
+                            # pass directly so the user sees text
+                            # appear as it's decoded.
                             _set_phase("transcribing", "")
                             words = engines.transcribe_clip_verbatim(
                                 mix_path, progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb)
                     else:
                         # Multi-track — transcribe each independently so
                         # we know who said what (speaker = source file).
@@ -13048,12 +13098,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 progress_cb=_on_seg_end,
                                 cancel_event=cancel_event)
                         else:
+                            # Non-progressive multi-track: stream
+                            # configured directly.
                             _set_phase("transcribing {} tracks".format(
                                 len(audios)))
                             words = engines.transcribe_session_per_track(
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb)
                         # Build a mix purely for the playback cache so
                         # the user can hear both speakers when auditioning
                         # transcript regions.
