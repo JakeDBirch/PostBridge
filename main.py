@@ -13196,16 +13196,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _pq_render_progress_placeholder(self):
         """Show an animated 'transcription in progress' message in the
-        transcript pane, replacing both the static placeholder and any
-        prior transcript text.  Reads progress from the currently-visible
-        session.  Silently no-ops if the widget has been destroyed (user
-        navigated away) or this session isn't running."""
+        transcript pane while a session is decoding AND has no words yet.
+
+        Critical: once a transcript exists (e.g. the tiny preview during
+        a progressive run), DO NOT overwrite it — the user is already
+        reading and possibly editing.  The placeholder is only useful
+        when the pane is otherwise empty.  Status / refining state is
+        communicated via the status label instead.
+        """
         tx      = getattr(self, "_pq_tx_text", None)
         session = getattr(self, "_pq_current_session", None)
         if not tx or session is None:
             return
         prog = session.get("_progress") or {}
         if not prog.get("active"):
+            return
+        # Don't clobber an existing transcript (tiny preview or full).
+        if session.get("transcript"):
             return
         try:
             if not tx.winfo_exists():
