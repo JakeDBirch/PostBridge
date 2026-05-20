@@ -132,6 +132,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _saved_model = self._prefs.get("whisper_model")
         if _saved_model:
             engines.set_active_model(_saved_model)
+        # Seed bundled tiny into the persistent cache and kick off a
+        # background download of base + small.  The installer ships
+        # only tiny to stay slim; this populates the practical CPU
+        # choices the user can pick from the dropdown without the
+        # user paying a wait on their first selection.  Failures
+        # (offline, partial download) are silent — faster-whisper
+        # will simply retry the next time the user picks one.
+        try:
+            engines._seed_bundled_models()
+            engines.prefetch_models_async(sizes=("base", "small"))
+        except Exception:
+            pass
         self._header()
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=44, pady=(0, 14))

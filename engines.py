@@ -490,10 +490,11 @@ def pull_result_cache_clear(pull, transcript_path, pad):
 
 # ── Transcription ──────────────────────────────────────────────────────────────
 def _bundled_models_root():
-    """Return the path to bundled Whisper model weights if shipped
-    alongside the executable, else None.  Build scripts pre-download
-    tiny/base/small into ``models/`` next to the frozen exe so first-
-    run users don't sit through a 100–500 MB download.
+    """Return the path to bundled Whisper model weights shipped with
+    the executable, else None.  Build scripts pre-download only the
+    `tiny` model (~75 MB) into ``models/`` so the installer stays
+    small enough to send via chat tools; `base` and `small` are
+    fetched in the background after launch.
     """
     # PyInstaller-frozen apps have sys._MEIPASS for read-only data;
     # development runs use the source-tree CWD.
@@ -507,6 +508,103 @@ def _bundled_models_root():
         if os.path.isdir(c):
             return c
     return None
+
+
+def _persistent_models_dir():
+    """Return the writable directory where Whisper weights live across
+    runs.  Created on first call.  This is faster-whisper's
+    ``download_root`` for every WhisperModel() construction — bundled
+    tiny is seeded here from the read-only bundle on first launch,
+    and the background downloader writes base/small/medium/large-v3
+    here as they're acquired.
+    """
+    base = os.path.join(os.path.expanduser("~"), ".postbridge_models")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
+def _seed_bundled_models():
+    """Copy any model directories that ship in the read-only bundle
+    into the persistent cache so faster-whisper finds them under
+    ``download_root``.  Idempotent: only seeds entries the persistent
+    cache doesn't already hold.
+
+    Safe to call repeatedly; the first call does the copy on cold
+    install, subsequent calls are essentially no-ops (just a directory
+    listing).
+    """
+    bundled = _bundled_models_root()
+    if not bundled:
+        return
+    persistent = _persistent_models_dir()
+    import shutil as _sh
+    try:
+        for entry in os.listdir(bundled):
+            src = os.path.join(bundled, entry)
+            dst = os.path.join(persistent, entry)
+            if os.path.exists(dst):
+                continue
+            try:
+                if os.path.isdir(src):
+                    _sh.copytree(src, dst)
+                else:
+                    _sh.copy2(src, dst)
+            except Exception as e:
+                # Don't let a seed failure block startup — the model
+                # will just get re-downloaded.
+                print("PostBridge: model seed failed for {}: {}".format(
+                    entry, e), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _is_model_cached(size):
+    """True if the given Whisper size is already in the persistent
+    cache (won't trigger a HuggingFace download).  Used by the
+    background pre-fetcher to skip work it doesn't need to do."""
+    cache = _persistent_models_dir()
+    # faster-whisper stores under models--Systran--faster-whisper-<size>/
+    expected = os.path.join(
+        cache, "models--Systran--faster-whisper-{}".format(size))
+    return os.path.isdir(expected) and len(
+        os.listdir(expected)) > 0
+
+
+def prefetch_models_async(sizes=("base", "small")):
+    """Spawn a background thread that downloads each of ``sizes`` into
+    the persistent cache if it isn't already there.  Returns the
+    Thread so callers can join() if they need to.  Failures (no
+    network, etc.) are silent — the next time the user picks one of
+    these models, faster-whisper will simply re-attempt the download.
+    """
+    def _run():
+        try:
+            from faster_whisper.utils import download_model
+        except ImportError:
+            try:
+                from faster_whisper import download_model
+            except ImportError:
+                return
+        cache = _persistent_models_dir()
+        for size in sizes:
+            if _is_model_cached(size):
+                continue
+            try:
+                download_model(size, cache_dir=cache)
+            except Exception as e:
+                # Network failure or interrupted download — leave for
+                # next attempt.  Don't crash the helper thread.
+                print("PostBridge: background prefetch for '{}' "
+                      "failed: {}".format(size, e),
+                      file=sys.stderr)
+                return
+    t = threading.Thread(target=_run, daemon=True,
+                          name="postbridge-model-prefetch")
+    t.start()
+    return t
 
 
 def get_model(size=None):
@@ -528,16 +626,19 @@ def get_model(size=None):
                 compute = "float16" if device == "cuda" else "int8"
             except ImportError:
                 device = "cpu"; compute = "int8"
-            # If the bundle ships a pre-downloaded copy of this model,
-            # point faster-whisper at it via download_root so it loads
-            # locally instead of pulling from HuggingFace.  Missing
-            # bundles (e.g. medium/large-v3 on the standard build) fall
-            # through to the normal HuggingFace download path.
-            _bundle_root = _bundled_models_root()
-            kwargs = dict(device=device, compute_type=compute)
-            if _bundle_root:
-                kwargs["download_root"] = _bundle_root
-            _model_cache[size] = WhisperModel(size, **kwargs)
+            # Seed the bundled tiny model into the persistent cache on
+            # first call, then always point faster-whisper at the
+            # persistent cache.  This way:
+            #   - Bundled tiny (~75 MB in the installer) seeds cache
+            #     on first launch and is found instantly thereafter.
+            #   - base/small downloaded by the background prefetcher
+            #     land in the same cache and are found by name.
+            #   - medium/large-v3 download on demand the first time
+            #     the user picks them.
+            _seed_bundled_models()
+            _model_cache[size] = WhisperModel(
+                size, device=device, compute_type=compute,
+                download_root=_persistent_models_dir())
         return _model_cache[size]
 
 def _clip_rms_db(wav_path):

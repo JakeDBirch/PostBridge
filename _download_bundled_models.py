@@ -8,15 +8,22 @@ Models land in ./models/ in faster-whisper's standard cache layout.
 The PyInstaller spec picks the folder up automatically when present
 and engines.get_model() reads from it at runtime via download_root.
 
-Bundling targets the practical CPU choices (tiny / base / small) so
-first-launch users don't sit through a 100-500 MB download.  Medium
-and large-v3 stay on-demand to keep installer size manageable.
+Default bundle is just `tiny` (~75 MB) so the installer stays under
+the size limits of common chat tools (Slack, Discord, etc.).  Other
+models are fetched after launch:
+  - base + small download in the background on first run
+    (engines.prefetch_models_async)
+  - medium + large-v3 download on demand the first time the user
+    selects them in the model picker
+
+Override on the command line if you want a fatter bundle, e.g.:
+    python _download_bundled_models.py tiny base small
 """
 import os
 import sys
 
-# Default sizes — override on the command line:  python _download_bundled_models.py tiny base
-SIZES = sys.argv[1:] or ["tiny", "base", "small"]
+# Default size — override on the command line for a fatter bundle.
+SIZES = sys.argv[1:] or ["tiny"]
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 # faster-whisper exposes download_model() for fetching weights without

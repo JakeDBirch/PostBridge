@@ -283,7 +283,7 @@ Inline dropdowns live next to the TRANSCRIBE button (Pull Quotes session view), 
 
 Your choice persists across sessions (saved to `~/.postbridge_prefs.json`). On the next transcription the new model loads — first-load is slower because the weights are downloaded if not already cached. GPU acceleration multiplies all of these by ~5–15×.
 
-**Bundled vs. on-demand:** PostBridge ships with `tiny`, `base`, and `small` pre-bundled (~700 MB total) so the common choices work instantly out of the box. `medium` and `large-v3` are larger (1.5 GB / 3 GB) and download from Hugging Face the first time you select them, then cache locally.
+**Bundled vs. on-demand:** PostBridge ships with only `tiny` pre-bundled (~75 MB) so the installer stays small enough to send via chat tools. On first launch, the app silently downloads `base` and then `small` in the background into `~/.postbridge_models/` so they're ready when you pick them later. `medium` and `large-v3` download on demand the first time you select them, then cache locally. All models persist across upgrades.
 
 ### Code-level settings
 
