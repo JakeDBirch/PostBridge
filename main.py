@@ -12577,14 +12577,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if has_session_transcript:
             wc = len([w for w in session.get("transcript", [])
                       if (w.get("word") or "").strip()])
+            edits = len([w for w in session.get("transcript", [])
+                         if w.get("_src") == "user"])
             lines.append(
                 "Session already has a {:,}-word transcript.".format(wc))
+            if edits:
+                lines.append(
+                    "Your {} edited word{} will be preserved at "
+                    "their original timestamps.".format(
+                        edits, "s" if edits != 1 else ""))
         if sidecar_paths:
             n = len(sidecar_paths)
             lines.append(
                 "{} cached transcript{} on disk.".format(
                     n, "s" if n != 1 else ""))
-        lines.append("Re-transcribing overwrites any edits.")
 
         tk.Label(body, text="\n".join(lines), font=FB,
                  bg=BG, fg=TEXT, justify="left",
@@ -12864,6 +12870,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _set_phase("loading model")
                 engines.get_model()
 
+                # Snapshot the pre-run transcript so re-transcribe can
+                # preserve user edits via the same merge logic the
+                # progressive flow uses.  If the user previously edited
+                # any words (right-click → Edit), those entries carry
+                # _src='user' and survive every subsequent run.
+                pre_run_transcript = list(session.get("transcript") or [])
+                pre_run_user_edits = [
+                    w for w in pre_run_transcript
+                    if w.get("_src") == "user"
+                ]
+
                 audios = [p for p in media if not is_video(p)]
                 if not audios:
                     audios = list(media)
@@ -12971,14 +12988,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         mix_path = engines.mix_for_transcript(audios)
                         tmp_paths.append(mix_path)
 
-                    # ── Merge tiny draft → configured refine ─────────
-                    # User may have edited the tiny preview before the
-                    # refine finished.  _pq_merge_refine preserves every
-                    # _src=='user' word at its exact timestamp and
-                    # replaces everything else with the refine output.
+                    # ── Merge with prior user edits ──────────────────
+                    # Two scenarios produce a merge:
+                    #
+                    #  A) Progressive run.  Tiny pre-pass populated
+                    #     session['transcript'] with _src='tiny' words;
+                    #     user may have edited some of them (now
+                    #     _src='user') while the configured model ran.
+                    #     Merge against the CURRENT session transcript
+                    #     so we pick up those mid-flight edits.
+                    #
+                    #  B) Re-transcribe.  No tiny pass; the old
+                    #     transcript carried _src='user' edits from
+                    #     prior sessions.  Merge against the
+                    #     pre_run_transcript snapshot we captured
+                    #     before the worker started.
                     if do_progressive and session.get("transcript"):
                         words = App._pq_merge_refine(
                             session["transcript"], words)
+                    elif pre_run_user_edits:
+                        words = App._pq_merge_refine(
+                            pre_run_transcript, words)
 
                     # Persist the mix (or single extracted WAV) as the
                     # session's playback cache.
