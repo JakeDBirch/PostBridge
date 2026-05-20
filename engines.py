@@ -623,13 +623,20 @@ class TranscriptionCancelled(Exception):
         self.partial_words = partial_words or []
 
 
-def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
+def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
+                              model_size=None):
     """Whisper transcription that preserves the model's natural punctuation,
     casing, and segment boundaries — for human-readable display (Pull Quotes).
 
     Returns a flat list of entries:
-        {"word": "<text>", "start": float, "end": float}
-        {"word": "\\n\\n",   "start": ts,    "end": ts, "break": True}
+        {"word": "<text>", "start": float, "end": float, "_src": "<size>"}
+        {"word": "\\n\\n",   "start": ts,    "end": ts, "break": True,
+         "_src": "<size>"}
+
+    The "_src" field records which Whisper size produced each word — used
+    by the progressive transcription merge logic to distinguish tiny-pass
+    drafts from configured-model refinements and from user edits (which
+    carry _src="user").
 
     The "break" entries are paragraph separators inserted between Whisper
     segments so the rendered transcript reads as paragraphed prose.
@@ -643,8 +650,13 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
     mid-segment, so the user sees up to ~5-15 s of lag (one segment
     duration) on a cancel click — far better than waiting for the whole
     file to finish.
+
+    `model_size`, if provided, forces a specific Whisper size (e.g. "tiny"
+    for a fast draft pass) and stamps every emitted word with that size
+    in the `_src` field.  When None, uses the active model.
     """
-    model = get_model()
+    effective_size = model_size or get_active_model_size()
+    model = get_model(size=effective_size)
     segments, info = model.transcribe(
         wav_path,
         word_timestamps=True,
@@ -678,6 +690,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
                 "end":   float(seg.start),
                 "break": True,
                 "gap":   gap,
+                "_src":  effective_size,
             })
         first_segment = False
 
@@ -694,6 +707,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
                     "word":  wt,
                     "start": float(w.start),
                     "end":   float(w.end),
+                    "_src":  effective_size,
                 })
         else:
             # Fall back to segment text if word-level timing is missing.
@@ -703,6 +717,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
                     "word":  (" " if out and not out[-1].get("break") else "") + text,
                     "start": float(seg.start),
                     "end":   float(seg.end),
+                    "_src":  effective_size,
                 })
 
         prev_end = float(seg.end)
@@ -716,7 +731,8 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
 
 
 def transcribe_session_per_track(audio_paths, speaker_labels=None,
-                                   progress_cb=None, cancel_event=None):
+                                   progress_cb=None, cancel_event=None,
+                                   model_size=None):
     """Transcribe each audio file separately and merge by timestamp.
 
     Each track is transcribed in isolation with `transcribe_clip_verbatim`,
@@ -772,7 +788,8 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
             try:
                 words = transcribe_clip_verbatim(
                     tmp, progress_cb=_wrap_cb,
-                    cancel_event=cancel_event)
+                    cancel_event=cancel_event,
+                    model_size=model_size)
             except TranscriptionCancelled as _tc:
                 # Propagate, but include words gathered from any
                 # previously-completed tracks plus the partial words

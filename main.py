@@ -11546,6 +11546,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "word":  wt,
                     "start": range_start + i * per,
                     "end":   range_start + (i + 1) * per,
+                    # Mark these words as user-authored so a later
+                    # progressive-refinement pass preserves them
+                    # instead of overwriting with Whisper output.
+                    "_src":  "user",
                 }
                 if common_speaker:
                     entry["speaker"] = common_speaker
@@ -12630,6 +12634,94 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.wait_window(win)
         return result["choice"]
 
+    def _pq_preview_ready(self, session):
+        """Called on the main thread when the tiny draft pass completes
+        for a session.  Renders the preview transcript and flips the
+        status label to 'preview · refining…' so the user knows the
+        configured model is still working in the background."""
+        if getattr(self, "_pq_current_session", None) is session:
+            try:
+                self._pq_render_transcript_text(session)
+            except Exception:
+                pass
+            lbl = getattr(self, "_pq_status_lbl", None)
+            if lbl:
+                try:
+                    lbl.config(text="preview · refining…", fg=WARN)
+                except tk.TclError:
+                    pass
+
+    @staticmethod
+    def _pq_user_edited_spans(words):
+        """Walk a transcript and return a list of (start_s, end_s) spans
+        covering every contiguous run of words with _src=='user'.  Used
+        by the refine-merge logic to keep user edits intact when a
+        higher-quality transcription pass overwrites the rest."""
+        spans = []
+        run = None
+        for w in words or []:
+            if w.get("break"):
+                continue
+            if w.get("_src") == "user":
+                ws = float(w.get("start", 0.0))
+                we = float(w.get("end",   ws))
+                if run is None:
+                    run = [ws, we]
+                else:
+                    run[1] = max(run[1], we)
+            else:
+                if run is not None:
+                    spans.append(tuple(run))
+                    run = None
+        if run is not None:
+            spans.append(tuple(run))
+        return spans
+
+    @staticmethod
+    def _pq_merge_refine(current_words, refine_words):
+        """Merge a refined (higher-quality) transcription into the current
+        transcript, preserving every word in user-edited time spans.
+
+        Algorithm:
+          1. Identify user-edited spans in current_words (_src=='user')
+          2. Drop refine_words that fall inside any user span
+          3. Splice the surviving user words back into the result at
+             their original timestamps
+          4. Sort everything by start time
+
+        Returns a new word list — caller assigns to session['transcript']."""
+        user_spans = App._pq_user_edited_spans(current_words)
+
+        def _in_user_span(t):
+            return any(s <= t <= e for (s, e) in user_spans)
+
+        # Refine words that DON'T overlap user-edited regions
+        keep = []
+        for w in refine_words or []:
+            if w.get("break"):
+                # Drop refine breaks too if they fall in a user span;
+                # the user's words own that region of audio.
+                t = float(w.get("start", 0.0))
+                if _in_user_span(t):
+                    continue
+                keep.append(w)
+                continue
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end",   ws))
+            mid = (ws + we) / 2.0
+            if _in_user_span(mid):
+                continue
+            keep.append(w)
+
+        # User words to splice in
+        user_words = [
+            w for w in (current_words or [])
+            if w.get("_src") == "user"
+        ]
+        merged = keep + user_words
+        merged.sort(key=lambda w: float(w.get("start", 0.0)))
+        return merged
+
     def _pq_run_transcription(self, session):
         """Kick off (or refuse to start) a transcription for `session`.
 
@@ -12798,6 +12890,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             prog["extra"] = "{} · {} decoded".format(
                                 prefix, _fmt_dur(audio_s))
 
+                    # ── Decide whether to run a tiny draft pass ────────
+                    # When the user is actively viewing this session and
+                    # their configured model isn't already 'tiny', do a
+                    # fast tiny pass first so they see SOMETHING within
+                    # ~30 s instead of waiting minutes for the full
+                    # configured model.  Audio extraction takes a few
+                    # seconds so the "is the user viewing?" check
+                    # naturally functions as a dwell filter — drive-by
+                    # transcribe-then-leave doesn't pay the tiny cost.
+                    configured_size = engines.get_active_model_size()
+                    is_viewing_now = (getattr(self, "_pq_current_session",
+                                               None) is session)
+                    do_progressive = (is_viewing_now
+                                       and configured_size != "tiny"
+                                       and not session.get("transcript"))
+
                     if len(audios) == 1:
                         # Single source — existing fast path.
                         with tempfile.NamedTemporaryFile(
@@ -12810,7 +12918,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         if not ok:
                             raise RuntimeError(
                                 "audio extract failed: " + (err or ""))
-                        _set_phase("transcribing", "")
+
+                        # ── Optional tiny draft pass ──────────────────
+                        if do_progressive:
+                            _set_phase("draft (tiny)", "")
+                            tiny_words = engines.transcribe_clip_verbatim(
+                                mix_path, progress_cb=_on_seg_end,
+                                cancel_event=cancel_event,
+                                model_size="tiny")
+                            if tiny_words:
+                                session["transcript"] = list(tiny_words)
+                                self._ui(lambda s=session:
+                                          self._pq_preview_ready(s))
+
+                        _set_phase(
+                            "refining" if do_progressive else "transcribing",
+                            "")
                         words = engines.transcribe_clip_verbatim(
                             mix_path, progress_cb=_on_seg_end,
                             cancel_event=cancel_event)
@@ -12820,8 +12943,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         # Speaker labels can be customised via
                         # session["speakers"] = {basename: label}.
                         speaker_labels = session.get("speakers") or {}
-                        _set_phase("transcribing {} tracks".format(
-                            len(audios)))
+
+                        if do_progressive:
+                            _set_phase("draft (tiny)")
+                            tiny_words = engines.transcribe_session_per_track(
+                                audios, speaker_labels=speaker_labels,
+                                progress_cb=_on_seg_end,
+                                cancel_event=cancel_event,
+                                model_size="tiny")
+                            if tiny_words:
+                                session["transcript"] = list(tiny_words)
+                                self._ui(lambda s=session:
+                                          self._pq_preview_ready(s))
+
+                        _set_phase(
+                            ("refining " if do_progressive else
+                             "transcribing ") + "{} tracks".format(
+                                 len(audios)))
                         words = engines.transcribe_session_per_track(
                             audios, speaker_labels=speaker_labels,
                             progress_cb=_on_seg_end,
@@ -12832,6 +12970,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         _set_phase("building playback mix")
                         mix_path = engines.mix_for_transcript(audios)
                         tmp_paths.append(mix_path)
+
+                    # ── Merge tiny draft → configured refine ─────────
+                    # User may have edited the tiny preview before the
+                    # refine finished.  _pq_merge_refine preserves every
+                    # _src=='user' word at its exact timestamp and
+                    # replaces everything else with the refine output.
+                    if do_progressive and session.get("transcript"):
+                        words = App._pq_merge_refine(
+                            session["transcript"], words)
 
                     # Persist the mix (or single extracted WAV) as the
                     # session's playback cache.
