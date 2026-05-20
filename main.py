@@ -125,6 +125,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
         self._load_prefs()
+        # Apply the user's saved Whisper model preference (if any) before
+        # any transcription kicks off.  Without this, the engine would
+        # fall back to the WHISPER_MODEL config default and ignore the
+        # choice the user made in Settings on the previous session.
+        _saved_model = self._prefs.get("whisper_model")
+        if _saved_model:
+            engines.set_active_model(_saved_model)
         self._header()
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=44, pady=(0, 14))
@@ -300,6 +307,152 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
         for w in self.body.winfo_children(): w.destroy()
 
+    def _show_settings_dialog(self):
+        """Settings dialog — currently scoped to Whisper model selection.
+
+        The picker shows the same models faster-whisper supports, with
+        params count, approximate CPU-side speed multiplier vs realtime
+        audio, RAM/VRAM footprint, and a one-line note on quality.
+
+        Choice persists to ~/.postbridge_prefs.json via _save_prefs and
+        is applied via engines.set_active_model(); the cached model
+        instance is cleared so the next transcription loads fresh.
+        """
+        win = tk.Toplevel(self)
+        win.title("PostBridge — Settings")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+
+        hdr = tk.Frame(win, bg=ACCENT, padx=16, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Transcription Model",
+                 font=FBT, bg=ACCENT, fg="#1c1c1c").pack(anchor="w")
+
+        body = tk.Frame(win, bg=BG, padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body,
+                 text=("Pick the Whisper model PostBridge uses to "
+                       "transcribe audio.  Larger = more accurate but "
+                       "slower and more memory-hungry.  Smaller models "
+                       "still produce useful drafts you can edit in the "
+                       "Pull Quotes view.\n\n"
+                       "Speed numbers below are rough CPU benchmarks "
+                       "for a single-speaker English clip — your "
+                       "mileage will vary.  Speed roughly doubles each "
+                       "size step down; accuracy roughly halves its "
+                       "error rate each step up."),
+                 font=FB, bg=BG, fg=SUB,
+                 justify="left", wraplength=620).pack(anchor="w",
+                                                      pady=(0, 14))
+
+        current_model = engines.get_active_model_size()
+        self._settings_model_var = tk.StringVar(value=current_model)
+
+        # Model table.  Speed estimates are for CPU; GPU is roughly
+        # 5–15× faster across the board.  RAM values cover the loaded
+        # model plus inference workspace.
+        models = [
+            ("tiny",
+             "39 M",   "~32× real-time", "~150 MB",
+             "Draft quality.  Useful for fast first-pass on slow CPUs."),
+            ("base",
+             "74 M",   "~16× real-time", "~250 MB",
+             "Fast and reasonably accurate.  Strong CPU choice."),
+            ("small",
+             "244 M",  "~6× real-time",  "~600 MB",
+             "Default.  Balanced speed and accuracy on most hardware."),
+            ("medium",
+             "769 M",  "~2× real-time",  "~1.5 GB",
+             "Higher accuracy.  Slow on CPU; comfortable on GPU."),
+            ("large-v3",
+             "1.55 B", "~1× real-time",  "~3 GB",
+             "Best accuracy.  Practical mainly with GPU acceleration."),
+        ]
+
+        tbl = tk.Frame(body, bg=BG)
+        tbl.pack(fill="x", pady=(0, 12))
+
+        # Column headers
+        col_titles = ["", "Model", "Params", "Speed (CPU)",
+                       "RAM / VRAM", "Notes"]
+        for col, txt in enumerate(col_titles):
+            tk.Label(tbl, text=txt,
+                     font=("Courier New", 10, "bold"),
+                     bg=BG, fg=SUB, anchor="w").grid(
+                         row=0, column=col, sticky="w",
+                         padx=(0, 14), pady=(0, 6))
+
+        for r, (sz, p, sp, mem, note) in enumerate(models, start=1):
+            rb = tk.Radiobutton(tbl, value=sz,
+                                 variable=self._settings_model_var,
+                                 bg=BG, fg=TEXT, selectcolor=BG,
+                                 activebackground=BG,
+                                 activeforeground=TEXT,
+                                 highlightthickness=0, bd=0,
+                                 takefocus=0)
+            rb.grid(row=r, column=0, sticky="w")
+            tk.Label(tbl, text=sz,
+                     font=("Courier New", 11, "bold"),
+                     bg=BG, fg=ACCENT, anchor="w"
+                     ).grid(row=r, column=1, sticky="w",
+                            padx=(0, 14), pady=2)
+            for i, val in enumerate([p, sp, mem], start=2):
+                tk.Label(tbl, text=val, font=FB, bg=BG, fg=TEXT,
+                         anchor="w").grid(row=r, column=i,
+                                          sticky="w", padx=(0, 14))
+            tk.Label(tbl, text=note, font=FB, bg=BG, fg=SUB,
+                     anchor="w", justify="left", wraplength=300
+                     ).grid(row=r, column=5, sticky="w")
+
+        # Footer: GPU hint
+        tk.Label(body,
+                 text=("Tip: the Windows-GPU build of PostBridge runs "
+                       "Whisper on NVIDIA cards and is 5-15× faster "
+                       "across all sizes.  Without a GPU, the small / "
+                       "base models give the best speed/accuracy "
+                       "balance."),
+                 font=FB, bg=BG, fg=SUB,
+                 justify="left", wraplength=620).pack(anchor="w",
+                                                      pady=(8, 0))
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(8, 14))
+
+        def _save_and_close():
+            choice = self._settings_model_var.get()
+            if choice and choice != engines.get_active_model_size():
+                engines.set_active_model(choice)
+                self._prefs["whisper_model"] = choice
+                self._save_prefs()
+                # Drop any cached model so the new size loads on the
+                # next transcription.  The old model is garbage-collected.
+                engines._model_cache.clear()
+                messagebox.showinfo(
+                    "Model changed",
+                    "Whisper model set to '{}'.\n\n"
+                    "The new model loads on the next transcription "
+                    "(first run is slower — model is downloaded if "
+                    "not already cached).".format(choice),
+                    parent=win)
+            win.destroy()
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "APPLY",
+                  _save_and_close, color=ACCENT).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        ww = max(780, win.winfo_reqwidth())
+        wh = max(460, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+
     def _home(self):
         # Reset session-specific state so a new workflow starts clean.
         # Halt any Pull Quotes playback before tearing down.
@@ -318,8 +471,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
-        tk.Label(self.body, text="Choose a workflow",
-                 font=FBT, bg=BG, fg=SUB).pack(pady=(0,16))
+        # Heading row with a Settings link top-right.  Keeps the model
+        # picker reachable without cluttering each workflow's chrome.
+        head_row = tk.Frame(self.body, bg=BG)
+        head_row.pack(fill="x", padx=20, pady=(0, 16))
+        tk.Label(head_row, text="Choose a workflow",
+                 font=FBT, bg=BG, fg=SUB).pack(side="left", expand=True)
+        _model_now = engines.get_active_model_size()
+        settings_lbl = tk.Label(
+            head_row,
+            text="⚙ Settings   ·   model: {}".format(_model_now),
+            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=4)
+        settings_lbl.pack(side="right")
+        settings_lbl.bind("<Enter>",
+                           lambda e, w=settings_lbl: w.config(fg=ACCENT))
+        settings_lbl.bind("<Leave>",
+                           lambda e, w=settings_lbl: w.config(fg=SUB))
+        settings_lbl.bind("<Button-1>",
+                           lambda e: self._show_settings_dialog())
 
         # ── Resume last project (shown only when a previous script is known) ──
         _last_script = self._prefs.get("last_script", "")

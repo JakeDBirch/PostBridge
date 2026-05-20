@@ -61,6 +61,29 @@ _channel_cache = {}
 _model_cache = {}
 _model_lock  = threading.Lock()
 
+# User-selected Whisper model size override.  When set, replaces the
+# config-level WHISPER_MODEL default for every get_model() call.  The
+# settings dialog in main.py calls set_active_model() to persist the
+# user's choice across the session.  None = use config default.
+_active_model_override = None
+
+
+def set_active_model(size):
+    """Override the Whisper model size used by all get_model() calls.
+
+    ``size`` should be one of the faster-whisper recognised model names
+    (``tiny``, ``base``, ``small``, ``medium``, ``large-v3``, plus the
+    ``.en`` English-only variants).  Pass ``None`` to revert to the
+    config.WHISPER_MODEL default.
+    """
+    global _active_model_override
+    _active_model_override = size or None
+
+
+def get_active_model_size():
+    """Return the model size that get_model() will currently use."""
+    return _active_model_override or WHISPER_MODEL
+
 # ── Audio extraction (uses bundled ffmpeg if not on PATH) ───────────────────────
 def _ffmpeg_cmd():
     try:
@@ -454,7 +477,13 @@ def pull_result_cache_clear(pull, transcript_path, pad):
             pass
 
 # ── Transcription ──────────────────────────────────────────────────────────────
-def get_model(size=WHISPER_MODEL):
+def get_model(size=None):
+    # Resolve "active" model size when none was passed:
+    #   user override (set via the Settings dialog)  >  config default.
+    # Callers that need a specific size (e.g. forced fallback) can still
+    # pass it explicitly.
+    if size is None:
+        size = _active_model_override or WHISPER_MODEL
     # Fast path — no lock needed once the model is loaded.
     if size in _model_cache:
         return _model_cache[size]

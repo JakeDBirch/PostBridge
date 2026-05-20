@@ -268,7 +268,23 @@ The `.pb_transcript.json` sidecars are shared between workflows: transcribing in
 
 ## Settings
 
-Most settings live in `config.py` and require a code edit:
+### Model picker (in-app)
+
+Click **⚙ Settings** in the upper-right of the home screen to choose your Whisper model. Picker is a five-row table with params count, ~CPU speed, RAM/VRAM footprint, and a quality note for each option:
+
+| Model | Params | Speed (CPU) | RAM/VRAM | Notes |
+|---|---|---|---|---|
+| `tiny` | 39 M | ~32× real-time | ~150 MB | Draft quality; fast first-pass on slow CPUs |
+| `base` | 74 M | ~16× real-time | ~250 MB | Strong CPU choice |
+| `small` | 244 M | ~6× real-time | ~600 MB | **Default** — balanced |
+| `medium` | 769 M | ~2× real-time | ~1.5 GB | High accuracy; slow on CPU, comfortable on GPU |
+| `large-v3` | 1.55 B | ~1× real-time | ~3 GB | Best accuracy; needs GPU to be practical |
+
+Your choice persists across sessions (saved to `~/.postbridge_prefs.json`). On the next transcription the new model loads — first-load is slower because the weights are downloaded if not already cached. GPU acceleration multiplies all of these by ~5–15×.
+
+### Code-level settings
+
+Most other settings live in `config.py` and require a code edit:
 
 | Setting | Default | Description |
 |---|---|---|
