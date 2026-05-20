@@ -526,8 +526,122 @@ def match_source_to_video(source_base, video_paths):
     return best_path if best_score >= 0.5 else None
 
 
-def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate=8000,
-                       start_offset=0.0):
+def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
+                        sample_rate=8000, start_offset=0.0,
+                        n_probes=3):
+    """Multi-window sync detection wrapper.
+
+    Real-world video/audio files have setup/teardown noise at the head
+    and tail (mic checks, slating, room handling, gear bumps).  Probing
+    only the first 300 s — the previous behaviour — drops false peaks
+    into the cross-correlation that are uncorrelated with the true
+    speech rhythm, and the algorithm commits to whichever one wins.
+
+    This wrapper picks N evenly-spaced probe positions through the file,
+    runs the full multi-stage detector at each, and arbitrates by
+    consistency: the true offset is the same regardless of where in the
+    file you measure, false peaks aren't.
+
+    n_probes=1 reproduces the legacy single-window behaviour (used for
+    short files or when explicit start_offset is supplied).
+    """
+    # Legacy single-window path — preserve the original behaviour when
+    # the caller specifies an explicit start_offset or asks for one probe.
+    if n_probes <= 1 or start_offset != 0.0:
+        return _detect_sync_offset_at(video_path, audio_path,
+                                       probe_duration=probe_duration,
+                                       sample_rate=sample_rate,
+                                       start_offset=start_offset)
+
+    # Probe file duration so we can place windows away from head/tail.
+    # Lazy import to avoid circular dependency on engines.
+    try:
+        from engines import get_media_duration as _gmd
+        total = _gmd(audio_path) or 0.0
+    except Exception:
+        total = 0.0
+
+    # If we can't measure the file or it's too short for multi-window
+    # probing to add value, fall back to the legacy single-window run.
+    if total < probe_duration * 1.5:
+        return _detect_sync_offset_at(video_path, audio_path,
+                                       probe_duration=probe_duration,
+                                       sample_rate=sample_rate,
+                                       start_offset=0.0)
+
+    # Probe centres at ~25 %, ~50 %, ~75 % of the file.  Each probe
+    # consumes probe_duration seconds; clamp so we don't fall off the end.
+    fractions = [0.25, 0.50, 0.75][:max(1, n_probes)]
+    probe_starts = []
+    for frac in fractions:
+        centre = total * frac
+        s = max(0.0, centre - probe_duration / 2.0)
+        s = min(s, max(0.0, total - probe_duration))
+        probe_starts.append(s)
+    # De-dupe to avoid running the same window twice on short files.
+    probe_starts = sorted(set(round(s, 1) for s in probe_starts))
+    if len(probe_starts) < 2:
+        return _detect_sync_offset_at(video_path, audio_path,
+                                       probe_duration=probe_duration,
+                                       sample_rate=sample_rate,
+                                       start_offset=probe_starts[0]
+                                       if probe_starts else 0.0)
+
+    # Run probes sequentially — each call is already CPU-bound on FFT
+    # work; parallelising them would just fight for the same cores and
+    # produce the same wall-clock with worse contention.
+    results = []
+    for s in probe_starts:
+        try:
+            T, conf = _detect_sync_offset_at(video_path, audio_path,
+                                              probe_duration=probe_duration,
+                                              sample_rate=sample_rate,
+                                              start_offset=s)
+            results.append((T, conf, s))
+        except Exception:
+            pass
+
+    if not results:
+        return 0.0, 0.0
+    if len(results) == 1:
+        return results[0][0], results[0][1]
+
+    # Cluster offsets that agree within ±AGREE_S.  True offset → every
+    # probe lands inside the same cluster.  False peak → probes scatter
+    # across the file's noisy regions.
+    AGREE_S = 0.5
+    best_cluster = []
+    for i, ri in enumerate(results):
+        cluster = [ri]
+        for j, rj in enumerate(results):
+            if i == j:
+                continue
+            if abs(rj[0] - ri[0]) <= AGREE_S:
+                cluster.append(rj)
+        if len(cluster) > len(best_cluster):
+            best_cluster = cluster
+
+    if len(best_cluster) >= 2:
+        # Confidence-weighted average across agreeing probes.
+        total_w = sum(r[1] for r in best_cluster) or float(len(best_cluster))
+        avg_T = sum(r[0] * (r[1] or 1.0) for r in best_cluster) / total_w
+        # Agreement across N windows is itself strong evidence — bump
+        # confidence to reflect that.  Two-window agreement caps at
+        # 0.92; full N-way agreement reaches 1.0.
+        max_inner = max(r[1] for r in best_cluster)
+        agree_floor = 0.92 if len(best_cluster) == 2 else 1.0
+        final_conf = min(1.0, max(max_inner, agree_floor))
+        return round(avg_T, 6), round(final_conf, 4)
+
+    # No probes agreed — that's a strong signal something's off.  Return
+    # the highest-confidence single result but DEMOTE its confidence so
+    # the UI flags it for manual verification.
+    best = max(results, key=lambda r: r[1])
+    return round(best[0], 6), round(min(best[1], 0.45), 4)
+
+
+def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
+                            sample_rate=8000, start_offset=0.0):
     """
     Hierarchical multi-scale sync detection.
 
@@ -895,7 +1009,11 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0, sample_rate
         else:
             v_start2M = _v2M_ideal
             a_start2M = start_offset
-        SEARCH2M  = 20.0
+        # Adaptive Mirror search width: when Stage 2 returned a mediocre
+        # confidence, the true offset is more likely to be far from -T1.
+        # Widen the search window so we catch ≥-5 s true offsets that
+        # would otherwise fall outside ±20 s of the mirror anchor.
+        SEARCH2M  = 20.0 if conf2 >= 0.85 else 60.0
         max_lag2M = int(SEARCH2M * sr2_eff)
         raw_a2M, raw_v2M = _extract_pair(audio_path, a_start2M,
                                           video_path,  v_start2M, PROBE2, SR2)

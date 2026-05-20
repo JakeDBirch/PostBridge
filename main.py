@@ -7635,18 +7635,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     sync_var.set(True)
 
                 pct = int(confidence * 100)
-                # Very large offsets (>30 s) are almost always wrong-reference-file
-                # matches — flag them distinctly regardless of confidence.
-                # (10–20 s offsets are normal for dual-system shoots.)
+                # Confidence tiers calibrated from real-world false-positive
+                # rates in sync_corrections.jsonl: 0.95+ was consistently
+                # correct, 0.85-0.94 was usually within ~0.5 s of truth,
+                # below 0.85 had a meaningful rate of multi-second errors
+                # that need manual verification.  Very large offsets (>30 s)
+                # are almost always wrong-reference-file matches — flag
+                # them distinctly regardless of confidence.
                 large = abs(offset) > 30.0
                 if large:
                     lbl = "\u26a0 {:.3f}s ({:d}%)  — verify ref audio!".format(offset, pct)
-                elif confidence >= 0.50:
+                elif confidence >= 0.95:
                     lbl = "\u2713 {:.3f}s ({:d}%)".format(offset, pct)
-                elif confidence >= 0.20:
-                    lbl = "\u26a0 {:.3f}s ({:d}%)".format(offset, pct)
+                elif confidence >= 0.85:
+                    lbl = "\u26a0 {:.3f}s ({:d}%)  — verify recommended".format(offset, pct)
+                elif confidence >= 0.50:
+                    lbl = "\u26a0 {:.3f}s ({:d}%)  — verify required".format(offset, pct)
                 else:
-                    lbl = "\u26a0 {:.3f}s ({:d}%)  — low conf".format(offset, pct)
+                    lbl = "\u26a0 {:.3f}s ({:d}%)  — low conf, must verify".format(offset, pct)
 
                 lv = self._aaf_source_sync_label_vars.get(base)
                 if lv: lv.set(lbl)
