@@ -325,6 +325,107 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return True
         return False
 
+    def _prompt_busy_model_swap(self, parent, new_choice, current_choice):
+        """Three-button modal shown when the user applies a model change
+        while a transcription is in flight.  Returns one of:
+
+            "back"           — don't change anything; close settings
+            "apply_next"     — apply on next transcription only; let
+                                the current one keep using its model
+            "cancel_current" — request cancellation of in-flight work,
+                                then apply the new model now
+        """
+        win = tk.Toplevel(parent)
+        win.title("Transcription in Progress")
+        win.configure(bg=BG)
+        win.transient(parent); win.grab_set()
+        win.resizable(False, False)
+
+        hdr = tk.Frame(win, bg=WARN, padx=16, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="⚠   Transcription in Progress",
+                 font=FBT, bg=WARN, fg="#1c1c1c").pack(anchor="w")
+
+        body = tk.Frame(win, bg=BG, padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+        tk.Label(body,
+                 text=("A transcription is currently running with the "
+                       "'{}' model.\n\n"
+                       "Live model swaps can crash the inference engine "
+                       "(CTranslate2 doesn't tolerate the model being "
+                       "freed mid-decode), so PostBridge offers two "
+                       "safe paths:".format(current_choice)),
+                 font=FB, bg=BG, fg=TEXT, justify="left",
+                 wraplength=540).pack(anchor="w", pady=(0, 10))
+
+        # Two-option summary so the buttons are self-explanatory
+        opts = tk.Frame(body, bg=BG)
+        opts.pack(fill="x", pady=(0, 12))
+        tk.Label(opts,
+                 text=("Apply on next run — the running transcription "
+                       "finishes with '{}'; '{}' kicks in on the next "
+                       "TRANSCRIBE click.\n\n"
+                       "Cancel & apply now — the running transcription "
+                       "is abandoned (its results are discarded) and "
+                       "'{}' becomes active immediately."
+                       .format(current_choice, new_choice, new_choice)),
+                 font=FB, bg=BG, fg=SUB, justify="left",
+                 wraplength=540).pack(anchor="w")
+
+        result = {"choice": "back"}
+
+        def _pick(c):
+            result["choice"] = c
+            win.destroy()
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(0, 14))
+        self._btn(nav, "BACK", lambda: _pick("back"),
+                  small=True).pack(side="left")
+        self._btn(nav, "CANCEL & APPLY NOW",
+                  lambda: _pick("cancel_current"),
+                  color=ERR).pack(side="right")
+        self._btn(nav, "APPLY ON NEXT RUN",
+                  lambda: _pick("apply_next"),
+                  color=ACCENT).pack(side="right", padx=(0, 8))
+        win.bind("<Escape>", lambda e: _pick("back"))
+
+        win.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        ww = max(620, win.winfo_reqwidth())
+        wh = max(320, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+        self.wait_window(win)
+        return result["choice"]
+
+    def _request_cancel_active_transcriptions(self):
+        """Best-effort cancellation of every in-flight transcription.
+
+        Script -> Session: signals self._cancel, which the reconcile
+        workers poll regularly and bail out within seconds.
+
+        Pull Quotes: CTranslate2's decode can't be interrupted mid-
+        stream, but we set a _cancel_requested flag on each session.
+        The worker's completion handler checks it and discards the
+        finished transcript instead of writing it back, so from the
+        user's perspective the result is the same — their click of
+        'Cancel transcription' invalidates whatever was running.
+        """
+        proj = getattr(self, "_pq_project", None)
+        if proj is not None:
+            for s in proj.get("sessions", []):
+                if (s.get("_progress") or {}).get("active"):
+                    s["_cancel_requested"] = True
+        if getattr(self, "_reconcile_busy", False):
+            try:
+                self._cancel.set()
+            except Exception:
+                pass
+
     def _refresh_model_indicators(self):
         """Update every visible 'model: <name>' indicator label in the UI
         after a Settings change.  Safe to call when none exist — each
@@ -463,17 +564,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # process (confirmed crash on small -> tiny swap with
                 # ~8 min audio in flight on Pull Quotes).
                 if self._is_transcription_running():
-                    if not messagebox.askyesno(
-                        "Transcription in Progress",
-                        "A transcription is currently running.\n\n"
-                        "The new model ('{}') will take effect on the "
-                        "NEXT transcription — the in-flight run keeps "
-                        "using '{}' to avoid crashing the inference "
-                        "engine.\n\n"
-                        "Apply anyway?".format(
-                            choice, engines.get_active_model_size()),
-                        parent=win, icon="warning"):
+                    decision = self._prompt_busy_model_swap(
+                        win, choice, engines.get_active_model_size())
+                    if decision == "back":
                         return
+                    if decision == "cancel_current":
+                        self._request_cancel_active_transcriptions()
                 engines.set_active_model(choice)
                 self._prefs["whisper_model"] = choice
                 self._save_prefs()
@@ -12721,6 +12817,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         try: os.unlink(tp)
                         except Exception: pass
 
+                # Honour cancel-requested flag set via the Settings
+                # dialog's "Cancel transcription & apply" path.  We can't
+                # interrupt CTranslate2's decode mid-run, but we can
+                # discard the results so the user effectively got their
+                # cancel.  Skip persisting the transcript and skip the
+                # success path entirely.
+                if session.get("_cancel_requested"):
+                    session.pop("_cancel_requested", None)
+                    raise RuntimeError("cancelled by user")
+
                 session["transcript"] = list(words or [])
                 self._pq_save_session_file(session)
 
@@ -12748,6 +12854,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 err = str(e)
                 is_mem = isinstance(e, MemoryError) or "allocate" in err.lower()
+                # User-requested cancel: handled separately so we don't
+                # show an "error" dialog for an explicit user action.
+                is_cancel = "cancelled by user" in err.lower()
                 def _err():
                     prog = session.get("_progress")
                     if prog is not None:
@@ -12756,7 +12865,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         if (btn := getattr(self, "_pq_retx_btn", None)):
                             btn.config(text="⟳ TRANSCRIBE", fg=TEXT)
                         if (lbl := getattr(self, "_pq_status_lbl", None)):
-                            lbl.config(text="error", fg=ERR)
+                            lbl.config(
+                                text=("cancelled" if is_cancel else "error"),
+                                fg=(SUB if is_cancel else ERR))
                         self._pq_render_transcript_text(session)
                     elif getattr(self, "_pq_current_session", None) is None:
                         self._pq_update_project_row(session)
@@ -12789,6 +12900,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             "Out of Memory ({})".format(
                                 session.get("token", "?")),
                             "\n".join(diag))
+                    elif is_cancel:
+                        # No popup — the user already saw the Settings
+                        # dialog and chose to cancel.  Status lbl above
+                        # already reads "cancelled".
+                        pass
                     else:
                         messagebox.showerror(
                             "Transcription failed ({})".format(
