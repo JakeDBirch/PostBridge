@@ -312,8 +312,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         after a Settings change.  Safe to call when none exist — each
         widget is consulted via getattr + winfo_exists."""
         name = engines.get_active_model_size()
-        for attr in ("_pq_model_lbl", "_aaf_model_lbl",
-                      "_s3_model_lbl"):
+        for attr in ("_pq_model_lbl", "_pq_proj_model_lbl",
+                      "_aaf_model_lbl", "_s3_model_lbl"):
             w = getattr(self, attr, None)
             if w is None:
                 continue
@@ -9989,6 +9989,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                          fg=ACCENT if new_val else SUB)
         bg_ck.bind("<Button-1>",  lambda e: _toggle_bg_proj())
         bg_lbl.bind("<Button-1>", lambda e: _toggle_bg_proj())
+
+        # Model indicator — pick the Whisper size before opening any
+        # session.  Lives in the project view's OPTIONS row so the user
+        # doesn't have to enter a session to change it.
+        self._pq_proj_model_lbl = tk.Label(
+            ctrl_row,
+            text="model: {}".format(engines.get_active_model_size()),
+            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=12)
+        self._pq_proj_model_lbl.pack(side="left", padx=(24, 0))
+        self._pq_proj_model_lbl.bind(
+            "<Enter>", lambda e: self._pq_proj_model_lbl.config(fg=ACCENT))
+        self._pq_proj_model_lbl.bind(
+            "<Leave>", lambda e: self._pq_proj_model_lbl.config(fg=SUB))
+        self._pq_proj_model_lbl.bind(
+            "<Button-1>", lambda e: self._show_settings_dialog())
 
         # (MANAGE SPEAKERS removed — speaker labels are renamed inline
         # by double-clicking any "JORDAN:" / "JENA:" header in the
