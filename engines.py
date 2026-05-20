@@ -611,7 +611,19 @@ def transcribe_clip(wav_path, progress_cb=None):
     return [w for w in words if w["word"]]
 
 
-def transcribe_clip_verbatim(wav_path, progress_cb=None):
+class TranscriptionCancelled(Exception):
+    """Raised by transcribe_clip_verbatim / transcribe_session_per_track
+    when the caller-supplied cancel_event is set between segments.  The
+    exception carries any words decoded so far on .partial_words in case
+    the caller wants to preserve them; the Pull Quotes worker discards
+    them and treats the run as a clean cancel."""
+
+    def __init__(self, partial_words=None):
+        super().__init__("transcription cancelled by user")
+        self.partial_words = partial_words or []
+
+
+def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None):
     """Whisper transcription that preserves the model's natural punctuation,
     casing, and segment boundaries — for human-readable display (Pull Quotes).
 
@@ -624,6 +636,13 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None):
 
     `progress_cb`, if provided, receives one floating-point seconds value per
     segment as decoding progresses (the end time of the last segment seen).
+
+    `cancel_event`, if provided (threading.Event), is polled between each
+    decoded segment.  When set, raises TranscriptionCancelled carrying the
+    words decoded so far.  CTranslate2's C++ decode can't be interrupted
+    mid-segment, so the user sees up to ~5-15 s of lag (one segment
+    duration) on a cancel click — far better than waiting for the whole
+    file to finish.
     """
     model = get_model()
     segments, info = model.transcribe(
@@ -643,6 +662,11 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None):
     first_segment = True
     prev_end = 0.0
     for seg in segments:
+        # Cancel check at the segment boundary.  CTranslate2 has just
+        # finished decoding one segment and is about to start the next;
+        # this is the natural point to bail out.
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled(partial_words=out)
         if not first_segment:
             # Record the silence gap so the renderer can choose between a
             # within-paragraph line break (short gap) and a paragraph break
@@ -692,7 +716,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None):
 
 
 def transcribe_session_per_track(audio_paths, speaker_labels=None,
-                                   progress_cb=None):
+                                   progress_cb=None, cancel_event=None):
     """Transcribe each audio file separately and merge by timestamp.
 
     Each track is transcribed in isolation with `transcribe_clip_verbatim`,
@@ -715,6 +739,10 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
     all_words = []
     n = len(audio_paths)
     for i, src in enumerate(audio_paths):
+        # Check between tracks too — a cancel mid-multi-track session
+        # bails before we even start the next track's audio extraction.
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled(partial_words=all_words)
         if not src or not os.path.isfile(src):
             continue
         # Tag for this track
@@ -741,7 +769,21 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
                     progress_cb(audio_s, track_index=_i, n_tracks=_n,
                                 track_name=os.path.basename(_src))
 
-            words = transcribe_clip_verbatim(tmp, progress_cb=_wrap_cb)
+            try:
+                words = transcribe_clip_verbatim(
+                    tmp, progress_cb=_wrap_cb,
+                    cancel_event=cancel_event)
+            except TranscriptionCancelled as _tc:
+                # Propagate, but include words gathered from any
+                # previously-completed tracks plus the partial words
+                # from the current one (callers can choose to keep
+                # them or discard them).
+                for w in _tc.partial_words or []:
+                    if w.get("break"):
+                        continue
+                    w["speaker"] = speaker
+                    all_words.append(w)
+                raise TranscriptionCancelled(partial_words=all_words)
         finally:
             try: os.unlink(tmp)
             except Exception: pass

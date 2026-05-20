@@ -590,18 +590,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         Script -> Session: signals self._cancel, which the reconcile
         workers poll regularly and bail out within seconds.
 
-        Pull Quotes: CTranslate2's decode can't be interrupted mid-
-        stream, but we set a _cancel_requested flag on each session.
-        The worker's completion handler checks it and discards the
-        finished transcript instead of writing it back, so from the
-        user's perspective the result is the same — their click of
-        'Cancel transcription' invalidates whatever was running.
+        Pull Quotes: sets a per-session threading.Event that's polled
+        between Whisper segments inside engines.transcribe_clip_verbatim
+        and transcribe_session_per_track.  CTranslate2's C++ decode
+        can't be interrupted mid-segment, so the user sees up to ~5-15 s
+        of lag (one segment) on cancel — but the GPU is freed and the
+        worker exits cleanly with no transcript saved.
         """
         proj = getattr(self, "_pq_project", None)
         if proj is not None:
             for s in proj.get("sessions", []):
                 if (s.get("_progress") or {}).get("active"):
                     s["_cancel_requested"] = True
+                    ev = s.get("_cancel_event")
+                    if ev is not None:
+                        try:
+                            ev.set()
+                        except Exception:
+                            pass
         if getattr(self, "_reconcile_busy", False):
             try:
                 self._cancel.set()
@@ -12710,6 +12716,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             m, s = divmod(r, 60)
             return "{:02d}:{:02d}:{:02d}".format(h, m, s)
 
+        # Cancel-event handle the worker passes into the engine.  Set
+        # by _request_cancel_active_transcriptions when the user picks
+        # "Cancel & apply now" in the model-swap dialog.  Stored on the
+        # session dict so external code can find it.
+        cancel_event = threading.Event()
+        session["_cancel_event"] = cancel_event
+
         def _worker():
             t0 = time.perf_counter()
             try:
@@ -12773,7 +12786,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 "audio extract failed: " + (err or ""))
                         _set_phase("transcribing", "")
                         words = engines.transcribe_clip_verbatim(
-                            mix_path, progress_cb=_on_seg_end)
+                            mix_path, progress_cb=_on_seg_end,
+                            cancel_event=cancel_event)
                     else:
                         # Multi-track — transcribe each independently so
                         # we know who said what (speaker = source file).
@@ -12784,7 +12798,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             len(audios)))
                         words = engines.transcribe_session_per_track(
                             audios, speaker_labels=speaker_labels,
-                            progress_cb=_on_seg_end)
+                            progress_cb=_on_seg_end,
+                            cancel_event=cancel_event)
                         # Build a mix purely for the playback cache so
                         # the user can hear both speakers when auditioning
                         # transcript regions.
@@ -12809,15 +12824,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         try: os.unlink(tp)
                         except Exception: pass
 
-                # Honour cancel-requested flag set via the Settings
-                # dialog's "Cancel transcription & apply" path.  We can't
-                # interrupt CTranslate2's decode mid-run, but we can
-                # discard the results so the user effectively got their
-                # cancel.  Skip persisting the transcript and skip the
-                # success path entirely.
+                # Late safety net: if cancel was requested but the
+                # decode somehow completed before the next segment
+                # boundary was checked, still discard the result.  The
+                # primary cancellation path is the TranscriptionCancelled
+                # exception raised from within the engine — see the
+                # exception handler below.
                 if session.get("_cancel_requested"):
                     session.pop("_cancel_requested", None)
-                    raise RuntimeError("cancelled by user")
+                    raise engines.TranscriptionCancelled()
 
                 session["transcript"] = list(words or [])
                 self._pq_save_session_file(session)
@@ -12846,9 +12861,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 err = str(e)
                 is_mem = isinstance(e, MemoryError) or "allocate" in err.lower()
-                # User-requested cancel: handled separately so we don't
-                # show an "error" dialog for an explicit user action.
-                is_cancel = "cancelled by user" in err.lower()
+                # User-requested cancel: detected either by the dedicated
+                # TranscriptionCancelled exception raised mid-decode from
+                # the engine, or by the late-safety-net check above.
+                is_cancel = (
+                    isinstance(e, engines.TranscriptionCancelled)
+                    or "cancelled by user" in err.lower()
+                    or "cancelled" in err.lower())
                 def _err():
                     prog = session.get("_progress")
                     if prog is not None:
@@ -12904,6 +12923,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._ui(_err)
             finally:
                 self._pq_apply_priority(low=False, prev=prev_priority)
+                # Clear cancel state regardless of how the worker
+                # exited; the next TRANSCRIBE click will recreate it.
+                session.pop("_cancel_event", None)
+                session.pop("_cancel_requested", None)
 
         threading.Thread(target=_worker, daemon=True).start()
 
