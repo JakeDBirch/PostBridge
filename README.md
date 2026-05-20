@@ -12,10 +12,21 @@ Pre-built app bundles are produced manually via [GitHub Actions](https://github.
 
 1. Go to the **Actions** tab → click a **Build PostBridge** run marked ✓
 2. Download the artifact for your platform under the **Artifacts** section:
-   - `PostBridge-windows` → Windows (x64)
+   - `PostBridge-windows` → Windows (x64) — **CPU only**, ~500 MB
+   - `PostBridge-windows-gpu` → Windows (x64) — **NVIDIA CUDA bundled**, ~3.5 GB
    - `PostBridge-mac-arm64` → macOS Apple Silicon (M1/M2/M3)
 
 No Python installation required — everything is bundled.
+
+**Which Windows build do I want?**
+
+| You have... | Download |
+|---|---|
+| NVIDIA GPU (RTX 30/40/50 series, or older with CUDA 12.8 support) | `PostBridge-windows-gpu` — Whisper runs ~5–15× faster |
+| AMD / Intel GPU, integrated graphics, or no GPU | `PostBridge-windows` — works fine on CPU |
+| Not sure | Start with `PostBridge-windows`; switch to the GPU build later if reconcile feels slow |
+
+The GPU build is a drop-in replacement — same data files, same session JSONs, same UI. The only difference is what hardware it uses for inference. PostBridge auto-detects CUDA at startup; if torch fails to load, it silently falls back to CPU.
 
 > **macOS first launch:** Right-click the app → **Open** → click **Open** in the dialog. This bypasses Gatekeeper for unsigned apps and only needs to be done once.
 
@@ -37,15 +48,17 @@ The three workflows share transcript caches — a session transcribed in Pull Qu
 
 ## GPU acceleration
 
-On Windows with an NVIDIA GPU, PostBridge auto-detects CUDA via the installed PyTorch build and runs Whisper on the GPU. Typical speedup is **5–15× over CPU** on a small/medium model.
+On Windows with an NVIDIA GPU, PostBridge runs Whisper on the GPU instead of the CPU — typical speedup is **5–15× on a small/medium model**.
 
-To enable: install a CUDA-matched PyTorch build into PostBridge's Python before launch. For an RTX 50-series (Blackwell) card:
+**Easy path:** download the `PostBridge-windows-gpu` artifact. Everything is bundled — no Python install required.
+
+**Developer path (running from source or building your own bundle):** install a CUDA-matched PyTorch wheel before launch. For RTX 30/40/50 series:
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
-For older GPUs, pick the matching CUDA wheel index from [pytorch.org](https://pytorch.org/get-started/locally/). Without PyTorch installed, PostBridge falls back to CPU silently.
+For older GPU families, pick the matching CUDA wheel index from [pytorch.org](https://pytorch.org/get-started/locally/). Without PyTorch installed, PostBridge falls back to CPU silently.
 
 Step 3 (reconcile) shows a live resource monitor — GPU utilization, VRAM, and free RAM — so you can see at a glance whether CUDA is engaged. Click the ⓘ for a key.
 

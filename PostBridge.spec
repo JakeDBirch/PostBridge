@@ -23,6 +23,27 @@ added_files += collect_data_files("ctranslate2")
 added_files += collect_dynamic_libs("ctranslate2")
 added_files += collect_data_files("tkinterdnd2")
 
+# ── Optional GPU support: collect torch when present ──────────────────────────
+# CPU build: torch isn't installed; this block is a no-op and the resulting
+# bundle has no CUDA dependency.
+# GPU build: a CUDA-matched torch wheel is installed before PyInstaller runs;
+# `collect_all` pulls in torch's Python modules, data files, AND its CUDA
+# DLLs (cuDNN, cuBLAS, cudart, etc.) that ctranslate2 needs at runtime.
+_gpu_bundled = False
+_torch_binaries = []
+_torch_hiddenimports = []
+try:
+    import torch  # noqa: F401
+    from PyInstaller.utils.hooks import collect_all as _collect_all_torch
+    _t_datas, _t_binaries, _t_hidden = _collect_all_torch("torch")
+    added_files.extend(_t_datas)
+    _torch_binaries = _t_binaries
+    _torch_hiddenimports = _t_hidden
+    _gpu_bundled = True
+    print("PostBridge build: torch detected — bundling CUDA support.")
+except ImportError:
+    print("PostBridge build: torch not installed — CPU-only bundle.")
+
 # ── Bundle platform-specific ffmpeg/ffprobe static binaries ──────────────────
 # build.bat / build.sh download these before PyInstaller runs.
 _ffbin = os.path.join(src_dir, "ffmpeg-bin")
@@ -68,7 +89,7 @@ for _fn in ("blood_trails_formatter.html",):
 a = Analysis(
     ["main.py"],
     pathex=[src_dir],
-    binaries=[],
+    binaries=_torch_binaries,
     datas=added_files,
     hiddenimports=[
         "tkinter",
@@ -83,10 +104,14 @@ a = Analysis(
         "numpy",
         "av",
         "soundfile",
-    ],
+    ] + _torch_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
+    # 'torch' is large and excluding heavy sci-py deps it doesn't need keeps
+    # the CPU bundle slim AND avoids accidentally pulling them into the GPU
+    # bundle.  torch's own deps (sympy, jinja2, networkx, mpmath) come along
+    # via the collect_all() pull above when GPU is enabled.
     excludes=["matplotlib", "PIL", "scipy", "pandas"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -95,6 +120,10 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)   # noqa: F821
+
+# UPX corrupts torch's CUDA DLLs on Windows — disable it whenever torch is
+# bundled.  CPU builds keep UPX on for size savings.
+_use_upx = not _gpu_bundled
 
 exe = EXE(   # noqa: F821
     pyz,
@@ -105,7 +134,7 @@ exe = EXE(   # noqa: F821
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=_use_upx,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
@@ -121,7 +150,7 @@ coll = COLLECT(   # noqa: F821
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=_use_upx,
     upx_exclude=[],
     name="PostBridge",
 )

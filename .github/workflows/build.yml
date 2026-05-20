@@ -47,6 +47,55 @@ jobs:
           path: PostBridge-windows.zip
           retention-days: 5
 
+  # ── Windows  (NVIDIA GPU build — bundles CUDA-enabled PyTorch) ──────────────
+  # Drop-in replacement for build-windows for users with NVIDIA cards.
+  # ~3 GB larger; gives 5-15x speedup on Whisper transcription.
+  # PostBridge.spec auto-detects torch when it's installed and pulls in its
+  # CUDA DLLs via collect_all().  Same source, two artifacts.
+  build-windows-gpu:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Install PyTorch with CUDA 12.8 (Blackwell / RTX 50-series)
+        # cu128 wheels work on RTX 30, 40, and 50 series.  Pick a different
+        # CUDA index (cu121, cu124) if you need to ship a build for an older
+        # GPU family that doesn't support cu128.
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Download ffmpeg (Windows x64)
+        shell: pwsh
+        run: |
+          $base = "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          New-Item -ItemType Directory -Force ffmpeg-bin | Out-Null
+          Invoke-WebRequest "$base/ffmpeg-win-x64.exe"  -OutFile "ffmpeg-bin\ffmpeg.exe"
+          Invoke-WebRequest "$base/ffprobe-win-x64.exe" -OutFile "ffmpeg-bin\ffprobe.exe"
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip output folder
+        shell: pwsh
+        run: Compress-Archive -Path dist\PostBridge -DestinationPath PostBridge-windows-gpu.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-windows-gpu
+          path: PostBridge-windows-gpu.zip
+          retention-days: 5
+
   # ── macOS  Apple Silicon (M1 / M2 / M3) ─────────────────────────────────────
   build-macos-arm:
     runs-on: macos-14        # Apple Silicon runner
