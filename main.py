@@ -11655,22 +11655,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             new_text = ent.get("1.0", "end-1c").strip()
             toks = new_text.split() if new_text else []
 
-            # Whisper convention: a leading-space prefix on every word
-            # except the first.  Matches the renderer's concatenation
-            # logic so the resulting transcript reads naturally.
-            #
-            # Empty input (no tokens) is now valid — it deletes the
-            # selected words from the transcript.  Useful for cleaning
-            # up cases like "ok ay" -> "okay" where the user wants to
-            # remove a stray token, or "the the dog" -> "the dog" where
-            # Whisper duplicated a word.
+            # Whisper convention: every word includes any natural
+            # leading whitespace (e.g. " Hello,").  Preserve the first
+            # ORIGINAL word's leading-space behaviour for the first new
+            # word so the new text doesn't fuse to the preceding word.
+            # E.g., replacing " world" with "earth" must give " earth"
+            # not "earth" — otherwise "Hello world" becomes "Helloearth".
+            first_orig_word = real_orig[0].get("word", "") if real_orig else ""
+            first_starts_with_space = (
+                len(first_orig_word) > 0
+                and first_orig_word[0] in (" ", "\t"))
+
+            # Empty input (no tokens) deletes the selected words.
+            # Useful for cleaning up cases like "ok ay" -> "okay" where
+            # the user wants to remove a stray token, or "the the dog"
+            # -> "the dog" where Whisper duplicated a word.
             new_entries = []
             if toks:
                 n     = len(toks)
                 total = max(0.05, range_end - range_start)
                 per   = total / n
                 for i, tok in enumerate(toks):
-                    wt = (" " if i > 0 else "") + tok
+                    if i == 0:
+                        wt = (" " if first_starts_with_space else "") + tok
+                    else:
+                        wt = " " + tok
                     entry = {
                         "word":  wt,
                         "start": range_start + i * per,
@@ -13341,6 +13350,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if session.get("_cancel_requested"):
                     session.pop("_cancel_requested", None)
                     raise engines.TranscriptionCancelled()
+
+                # Defensive final-merge: edits committed in the brief
+                # window between the configured-pass merge and this
+                # final assignment would otherwise be silently lost.
+                # Re-merge against the LATEST session["transcript"]
+                # snapshot so any user edits made very late in the
+                # run are preserved.  Idempotent when nothing changed.
+                _latest = session.get("transcript") or []
+                _has_late_user_words = any(
+                    w.get("_src") == "user" for w in _latest)
+                if _has_late_user_words:
+                    words = App._pq_merge_refine(_latest, words)
 
                 session["transcript"] = list(words or [])
                 self._pq_save_session_file(session)
