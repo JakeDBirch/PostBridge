@@ -84,6 +84,18 @@ def get_active_model_size():
     """Return the model size that get_model() will currently use."""
     return _active_model_override or WHISPER_MODEL
 
+
+def is_cuda_available():
+    """Return True if a CUDA-enabled PyTorch build is installed and the
+    current machine actually has a usable GPU.  Used by the Pull Quotes
+    worker to decide between sequential (CPU) and parallel (GPU) draft +
+    refine transcription."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
 # ── Audio extraction (uses bundled ffmpeg if not on PATH) ───────────────────────
 def _ffmpeg_cmd():
     try:

@@ -12907,7 +12907,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             prog["extra"] = "{} · {} decoded".format(
                                 prefix, _fmt_dur(audio_s))
 
-                    # ── Decide whether to run a tiny draft pass ────────
+                    # ── Decide whether (and how) to run a tiny draft pass
                     # When the user is actively viewing this session and
                     # their configured model isn't already 'tiny', do a
                     # fast tiny pass first so they see SOMETHING within
@@ -12916,12 +12916,58 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     # seconds so the "is the user viewing?" check
                     # naturally functions as a dwell filter — drive-by
                     # transcribe-then-leave doesn't pay the tiny cost.
+                    #
+                    # On GPU we run tiny IN PARALLEL with the configured
+                    # model (two CTranslate2 instances, separate threads).
+                    # The tiny preview renders the moment it's ready; the
+                    # configured pass continues unaffected.  On CPU we
+                    # fall back to sequential — both inference loops
+                    # contending for the same cores would slow each
+                    # other down and the gain disappears.
                     configured_size = engines.get_active_model_size()
                     is_viewing_now = (getattr(self, "_pq_current_session",
                                                None) is session)
                     do_progressive = (is_viewing_now
                                        and configured_size != "tiny"
                                        and not session.get("transcript"))
+                    parallel_ok = engines.is_cuda_available()
+
+                    # Per-pass thread storage when running parallel.
+                    tiny_thread = None
+                    tiny_words_box = [None]   # mutable container; thread writes
+
+                    def _run_tiny_pass(audios=audios, mix_path_ref=None):
+                        """Tiny draft worker.  Writes to tiny_words_box,
+                        renders the preview on the main thread, and
+                        catches its own exceptions so a tiny crash never
+                        kills the parent worker's configured run."""
+                        try:
+                            if len(audios) == 1:
+                                tw = engines.transcribe_clip_verbatim(
+                                    mix_path_ref, progress_cb=_on_seg_end,
+                                    cancel_event=cancel_event,
+                                    model_size="tiny")
+                            else:
+                                speaker_labels = session.get("speakers") or {}
+                                tw = engines.transcribe_session_per_track(
+                                    audios, speaker_labels=speaker_labels,
+                                    progress_cb=_on_seg_end,
+                                    cancel_event=cancel_event,
+                                    model_size="tiny")
+                            tiny_words_box[0] = tw
+                            if tw and getattr(
+                                    self, "_pq_current_session", None
+                                    ) is session:
+                                session["transcript"] = list(tw)
+                                self._ui(lambda s=session:
+                                          self._pq_preview_ready(s))
+                        except engines.TranscriptionCancelled:
+                            pass
+                        except Exception as _e:
+                            # Don't let tiny failure block the configured
+                            # run — log and move on.
+                            print("PQ tiny pass failed:",
+                                  _e, file=sys.stderr)
 
                     if len(audios) == 1:
                         # Single source — existing fast path.
@@ -12936,51 +12982,66 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             raise RuntimeError(
                                 "audio extract failed: " + (err or ""))
 
-                        # ── Optional tiny draft pass ──────────────────
-                        if do_progressive:
-                            _set_phase("draft (tiny)", "")
-                            tiny_words = engines.transcribe_clip_verbatim(
+                        if do_progressive and parallel_ok:
+                            # GPU: launch tiny in a sibling thread, then
+                            # run configured here in parallel.
+                            _set_phase("draft + refining (parallel)", "")
+                            tiny_thread = threading.Thread(
+                                target=_run_tiny_pass,
+                                kwargs={"mix_path_ref": mix_path},
+                                daemon=True)
+                            tiny_thread.start()
+                            words = engines.transcribe_clip_verbatim(
                                 mix_path, progress_cb=_on_seg_end,
-                                cancel_event=cancel_event,
-                                model_size="tiny")
-                            if tiny_words:
-                                session["transcript"] = list(tiny_words)
-                                self._ui(lambda s=session:
-                                          self._pq_preview_ready(s))
-
-                        _set_phase(
-                            "refining" if do_progressive else "transcribing",
-                            "")
-                        words = engines.transcribe_clip_verbatim(
-                            mix_path, progress_cb=_on_seg_end,
-                            cancel_event=cancel_event)
+                                cancel_event=cancel_event)
+                            # Wait for tiny — almost always finished first
+                            # but guarantee both done before merge.
+                            tiny_thread.join()
+                        elif do_progressive:
+                            # CPU: run tiny then configured sequentially.
+                            _set_phase("draft (tiny)", "")
+                            _run_tiny_pass(mix_path_ref=mix_path)
+                            _set_phase("refining", "")
+                            words = engines.transcribe_clip_verbatim(
+                                mix_path, progress_cb=_on_seg_end,
+                                cancel_event=cancel_event)
+                        else:
+                            _set_phase("transcribing", "")
+                            words = engines.transcribe_clip_verbatim(
+                                mix_path, progress_cb=_on_seg_end,
+                                cancel_event=cancel_event)
                     else:
                         # Multi-track — transcribe each independently so
                         # we know who said what (speaker = source file).
-                        # Speaker labels can be customised via
-                        # session["speakers"] = {basename: label}.
                         speaker_labels = session.get("speakers") or {}
 
-                        if do_progressive:
-                            _set_phase("draft (tiny)")
-                            tiny_words = engines.transcribe_session_per_track(
+                        if do_progressive and parallel_ok:
+                            _set_phase("draft + refining (parallel)")
+                            tiny_thread = threading.Thread(
+                                target=_run_tiny_pass,
+                                daemon=True)
+                            tiny_thread.start()
+                            words = engines.transcribe_session_per_track(
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
-                                cancel_event=cancel_event,
-                                model_size="tiny")
-                            if tiny_words:
-                                session["transcript"] = list(tiny_words)
-                                self._ui(lambda s=session:
-                                          self._pq_preview_ready(s))
-
-                        _set_phase(
-                            ("refining " if do_progressive else
-                             "transcribing ") + "{} tracks".format(
-                                 len(audios)))
-                        words = engines.transcribe_session_per_track(
-                            audios, speaker_labels=speaker_labels,
-                            progress_cb=_on_seg_end,
-                            cancel_event=cancel_event)
+                                cancel_event=cancel_event)
+                            tiny_thread.join()
+                        elif do_progressive:
+                            _set_phase("draft (tiny)")
+                            _run_tiny_pass()
+                            _set_phase("refining {} tracks".format(
+                                len(audios)))
+                            words = engines.transcribe_session_per_track(
+                                audios, speaker_labels=speaker_labels,
+                                progress_cb=_on_seg_end,
+                                cancel_event=cancel_event)
+                        else:
+                            _set_phase("transcribing {} tracks".format(
+                                len(audios)))
+                            words = engines.transcribe_session_per_track(
+                                audios, speaker_labels=speaker_labels,
+                                progress_cb=_on_seg_end,
+                                cancel_event=cancel_event)
                         # Build a mix purely for the playback cache so
                         # the user can hear both speakers when auditioning
                         # transcript regions.
