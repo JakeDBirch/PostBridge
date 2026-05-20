@@ -11653,33 +11653,56 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         def _save(_e=None):
             new_text = ent.get("1.0", "end-1c").strip()
-            if not new_text:
-                win.destroy(); return "break"
-            toks = new_text.split()
-            if not toks:
-                win.destroy(); return "break"
+            toks = new_text.split() if new_text else []
 
             # Whisper convention: a leading-space prefix on every word
             # except the first.  Matches the renderer's concatenation
             # logic so the resulting transcript reads naturally.
-            n     = len(toks)
-            total = max(0.05, range_end - range_start)
-            per   = total / n
+            #
+            # Empty input (no tokens) is now valid — it deletes the
+            # selected words from the transcript.  Useful for cleaning
+            # up cases like "ok ay" -> "okay" where the user wants to
+            # remove a stray token, or "the the dog" -> "the dog" where
+            # Whisper duplicated a word.
             new_entries = []
-            for i, tok in enumerate(toks):
-                wt = (" " if i > 0 else "") + tok
-                entry = {
-                    "word":  wt,
-                    "start": range_start + i * per,
-                    "end":   range_start + (i + 1) * per,
-                    # Mark these words as user-authored so a later
-                    # progressive-refinement pass preserves them
-                    # instead of overwriting with Whisper output.
+            if toks:
+                n     = len(toks)
+                total = max(0.05, range_end - range_start)
+                per   = total / n
+                for i, tok in enumerate(toks):
+                    wt = (" " if i > 0 else "") + tok
+                    entry = {
+                        "word":  wt,
+                        "start": range_start + i * per,
+                        "end":   range_start + (i + 1) * per,
+                        # Mark these words as user-authored so a later
+                        # progressive-refinement pass preserves them
+                        # instead of overwriting with Whisper output.
+                        "_src":  "user",
+                    }
+                    if common_speaker:
+                        entry["speaker"] = common_speaker
+                    new_entries.append(entry)
+            else:
+                # Deletion: leave a single user-tagged placeholder so
+                # the merge layer knows this range is intentionally
+                # empty and shouldn't be refilled by a later refine
+                # pass.  Otherwise the configured-model output would
+                # come in and re-insert the words Jordan just deleted.
+                #
+                # Implementation: zero-width "user" marker with the
+                # original time range.  Renders as nothing visible
+                # but takes part in _pq_user_edited_spans so the
+                # merge respects the deletion.
+                new_entries.append({
+                    "word":  "",
+                    "start": range_start,
+                    "end":   range_end,
                     "_src":  "user",
-                }
+                    "_deleted": True,
+                })
                 if common_speaker:
-                    entry["speaker"] = common_speaker
-                new_entries.append(entry)
+                    new_entries[0]["speaker"] = common_speaker
 
             transcript[span_start:span_end] = new_entries
             session["transcript"] = transcript
@@ -13076,7 +13099,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         # the final word list).
                         if getattr(self, "_pq_current_session",
                                    None) is s:
-                            s["transcript"] = list(streaming_words)
+                            # Merge the streamed buffer with the
+                            # current session transcript so user edits
+                            # made between ticks survive.  Without
+                            # this, every tick overwrote the user's
+                            # _src='user' words with the raw stream.
+                            current = s.get("transcript") or []
+                            s["transcript"] = App._pq_merge_refine(
+                                current, list(streaming_words))
                             # Capture the interactive state (cursor,
                             # selection, scroll, focus) BEFORE the
                             # re-render so Jordan can edit / scroll /
@@ -13159,7 +13189,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 # Final render with the complete tiny
                                 # output (streaming may have rendered a
                                 # slightly stale view at last throttle).
-                                session["transcript"] = list(tw)
+                                # Merge against the current session
+                                # transcript so any user edits made
+                                # during the stream survive this
+                                # overwrite.
+                                session["transcript"] = App._pq_merge_refine(
+                                    session.get("transcript") or [],
+                                    list(tw))
                                 self._ui(lambda s=session:
                                           self._pq_preview_ready(s))
                         except engines.TranscriptionCancelled:
