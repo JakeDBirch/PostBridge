@@ -1,6 +1,7 @@
 dist/
 build/
 ffmpeg-bin/
+models/
 __pycache__/
 *.pyc
 .pb_cache/

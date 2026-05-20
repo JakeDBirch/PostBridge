@@ -307,6 +307,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
         for w in self.body.winfo_children(): w.destroy()
 
+    def _refresh_model_indicators(self):
+        """Update every visible 'model: <name>' indicator label in the UI
+        after a Settings change.  Safe to call when none exist — each
+        widget is consulted via getattr + winfo_exists."""
+        name = engines.get_active_model_size()
+        for attr in ("_pq_model_lbl", "_aaf_model_lbl",
+                      "_s3_model_lbl"):
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                if w.winfo_exists():
+                    w.config(text="model: {}".format(name))
+            except tk.TclError:
+                pass
+
     def _show_settings_dialog(self):
         """Settings dialog — currently scoped to Whisper model selection.
 
@@ -429,6 +445,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # Drop any cached model so the new size loads on the
                 # next transcription.  The old model is garbage-collected.
                 engines._model_cache.clear()
+                # Refresh any visible model-indicator labels so the new
+                # choice is reflected immediately.
+                self._refresh_model_indicators()
                 messagebox.showinfo(
                     "Model changed",
                     "Whisper model set to '{}'.\n\n"
@@ -471,24 +490,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._clear()
         tk.Frame(self.body, bg=BG, height=30).pack()
 
-        # Heading row with a Settings link top-right.  Keeps the model
-        # picker reachable without cluttering each workflow's chrome.
-        head_row = tk.Frame(self.body, bg=BG)
-        head_row.pack(fill="x", padx=20, pady=(0, 16))
-        tk.Label(head_row, text="Choose a workflow",
-                 font=FBT, bg=BG, fg=SUB).pack(side="left", expand=True)
-        _model_now = engines.get_active_model_size()
-        settings_lbl = tk.Label(
-            head_row,
-            text="⚙ Settings   ·   model: {}".format(_model_now),
-            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=4)
-        settings_lbl.pack(side="right")
-        settings_lbl.bind("<Enter>",
-                           lambda e, w=settings_lbl: w.config(fg=ACCENT))
-        settings_lbl.bind("<Leave>",
-                           lambda e, w=settings_lbl: w.config(fg=SUB))
-        settings_lbl.bind("<Button-1>",
-                           lambda e: self._show_settings_dialog())
+        tk.Label(self.body, text="Choose a workflow",
+                 font=FBT, bg=BG, fg=SUB).pack(pady=(0, 16))
 
         # ── Resume last project (shown only when a previous script is known) ──
         _last_script = self._prefs.get("last_script", "")
@@ -1066,6 +1069,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "RECONCILE  →",   self._start_reconcile,
                   color=ACCENT).pack(side="right")
+
+        # Model indicator — click to open the picker.  Lives just left of
+        # the RECONCILE button so the user sees which Whisper model their
+        # click will use.
+        self._s3_model_lbl = tk.Label(
+            nav, text="model: {}".format(engines.get_active_model_size()),
+            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=8)
+        self._s3_model_lbl.pack(side="right", padx=(0, 12))
+        self._s3_model_lbl.bind(
+            "<Enter>", lambda e: self._s3_model_lbl.config(fg=ACCENT))
+        self._s3_model_lbl.bind(
+            "<Leave>", lambda e: self._s3_model_lbl.config(fg=SUB))
+        self._s3_model_lbl.bind(
+            "<Button-1>", lambda e: self._show_settings_dialog())
 
         # ── Background mode toggle ────────────────────────────────────────────
         if not hasattr(self, "_reconcile_bg_mode"):
@@ -10564,6 +10581,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             lambda s=session: self._pq_run_transcription(s),
             small=True, color=ACCENT)
         self._pq_retx_btn.pack(side="left", padx=(8, 0))
+
+        # Model indicator — click to open the picker.  Lives right next to
+        # TRANSCRIBE so the user sees which model their click will run.
+        self._pq_model_lbl = tk.Label(
+            btn_row,
+            text="model: {}".format(engines.get_active_model_size()),
+            font=FB, bg=SURF, fg=SUB, cursor="hand2", padx=8)
+        self._pq_model_lbl.pack(side="left", padx=(12, 0))
+        self._pq_model_lbl.bind(
+            "<Enter>", lambda e: self._pq_model_lbl.config(fg=ACCENT))
+        self._pq_model_lbl.bind(
+            "<Leave>", lambda e: self._pq_model_lbl.config(fg=SUB))
+        self._pq_model_lbl.bind(
+            "<Button-1>", lambda e: self._show_settings_dialog())
 
         # Background-mode checkbox — same intent as the script→session flow:
         # opting in makes the whisper worker yield so the rest of the system

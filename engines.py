@@ -1,4 +1,4 @@
-import os, re, io, json, tempfile, subprocess, wave, hashlib, threading
+import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
 
 
 def _safe_net_call(fn, default, _timeout=2.0):
@@ -477,6 +477,26 @@ def pull_result_cache_clear(pull, transcript_path, pad):
             pass
 
 # ── Transcription ──────────────────────────────────────────────────────────────
+def _bundled_models_root():
+    """Return the path to bundled Whisper model weights if shipped
+    alongside the executable, else None.  Build scripts pre-download
+    tiny/base/small into ``models/`` next to the frozen exe so first-
+    run users don't sit through a 100–500 MB download.
+    """
+    # PyInstaller-frozen apps have sys._MEIPASS for read-only data;
+    # development runs use the source-tree CWD.
+    candidates = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(os.path.join(base, "models"))
+    candidates.append(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "models"))
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
 def get_model(size=None):
     # Resolve "active" model size when none was passed:
     #   user override (set via the Settings dialog)  >  config default.
@@ -496,7 +516,16 @@ def get_model(size=None):
                 compute = "float16" if device == "cuda" else "int8"
             except ImportError:
                 device = "cpu"; compute = "int8"
-            _model_cache[size] = WhisperModel(size, device=device, compute_type=compute)
+            # If the bundle ships a pre-downloaded copy of this model,
+            # point faster-whisper at it via download_root so it loads
+            # locally instead of pulling from HuggingFace.  Missing
+            # bundles (e.g. medium/large-v3 on the standard build) fall
+            # through to the normal HuggingFace download path.
+            _bundle_root = _bundled_models_root()
+            kwargs = dict(device=device, compute_type=compute)
+            if _bundle_root:
+                kwargs["download_root"] = _bundle_root
+            _model_cache[size] = WhisperModel(size, **kwargs)
         return _model_cache[size]
 
 def _clip_rms_db(wav_path):

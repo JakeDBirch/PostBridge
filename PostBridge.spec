@@ -85,6 +85,21 @@ for _fn in ("blood_trails_formatter.html",):
     if os.path.isfile(_fp):
         added_files.append((_fp, "."))
 
+# ── Bundle pre-downloaded Whisper models when present ─────────────────────────
+# Build scripts may populate `models/` with tiny/base/small.  When the folder
+# exists, drop it whole into the bundle root so engines._bundled_models_root()
+# finds it at runtime.  Missing models (medium / large-v3) fall back to a
+# normal HuggingFace download on first use.
+_models_dir = os.path.join(src_dir, "models")
+if os.path.isdir(_models_dir):
+    for _root, _dirs, _files in os.walk(_models_dir):
+        for _f in _files:
+            _src = os.path.join(_root, _f)
+            _rel = os.path.relpath(_src, src_dir)
+            # dest is the directory inside the bundle (without the file name)
+            added_files.append((_src, os.path.dirname(_rel)))
+    print("PostBridge build: bundling models from {}.".format(_models_dir))
+
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
     ["main.py"],

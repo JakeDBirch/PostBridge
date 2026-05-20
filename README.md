@@ -270,7 +270,7 @@ The `.pb_transcript.json` sidecars are shared between workflows: transcribing in
 
 ### Model picker (in-app)
 
-Click **⚙ Settings** in the upper-right of the home screen to choose your Whisper model. Picker is a five-row table with params count, ~CPU speed, RAM/VRAM footprint, and a quality note for each option:
+Click the **model: …** indicator next to the TRANSCRIBE button (Pull Quotes) or the RECONCILE button (Script → Session) to open the picker. Five-row table with params count, ~CPU speed, RAM/VRAM footprint, and a quality note for each option:
 
 | Model | Params | Speed (CPU) | RAM/VRAM | Notes |
 |---|---|---|---|---|
@@ -281,6 +281,8 @@ Click **⚙ Settings** in the upper-right of the home screen to choose your Whis
 | `large-v3` | 1.55 B | ~1× real-time | ~3 GB | Best accuracy; needs GPU to be practical |
 
 Your choice persists across sessions (saved to `~/.postbridge_prefs.json`). On the next transcription the new model loads — first-load is slower because the weights are downloaded if not already cached. GPU acceleration multiplies all of these by ~5–15×.
+
+**Bundled vs. on-demand:** PostBridge ships with `tiny`, `base`, and `small` pre-bundled (~700 MB total) so the common choices work instantly out of the box. `medium` and `large-v3` are larger (1.5 GB / 3 GB) and download from Hugging Face the first time you select them, then cache locally.
 
 ### Code-level settings
 
