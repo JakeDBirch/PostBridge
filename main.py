@@ -12879,7 +12879,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 except Exception:
                     pass
 
-                _set_phase("loading model")
+                # Be explicit when the configured model isn't cached
+                # yet — get_model() can sit for several minutes inside
+                # faster-whisper's download path with no visible
+                # progress.  Surface that we're downloading so the user
+                # doesn't think the worker is hung.
+                _cfg_size = engines.get_active_model_size()
+                if not engines._is_model_cached(_cfg_size):
+                    # Rough sizes for the status message.
+                    _approx = {
+                        "tiny":     "75 MB",
+                        "base":     "145 MB",
+                        "small":    "485 MB",
+                        "medium":   "1.5 GB",
+                        "large-v3": "3.1 GB",
+                    }.get(_cfg_size, "")
+                    _set_phase(
+                        "downloading model ({}){}".format(
+                            _cfg_size,
+                            " — " + _approx if _approx else ""),
+                        "")
+                else:
+                    _set_phase("loading model")
                 engines.get_model()
 
                 # Snapshot the pre-run transcript so re-transcribe can
