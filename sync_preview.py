@@ -238,7 +238,7 @@ class SyncPreviewDialog:
                      font=FB, bg=BG, fg=SUB).pack(side="left")
             self._cand_lbl = tk.Label(
                 cand_row,
-                text="  showing #1 of {}".format(len(self._candidates)),
+                text=self._candidate_label_text(),
                 font=FB, bg=BG, fg=TEXT)
             self._cand_lbl.pack(side="left", padx=(4, 12))
 
@@ -254,6 +254,19 @@ class SyncPreviewDialog:
                      lambda e: self._cycle_candidate())
         else:
             self._cand_lbl = None
+
+    def _candidate_label_text(self):
+        """Format the candidate-row readout: 'showing #i of N \u00b7 -5.42 s
+        (conf 62%)'.  The auto-pick at index 0 is labelled 'auto' instead
+        of a confidence to avoid confusion (its conf is synthetic 1.0)."""
+        i = self._candidate_idx
+        n = len(self._candidates)
+        t, c = self._candidates[i]
+        if i == 0:
+            tail = "auto pick"
+        else:
+            tail = "{:+.3f} s   conf {:d}%".format(t, int(round(c * 100)))
+        return "  showing #{} of {}   \u00b7   {}".format(i + 1, n, tail)
 
         # Accept / Cancel row
         bot = tk.Frame(win, bg=BG)
@@ -556,10 +569,7 @@ class SyncPreviewDialog:
                 pass
         if self._cand_lbl is not None:
             try:
-                self._cand_lbl.config(
-                    text="  showing #{} of {}".format(
-                        self._candidate_idx + 1,
-                        len(self._candidates)))
+                self._cand_lbl.config(text=self._candidate_label_text())
             except Exception:
                 pass
         self._draw()
