@@ -11265,6 +11265,120 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                      fg=TEXT if ok else ERR
                      ).pack(side="left")
 
+    def _pq_capture_text_state(self):
+        """Snapshot the text widget's interactive state so a streaming
+        re-render can restore it instead of jumping the user to the end.
+
+        Anchors cursor / selection by the id() of the word-dict the
+        cursor is currently in, not by character index — character
+        indexes can shift slightly across re-renders (paragraph break
+        positions move when new context arrives) but the word dicts
+        themselves are stable across streaming updates.
+
+        Returns a dict; pair with _pq_restore_text_state().
+        """
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is None:
+            return None
+        state = {}
+        try:
+            if not tx.winfo_exists():
+                return None
+            word_idx = getattr(self, "_pq_word_index", []) or []
+            # Cursor position by word id
+            try:
+                c = _tx_count_chars(tx, "1.0", tx.index("insert"))
+                for s, e, w in word_idx:
+                    if s <= c <= e:
+                        state["insert_word_id"] = id(w)
+                        break
+            except Exception:
+                pass
+            # Selection range by word ids
+            try:
+                f = _tx_count_chars(tx, "1.0", tx.index("sel.first"))
+                l = _tx_count_chars(tx, "1.0", tx.index("sel.last"))
+                first_id = last_id = None
+                for s, e, w in word_idx:
+                    if first_id is None and s <= f <= e:
+                        first_id = id(w)
+                    if s <= l <= e:
+                        last_id = id(w)
+                if first_id is not None and last_id is not None:
+                    state["sel_first_id"] = first_id
+                    state["sel_last_id"]  = last_id
+            except tk.TclError:
+                pass
+            # Scroll position (top fraction)
+            try:
+                state["yview"] = tx.yview()[0]
+            except Exception:
+                pass
+            # Was the widget focused?
+            try:
+                state["had_focus"] = (self.focus_get() is tx)
+            except Exception:
+                state["had_focus"] = False
+        except Exception:
+            return None
+        return state
+
+    def _pq_restore_text_state(self, state):
+        """Restore cursor, selection, scroll, focus after a re-render.
+        Pairs with _pq_capture_text_state."""
+        if not state:
+            return
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is None:
+            return
+        try:
+            if not tx.winfo_exists():
+                return
+            word_idx = getattr(self, "_pq_word_index", []) or []
+            # Cursor: find the word dict by id and place insert mark
+            # at its start position in the new render.
+            ins_id = state.get("insert_word_id")
+            if ins_id is not None:
+                for s, e, w in word_idx:
+                    if id(w) == ins_id:
+                        try:
+                            tx.mark_set("insert",
+                                         "1.0+{}c".format(s))
+                        except tk.TclError:
+                            pass
+                        break
+            # Selection
+            sf = state.get("sel_first_id")
+            sl = state.get("sel_last_id")
+            if sf is not None and sl is not None:
+                new_first = new_last = None
+                for s, e, w in word_idx:
+                    if id(w) == sf and new_first is None:
+                        new_first = "1.0+{}c".format(s)
+                    if id(w) == sl:
+                        new_last = "1.0+{}c".format(e)
+                if new_first and new_last:
+                    try:
+                        tx.tag_remove("sel", "1.0", "end")
+                        tx.tag_add("sel", new_first, new_last)
+                    except tk.TclError:
+                        pass
+            # Scroll position
+            yv = state.get("yview")
+            if yv is not None:
+                try:
+                    tx.yview_moveto(yv)
+                except tk.TclError:
+                    pass
+            # Restore focus
+            if state.get("had_focus"):
+                try:
+                    tx.focus_set()
+                except tk.TclError:
+                    pass
+        except Exception:
+            pass
+
     def _pq_render_transcript_text(self, session, placeholder=None):
         """Re-render the transcript pane.
 
@@ -12963,10 +13077,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         if getattr(self, "_pq_current_session",
                                    None) is s:
                             s["transcript"] = list(streaming_words)
+                            # Capture the interactive state (cursor,
+                            # selection, scroll, focus) BEFORE the
+                            # re-render so Jordan can edit / scroll /
+                            # select during the stream without being
+                            # yanked back to the end on every tick.
+                            state = self._pq_capture_text_state()
                             try:
                                 self._pq_render_transcript_text(s)
                             except Exception:
                                 pass
+                            else:
+                                self._pq_restore_text_state(state)
 
                     def _stream_seg_cb(seg_words):
                         streaming_words.extend(seg_words)
