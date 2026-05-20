@@ -448,20 +448,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                      bg=BG, fg=SUB, anchor="w"
                      ).grid(row=0, column=col, sticky="w",
                             padx=(0, 14), pady=(0, 6))
+        # Generous row padding (10 px each side) keeps the wrapped
+        # 2-line notes visually separated from the next row's notes.
+        # Without this they butt right against each other and read as
+        # one continuous block of text.
+        _row_pady = (10, 10)
         for r, (sz, p, sp, mem, note) in enumerate(
                 self._MODEL_INFO, start=1):
             tk.Label(tbl, text=sz,
                      font=("Courier New", 11, "bold"),
-                     bg=BG, fg=ACCENT, anchor="w"
-                     ).grid(row=r, column=0, sticky="w",
-                            padx=(0, 14), pady=2)
+                     bg=BG, fg=ACCENT, anchor="nw"
+                     ).grid(row=r, column=0, sticky="nw",
+                            padx=(0, 14), pady=_row_pady)
             for i, val in enumerate([p, sp, mem], start=1):
                 tk.Label(tbl, text=val, font=FB, bg=BG, fg=TEXT,
-                         anchor="w").grid(row=r, column=i,
-                                          sticky="w", padx=(0, 14))
+                         anchor="nw"
+                         ).grid(row=r, column=i, sticky="nw",
+                                padx=(0, 14), pady=_row_pady)
             tk.Label(tbl, text=note, font=FB, bg=BG, fg=SUB,
-                     anchor="w", justify="left", wraplength=480
-                     ).grid(row=r, column=4, sticky="w")
+                     anchor="nw", justify="left", wraplength=480
+                     ).grid(row=r, column=4, sticky="nw",
+                            pady=_row_pady)
 
         tk.Label(body,
                  text=("Bundled: tiny, base, small.  "
