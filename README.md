@@ -270,7 +270,7 @@ The `.pb_transcript.json` sidecars are shared between workflows: transcribing in
 
 ### Model picker (in-app)
 
-Click the **model: …** indicator next to the TRANSCRIBE button (Pull Quotes) or the RECONCILE button (Script → Session) to open the picker. Five-row table with params count, ~CPU speed, RAM/VRAM footprint, and a quality note for each option:
+Inline dropdowns live next to the TRANSCRIBE button (Pull Quotes session view), in the Pull Quotes project OPTIONS row, and next to the RECONCILE button (Script → Session step 2). Pick a size — it applies immediately. Click the **?** beside the dropdown for the size guide:
 
 | Model | Params | Speed (CPU) | RAM/VRAM | Notes |
 |---|---|---|---|---|

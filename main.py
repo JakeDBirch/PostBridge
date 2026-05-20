@@ -307,6 +307,188 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
         for w in self.body.winfo_children(): w.destroy()
 
+    # ── Model picker (inline dropdown widgets) ─────────────────────────────
+
+    # Static description of every Whisper model.  Surfaced via the "?"
+    # button next to each inline picker; previously lived in the modal
+    # Settings dialog.  Keeping it here so all three pickers stay in
+    # sync — every workflow shows the same table.
+    _MODEL_INFO = [
+        ("tiny",
+         "39 M",   "~32× real-time", "~150 MB",
+         "Draft quality.  Useful for fast first-pass on slow CPUs."),
+        ("base",
+         "74 M",   "~16× real-time", "~250 MB",
+         "Fast and reasonably accurate.  Strong CPU choice."),
+        ("small",
+         "244 M",  "~6× real-time",  "~600 MB",
+         "Default.  Balanced speed and accuracy on most hardware."),
+        ("medium",
+         "769 M",  "~2× real-time",  "~1.5 GB",
+         "Higher accuracy.  Slow on CPU; comfortable on GPU."),
+        ("large-v3",
+         "1.55 B", "~1× real-time",  "~3 GB",
+         "Best accuracy.  Practical mainly with GPU acceleration."),
+    ]
+    _MODEL_SIZES = [m[0] for m in _MODEL_INFO]
+
+    def _build_model_picker(self, parent, bg=None):
+        """Return a Frame containing 'Model:' + dropdown + '?' button.
+
+        Wires the dropdown to apply the choice immediately (with the
+        busy-transcription gate) and registers the resulting widget on
+        self so _refresh_model_indicators() can update it after an
+        external change.  Used in PQ project view, PQ session view and
+        Script -> Session step 2.
+        """
+        if bg is None:
+            bg = BG
+        row = tk.Frame(parent, bg=bg)
+        tk.Label(row, text="Model:", font=FB, bg=bg, fg=SUB
+                 ).pack(side="left", padx=(0, 4))
+        var = tk.StringVar(value=engines.get_active_model_size())
+        opt = tk.OptionMenu(row, var, *self._MODEL_SIZES)
+        # OptionMenu defaults are heavy and don't fit our dark theme —
+        # tighten font and colours.
+        opt.config(font=FB, bg=SURF2, fg=TEXT,
+                    activebackground=ACCENT, activeforeground=TEXT,
+                    highlightthickness=0, bd=0, padx=8, pady=2,
+                    cursor="hand2")
+        opt["menu"].config(font=FB, bg=SURF2, fg=TEXT,
+                            activebackground=ACCENT,
+                            activeforeground=TEXT, bd=0)
+        opt.pack(side="left")
+
+        help_lbl = tk.Label(row, text="?", font=FBT,
+                             bg=bg, fg=SUB, cursor="hand2",
+                             padx=6, pady=2)
+        help_lbl.pack(side="left")
+        help_lbl.bind("<Enter>",
+                       lambda e, w=help_lbl: w.config(fg=ACCENT))
+        help_lbl.bind("<Leave>",
+                       lambda e, w=help_lbl: w.config(fg=SUB))
+        help_lbl.bind("<Button-1>",
+                       lambda e: self._show_model_help())
+
+        # Trace the dropdown — every user change runs through the gate.
+        # We use a flag to prevent the trace re-firing when we revert
+        # the var (e.g. user clicked BACK on the busy-swap dialog).
+        guard = {"in_revert": False}
+
+        def _on_change(*_):
+            if guard["in_revert"]:
+                return
+            new_choice = var.get()
+            if not new_choice or new_choice == engines.get_active_model_size():
+                return
+            old_choice = engines.get_active_model_size()
+            if self._is_transcription_running():
+                decision = self._prompt_busy_model_swap(
+                    self, new_choice, old_choice)
+                if decision == "back":
+                    # Revert dropdown to the still-active model.
+                    guard["in_revert"] = True
+                    try:
+                        var.set(old_choice)
+                    finally:
+                        guard["in_revert"] = False
+                    return
+                if decision == "cancel_current":
+                    self._request_cancel_active_transcriptions()
+            engines.set_active_model(new_choice)
+            self._prefs["whisper_model"] = new_choice
+            self._save_prefs()
+            self._refresh_model_indicators()
+
+        var.trace_add("write", _on_change)
+
+        # Register the var on self so _refresh_model_indicators can
+        # sync it after an external change (currently no external
+        # changers, but future progressive-transcribe code may flip
+        # the model briefly to tiny).
+        if not hasattr(self, "_model_picker_vars"):
+            self._model_picker_vars = []
+        self._model_picker_vars.append(var)
+        return row
+
+    def _show_model_help(self):
+        """Pop a non-modal-feeling help dialog explaining each Whisper
+        model size.  Triggered by the '?' button on every inline picker."""
+        win = tk.Toplevel(self)
+        win.title("Whisper Models")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.resizable(False, False)
+
+        hdr = tk.Frame(win, bg=ACCENT, padx=16, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Whisper Model Sizes",
+                 font=FBT, bg=ACCENT, fg="#1c1c1c").pack(anchor="w")
+
+        body = tk.Frame(win, bg=BG, padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body,
+                 text=("Larger = more accurate but slower and more "
+                       "memory-hungry.  Smaller models still produce "
+                       "useful drafts you can edit in the transcript "
+                       "view.\n\n"
+                       "Speed numbers are rough CPU benchmarks for a "
+                       "single-speaker English clip.  GPU acceleration "
+                       "multiplies all by ~5–15×."),
+                 font=FB, bg=BG, fg=SUB,
+                 justify="left", wraplength=620
+                 ).pack(anchor="w", pady=(0, 14))
+
+        tbl = tk.Frame(body, bg=BG)
+        tbl.pack(fill="x", pady=(0, 8))
+        for col, txt in enumerate(
+                ["Model", "Params", "Speed (CPU)",
+                 "RAM / VRAM", "Notes"]):
+            tk.Label(tbl, text=txt,
+                     font=("Courier New", 10, "bold"),
+                     bg=BG, fg=SUB, anchor="w"
+                     ).grid(row=0, column=col, sticky="w",
+                            padx=(0, 14), pady=(0, 6))
+        for r, (sz, p, sp, mem, note) in enumerate(
+                self._MODEL_INFO, start=1):
+            tk.Label(tbl, text=sz,
+                     font=("Courier New", 11, "bold"),
+                     bg=BG, fg=ACCENT, anchor="w"
+                     ).grid(row=r, column=0, sticky="w",
+                            padx=(0, 14), pady=2)
+            for i, val in enumerate([p, sp, mem], start=1):
+                tk.Label(tbl, text=val, font=FB, bg=BG, fg=TEXT,
+                         anchor="w").grid(row=r, column=i,
+                                          sticky="w", padx=(0, 14))
+            tk.Label(tbl, text=note, font=FB, bg=BG, fg=SUB,
+                     anchor="w", justify="left", wraplength=300
+                     ).grid(row=r, column=4, sticky="w")
+
+        tk.Label(body,
+                 text=("PostBridge bundles tiny, base, and small in "
+                       "every build.  Medium and large-v3 download "
+                       "from Hugging Face the first time you pick them, "
+                       "then cache locally."),
+                 font=FB, bg=BG, fg=SUB,
+                 justify="left", wraplength=620
+                 ).pack(anchor="w", pady=(8, 0))
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(0, 14))
+        self._btn(nav, "CLOSE", win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        ww = max(780, win.winfo_reqwidth())
+        wh = max(380, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
+
     def _is_transcription_running(self):
         """Return True if any transcription is currently in flight.
         Used to gate the Settings dialog model swap — applying a new
@@ -427,183 +609,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
 
     def _refresh_model_indicators(self):
-        """Update every visible 'model: <name>' indicator label in the UI
-        after a Settings change.  Safe to call when none exist — each
-        widget is consulted via getattr + winfo_exists."""
+        """Push the active model name into every visible picker dropdown.
+        Safe to call when none exist."""
         name = engines.get_active_model_size()
-        for attr in ("_pq_model_lbl", "_pq_proj_model_lbl",
-                      "_aaf_model_lbl", "_s3_model_lbl"):
-            w = getattr(self, attr, None)
-            if w is None:
-                continue
+        for var in getattr(self, "_model_picker_vars", []):
             try:
-                if w.winfo_exists():
-                    w.config(text="model: {}".format(name))
+                if var.get() != name:
+                    var.set(name)
             except tk.TclError:
                 pass
 
     def _show_settings_dialog(self):
-        """Settings dialog — currently scoped to Whisper model selection.
-
-        The picker shows the same models faster-whisper supports, with
-        params count, approximate CPU-side speed multiplier vs realtime
-        audio, RAM/VRAM footprint, and a one-line note on quality.
-
-        Choice persists to ~/.postbridge_prefs.json via _save_prefs and
-        is applied via engines.set_active_model(); the cached model
-        instance is cleared so the next transcription loads fresh.
-        """
-        win = tk.Toplevel(self)
-        win.title("PostBridge — Settings")
-        win.configure(bg=BG)
-        win.transient(self); win.grab_set()
-        win.resizable(False, False)
-
-        hdr = tk.Frame(win, bg=ACCENT, padx=16, pady=10)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Transcription Model",
-                 font=FBT, bg=ACCENT, fg="#1c1c1c").pack(anchor="w")
-
-        body = tk.Frame(win, bg=BG, padx=20, pady=14)
-        body.pack(fill="both", expand=True)
-
-        tk.Label(body,
-                 text=("Pick the Whisper model PostBridge uses to "
-                       "transcribe audio.  Larger = more accurate but "
-                       "slower and more memory-hungry.  Smaller models "
-                       "still produce useful drafts you can edit in the "
-                       "Pull Quotes view.\n\n"
-                       "Speed numbers below are rough CPU benchmarks "
-                       "for a single-speaker English clip — your "
-                       "mileage will vary.  Speed roughly doubles each "
-                       "size step down; accuracy roughly halves its "
-                       "error rate each step up."),
-                 font=FB, bg=BG, fg=SUB,
-                 justify="left", wraplength=620).pack(anchor="w",
-                                                      pady=(0, 14))
-
-        current_model = engines.get_active_model_size()
-        self._settings_model_var = tk.StringVar(value=current_model)
-
-        # Model table.  Speed estimates are for CPU; GPU is roughly
-        # 5–15× faster across the board.  RAM values cover the loaded
-        # model plus inference workspace.
-        models = [
-            ("tiny",
-             "39 M",   "~32× real-time", "~150 MB",
-             "Draft quality.  Useful for fast first-pass on slow CPUs."),
-            ("base",
-             "74 M",   "~16× real-time", "~250 MB",
-             "Fast and reasonably accurate.  Strong CPU choice."),
-            ("small",
-             "244 M",  "~6× real-time",  "~600 MB",
-             "Default.  Balanced speed and accuracy on most hardware."),
-            ("medium",
-             "769 M",  "~2× real-time",  "~1.5 GB",
-             "Higher accuracy.  Slow on CPU; comfortable on GPU."),
-            ("large-v3",
-             "1.55 B", "~1× real-time",  "~3 GB",
-             "Best accuracy.  Practical mainly with GPU acceleration."),
-        ]
-
-        tbl = tk.Frame(body, bg=BG)
-        tbl.pack(fill="x", pady=(0, 12))
-
-        # Column headers
-        col_titles = ["", "Model", "Params", "Speed (CPU)",
-                       "RAM / VRAM", "Notes"]
-        for col, txt in enumerate(col_titles):
-            tk.Label(tbl, text=txt,
-                     font=("Courier New", 10, "bold"),
-                     bg=BG, fg=SUB, anchor="w").grid(
-                         row=0, column=col, sticky="w",
-                         padx=(0, 14), pady=(0, 6))
-
-        for r, (sz, p, sp, mem, note) in enumerate(models, start=1):
-            rb = tk.Radiobutton(tbl, value=sz,
-                                 variable=self._settings_model_var,
-                                 bg=BG, fg=TEXT, selectcolor=BG,
-                                 activebackground=BG,
-                                 activeforeground=TEXT,
-                                 highlightthickness=0, bd=0,
-                                 takefocus=0)
-            rb.grid(row=r, column=0, sticky="w")
-            tk.Label(tbl, text=sz,
-                     font=("Courier New", 11, "bold"),
-                     bg=BG, fg=ACCENT, anchor="w"
-                     ).grid(row=r, column=1, sticky="w",
-                            padx=(0, 14), pady=2)
-            for i, val in enumerate([p, sp, mem], start=2):
-                tk.Label(tbl, text=val, font=FB, bg=BG, fg=TEXT,
-                         anchor="w").grid(row=r, column=i,
-                                          sticky="w", padx=(0, 14))
-            tk.Label(tbl, text=note, font=FB, bg=BG, fg=SUB,
-                     anchor="w", justify="left", wraplength=300
-                     ).grid(row=r, column=5, sticky="w")
-
-        # Footer: GPU hint
-        tk.Label(body,
-                 text=("Tip: the Windows-GPU build of PostBridge runs "
-                       "Whisper on NVIDIA cards and is 5-15× faster "
-                       "across all sizes.  Without a GPU, the small / "
-                       "base models give the best speed/accuracy "
-                       "balance."),
-                 font=FB, bg=BG, fg=SUB,
-                 justify="left", wraplength=620).pack(anchor="w",
-                                                      pady=(8, 0))
-
-        nav = tk.Frame(win, bg=BG)
-        nav.pack(fill="x", padx=20, pady=(8, 14))
-
-        def _save_and_close():
-            choice = self._settings_model_var.get()
-            if choice and choice != engines.get_active_model_size():
-                # Refuse a silent mid-transcription swap.  Clearing the
-                # model cache or loading a new CTranslate2 model while
-                # the GPU backend is mid-decode can segfault the whole
-                # process (confirmed crash on small -> tiny swap with
-                # ~8 min audio in flight on Pull Quotes).
-                if self._is_transcription_running():
-                    decision = self._prompt_busy_model_swap(
-                        win, choice, engines.get_active_model_size())
-                    if decision == "back":
-                        return
-                    if decision == "cancel_current":
-                        self._request_cancel_active_transcriptions()
-                engines.set_active_model(choice)
-                self._prefs["whisper_model"] = choice
-                self._save_prefs()
-                # IMPORTANT: we deliberately do NOT clear _model_cache
-                # here.  Dropping the cache entry while another thread
-                # is mid-transcribe risks the CTranslate2 backend
-                # segfaulting on the freed CUDA memory.  The new model
-                # is loaded by the next get_model() call via the normal
-                # path; the previous model stays cached until process
-                # exit (tens to hundreds of MB held; acceptable).
-                self._refresh_model_indicators()
-                messagebox.showinfo(
-                    "Model changed",
-                    "Whisper model set to '{}'.\n\n"
-                    "It loads on the next transcription you start. "
-                    "First-load is slower if the weights aren't "
-                    "already cached.".format(choice),
-                    parent=win)
-            win.destroy()
-
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "APPLY",
-                  _save_and_close, color=ACCENT).pack(side="right")
-        win.bind("<Escape>", lambda e: win.destroy())
-
-        win.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_rootx(), self.winfo_rooty()
-        ww = max(780, win.winfo_reqwidth())
-        wh = max(460, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        """Backwards-compat shim — kept in case anything still calls
+        the old modal entry point.  The inline dropdown pickers
+        replaced it; this just opens the help popup instead."""
+        self._show_model_help()
 
     def _home(self):
         # Reset session-specific state so a new workflow starts clean.
@@ -1203,19 +1223,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "RECONCILE  →",   self._start_reconcile,
                   color=ACCENT).pack(side="right")
 
-        # Model indicator — click to open the picker.  Lives just left of
-        # the RECONCILE button so the user sees which Whisper model their
-        # click will use.
-        self._s3_model_lbl = tk.Label(
-            nav, text="model: {}".format(engines.get_active_model_size()),
-            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=8)
-        self._s3_model_lbl.pack(side="right", padx=(0, 12))
-        self._s3_model_lbl.bind(
-            "<Enter>", lambda e: self._s3_model_lbl.config(fg=ACCENT))
-        self._s3_model_lbl.bind(
-            "<Leave>", lambda e: self._s3_model_lbl.config(fg=SUB))
-        self._s3_model_lbl.bind(
-            "<Button-1>", lambda e: self._show_settings_dialog())
+        # Inline model picker just left of RECONCILE so the user can
+        # change the Whisper size before kicking off the reconcile.
+        self._build_model_picker(nav, bg=BG).pack(side="right",
+                                                   padx=(0, 12))
 
         # ── Background mode toggle ────────────────────────────────────────────
         if not hasattr(self, "_reconcile_bg_mode"):
@@ -10129,20 +10140,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         bg_ck.bind("<Button-1>",  lambda e: _toggle_bg_proj())
         bg_lbl.bind("<Button-1>", lambda e: _toggle_bg_proj())
 
-        # Model indicator — pick the Whisper size before opening any
-        # session.  Lives in the project view's OPTIONS row so the user
-        # doesn't have to enter a session to change it.
-        self._pq_proj_model_lbl = tk.Label(
-            ctrl_row,
-            text="model: {}".format(engines.get_active_model_size()),
-            font=FB, bg=BG, fg=SUB, cursor="hand2", padx=12)
-        self._pq_proj_model_lbl.pack(side="left", padx=(24, 0))
-        self._pq_proj_model_lbl.bind(
-            "<Enter>", lambda e: self._pq_proj_model_lbl.config(fg=ACCENT))
-        self._pq_proj_model_lbl.bind(
-            "<Leave>", lambda e: self._pq_proj_model_lbl.config(fg=SUB))
-        self._pq_proj_model_lbl.bind(
-            "<Button-1>", lambda e: self._show_settings_dialog())
+        # Inline model picker so the user can change the Whisper size
+        # before opening any session.
+        self._build_model_picker(ctrl_row, bg=BG).pack(side="left",
+                                                       padx=(24, 0))
 
         # (MANAGE SPEAKERS removed — speaker labels are renamed inline
         # by double-clicking any "JORDAN:" / "JENA:" header in the
@@ -10736,19 +10737,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             small=True, color=ACCENT)
         self._pq_retx_btn.pack(side="left", padx=(8, 0))
 
-        # Model indicator — click to open the picker.  Lives right next to
-        # TRANSCRIBE so the user sees which model their click will run.
-        self._pq_model_lbl = tk.Label(
-            btn_row,
-            text="model: {}".format(engines.get_active_model_size()),
-            font=FB, bg=SURF, fg=SUB, cursor="hand2", padx=8)
-        self._pq_model_lbl.pack(side="left", padx=(12, 0))
-        self._pq_model_lbl.bind(
-            "<Enter>", lambda e: self._pq_model_lbl.config(fg=ACCENT))
-        self._pq_model_lbl.bind(
-            "<Leave>", lambda e: self._pq_model_lbl.config(fg=SUB))
-        self._pq_model_lbl.bind(
-            "<Button-1>", lambda e: self._show_settings_dialog())
+        # Inline model picker (dropdown + ? help).  Lives right next to
+        # TRANSCRIBE so the user can change the model before clicking.
+        self._build_model_picker(btn_row, bg=SURF).pack(side="left",
+                                                        padx=(16, 0))
 
         # Background-mode checkbox — same intent as the script→session flow:
         # opting in makes the whisper worker yield so the rest of the system
