@@ -1236,15 +1236,27 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
                 for _line in _fc:
                     try:
                         _ce = json.loads(_line)
+                        # Only entries that actually carry both auto_T AND
+                        # accepted_T can teach us anything about per-file
+                        # calibration.  "accepted" verdicts have only
+                        # auto_T (user kept it as-is) and previously
+                        # poisoned _T_CAL_S because accepted_T defaulted
+                        # to 0.0, making delta = -auto_T and wiping out
+                        # the offset on every subsequent run.  "wrong"
+                        # and "verified" verdicts are kept out for the
+                        # original reasons (algorithm grabbed wrong
+                        # reference; no correction data).
                         if (_ce.get("audio") == _audio_name and
-                                _ce.get("verdict") not in ("wrong", "verified")):
+                                _ce.get("verdict") in ("exact", "close")):
                             _first_good = _ce
                             break   # first match wins
                     except Exception:
                         pass
             if _first_good is not None:
-                _delta = (_first_good.get("accepted_T", 0.0)
-                          - _first_good.get("auto_T",     0.0))
+                _auto_T_logged     = _first_good.get("auto_T", 0.0)
+                _accepted_T_logged = _first_good.get("accepted_T",
+                                                      _auto_T_logged)
+                _delta             = _accepted_T_logged - _auto_T_logged
                 _cal_at_log = _first_good.get("cal_global",
                                               _T_CAL_GLOBAL_LEGACY)
                 _T_CAL_S = _delta + _cal_at_log
