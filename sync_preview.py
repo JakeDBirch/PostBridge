@@ -272,8 +272,12 @@ class SyncPreviewDialog:
         bot = tk.Frame(win, bg=BG)
         bot.pack(fill="x", padx=12, pady=(10, 12))
 
+        # Width = longest label ("ACCEPT OFFSET" = 13) so both buttons
+        # render the same visual size.
+        _W = 13
         cancel = tk.Label(bot, text="CANCEL", font=FBT, bg=SURF3, fg=TEXT,
                           cursor="hand2", padx=16, pady=6, bd=0,
+                          width=_W, anchor="center",
                           highlightbackground=BORDER, highlightthickness=1)
         cancel.pack(side="left")
         cancel.bind("<Enter>", lambda e: cancel.config(bg="#5a2020"))
@@ -282,6 +286,7 @@ class SyncPreviewDialog:
 
         accept = tk.Label(bot, text="ACCEPT OFFSET", font=FBT, bg=SUCCESS,
                           fg=TEXT, cursor="hand2", padx=16, pady=6, bd=0,
+                          width=_W, anchor="center",
                           highlightbackground=BORDER, highlightthickness=1)
         accept.pack(side="right")
         accept.bind("<Enter>", lambda e: accept.config(bg="#4a9a51"))

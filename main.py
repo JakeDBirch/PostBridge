@@ -435,8 +435,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  text=("Larger = more accurate but slower.  "
                        "Speeds are CPU; GPU is ~5–15× faster."),
                  font=FB, bg=BG, fg=SUB,
-                 justify="left", wraplength=620
-                 ).pack(anchor="w", pady=(0, 12))
+                 justify="left", wraplength=900
+                 ).pack(anchor="w", pady=(0, 14))
 
         tbl = tk.Frame(body, bg=BG)
         tbl.pack(fill="x", pady=(0, 8))
@@ -460,14 +460,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                          anchor="w").grid(row=r, column=i,
                                           sticky="w", padx=(0, 14))
             tk.Label(tbl, text=note, font=FB, bg=BG, fg=SUB,
-                     anchor="w", justify="left", wraplength=300
+                     anchor="w", justify="left", wraplength=480
                      ).grid(row=r, column=4, sticky="w")
 
         tk.Label(body,
                  text=("Bundled: tiny, base, small.  "
                        "Medium and large-v3 download on first use."),
                  font=FB, bg=BG, fg=SUB,
-                 justify="left", wraplength=620
+                 justify="left", wraplength=900
                  ).pack(anchor="w", pady=(8, 0))
 
         nav = tk.Frame(win, bg=BG)
@@ -479,8 +479,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         win.update_idletasks()
         pw, ph = self.winfo_width(), self.winfo_height()
         px, py = self.winfo_rootx(), self.winfo_rooty()
-        ww = max(780, win.winfo_reqwidth())
-        wh = max(380, win.winfo_reqheight())
+        # Wider default so the notes column has room to breathe instead
+        # of wrapping every line.  Caller can drag tighter if they want.
+        ww = max(1080, win.winfo_reqwidth())
+        wh = max(420, win.winfo_reqheight())
         win.geometry("{}x{}+{}+{}".format(
             ww, wh,
             px + max(0, (pw - ww) // 2),
@@ -540,10 +542,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             result["choice"] = c
             win.destroy()
 
-        # Three uniform buttons — same size, same height, right-aligned.
+        # Width = longest label ("CANCEL & APPLY NOW" = 18).  Snug so
+        # BACK doesn't sit in a sea of centred whitespace.
         nav = tk.Frame(win, bg=BG)
         nav.pack(fill="x", padx=20, pady=(0, 14))
-        _W = 20   # chars; comfortably fits "CANCEL & APPLY NOW"
+        _W = 18
         self._btn(nav, "BACK", lambda: _pick("back"),
                   width=_W).pack(side="left")
         self._btn(nav, "CANCEL & APPLY NOW",
@@ -2904,7 +2907,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(win, bg=BG)
         nav.pack(fill="x", padx=20, pady=(0, 14))
-        self._btn(nav, "CLOSE", win.destroy).pack(side="right")
+        self._btn(nav, "CLOSE", win.destroy, width=10
+                  ).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
@@ -10585,8 +10589,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             win.destroy()
             self._pq_open_session_view(session, transcribe_now=True)
 
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "TRANSCRIBE  →", _go, color=ACCENT).pack(side="right")
+        _W = 14  # fits "TRANSCRIBE  →"
+        self._btn(nav, "CANCEL", win.destroy, width=_W).pack(side="left")
+        self._btn(nav, "TRANSCRIBE  →", _go,
+                  color=ACCENT, width=_W).pack(side="right")
 
         _refresh_list()
         tok_entry.focus_set()
@@ -11549,8 +11555,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
             return "break"
 
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "SAVE",   _save, color=ACCENT).pack(side="right")
+        _W = 8  # fits "CANCEL"
+        self._btn(nav, "CANCEL", win.destroy, width=_W).pack(side="left")
+        self._btn(nav, "SAVE", _save,
+                  color=ACCENT, width=_W).pack(side="right")
         win.bind("<Control-Return>",   _save)
         win.bind("<Control-KP_Enter>", _save)
         ent.bind("<Control-Return>",   _save)
@@ -11656,8 +11664,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._pq_render_notes_panel()
             return "break"
 
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "SAVE NOTE", _save, color=ACCENT).pack(side="right")
+        _W = 10  # fits "SAVE NOTE"
+        self._btn(nav, "CANCEL", win.destroy, width=_W).pack(side="left")
+        self._btn(nav, "SAVE NOTE", _save,
+                  color=ACCENT, width=_W).pack(side="right")
         # Ctrl+Enter from anywhere in the dialog (incl. inside the Text
         # widget where Tk's class binding for <Return> would normally
         # eat the event).  Bind on both the window and the editor.
@@ -12122,8 +12132,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "Renamed {} speaker label{}.".format(
                     renamed, "s" if renamed != 1 else ""))
 
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "SAVE",   _save, color=ACCENT).pack(side="right")
+        _W = 8
+        self._btn(nav, "CANCEL", win.destroy, width=_W).pack(side="left")
+        self._btn(nav, "SAVE", _save,
+                  color=ACCENT, width=_W).pack(side="right")
 
         win.update_idletasks()
         pw = self.winfo_width(); ph = self.winfo_height()
@@ -12208,8 +12220,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             # Re-render the open session view
             self._pq_render_transcript_text(session)
 
-        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
-        self._btn(nav, "RENAME", _apply, color=ACCENT).pack(side="right")
+        _W = 8
+        self._btn(nav, "CANCEL", win.destroy, width=_W).pack(side="left")
+        self._btn(nav, "RENAME", _apply,
+                  color=ACCENT, width=_W).pack(side="right")
         win.bind("<Return>", lambda e: _apply())
         win.bind("<Escape>", lambda e: win.destroy())
 
@@ -12569,7 +12583,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             result["choice"] = c
             win.destroy()
 
-        _W = 16   # chars; fits "RE-TRANSCRIBE"
+        # Width = longest label (RE-TRANSCRIBE = 13).  Snug so short
+        # labels don't sit in a sea of centred whitespace.
+        _W = 13
         self._btn(nav, "CANCEL", lambda: _pick("cancel"),
                   width=_W).pack(side="left")
         # "Use cached" only makes sense when there's a sidecar to load from.
