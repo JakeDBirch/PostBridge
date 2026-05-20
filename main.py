@@ -307,6 +307,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
         for w in self.body.winfo_children(): w.destroy()
 
+    def _is_transcription_running(self):
+        """Return True if any transcription is currently in flight.
+        Used to gate the Settings dialog model swap — applying a new
+        model mid-transcription can segfault the CTranslate2 backend
+        (confirmed crash with small -> tiny swap on GPU)."""
+        # Pull Quotes: every session carries a _progress.active flag
+        # while its Whisper worker is running.
+        proj = getattr(self, "_pq_project", None)
+        if proj is not None:
+            for s in proj.get("sessions", []):
+                if (s.get("_progress") or {}).get("active"):
+                    return True
+        # Script -> Session: tracked by the global busy flag the
+        # reconcile launcher sets (see _start_reconcile / _finish_reconcile).
+        if getattr(self, "_reconcile_busy", False):
+            return True
+        return False
+
     def _refresh_model_indicators(self):
         """Update every visible 'model: <name>' indicator label in the UI
         after a Settings change.  Safe to call when none exist — each
@@ -439,21 +457,40 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         def _save_and_close():
             choice = self._settings_model_var.get()
             if choice and choice != engines.get_active_model_size():
+                # Refuse a silent mid-transcription swap.  Clearing the
+                # model cache or loading a new CTranslate2 model while
+                # the GPU backend is mid-decode can segfault the whole
+                # process (confirmed crash on small -> tiny swap with
+                # ~8 min audio in flight on Pull Quotes).
+                if self._is_transcription_running():
+                    if not messagebox.askyesno(
+                        "Transcription in Progress",
+                        "A transcription is currently running.\n\n"
+                        "The new model ('{}') will take effect on the "
+                        "NEXT transcription — the in-flight run keeps "
+                        "using '{}' to avoid crashing the inference "
+                        "engine.\n\n"
+                        "Apply anyway?".format(
+                            choice, engines.get_active_model_size()),
+                        parent=win, icon="warning"):
+                        return
                 engines.set_active_model(choice)
                 self._prefs["whisper_model"] = choice
                 self._save_prefs()
-                # Drop any cached model so the new size loads on the
-                # next transcription.  The old model is garbage-collected.
-                engines._model_cache.clear()
-                # Refresh any visible model-indicator labels so the new
-                # choice is reflected immediately.
+                # IMPORTANT: we deliberately do NOT clear _model_cache
+                # here.  Dropping the cache entry while another thread
+                # is mid-transcribe risks the CTranslate2 backend
+                # segfaulting on the freed CUDA memory.  The new model
+                # is loaded by the next get_model() call via the normal
+                # path; the previous model stays cached until process
+                # exit (tens to hundreds of MB held; acceptable).
                 self._refresh_model_indicators()
                 messagebox.showinfo(
                     "Model changed",
                     "Whisper model set to '{}'.\n\n"
-                    "The new model loads on the next transcription "
-                    "(first run is slower — model is downloaded if "
-                    "not already cached).".format(choice),
+                    "It loads on the next transcription you start. "
+                    "First-load is slower if the weights aren't "
+                    "already cached.".format(choice),
                     parent=win)
             win.destroy()
 
@@ -3396,6 +3433,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         }
         pad_secs = self.pad_var.get()
 
+        # Flag the reconcile as busy so _is_transcription_running()
+        # (used by the Settings dialog model-swap gate) reports True.
+        self._reconcile_busy = True
         threading.Thread(
             target=self._run_reconcile,
             args=(int_assets, token_audio_paths, pad_secs),
@@ -4499,6 +4539,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         transitions to Step 4.  All Tk operations happen here, safely."""
         self._dot_running = False   # stop the animated dots
         self._res_monitor_running = False   # stop the resource poller
+        # Clear the reconcile-busy flag so the Settings model picker
+        # stops gating itself behind the warning dialog.
+        self._reconcile_busy = False
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
