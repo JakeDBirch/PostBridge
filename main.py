@@ -348,12 +348,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  ).pack(side="left", padx=(0, 4))
         var = tk.StringVar(value=engines.get_active_model_size())
         opt = tk.OptionMenu(row, var, *self._MODEL_SIZES)
-        # OptionMenu defaults are heavy and don't fit our dark theme —
-        # tighten font and colours.
+        # Fix the dropdown to a single width regardless of which model
+        # is selected — without this the picker shrinks for "tiny" and
+        # grows for "large-v3", causing the whole row to jitter on
+        # change.  9 chars comfortably fits "large-v3" plus the chevron.
         opt.config(font=FB, bg=SURF2, fg=TEXT,
                     activebackground=ACCENT, activeforeground=TEXT,
                     highlightthickness=0, bd=0, padx=8, pady=2,
-                    cursor="hand2")
+                    cursor="hand2", width=9, anchor="w",
+                    indicatoron=True)
         opt["menu"].config(font=FB, bg=SURF2, fg=TEXT,
                             activebackground=ACCENT,
                             activeforeground=TEXT, bd=0)
@@ -429,16 +432,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         body.pack(fill="both", expand=True)
 
         tk.Label(body,
-                 text=("Larger = more accurate but slower and more "
-                       "memory-hungry.  Smaller models still produce "
-                       "useful drafts you can edit in the transcript "
-                       "view.\n\n"
-                       "Speed numbers are rough CPU benchmarks for a "
-                       "single-speaker English clip.  GPU acceleration "
-                       "multiplies all by ~5–15×."),
+                 text=("Larger = more accurate but slower.  "
+                       "Speeds are CPU; GPU is ~5–15× faster."),
                  font=FB, bg=BG, fg=SUB,
                  justify="left", wraplength=620
-                 ).pack(anchor="w", pady=(0, 14))
+                 ).pack(anchor="w", pady=(0, 12))
 
         tbl = tk.Frame(body, bg=BG)
         tbl.pack(fill="x", pady=(0, 8))
@@ -466,17 +464,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                      ).grid(row=r, column=4, sticky="w")
 
         tk.Label(body,
-                 text=("PostBridge bundles tiny, base, and small in "
-                       "every build.  Medium and large-v3 download "
-                       "from Hugging Face the first time you pick them, "
-                       "then cache locally."),
+                 text=("Bundled: tiny, base, small.  "
+                       "Medium and large-v3 download on first use."),
                  font=FB, bg=BG, fg=SUB,
                  justify="left", wraplength=620
                  ).pack(anchor="w", pady=(8, 0))
 
         nav = tk.Frame(win, bg=BG)
         nav.pack(fill="x", padx=20, pady=(0, 14))
-        self._btn(nav, "CLOSE", win.destroy).pack(side="right")
+        self._btn(nav, "CLOSE", win.destroy, width=14
+                  ).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
@@ -531,28 +528,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         body = tk.Frame(win, bg=BG, padx=20, pady=14)
         body.pack(fill="both", expand=True)
         tk.Label(body,
-                 text=("A transcription is currently running with the "
-                       "'{}' model.\n\n"
-                       "Live model swaps can crash the inference engine "
-                       "(CTranslate2 doesn't tolerate the model being "
-                       "freed mid-decode), so PostBridge offers two "
-                       "safe paths:".format(current_choice)),
+                 text=("A transcription is running with '{}'.\n"
+                       "How do you want to switch to '{}'?".format(
+                           current_choice, new_choice)),
                  font=FB, bg=BG, fg=TEXT, justify="left",
-                 wraplength=540).pack(anchor="w", pady=(0, 10))
-
-        # Two-option summary so the buttons are self-explanatory
-        opts = tk.Frame(body, bg=BG)
-        opts.pack(fill="x", pady=(0, 12))
-        tk.Label(opts,
-                 text=("Apply on next run — the running transcription "
-                       "finishes with '{}'; '{}' kicks in on the next "
-                       "TRANSCRIBE click.\n\n"
-                       "Cancel & apply now — the running transcription "
-                       "is abandoned (its results are discarded) and "
-                       "'{}' becomes active immediately."
-                       .format(current_choice, new_choice, new_choice)),
-                 font=FB, bg=BG, fg=SUB, justify="left",
-                 wraplength=540).pack(anchor="w")
+                 wraplength=540).pack(anchor="w", pady=(0, 12))
 
         result = {"choice": "back"}
 
@@ -560,16 +540,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             result["choice"] = c
             win.destroy()
 
+        # Three uniform buttons — same size, same height, right-aligned.
         nav = tk.Frame(win, bg=BG)
         nav.pack(fill="x", padx=20, pady=(0, 14))
+        _W = 20   # chars; comfortably fits "CANCEL & APPLY NOW"
         self._btn(nav, "BACK", lambda: _pick("back"),
-                  small=True).pack(side="left")
+                  width=_W).pack(side="left")
         self._btn(nav, "CANCEL & APPLY NOW",
                   lambda: _pick("cancel_current"),
-                  color=ERR).pack(side="right")
+                  color=ERR, width=_W
+                  ).pack(side="right")
         self._btn(nav, "APPLY ON NEXT RUN",
                   lambda: _pick("apply_next"),
-                  color=ACCENT).pack(side="right", padx=(0, 8))
+                  color=ACCENT, width=_W
+                  ).pack(side="right", padx=(0, 8))
         win.bind("<Escape>", lambda e: _pick("back"))
 
         win.update_idletasks()
@@ -880,14 +864,23 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         widget.bind("<Enter>", _show, add="+")
         widget.bind("<Leave>", _hide, add="+")
 
-    def _btn(self, parent, label, cmd, small=False, color=None):
+    def _btn(self, parent, label, cmd, small=False, color=None,
+              width=None):
+        # `width` is in characters and gives all buttons in a row the
+        # same visual width when their labels differ.  Use it whenever
+        # several buttons appear together so they align cleanly instead
+        # of each sizing to its own label.
         bg  = color or SURF3
         pad = (8,4) if small else (16,8)
-        w   = tk.Label(parent, text=label,
-                       font=FB if small else FBT,
-                       bg=bg, fg=TEXT,
-                       cursor="arrow", padx=pad[0], pady=pad[1],
-                       bd=0, highlightbackground=BORDER, highlightthickness=1)
+        kw  = dict(text=label,
+                    font=FB if small else FBT,
+                    bg=bg, fg=TEXT,
+                    cursor="arrow", padx=pad[0], pady=pad[1],
+                    bd=0, highlightbackground=BORDER, highlightthickness=1,
+                    anchor="center")
+        if width is not None:
+            kw["width"] = width
+        w   = tk.Label(parent, **kw)
         w.bind("<Enter>", lambda e, w=w: w.config(bg=ACCENT, fg=TEXT))
         w.bind("<Leave>", lambda e, w=w, c=bg: w.config(bg=c, fg=TEXT))
         def _press(e, w=w, f=cmd):
@@ -12554,25 +12547,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             wc = len([w for w in session.get("transcript", [])
                       if (w.get("word") or "").strip()])
             lines.append(
-                "This session already has a transcript ({:,} words).".format(wc))
+                "Session already has a {:,}-word transcript.".format(wc))
         if sidecar_paths:
             n = len(sidecar_paths)
             lines.append(
-                "{} cached transcript{} found next to the source audio "
-                "(.pb_transcript.json from a prior run).".format(
+                "{} cached transcript{} on disk.".format(
                     n, "s" if n != 1 else ""))
-        lines.append("")
-        lines.append(
-            "Re-transcribing will overwrite any edits you've made and "
-            "burn GPU time you've already paid.")
+        lines.append("Re-transcribing overwrites any edits.")
 
         tk.Label(body, text="\n".join(lines), font=FB,
                  bg=BG, fg=TEXT, justify="left",
                  wraplength=520).pack(anchor="w", pady=(0, 14))
 
         result = {"choice": "cancel"}
-        # NOTE: widget-level pady expects a single screen distance — tuples
-        # are only valid on pack().  Put the asymmetric padding on pack.
+        # Uniform button sizing — all three buttons same width and height
+        # so they align cleanly along the bottom row.
         nav = tk.Frame(win, bg=BG)
         nav.pack(fill="x", padx=20, pady=(0, 14))
 
@@ -12580,15 +12569,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             result["choice"] = c
             win.destroy()
 
+        _W = 16   # chars; fits "RE-TRANSCRIBE"
         self._btn(nav, "CANCEL", lambda: _pick("cancel"),
-                  small=True).pack(side="left")
+                  width=_W).pack(side="left")
         # "Use cached" only makes sense when there's a sidecar to load from.
         if sidecar_paths:
             self._btn(nav, "USE EXISTING",
                       lambda: _pick("use_cached"),
-                      color=ACCENT).pack(side="right", padx=(8, 0))
-        self._btn(nav, "RE-TRANSCRIBE (overwrite)",
-                  lambda: _pick("transcribe")).pack(side="right")
+                      color=ACCENT, width=_W
+                      ).pack(side="right", padx=(8, 0))
+        self._btn(nav, "RE-TRANSCRIBE",
+                  lambda: _pick("transcribe"),
+                  width=_W).pack(side="right")
 
         win.bind("<Escape>", lambda e: _pick("cancel"))
 
