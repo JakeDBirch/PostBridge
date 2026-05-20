@@ -34,15 +34,16 @@ The GPU build is a drop-in replacement — same data files, same session JSONs, 
 
 ## What it does
 
-PostBridge handles three workflows:
+PostBridge handles four workflows:
 
 | Workflow | Use when |
 |---|---|
 | **Pull Quotes** | You have raw interview audio and want to read the transcript, highlight quotes, and copy them straight into your script with precise timecodes baked in. |
+| **Format Script** | You have a draft script written in any format and want help converting it to PostBridge markup — block builders, token lists, an AI prompt for ChatGPT/Claude. |
 | **Script → Session** | You have a formatted script with marked interview pulls and want PostBridge to find each quote on tape and assemble an editor-ready timeline. |
 | **AAF → XML** | Pro Tools audio is locked. You need to hand it off to Premiere/FCP with the correct video synced underneath. |
 
-The three workflows share transcript caches — a session transcribed in Pull Quotes is instantly available to Script → Session reconcile, and vice versa.
+The four workflows share transcript caches — a session transcribed in Pull Quotes is instantly available to Script → Session reconcile, and vice versa.
 
 ---
 
@@ -95,7 +96,39 @@ Paste straight into your PostBridge script. Timecodes are Whisper-precise — no
 
 ---
 
-## Workflow 2: Script → Session
+## Workflow 2: Format Script
+
+For when you have a draft script in plain prose, a Google Doc, a Word file, etc., and need to convert it into PostBridge's bracketed markup before reconciling.
+
+From the home screen, choose **FORMAT SCRIPT**. The view is a set of cards:
+
+### Format reference
+
+Shows the directive cheat sheet inline — `[PART …]`, `[VO …]`, `[<TOKEN> HH:MM:SS-HH:MM:SS]` — with examples of how the body text flows under each header. Useful when you're writing from scratch.
+
+### Copy AI Prompt
+
+Generates a paste-ready instruction block for ChatGPT / Claude / any LLM. Paste the prompt followed by your raw script and the model rewrites it into PostBridge format. Faster than learning the syntax by hand — and the AI also catches token-naming inconsistencies that would break reconcile later.
+
+### Episode Tokens
+
+A multi-line text input where you list every speaker/asset token used in the episode. As you type, the cards below register chips for each token so the @PULL builder knows what to offer. Clicking **Copy [TOKENS] block** copies the full `[TOKENS]…[/TOKENS]` header for pasting into the top of your script.
+
+### Block builders
+
+Three composers for the three header types:
+
+- **[PART name]** — type a part name, hit copy, paste at a section boundary in your script
+- **[VO id]** — pick from your registered tokens, optionally paste the body text, copy the block
+- **[<TOKEN> in-out]** — pick a token, enter in/out timecodes, paste the quote text, copy a complete @PULL block
+
+Every "copy" button confirms with a brief ✓ Copied! marker so you can move quickly between PostBridge and your script editor.
+
+The Format Script tool produces plain text only — no PostBridge state is saved. You assemble your script in whatever editor you prefer (VS Code, Google Docs, plain Notepad) and then save it as `.txt` for Script → Session to load.
+
+---
+
+## Workflow 3: Script → Session
 
 For when you already have a script with marked interview pulls.
 
@@ -138,7 +171,7 @@ Choose **AAF** or **XML**, set sequence name and inter-part gap, then export.
 
 ---
 
-## Workflow 3: AAF → XML
+## Workflow 4: AAF → XML
 
 For when audio is locked in Pro Tools and needs Premiere-compatible video sync.
 
