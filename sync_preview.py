@@ -272,18 +272,10 @@ class SyncPreviewDialog:
         bot = tk.Frame(win, bg=BG)
         bot.pack(fill="x", padx=12, pady=(10, 12))
 
-        # Width = longest label ("ACCEPT OFFSET" = 13) so both buttons
-        # render the same visual size.
+        # Both buttons pack right-aligned with an 8 px gap so they read
+        # as a single tight action group instead of CANCEL hugging the
+        # left edge and ACCEPT floating on the right.
         _W = 13
-        cancel = tk.Label(bot, text="CANCEL", font=FBT, bg=SURF3, fg=TEXT,
-                          cursor="hand2", padx=16, pady=6, bd=0,
-                          width=_W, anchor="center",
-                          highlightbackground=BORDER, highlightthickness=1)
-        cancel.pack(side="left")
-        cancel.bind("<Enter>", lambda e: cancel.config(bg="#5a2020"))
-        cancel.bind("<Leave>", lambda e: cancel.config(bg=SURF3))
-        cancel.bind("<ButtonRelease-1>", lambda e: self._on_cancel())
-
         accept = tk.Label(bot, text="ACCEPT OFFSET", font=FBT, bg=SUCCESS,
                           fg=TEXT, cursor="hand2", padx=16, pady=6, bd=0,
                           width=_W, anchor="center",
@@ -292,6 +284,15 @@ class SyncPreviewDialog:
         accept.bind("<Enter>", lambda e: accept.config(bg="#4a9a51"))
         accept.bind("<Leave>", lambda e: accept.config(bg=SUCCESS))
         accept.bind("<ButtonRelease-1>", lambda e: self._on_accept_click())
+
+        cancel = tk.Label(bot, text="CANCEL", font=FBT, bg=SURF3, fg=TEXT,
+                          cursor="hand2", padx=16, pady=6, bd=0,
+                          width=_W, anchor="center",
+                          highlightbackground=BORDER, highlightthickness=1)
+        cancel.pack(side="right", padx=(0, 8))
+        cancel.bind("<Enter>", lambda e: cancel.config(bg="#5a2020"))
+        cancel.bind("<Leave>", lambda e: cancel.config(bg=SURF3))
+        cancel.bind("<ButtonRelease-1>", lambda e: self._on_cancel())
 
     # ── Waveform Extraction (background) ──────────────────────────────────
 
