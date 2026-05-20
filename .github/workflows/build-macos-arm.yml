@@ -1,0 +1,57 @@
+name: Build PostBridge — macOS (Apple Silicon)
+
+# Manual trigger only — Actions tab → "Build PostBridge — macOS
+# (Apple Silicon)" → Run workflow.  Produces the PostBridge-mac-arm64
+# artifact (.app bundle, ~1.2 GB with bundled tiny/base/small Whisper
+# models).
+#
+# Intel Macs (pre-2020) run the ARM build via Rosetta 2 — no separate
+# job needed.  macos-13 Intel runners were deprecated by GitHub in
+# early 2025.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14        # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Pre-download Whisper models (tiny / base / small)
+        # Bundling these three keeps the install size manageable while
+        # covering the practical choices for non-GPU users.  Medium and
+        # large-v3 still download on first use.
+        run: python _download_bundled_models.py
+
+      - name: Download ffmpeg (macOS ARM64)
+        run: |
+          mkdir -p ffmpeg-bin
+          base="https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          curl -fL -o ffmpeg-bin/ffmpeg-osx-arm64  "$base/ffmpeg-osx-arm64"
+          curl -fL -o ffmpeg-bin/ffprobe-osx-arm64 "$base/ffprobe-osx-arm64"
+          chmod +x ffmpeg-bin/ffmpeg-osx-arm64 ffmpeg-bin/ffprobe-osx-arm64
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip .app (preserving macOS metadata)
+        run: ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-mac-arm64
+          path: PostBridge-mac-arm64.zip
+          retention-days: 5

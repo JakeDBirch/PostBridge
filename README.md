@@ -8,15 +8,16 @@ Built for **Windows** and **macOS** (Apple Silicon + Intel via Rosetta 2).
 
 ## Download
 
-Pre-built app bundles are produced manually via [GitHub Actions](https://github.com/JakeDBirch/PostBridge/actions):
+Pre-built app bundles are produced manually via [GitHub Actions](https://github.com/JakeDBirch/PostBridge/actions). Three independent workflows — pick the one you actually need so you don't burn artifact storage on builds you'll never download:
 
-1. Go to the **Actions** tab → click a **Build PostBridge** run marked ✓
-2. Download the artifact for your platform under the **Artifacts** section:
-   - `PostBridge-windows` → Windows (x64) — **CPU only**, ~500 MB
-   - `PostBridge-windows-gpu` → Windows (x64) — **NVIDIA CUDA bundled**, ~3.5 GB
-   - `PostBridge-mac-arm64` → macOS Apple Silicon (M1/M2/M3)
+1. Go to the **Actions** tab and pick a workflow from the left sidebar:
+   - **Build PostBridge — Windows (CPU)** → Windows (x64), CPU only, ~1.2 GB
+   - **Build PostBridge — Windows (GPU)** → Windows (x64), NVIDIA CUDA bundled, ~4 GB
+   - **Build PostBridge — macOS (Apple Silicon)** → macOS M1/M2/M3, ~1.2 GB
+2. Click **Run workflow** → wait for the green check
+3. Open the completed run and download the artifact from the **Artifacts** section
 
-No Python installation required — everything is bundled.
+No Python installation required — everything is bundled. Each workflow ships its build only; nothing else runs in parallel.
 
 **Which Windows build do I want?**
 

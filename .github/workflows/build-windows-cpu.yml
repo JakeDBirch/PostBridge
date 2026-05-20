@@ -1,0 +1,56 @@
+name: Build PostBridge — Windows (CPU)
+
+# Manual trigger only — Actions tab → "Build PostBridge — Windows (CPU)"
+# → Run workflow.  Produces the PostBridge-windows artifact (~1.2 GB
+# with bundled tiny/base/small Whisper models).
+#
+# This is the smaller, no-GPU Windows build.  For NVIDIA GPU users,
+# run "Build PostBridge — Windows (GPU)" instead.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Pre-download Whisper models (tiny / base / small)
+        # Bundling these three keeps the install size manageable while
+        # covering the practical choices for non-GPU users.  Medium and
+        # large-v3 still download on first use.
+        run: python _download_bundled_models.py
+
+      - name: Download ffmpeg (Windows x64)
+        shell: pwsh
+        run: |
+          $base = "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
+          New-Item -ItemType Directory -Force ffmpeg-bin | Out-Null
+          Invoke-WebRequest "$base/ffmpeg-win-x64.exe"  -OutFile "ffmpeg-bin\ffmpeg.exe"
+          Invoke-WebRequest "$base/ffprobe-win-x64.exe" -OutFile "ffmpeg-bin\ffprobe.exe"
+
+      - name: Build with PyInstaller
+        run: pyinstaller PostBridge.spec --noconfirm
+
+      - name: Zip output folder
+        shell: pwsh
+        run: Compress-Archive -Path dist\PostBridge -DestinationPath PostBridge-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-windows
+          path: PostBridge-windows.zip
+          retention-days: 5
