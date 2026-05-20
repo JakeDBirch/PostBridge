@@ -528,7 +528,8 @@ def match_source_to_video(source_base, video_paths):
 
 def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
                         sample_rate=8000, start_offset=0.0,
-                        n_probes=3):
+                        n_probes=3, return_candidates=False,
+                        has_slate=False):
     """Multi-window sync detection wrapper.
 
     Real-world video/audio files have setup/teardown noise at the head
@@ -544,14 +545,29 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
 
     n_probes=1 reproduces the legacy single-window behaviour (used for
     short files or when explicit start_offset is supplied).
+
+    When ``return_candidates`` is True the function returns a 3-tuple
+    ``(T, conf, candidates)``.  ``candidates`` is a list of up to ~5
+    ``(T_alt, conf_alt)`` tuples representing runner-up sync hypotheses
+    surfaced by Stage 1 — used by the sync-preview dialog to let the
+    user audition alternatives when the auto pick is wrong.
     """
+
+    def _emit(T, conf, alts):
+        if return_candidates:
+            return T, conf, alts
+        return T, conf
+
     # Legacy single-window path — preserve the original behaviour when
     # the caller specifies an explicit start_offset or asks for one probe.
     if n_probes <= 1 or start_offset != 0.0:
-        return _detect_sync_offset_at(video_path, audio_path,
-                                       probe_duration=probe_duration,
-                                       sample_rate=sample_rate,
-                                       start_offset=start_offset)
+        T, conf, alts = _detect_sync_offset_at(
+            video_path, audio_path,
+            probe_duration=probe_duration,
+            sample_rate=sample_rate,
+            start_offset=start_offset,
+            has_slate=has_slate)
+        return _emit(T, conf, alts)
 
     # Probe file duration so we can place windows away from head/tail.
     # Lazy import to avoid circular dependency on engines.
@@ -564,10 +580,13 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     # If we can't measure the file or it's too short for multi-window
     # probing to add value, fall back to the legacy single-window run.
     if total < probe_duration * 1.5:
-        return _detect_sync_offset_at(video_path, audio_path,
-                                       probe_duration=probe_duration,
-                                       sample_rate=sample_rate,
-                                       start_offset=0.0)
+        T, conf, alts = _detect_sync_offset_at(
+            video_path, audio_path,
+            probe_duration=probe_duration,
+            sample_rate=sample_rate,
+            start_offset=0.0,
+            has_slate=has_slate)
+        return _emit(T, conf, alts)
 
     # Probe centres at ~25 %, ~50 %, ~75 % of the file.  Each probe
     # consumes probe_duration seconds; clamp so we don't fall off the end.
@@ -581,30 +600,34 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     # De-dupe to avoid running the same window twice on short files.
     probe_starts = sorted(set(round(s, 1) for s in probe_starts))
     if len(probe_starts) < 2:
-        return _detect_sync_offset_at(video_path, audio_path,
-                                       probe_duration=probe_duration,
-                                       sample_rate=sample_rate,
-                                       start_offset=probe_starts[0]
-                                       if probe_starts else 0.0)
+        T, conf, alts = _detect_sync_offset_at(
+            video_path, audio_path,
+            probe_duration=probe_duration,
+            sample_rate=sample_rate,
+            start_offset=probe_starts[0] if probe_starts else 0.0,
+            has_slate=has_slate)
+        return _emit(T, conf, alts)
 
     # Run probes sequentially — each call is already CPU-bound on FFT
     # work; parallelising them would just fight for the same cores and
     # produce the same wall-clock with worse contention.
-    results = []
+    results = []          # list of (T, conf, start, alts)
     for s in probe_starts:
         try:
-            T, conf = _detect_sync_offset_at(video_path, audio_path,
-                                              probe_duration=probe_duration,
-                                              sample_rate=sample_rate,
-                                              start_offset=s)
-            results.append((T, conf, s))
+            T, conf, alts = _detect_sync_offset_at(
+                video_path, audio_path,
+                probe_duration=probe_duration,
+                sample_rate=sample_rate,
+                start_offset=s,
+                has_slate=has_slate)
+            results.append((T, conf, s, alts))
         except Exception:
             pass
 
     if not results:
-        return 0.0, 0.0
+        return _emit(0.0, 0.0, [])
     if len(results) == 1:
-        return results[0][0], results[0][1]
+        return _emit(results[0][0], results[0][1], results[0][3])
 
     # Cluster offsets that agree within ±AGREE_S.  True offset → every
     # probe lands inside the same cluster.  False peak → probes scatter
@@ -621,27 +644,47 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
         if len(cluster) > len(best_cluster):
             best_cluster = cluster
 
+    # Build the merged candidate list for audition: each probe's main
+    # answer (if not the cluster winner) PLUS each probe's alternatives.
+    # Sort by confidence and dedup within ±0.5 s.
     if len(best_cluster) >= 2:
-        # Confidence-weighted average across agreeing probes.
         total_w = sum(r[1] for r in best_cluster) or float(len(best_cluster))
         avg_T = sum(r[0] * (r[1] or 1.0) for r in best_cluster) / total_w
-        # Agreement across N windows is itself strong evidence — bump
-        # confidence to reflect that.  Two-window agreement caps at
-        # 0.92; full N-way agreement reaches 1.0.
         max_inner = max(r[1] for r in best_cluster)
         agree_floor = 0.92 if len(best_cluster) == 2 else 1.0
         final_conf = min(1.0, max(max_inner, agree_floor))
-        return round(avg_T, 6), round(final_conf, 4)
+        final_T = round(avg_T, 6)
+        final_conf = round(final_conf, 4)
+    else:
+        best = max(results, key=lambda r: r[1])
+        final_T    = round(best[0], 6)
+        final_conf = round(min(best[1], 0.45), 4)
 
-    # No probes agreed — that's a strong signal something's off.  Return
-    # the highest-confidence single result but DEMOTE its confidence so
-    # the UI flags it for manual verification.
-    best = max(results, key=lambda r: r[1])
-    return round(best[0], 6), round(min(best[1], 0.45), 4)
+    # Aggregate alternatives across all probes.  Include each probe's
+    # own main answer as a candidate too (it might be the correct one
+    # the wrapper rejected via clustering).
+    _DEDUP_S = 0.5
+    merged = []
+    pool = []
+    for T_p, conf_p, _s, alts_p in results:
+        pool.append((T_p, conf_p))
+        pool.extend(alts_p or [])
+    pool.sort(key=lambda x: -x[1])
+    for t, c in pool:
+        if abs(t - final_T) <= _DEDUP_S:
+            continue
+        if any(abs(t - x[0]) <= _DEDUP_S for x in merged):
+            continue
+        merged.append((round(t, 4), round(min(1.0, c), 4)))
+        if len(merged) >= 5:
+            break
+
+    return _emit(final_T, final_conf, merged)
 
 
 def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
-                            sample_rate=8000, start_offset=0.0):
+                            sample_rate=8000, start_offset=0.0,
+                            has_slate=False):
     """
     Hierarchical multi-scale sync detection.
 
@@ -805,7 +848,8 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
         conf        = min(1.0, z / 8.0)
         return lag, conf
 
-    def _xcorr_top_n(a_sig, b_sig, max_lag_samp, n_peaks=3, min_gap=5):
+    def _xcorr_top_n(a_sig, b_sig, max_lag_samp, n_peaks=3, min_gap=5,
+                      phat=False):
         """
         Like _xcorr_bounded but returns the top-N (lag, conf) pairs,
         each at least min_gap lag-samples apart.  Peaks are found by
@@ -816,13 +860,22 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
         Used for multi-candidate Stage 1: instead of committing to the
         single strongest 1 Hz peak, we keep the top 3 and let Stage 2
         arbitrate by running a separate ±20 s search from each.
+
+        ``phat=True`` applies GCC-PHAT weighting: the cross-spectrum is
+        normalised by its magnitude before inverse-FFT, whitening the
+        result so impulsive events (claps, slate transients) produce
+        sharp peaks instead of broad smears.  Slate-aware sync detection
+        uses this.
         """
         na, nb = len(a_sig), len(b_sig)
         n  = na + nb - 1
         N  = 1 << int(_np.ceil(_np.log2(max(n, 1))))
-        C  = _np.fft.irfft(
-                 _np.fft.rfft(b_sig, N) * _np.conj(_np.fft.rfft(a_sig, N)),
-                 N)[:n]
+        A = _np.fft.rfft(a_sig, N)
+        B = _np.fft.rfft(b_sig, N)
+        X = B * _np.conj(A)
+        if phat:
+            X = X / (_np.abs(X) + 1e-12)
+        C  = _np.fft.irfft(X, N)[:n]
         C_abs = _np.abs(C)
 
         ml      = min(max_lag_samp, n // 2 - 1)
@@ -922,14 +975,23 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
     _DUR_A   = int(60.0 * _SR1_EXTR)   # first 60 s in raw samples
     _raw_v_a = raw_vid1[:_DUR_A]
     _raw_a_a = raw_aud1[:_DUR_A]
-    _env_v_a = _peak_env(_raw_v_a, _WIN_A, top_pct=20) if len(_raw_v_a) >= _WIN_A else None
-    _env_a_a = _peak_env(_raw_a_a, _WIN_A, top_pct=20) if len(_raw_a_a) >= _WIN_A else None
+    # For slate-marked content the clapper transient is the dominant
+    # sync signal — keep more of the loud frames so it survives the
+    # percentile gate.  Otherwise stay on the standard top-20 % gate.
+    _A_TOP   = 50 if has_slate else 20
+    _env_v_a = _peak_env(_raw_v_a, _WIN_A, top_pct=_A_TOP) if len(_raw_v_a) >= _WIN_A else None
+    _env_a_a = _peak_env(_raw_a_a, _WIN_A, top_pct=_A_TOP) if len(_raw_a_a) >= _WIN_A else None
     T1A, conf1A = 0.0, 0.0
     if _env_v_a is not None and _env_a_a is not None and len(_env_v_a) >= 4:
         _MAX_LAG_A  = int(30.0 * 50)              # ±30 s at 50 Hz = 1500 samples
         _MIN_GAP_A  = max(1, int(50 * 2))         # ≥2 s between candidates
+        # GCC-PHAT whitens the cross-spectrum so impulsive events (clap
+        # boards, sync slates) produce sharp peaks instead of broad
+        # smears.  Standard speech rhythm correlation works better
+        # without it, so only opt in when the user flagged a slate.
         _cands_a    = _xcorr_top_n(_env_a_a, _env_v_a, _MAX_LAG_A,
-                                    n_peaks=3, min_gap=_MIN_GAP_A)
+                                    n_peaks=3, min_gap=_MIN_GAP_A,
+                                    phat=has_slate)
         T1A    = float(_cands_a[0][0]) / 50.0
         conf1A = _cands_a[0][1]
 
@@ -1303,7 +1365,47 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
     except Exception:
         pass
 
-    return final_T, final_conf
+    # ── Alternative-offset candidates for sync-preview audition ──────────
+    # Auto-sync sometimes commits to the wrong xcorr peak (e.g. short
+    # files where the true peak isn't strongest).  Surface the runner-up
+    # peaks from Stage 1 so the user can audition them in the sync
+    # preview dialog instead of guessing offsets manually.
+    #
+    # Sources:
+    #   • Stage 1 Pass A top-3 peaks (50 Hz envelope, first 60 s)
+    #   • Mirror of each Pass A peak (in case the true offset has the
+    #     opposite sign)
+    #   • Stage 1 Pass B top peak (5 Hz, full probe — catches large offsets)
+    #
+    # Apply the same calibration shift as final_T so candidates are on
+    # the same scale.  Dedup vs final_T and against each other (within
+    # 0.5 s).  Return up to 3 alternatives, ranked by confidence.
+    _alts_raw = []
+    try:
+        for _lag_a, _c_a in (_cands_a or []):
+            _t = float(_lag_a) / 50.0 + _T_CAL_S
+            _alts_raw.append((_t, float(_c_a), "PassA"))
+            if abs(_t - _T_CAL_S) >= 0.5:
+                _alts_raw.append((-_t + 2 * _T_CAL_S,
+                                  float(_c_a) * 0.7, "PassA-mirror"))
+        if _cands_b:
+            _t = float(_cands_b[0][0]) / 5.0 + _T_CAL_S
+            _alts_raw.append((_t, float(_cands_b[0][1]), "PassB"))
+    except Exception:
+        pass
+
+    _alts = []
+    _DEDUP_S = 0.5
+    for _t, _c, _src in sorted(_alts_raw, key=lambda x: -x[1]):
+        if abs(_t - final_T) <= _DEDUP_S:
+            continue
+        if any(abs(_t - x[0]) <= _DEDUP_S for x in _alts):
+            continue
+        _alts.append((round(_t, 4), round(min(1.0, _c), 4)))
+        if len(_alts) >= 3:
+            break
+
+    return final_T, final_conf, _alts
 
 
 def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):

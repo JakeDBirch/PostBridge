@@ -61,12 +61,23 @@ class SyncPreviewDialog:
     """
 
     def __init__(self, parent, video_path, audio_path, initial_offset=0.0,
-                 on_accept=None, source_name=""):
+                 on_accept=None, source_name="", candidates=None):
         self._parent = parent
         self._vp = video_path
         self._ap = audio_path
         self._on_accept = on_accept
         self._sr = _SR
+
+        # Auto-sync alternative candidates ((T_secs, conf), ...) the user
+        # can audition when the auto pick is wrong.  The "Try next candidate"
+        # button cycles through this list.  An entry for the initial offset
+        # is prepended so the user can come back to it.
+        self._candidates = [(float(initial_offset), 1.0)] + [
+            (float(t), float(c))
+            for (t, c) in (candidates or [])
+            if abs(float(t) - float(initial_offset)) > 0.01
+        ]
+        self._candidate_idx = 0
 
         # Offset state (in samples at _SR).
         # Internally stored negated relative to the semantic v_offset so that
@@ -211,6 +222,38 @@ class SyncPreviewDialog:
             b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT))
             b.bind("<Leave>", lambda e, w=b: w.config(bg=SURF3))
             b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
+
+        # \u2500\u2500 Candidate audition row \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # When auto-sync returned alternative offset candidates, surface a
+        # "Try next" button that cycles through them.  Useful when the
+        # primary auto pick is wrong but a runner-up xcorr peak is right \u2014
+        # the user can quickly audition each candidate visually + aurally
+        # instead of nudging a slider.
+        if len(self._candidates) > 1:
+            cand_row = tk.Frame(win, bg=BG)
+            cand_row.pack(fill="x", padx=12, pady=(6, 2))
+            tk.Label(cand_row,
+                     text="Auto-sync had {} candidates:".format(
+                         len(self._candidates)),
+                     font=FB, bg=BG, fg=SUB).pack(side="left")
+            self._cand_lbl = tk.Label(
+                cand_row,
+                text="  showing #1 of {}".format(len(self._candidates)),
+                font=FB, bg=BG, fg=TEXT)
+            self._cand_lbl.pack(side="left", padx=(4, 12))
+
+            nxt = tk.Label(cand_row, text="TRY NEXT \u25b6", font=FBT,
+                            bg=SURF3, fg=TEXT, cursor="hand2",
+                            padx=10, pady=4, bd=0,
+                            highlightbackground=BORDER,
+                            highlightthickness=1)
+            nxt.pack(side="left")
+            nxt.bind("<Enter>", lambda e, w=nxt: w.config(bg=ACCENT))
+            nxt.bind("<Leave>", lambda e, w=nxt: w.config(bg=SURF3))
+            nxt.bind("<ButtonRelease-1>",
+                     lambda e: self._cycle_candidate())
+        else:
+            self._cand_lbl = None
 
         # Accept / Cancel row
         bot = tk.Frame(win, bg=BG)
@@ -493,6 +536,32 @@ class SyncPreviewDialog:
             return
         self._offset_samples += frames * _NUDGE_SAMP
         self._offset_var.set(self._fmt_offset())
+        self._draw()
+
+    def _cycle_candidate(self):
+        """Advance to the next auto-sync candidate offset (cycles back to
+        the start when the list is exhausted).  Updates the waveform view
+        and the offset readout so the user can audition the alternative
+        visually + via the playback row."""
+        if len(self._candidates) <= 1:
+            return
+        self._stop()
+        self._candidate_idx = (self._candidate_idx + 1) % len(self._candidates)
+        t_secs, _conf = self._candidates[self._candidate_idx]
+        self._offset_samples = -int(round(t_secs * _SR))
+        if hasattr(self, "_offset_var"):
+            try:
+                self._offset_var.set(self._fmt_offset())
+            except Exception:
+                pass
+        if self._cand_lbl is not None:
+            try:
+                self._cand_lbl.config(
+                    text="  showing #{} of {}".format(
+                        self._candidate_idx + 1,
+                        len(self._candidates)))
+            except Exception:
+                pass
         self._draw()
 
     # ── Playback ──────────────────────────────────────────────────────────

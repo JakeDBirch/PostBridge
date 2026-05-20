@@ -6368,6 +6368,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._aaf_needs_sync_vars[base]        = tk.BooleanVar(value=False)
             if base not in self._aaf_sync_locked_vars:
                 self._aaf_sync_locked_vars[base]       = tk.BooleanVar(value=False)
+            # Has-slate flag enables PHAT-weighted xcorr in Pass A, which
+            # sharpens slate transient peaks instead of smearing them.
+            if not hasattr(self, "_aaf_source_has_slate_vars"):
+                self._aaf_source_has_slate_vars = {}
+            if base not in self._aaf_source_has_slate_vars:
+                self._aaf_source_has_slate_vars[base] = tk.BooleanVar(value=False)
 
             # Multi-slot state
             if not hasattr(self, "_aaf_source_slot_counts"):
@@ -6727,6 +6733,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     rst_btn.bind("<Leave>",  lambda e, w=rst_btn: w.config(bg=SURF3))
                     rst_btn.bind("<ButtonRelease-1>",
                                  lambda e, b=base: self._aaf_reset_sync(b))
+
+                # Slate-aware toggle — when checked, the next SYNC run uses
+                # GCC-PHAT weighting to lock onto the slate transient peak
+                # instead of treating it as broadband noise.  Useful when
+                # the clapper is the strongest/cleanest sync signal in
+                # short clips where the speech-rhythm xcorr is ambiguous.
+                slate_var = self._aaf_source_has_slate_vars[base]
+                slate_ck = tk.Label(row1,
+                    text="☑ slate" if slate_var.get() else "☐ slate",
+                    font=FB, bg=BG,
+                    fg=ACCENT if slate_var.get() else SUB,
+                    cursor="hand2", padx=4)
+                slate_ck.pack(side="left", padx=(8, 0))
+                if locked:
+                    slate_ck.config(cursor="")
+                else:
+                    def _toggle_slate(_e=None, b=base, w=slate_ck,
+                                       v=slate_var):
+                        v.set(not v.get())
+                        w.config(text="☑ slate" if v.get() else "☐ slate",
+                                 fg=ACCENT if v.get() else SUB)
+                    slate_ck.bind("<Button-1>", _toggle_slate)
 
                 # SYNC button
                 sync_btn = self._btn(row1, "SYNC",
@@ -7540,6 +7568,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
 
         start_offset = 0.0
+        # Tk vars must be read on the main thread; cache the flag here so
+        # the worker thread doesn't touch Tk state.
+        _has_slate_flag = bool(self._aaf_source_has_slate_vars.get(
+            base, tk.BooleanVar()).get())
 
         # Disable button and start spinner animation while running
         if btn:
@@ -7570,22 +7602,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _sem.acquire()
             try:
                 if _n_vps == 1:
-                    off, conf = detect_sync_offset(_all_vps[0], ap,
-                                                   probe_duration=300.0,
-                                                   start_offset=start_offset)
-                    return off, conf, _all_vps[0]
+                    off, conf, alts = detect_sync_offset(
+                        _all_vps[0], ap,
+                        probe_duration=300.0,
+                        start_offset=start_offset,
+                        return_candidates=True,
+                        has_slate=_has_slate_flag)
+                    return off, conf, _all_vps[0], alts
                 # Multi-file: probe all candidates in parallel, pick best confidence
                 from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
                 results = []
                 with _TPE(max_workers=_n_vps) as _ex:
                     _fmap = {_ex.submit(detect_sync_offset, _vp, ap,
                                         probe_duration=300.0,
-                                        start_offset=start_offset): _vp
+                                        start_offset=start_offset,
+                                        return_candidates=True,
+                                        has_slate=_has_slate_flag): _vp
                              for _vp in _all_vps}
                     for _f in _asc(_fmap):
                         try:
-                            _off, _conf = _f.result()
-                            results.append((_off, _conf, _fmap[_f]))
+                            _off, _conf, _alts = _f.result()
+                            results.append((_off, _conf, _fmap[_f], _alts))
                         except Exception:
                             pass
                 if not results:
@@ -7599,7 +7636,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         def _done(fut):
             _animating[0] = False
             try:
-                offset, confidence, best_vp = fut.result()
+                offset, confidence, best_vp, alt_candidates = fut.result()
             except Exception as exc:
                 def _err():
                     lv = self._aaf_source_sync_label_vars.get(base)
@@ -7633,6 +7670,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 sync_var = self._aaf_source_sync_vars.get(base)
                 if sync_var:
                     sync_var.set(True)
+
+                # Store alternative-offset candidates so the sync preview
+                # dialog can let the user audition them when the auto pick
+                # is wrong.
+                if not hasattr(self, "_aaf_source_sync_candidates"):
+                    self._aaf_source_sync_candidates = {}
+                self._aaf_source_sync_candidates[base] = list(
+                    alt_candidates or [])
 
                 pct = int(confidence * 100)
                 # Confidence tiers calibrated from real-world false-positive
@@ -7800,11 +7845,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try: prev.close()
             except Exception: pass
 
+        # Pass any auto-sync alternative candidates so the dialog can
+        # offer a "Try next candidate" affordance — saves the user from
+        # manually nudging the offset slider when the auto pick is wrong.
+        candidates = list(getattr(self, "_aaf_source_sync_candidates",
+                                   {}).get(base, []))
+
         dlg = SyncPreviewDialog(
             self, video_path, audio_path,
             initial_offset=offset,
             on_accept=_on_accept,
-            source_name=base)
+            source_name=base,
+            candidates=candidates)
         self._aaf_sync_previews[base] = dlg
 
     # ── Sync helpers ─────────────────────────────────────────────────────────
