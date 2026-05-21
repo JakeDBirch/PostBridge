@@ -33,6 +33,13 @@ try:
 except ImportError:
     HAS_AAF = False
 
+# Streaming-merge diagnostics — when True, each Whisper segment emit
+# and each render tick is logged as a JSON line to _pq_stream.log next
+# to main.py.  Off by default; flip to True locally to inspect what
+# the tiny/main streaming buffers and user-edit spans are doing.
+# Never commit this set to True.
+_PQ_STREAM_DIAG = False
+
 # Import our custom modules!
 from config import *
 from config import _SANS
@@ -56,6 +63,23 @@ def _tx_count_chars(tx, a, b):
     zero and unwrap the tuple form."""
     try:
         r = tx.count(a, b, "chars")
+    except tk.TclError:
+        return 0
+    if r is None:
+        return 0
+    if isinstance(r, (tuple, list)):
+        return int(r[0]) if r else 0
+    return int(r)
+
+def _tx_count_displaylines(tx, a, b):
+    """Same wrapper as _tx_count_chars but for display lines (post
+    word-wrap).  Used by the streaming render's scroll preservation:
+    capture the number of display lines above the viewport, restore
+    with yview_scroll so the user stays the same DISTANCE from the
+    top regardless of how much content gets appended below.  Returns
+    0 on any failure or for empty ranges (e.g. caller was at top)."""
+    try:
+        r = tx.count(a, b, "displaylines")
     except tk.TclError:
         return 0
     if r is None:
@@ -141,9 +165,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # will simply retry the next time the user picks one.
         try:
             engines._seed_bundled_models()
-            engines.prefetch_models_async(sizes=("base", "small"))
         except Exception:
             pass
+        # No background prefetch: only tiny is bundled / seeded.
+        # Any other model size downloads on demand the first time
+        # the user actually picks it in the model picker.
         self._header()
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=44, pady=(0, 14))
@@ -10830,7 +10856,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # collapse-by-default lets the user reclaim that for the
         # transcript and pop it open with Ctrl+F or this icon.
         if not hasattr(self, "_pq_search_visible"):
-            self._pq_search_visible = True   # default to shown
+            # Collapsed by default — the 🔍 button toggles it.  Saves
+            # ~40 px of vertical space for the transcript itself
+            # without making search hard to find.  Preference sticks
+            # across re-renders via the hasattr check above.
+            self._pq_search_visible = False
         self._pq_search_toggle = tk.Label(
             tx_hdr, text="🔍", font=FB,
             bg=SURF3, fg=ACCENT if self._pq_search_visible else SUB,
@@ -10928,6 +10958,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.tag_configure("body",
                                lmargin1=0, lmargin2=0, rmargin=0,
                                lmargincolor=SURF2, rmargincolor=SURF2)
+        # Source-based fading: words from the tiny draft pass render
+        # in muted SUB grey so the user can see at a glance which
+        # parts of the transcript are still "draft" and which have
+        # been confirmed by the configured (main) pass or replaced
+        # by a user edit.  Tag must be raised above "body" so its
+        # foreground wins for tagged char ranges.
+        tx_text.tag_configure("body_tiny", foreground=SUB)
+        tx_text.tag_raise("body_tiny", "body")
+        # User-edited words get a thin underline — the conventional
+        # "tracked changes" indicator.  Subtle enough not to clash
+        # with reading, clear enough that the user always knows
+        # which parts they touched (and can right-click to restore
+        # the original Whisper text).
+        tx_text.tag_configure("body_user", underline=True)
+        tx_text.tag_raise("body_user", "body")
+        # Playback "karaoke" highlight — the current word under the
+        # playhead gets a warm orange-tinted background so the user
+        # can follow along visually while audio plays.  Driven by
+        # the periodic _pq_playback_highlight_tick poll while
+        # _pq_playing.  The colour is ACCENT mixed ~25% into BG so
+        # it reads as the same orange family without screaming.
+        tx_text.tag_configure("body_playing", background="#4a2a14")
+        tx_text.tag_raise("body_playing", "body")
         # Diagnostic on Ctrl+Shift+D — fast version: samples up to 30
         # logical lines spread evenly through the document and reports
         # each one's first display-line dimensions.  Capped iterations
@@ -11073,6 +11126,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 has_sel = bool(tx_text.tag_ranges("sel"))
             except tk.TclError:
                 has_sel = False
+            # Does the selection (or cursor word, when no selection)
+            # touch any user-edited entries with restore data?  Drives
+            # whether the "Restore Whisper original" item shows.
+            has_restorable = self._pq_selection_has_user_edits()
             menu = tk.Menu(tx_text, tearoff=0,
                             bg=SURF2, fg=TEXT,
                             activebackground=ACCENT,
@@ -11095,6 +11152,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 label="Edit selected text…",
                 command=self._pq_edit_selection,
                 state="normal" if has_sel else "disabled")
+            if has_restorable:
+                menu.add_command(
+                    label="Restore Whisper original",
+                    command=self._pq_restore_originals)
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -11285,12 +11346,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not tx.winfo_exists():
                 return None
             word_idx = getattr(self, "_pq_word_index", []) or []
-            # Cursor position by word id
+            # Cursor position by word id AND timestamp.  The id lets us
+            # restore exactly when the word dict survives the re-render
+            # (most ticks).  The timestamp is a fallback for the cases
+            # where the merge replaces the cursor's word with a fresh
+            # dict at the same audio time (refined pass overwriting
+            # tiny words) — without it, the cursor jumps to the end of
+            # the buffer mid-stream and feels twitchy.
             try:
                 c = _tx_count_chars(tx, "1.0", tx.index("insert"))
                 for s, e, w in word_idx:
                     if s <= c <= e:
                         state["insert_word_id"] = id(w)
+                        try:
+                            state["insert_word_t"] = (
+                                float(w.get("start", 0.0))
+                                + float(w.get("end", 0.0))) / 2.0
+                        except Exception:
+                            pass
                         break
             except Exception:
                 pass
@@ -11309,9 +11382,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     state["sel_last_id"]  = last_id
             except tk.TclError:
                 pass
-            # Scroll position (top fraction)
+            # Scroll position — store the absolute DISTANCE from the
+            # top, in display lines.  This is invariant to content
+            # changes BELOW the viewport (the streaming case): as
+            # more words append, the user's distance-from-top stays
+            # the same so they keep seeing the same content.  Beats
+            # any fraction-based or word-anchored scheme, because
+            # the top is a fixed anchor that nothing can shift.
             try:
-                state["yview"] = tx.yview()[0]
+                state["top_display_lines"] = _tx_count_displaylines(
+                    tx, "1.0", "@0,0")
             except Exception:
                 pass
             # Was the widget focused?
@@ -11335,18 +11415,47 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if not tx.winfo_exists():
                 return
             word_idx = getattr(self, "_pq_word_index", []) or []
-            # Cursor: find the word dict by id and place insert mark
-            # at its start position in the new render.
+            # Cursor: try id-match first, then fall back to the word
+            # whose audio time straddles the saved cursor timestamp.
+            # The fallback keeps the cursor stable during streaming
+            # when the refined pass swaps in fresh dicts for the same
+            # audio range.
             ins_id = state.get("insert_word_id")
+            ins_t  = state.get("insert_word_t")
+            placed = False
             if ins_id is not None:
                 for s, e, w in word_idx:
                     if id(w) == ins_id:
                         try:
                             tx.mark_set("insert",
                                          "1.0+{}c".format(s))
+                            placed = True
                         except tk.TclError:
                             pass
                         break
+            if not placed and ins_t is not None:
+                best = None
+                best_dt = float("inf")
+                for s, e, w in word_idx:
+                    try:
+                        ws = float(w.get("start", 0.0))
+                        we = float(w.get("end",   ws))
+                    except Exception:
+                        continue
+                    if ws <= ins_t <= we:
+                        best = s
+                        best_dt = 0.0
+                        break
+                    mid = (ws + we) / 2.0
+                    dt = abs(mid - ins_t)
+                    if dt < best_dt:
+                        best_dt = dt
+                        best = s
+                if best is not None:
+                    try:
+                        tx.mark_set("insert", "1.0+{}c".format(best))
+                    except tk.TclError:
+                        pass
             # Selection
             sf = state.get("sel_first_id")
             sl = state.get("sel_last_id")
@@ -11363,12 +11472,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         tx.tag_add("sel", new_first, new_last)
                     except tk.TclError:
                         pass
-            # Scroll position
-            yv = state.get("yview")
-            if yv is not None:
+            # Scroll restore.  Reset yview to the top, then scroll
+            # down by exactly the captured number of display lines.
+            # No fraction math, no dlineinfo, no update_idletasks —
+            # both calls happen inside the same Tk callback so the
+            # widget only paints once with the final scroll state.
+            n = state.get("top_display_lines")
+            if n is not None:
                 try:
-                    tx.yview_moveto(yv)
-                except tk.TclError:
+                    tx.yview_moveto(0.0)
+                    if n > 0:
+                        tx.yview_scroll(int(n), "units")
+                except (tk.TclError, ValueError):
                     pass
             # Restore focus
             if state.get("had_focus"):
@@ -11379,18 +11494,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception:
             pass
 
-    def _pq_render_transcript_text(self, session, placeholder=None):
+    def _pq_render_transcript_text(self, session, placeholder=None,
+                                    user_frontier=None):
         """Re-render the transcript pane.
 
         When `placeholder` is given (non-empty string), show it instead of
         the transcript — used during transcription to display "loading
         model…" / "transcribing…" without flashing a misleading
         "click TRANSCRIBE" prompt.
+
+        `user_frontier` (seconds, optional) hides user-edited words
+        whose audio start exceeds it.  Used by the streaming render
+        and the pre-stream wipe so preserved edits stay invisible
+        until the streaming transcription actually reaches them —
+        without removing them from session["transcript"], so they're
+        not lost on the next merge tick.
         """
         tx = getattr(self, "_pq_tx_text", None)
         if not tx:
             return
         words = session.get("transcript") or []
+        if user_frontier is not None and words:
+            words = [w for w in words
+                     if w.get("_src") != "user"
+                     or float(w.get("start", 0.0)) <= user_frontier]
         tx.configure(state="normal")
         tx.delete("1.0", "end")
         if placeholder:
@@ -11425,6 +11552,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 lambda e, t=tx: self._pq_inline_rename_speaker(e, t))
 
             self._pq_word_index = []
+
+            # Decide whether tiny-tagged words should render faded.
+            # Two conditions must hold:
+            #   1. A transcription is actively running on this session
+            #      (so "tiny" words are a transient draft).
+            #   2. The configured model is bigger than tiny (so a
+            #      refinement pass is actually coming for them).
+            # Without both, tiny-tagged words are the user's final
+            # answer and should render solid like any other.
+            _prog = session.get("_progress") or {}
+            _fade_tiny = (bool(_prog.get("active"))
+                          and engines.get_active_model_size() != "tiny")
 
             # Group consecutive words by speaker
             real_words = [w for w in words
@@ -11523,9 +11662,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     # Add 2 chars for each break before this word in run
                     n_before = sum(1 for bp in sorted_bps if bp <= s)
                     shift = n_before * 2
-                    self._pq_word_index.append(
-                        (run_start_abs + s + shift,
-                         run_start_abs + e + shift, w))
+                    abs_s = run_start_abs + s + shift
+                    abs_e = run_start_abs + e + shift
+                    self._pq_word_index.append((abs_s, abs_e, w))
+                    # Apply source-based styling.  Tiny-draft words
+                    # render faded ONLY while a non-tiny refinement
+                    # is actively running — otherwise tiny words are
+                    # the user's final choice and should render
+                    # solid like any other source.  User edits get
+                    # a thin underline (tracked-changes marker) so
+                    # the user always knows what they touched.
+                    src = w.get("_src")
+                    if _fade_tiny and src == "tiny":
+                        tx.tag_add(
+                            "body_tiny",
+                            "1.0 + {}c".format(abs_s),
+                            "1.0 + {}c".format(abs_e))
+                    elif src == "user":
+                        tx.tag_add(
+                            "body_user",
+                            "1.0 + {}c".format(abs_s),
+                            "1.0 + {}c".format(abs_e))
 
             # Reset undo history — programmatic render is not a user
             # edit, so Ctrl+Z shouldn't revert to "before render".
@@ -11638,14 +11795,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(win,
                  text=("Edited words inherit the original time span; "
                        "timestamps are distributed proportionally.  "
-                       "Ctrl+Enter to save · Esc to cancel."),
+                       "Enter to save · Esc to cancel."),
                  font=FB, bg=BG, fg=SUB, padx=20,
                  wraplength=520, justify="left"
                  ).pack(anchor="w", pady=(0, 8))
 
         ent = tk.Text(win, font=FB, bg=SURF2, fg=TEXT,
                        insertbackground=TEXT, relief="flat",
-                       bd=8, height=6, wrap="word", undo=True)
+                       bd=8, height=3, wrap="word", undo=True)
         ent.pack(fill="both", expand=True, padx=20, pady=(8, 0))
         ent.insert("1.0", orig_text)
         ent.tag_add("sel", "1.0", "end-1c")
@@ -11665,6 +11822,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             first_starts_with_space = (
                 len(first_orig_word) > 0
                 and first_orig_word[0] in (" ", "\t"))
+
+            # Unique id for this edit operation.  Every new entry from
+            # this Save shares the same _edit_id, so "Restore Whisper
+            # original" can locate the entire group from any one of
+            # them.  Time-ns hex is unique within the session and
+            # keeps the value short.
+            edit_id = "e{:x}".format(time.time_ns())
+
+            # Snapshot the original Whisper entries so a later restore
+            # can splice them back exactly as Whisper produced them.
+            # dict() to defensively decouple from later mutations of
+            # the original entries (e.g. a refine pass updating
+            # timestamps in place).
+            replaces_blob = [dict(w) for w in orig_words]
 
             # Empty input (no tokens) deletes the selected words.
             # Useful for cleaning up cases like "ok ay" -> "okay" where
@@ -11687,7 +11858,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         # Mark these words as user-authored so a later
                         # progressive-refinement pass preserves them
                         # instead of overwriting with Whisper output.
-                        "_src":  "user",
+                        "_src":      "user",
+                        "_edit_id":  edit_id,
+                        "_replaces": replaces_blob,
                     }
                     if common_speaker:
                         entry["speaker"] = common_speaker
@@ -11704,26 +11877,87 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # but takes part in _pq_user_edited_spans so the
                 # merge respects the deletion.
                 new_entries.append({
-                    "word":  "",
-                    "start": range_start,
-                    "end":   range_end,
-                    "_src":  "user",
-                    "_deleted": True,
+                    "word":      "",
+                    "start":     range_start,
+                    "end":       range_end,
+                    "_src":      "user",
+                    "_deleted":  True,
+                    "_edit_id":  edit_id,
+                    "_replaces": replaces_blob,
                 })
                 if common_speaker:
                     new_entries[0]["speaker"] = common_speaker
 
-            transcript[span_start:span_end] = new_entries
-            session["transcript"] = transcript
+            # Re-resolve the splice against the LIVE session transcript.
+            # While the dialog was open, streaming ticks may have
+            # appended more words OR replaced some via merge — using
+            # the captured `transcript` snapshot would silently delete
+            # any words added in that window.  Try id() lookup first
+            # (the picked dicts are still in transcript when no merge
+            # has run); fall back to time-range lookup if a refine
+            # pass replaced them with fresh dicts at the same span.
+            live = session.get("transcript")
+            if live is not None and live is not transcript:
+                live_start = None
+                live_end   = None
+                for i, w in enumerate(live):
+                    if id(w) in picked_ids:
+                        if live_start is None:
+                            live_start = i
+                        live_end = i + 1
+                if live_start is None:
+                    # Refine pass swept the picked dicts.  Splice by
+                    # time-range overlap of real (non-user, non-break)
+                    # words instead.
+                    for i, w in enumerate(live):
+                        if w.get("break") or w.get("_src") == "user":
+                            continue
+                        ws = float(w.get("start", 0.0))
+                        we = float(w.get("end",   ws))
+                        mid = (ws + we) / 2.0
+                        if range_start <= mid <= range_end:
+                            if live_start is None:
+                                live_start = i
+                            live_end = i + 1
+                if live_start is None:
+                    # Nothing to replace — just insert in time order.
+                    live.extend(new_entries)
+                    live.sort(
+                        key=lambda w: float(w.get("start", 0.0)))
+                else:
+                    live[live_start:live_end] = new_entries
+                session["transcript"] = live
+            else:
+                transcript[span_start:span_end] = new_entries
+                session["transcript"] = transcript
             try:
                 self._pq_save_session_file(session)
             except Exception:
                 pass
             win.destroy()
+            # Snapshot full interactive state (word-anchored scroll)
+            # before the re-render, then put the cursor at the END
+            # of the new entries (where the user would naturally
+            # continue) and replay the scroll anchor.
+            tx_after = getattr(self, "_pq_tx_text", None)
+            pre_state = self._pq_capture_text_state()
             try:
                 self._pq_render_transcript_text(session)
             except Exception:
                 pass
+            self._pq_restore_text_state(pre_state)
+            if tx_after is not None and new_entries:
+                last_id = id(new_entries[-1])
+                word_idx = getattr(self, "_pq_word_index", []) or []
+                for s, e, w in word_idx:
+                    if id(w) == last_id:
+                        try:
+                            tx_after.tag_remove("sel", "1.0", "end")
+                            tx_after.mark_set(
+                                "insert", "1.0+{}c".format(e))
+                        except tk.TclError:
+                            pass
+                        break
             return "break"
 
         _W = 8
@@ -11731,10 +11965,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                   color=ACCENT, width=_W).pack(side="right")
         self._btn(nav, "CANCEL", win.destroy, width=_W
                   ).pack(side="right", padx=(0, 8))
-        win.bind("<Control-Return>",   _save)
-        win.bind("<Control-KP_Enter>", _save)
-        ent.bind("<Control-Return>",   _save)
-        ent.bind("<Control-KP_Enter>", _save)
+        # Enter saves.  Multi-line edits aren't useful here (one
+        # transcript region is replaced as a flat span of tokens),
+        # so we block the newline insertion entirely by returning
+        # "break" from the bindings.  Ctrl+Enter still works for
+        # muscle-memory compatibility.
+        def _save_and_break(_e=None):
+            _save()
+            return "break"
+        for seq in ("<Return>", "<KP_Enter>",
+                    "<Control-Return>", "<Control-KP_Enter>"):
+            ent.bind(seq, _save_and_break)
+            win.bind(seq, _save_and_break)
         win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
@@ -11747,6 +11989,141 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             px + max(0, (pw - ww) // 2),
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
+
+    def _pq_selection_has_user_edits(self):
+        """True when the current selection overlaps any user-edited
+        entries that carry restore data (_edit_id + _replaces).  Used
+        to gate the 'Restore Whisper original' menu item — no point
+        showing it when there's nothing to restore."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return False
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            return False
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            return False
+        c0 = _tx_count_chars(tx, "1.0", sel_first)
+        c1 = _tx_count_chars(tx, "1.0", sel_last)
+        for (s, e, w) in word_idx:
+            if e <= c0 or s >= c1:
+                continue
+            if w.get("_src") == "user" and w.get("_edit_id"):
+                return True
+        return False
+
+    def _pq_restore_originals(self):
+        """Right-click action: replace every user-edited word in the
+        current selection with the original Whisper entries captured
+        at edit time.  Each user entry carries _edit_id + _replaces;
+        restoration is grouped by _edit_id so a multi-word edit is
+        restored as one atomic block (not piecemeal)."""
+        tx      = getattr(self, "_pq_tx_text", None)
+        session = getattr(self, "_pq_current_session", None)
+        if tx is None or session is None:
+            return
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        if not word_idx:
+            return
+        try:
+            sel_first = tx.index("sel.first")
+            sel_last  = tx.index("sel.last")
+        except tk.TclError:
+            return
+
+        c0 = _tx_count_chars(tx, "1.0", sel_first)
+        c1 = _tx_count_chars(tx, "1.0", sel_last)
+
+        # Collect unique _edit_ids touched by the selection that
+        # actually have restore data attached.
+        touched_ids = []
+        seen = set()
+        for (s, e, w) in word_idx:
+            if e <= c0 or s >= c1:
+                continue
+            if w.get("_src") != "user":
+                continue
+            eid = w.get("_edit_id")
+            if not eid or not w.get("_replaces"):
+                continue
+            if eid in seen:
+                continue
+            seen.add(eid)
+            touched_ids.append(eid)
+
+        if not touched_ids:
+            return
+
+        transcript = session.get("transcript") or []
+        if not transcript:
+            return
+
+        # Snapshot the full interactive state before mutating the
+        # transcript so the cursor / selection / scroll all survive
+        # the re-render that follows.  Using the shared capture
+        # helper means the scroll is anchored to the top-visible
+        # WORD rather than a yview fraction — robust against the
+        # transcript's char count shifting during streaming.
+        tx = getattr(self, "_pq_tx_text", None)
+        pre_state = self._pq_capture_text_state()
+
+        # For each touched edit_id, find the contiguous slice of
+        # entries sharing it and splice in the originals.  An
+        # edit_id should always be contiguous in the transcript
+        # (the edit dialog inserts new entries as one block) but
+        # we don't rely on that — we locate all matching indices
+        # and use [min, max+1] as the splice range.  Track the
+        # ids of the freshly-spliced dicts so the cursor lands on
+        # the first restored word after the re-render.
+        first_restored_id = None
+        for eid in touched_ids:
+            indices = [i for i, w in enumerate(transcript)
+                       if w.get("_edit_id") == eid]
+            if not indices:
+                continue
+            lo = min(indices)
+            hi = max(indices) + 1
+            originals = transcript[lo].get("_replaces") or []
+            # Defensive copy so future restores don't share dict
+            # identity with what's now back in the transcript.
+            restored = [dict(o) for o in originals]
+            if restored and first_restored_id is None:
+                first_restored_id = id(restored[0])
+            transcript[lo:hi] = restored
+
+        session["transcript"] = transcript
+        try:
+            self._pq_save_session_file(session)
+        except Exception:
+            pass
+        try:
+            self._pq_render_transcript_text(session)
+        except Exception:
+            pass
+
+        # Restore scroll via the shared helper (word-anchored), then
+        # place cursor at the first restored word and clear the
+        # stale selection (the words the user had selected just
+        # ceased to exist as edits).
+        self._pq_restore_text_state(pre_state)
+        if tx is not None:
+            try:
+                tx.tag_remove("sel", "1.0", "end")
+            except tk.TclError:
+                pass
+            if first_restored_id is not None:
+                word_idx = getattr(self, "_pq_word_index", []) or []
+                for s, e, w in word_idx:
+                    if id(w) == first_restored_id:
+                        try:
+                            tx.mark_set("insert", "1.0+{}c".format(s))
+                        except tk.TclError:
+                            pass
+                        break
 
     def _pq_add_margin_note(self):
         """Margin-mode action: prompt for a note tied to the current
@@ -12297,8 +12674,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 renamed += 1
             win.destroy()
             # Re-render whatever view we're in so the new labels show.
+            # Preserve cursor / selection / scroll — only speaker
+            # labels changed; the user's reading position should not.
             if getattr(self, "_pq_current_session", None) is not None:
+                _rn_state = self._pq_capture_text_state()
                 self._pq_render_transcript_text(self._pq_current_session)
+                self._pq_restore_text_state(_rn_state)
             else:
                 self._pq_render_project_view()
             messagebox.showinfo("Speakers updated",
@@ -12391,8 +12772,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._pq_save_session_file(s)
                 n_changed += 1
             win.destroy()
-            # Re-render the open session view
+            # Re-render the open session view.  Preserve cursor /
+            # selection / scroll — only the speaker label changed.
+            _ir_state = self._pq_capture_text_state()
             self._pq_render_transcript_text(session)
+            self._pq_restore_text_state(_ir_state)
 
         _W = 8
         self._btn(nav, "RENAME", _apply,
@@ -12712,11 +13096,43 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                   sidecar_paths):
         """Ask the user what to do when transcript data already exists.
 
-        Returns one of:
-            "transcribe"   — proceed with a fresh transcription (overwrite)
-            "use_cached"   — load the existing sidecar transcript instead
-            "cancel"       — abort
+        Returns a tuple (choice, preserve_edits):
+            choice         — "transcribe" / "use_cached" / "cancel"
+            preserve_edits — bool; when True, any prior user edits
+                             (in-memory OR in sidecar) are merged into
+                             the new transcription via the per-word
+                             _src='user' mechanism.  When False, edits
+                             are discarded before the run starts.
+                             Always False when no edits exist.
         """
+        # Count user edits from both sources.  In-memory session wins
+        # if both have content — that's the live state.  Otherwise
+        # peek at the most-recent sidecar so a fresh-session
+        # re-transcribe surfaces edits that aren't loaded yet.
+        session_edits = 0
+        if has_session_transcript:
+            session_edits = len(
+                [w for w in session.get("transcript", [])
+                 if w.get("_src") == "user"])
+
+        sidecar_edits = 0
+        sidecar_edit_src = None
+        if sidecar_paths and not has_session_transcript:
+            for sp in sidecar_paths:
+                try:
+                    words, _ = engines.pb_transcript_load(sp)
+                    if words:
+                        n = sum(1 for w in words
+                                if w.get("_src") == "user")
+                        if n:
+                            sidecar_edits = n
+                            sidecar_edit_src = sp
+                            break
+                except Exception:
+                    pass
+
+        total_edits = session_edits + sidecar_edits
+
         win = tk.Toplevel(self)
         win.title("Transcript Already Exists")
         win.configure(bg=BG)
@@ -12735,24 +13151,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if has_session_transcript:
             wc = len([w for w in session.get("transcript", [])
                       if (w.get("word") or "").strip()])
-            edits = len([w for w in session.get("transcript", [])
-                         if w.get("_src") == "user"])
             lines.append(
                 "Session already has a {:,}-word transcript.".format(wc))
-            if edits:
-                lines.append(
-                    "Your {} edited word{} will be preserved at "
-                    "their original timestamps.".format(
-                        edits, "s" if edits != 1 else ""))
         if sidecar_paths:
             n = len(sidecar_paths)
+            extra = ""
+            if sidecar_edits:
+                extra = " (with {} user edit{})".format(
+                    sidecar_edits,
+                    "s" if sidecar_edits != 1 else "")
             lines.append(
-                "{} cached transcript{} on disk.".format(
-                    n, "s" if n != 1 else ""))
+                "{} cached transcript{} on disk{}.".format(
+                    n, "s" if n != 1 else "", extra))
 
         tk.Label(body, text="\n".join(lines), font=FB,
                  bg=BG, fg=TEXT, justify="left",
-                 wraplength=520).pack(anchor="w", pady=(0, 14))
+                 wraplength=520).pack(anchor="w", pady=(0, 8))
+
+        # Preserve-edits checkbox.  Shown only when edits exist
+        # somewhere (in-memory session OR in the sidecar that would
+        # otherwise be ignored on a fresh-session re-transcribe).
+        # Default ON — losing user work silently is the worst default.
+        preserve_var = tk.BooleanVar(value=True)
+        if total_edits:
+            edit_total = max(session_edits, sidecar_edits)
+            cb_text = ("Preserve {} edited word{} when "
+                       "re-transcribing").format(
+                edit_total, "s" if edit_total != 1 else "")
+            cb = tk.Checkbutton(
+                body, text=cb_text, variable=preserve_var,
+                font=FB, bg=BG, fg=TEXT, selectcolor=SURF2,
+                activebackground=BG, activeforeground=TEXT,
+                highlightthickness=0, bd=0)
+            cb.pack(anchor="w", pady=(4, 10))
 
         result = {"choice": "cancel"}
         # Uniform button sizing — all three buttons same width and height
@@ -12796,7 +13227,44 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             px + max(0, (pw - ww) // 2),
             py + max(0, (ph - wh) // 2)))
         self.wait_window(win)
-        return result["choice"]
+
+        # Re-transcribe ALWAYS visually wipes — Jordan explicitly
+        # wanted a clean slate so the draft pass appears against an
+        # empty pane rather than fighting stale content.  Two modes:
+        #
+        #   preserve=True   → keep only the user-edited words; their
+        #                     timestamps survive and the worker's
+        #                     merge re-inserts them at the right
+        #                     positions as the draft / configured
+        #                     passes stream in.
+        #   preserve=False  → full wipe; nothing carries over.
+        #
+        # When the only source of edits is a sidecar (new-session
+        # re-transcribe), hoist its user-tagged words onto the
+        # session first so they participate in the merge.
+        preserve = bool(preserve_var.get()) and bool(total_edits)
+        if result["choice"] == "transcribe":
+            if preserve:
+                if has_session_transcript:
+                    session["transcript"] = [
+                        w for w in session["transcript"]
+                        if w.get("_src") == "user"]
+                elif sidecar_edits and sidecar_edit_src:
+                    try:
+                        words, _ = engines.pb_transcript_load(
+                            sidecar_edit_src)
+                        session["transcript"] = [
+                            w for w in (words or [])
+                            if w.get("_src") == "user"]
+                    except Exception:
+                        session["transcript"] = []
+                else:
+                    session["transcript"] = []
+            else:
+                session["transcript"] = []
+            self._pq_save_session_file(session)
+
+        return result["choice"], preserve
 
     def _pq_preview_ready(self, session):
         """Called on the main thread when the tiny draft pass completes
@@ -12804,10 +13272,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         status label to 'preview · refining…' so the user knows the
         configured model is still working in the background."""
         if getattr(self, "_pq_current_session", None) is session:
+            # Preserve cursor / selection / scroll across this render
+            # — without it the user gets bounced to the top of the
+            # transcript every time tiny finishes.
+            state = self._pq_capture_text_state()
             try:
                 self._pq_render_transcript_text(session)
             except Exception:
                 pass
+            else:
+                self._pq_restore_text_state(state)
             lbl = getattr(self, "_pq_status_lbl", None)
             if lbl:
                 try:
@@ -12816,13 +13290,156 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     pass
 
     @staticmethod
+    def _pq_merge_streams(tiny_words, main_words, current_words):
+        """Live merge of two streaming transcript sources plus the
+        user-edited words already in the current session transcript.
+
+        Priority:  user > main (configured) > tiny (draft) > backdrop
+
+        Algorithm:
+          1. User words from current_words are sacred.  Their time
+             spans are computed and every other source's words in those
+             spans are dropped.
+          2. Main's coverage is tracked via its 'frontier' — the latest
+             end-time of any main word emitted so far.  Words before
+             the frontier are 'main has decoded this'; words after it
+             are 'main hasn't reached yet'.
+          3. Tiny words AFTER the main frontier are kept; BEFORE it
+             they're dropped (main has them).
+          4. BACKDROP — current_words' non-user, non-tiny content (e.g.
+             pre-existing transcript on a re-transcribe).  Fills any
+             timestamp range still uncovered by main+tiny.  Without
+             this, every tick of a re-transcribe (where tiny doesn't
+             run) silently deleted everything past main's frontier
+             until main caught up.
+          5. All surviving words are sorted by start time; duplicates
+             at the same timestamp (within a small epsilon) are
+             deduped, keeping the higher-priority source.
+
+        Result: the live transcript starts as the existing transcript
+        / tiny draft, then progressively gets replaced by main as main
+        catches up, with user edits anchored throughout.
+        """
+        user_words = [w for w in (current_words or [])
+                      if w.get("_src") == "user"]
+        # IMPORTANT: pass the FULL current_words list, not the filtered
+        # user-only list.  _pq_user_edited_spans uses non-user words as
+        # run-break markers — feeding it the filtered list collapses
+        # every scattered user edit into one giant span from the first
+        # edit to the last, which then drops every other word in that
+        # range.  (Hit this bug in stream diagnostics: 4 scattered
+        # edits caused merged=388 instead of ~1700.)
+        user_spans = App._pq_user_edited_spans(current_words)
+
+        def _in_user(t):
+            return any(s <= t <= e for (s, e) in user_spans)
+
+        # Main's coverage frontier — latest end time of any main word.
+        main_frontier = 0.0
+        for w in main_words or []:
+            if w.get("break"):
+                continue
+            we = float(w.get("end", 0.0))
+            if we > main_frontier:
+                main_frontier = we
+
+        # Tiny's coverage envelope, used to know whether the backdrop
+        # should fill a range or defer to tiny.  An empty tiny buffer
+        # means tiny isn't running this pass (re-transcribe) so the
+        # backdrop should fill everything past main's frontier.
+        tiny_start = float("inf")
+        tiny_end   = 0.0
+        for w in tiny_words or []:
+            if w.get("break"):
+                continue
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end",   ws))
+            if ws < tiny_start: tiny_start = ws
+            if we > tiny_end:   tiny_end   = we
+        has_tiny = (tiny_end > 0.0)
+
+        result = []
+
+        # 1) main words (highest priority)
+        for w in main_words or []:
+            if w.get("break"):
+                t = float(w.get("start", 0.0))
+                if not _in_user(t):
+                    result.append(w)
+                continue
+            mid = (float(w.get("start", 0.0))
+                   + float(w.get("end", 0.0))) / 2.0
+            if not _in_user(mid):
+                result.append(w)
+
+        # 2) tiny words past the main frontier
+        for w in tiny_words or []:
+            if w.get("break"):
+                t = float(w.get("start", 0.0))
+                if _in_user(t) or t <= main_frontier:
+                    continue
+                result.append(w)
+                continue
+            mid = (float(w.get("start", 0.0))
+                   + float(w.get("end", 0.0))) / 2.0
+            if _in_user(mid) or mid <= main_frontier:
+                continue
+            result.append(w)
+
+        # 3) backdrop — pre-existing non-user words from current_words.
+        #    Skip anything inside a user span, behind main's frontier,
+        #    OR (when tiny is active) inside tiny's coverage envelope
+        #    — tiny is fresher than the previous render's leftovers.
+        for w in (current_words or []):
+            src = w.get("_src")
+            if src == "user":
+                continue   # handled separately
+            if w.get("break"):
+                t = float(w.get("start", 0.0))
+                if _in_user(t) or t <= main_frontier:
+                    continue
+                if has_tiny and tiny_start <= t <= tiny_end:
+                    continue
+                result.append(w)
+                continue
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end",   ws))
+            mid = (ws + we) / 2.0
+            if _in_user(mid) or mid <= main_frontier:
+                continue
+            if has_tiny and tiny_start <= mid <= tiny_end:
+                continue
+            result.append(w)
+
+        # 4) user words — ALL of them, always.  Filtering them by
+        # the streaming frontier here would drop edits made during
+        # streaming whose audio time hadn't been reached yet, and
+        # the next tick wouldn't see them in current_words to put
+        # them back.  The "hide until streaming reaches them" visual
+        # behaviour is applied at render time instead.
+        result.extend(user_words)
+
+        result.sort(key=lambda w: float(w.get("start", 0.0)))
+        return result
+
+    @staticmethod
     def _pq_user_edited_spans(words):
         """Walk a transcript and return a list of (start_s, end_s) spans
         covering every contiguous run of words with _src=='user'.  Used
         by the refine-merge logic to keep user edits intact when a
-        higher-quality transcription pass overwrites the rest."""
+        higher-quality transcription pass overwrites the rest.
+
+        Run-break heuristic: a run ends when EITHER a non-user word
+        appears OR the audio-time gap to the next user word exceeds
+        GAP_S seconds.  The time-gap check matters during streaming
+        re-transcribe when the transcript momentarily contains nothing
+        BUT scattered user edits — without it, three edits at 50 / 200
+        / 500 s would merge into one (50, 500) span and the merge
+        would drop everything inside that range."""
+        GAP_S = 2.0
         spans = []
         run = None
+        prev_end = None
         for w in words or []:
             if w.get("break"):
                 continue
@@ -12831,12 +13448,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 we = float(w.get("end",   ws))
                 if run is None:
                     run = [ws, we]
+                elif prev_end is not None and (ws - prev_end) > GAP_S:
+                    spans.append(tuple(run))
+                    run = [ws, we]
                 else:
                     run[1] = max(run[1], we)
+                prev_end = we
             else:
                 if run is not None:
                     spans.append(tuple(run))
                     run = None
+                    prev_end = None
         if run is not None:
             spans.append(tuple(run))
         return spans
@@ -12939,7 +13561,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 pass
 
         if has_session_transcript or sidecar_paths:
-            choice = self._pq_confirm_retranscribe(
+            choice, preserve_edits = self._pq_confirm_retranscribe(
                 session, has_session_transcript, sidecar_paths)
             if choice == "cancel":
                 return
@@ -12956,6 +13578,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 is session):
                             self._pq_render_transcript_text(session)
                         return
+            # choice == "transcribe": the dialog has already wiped
+            # session["transcript"] and (when preserve was checked)
+            # hoisted just the user-edited words back onto it, so the
+            # worker starts from a clean slate either way.  Force a
+            # re-render here so the visual wipe lands immediately —
+            # otherwise stale text lingers until the first stream tick.
+            # user_frontier=0 hides any preserved edits at this stage
+            # so the pane looks fully empty; streaming will reveal
+            # each edit when it arrives at the edit's timestamp.
+            if getattr(self, "_pq_current_session", None) is session:
+                try:
+                    self._pq_render_transcript_text(
+                        session, user_frontier=0.0)
+                except Exception:
+                    pass
 
         bg_mode = bool(getattr(self, "_pq_bg_mode_var",
                                tk.BooleanVar(value=False)).get())
@@ -13095,9 +13732,51 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     # pass to finish.  Throttled to ~1.2 s between
                     # renders so we don't redraw on every short
                     # segment of a busy file.
-                    streaming_words = []
+                    # Two parallel streaming buffers: one filled by the
+                    # tiny draft pass, one filled by the configured
+                    # ("main") refinement pass.  Both render through
+                    # the same throttle.  _pq_merge_streams combines
+                    # them so main words win at any timestamp the main
+                    # frontier has already passed, falling back to
+                    # tiny ahead of the frontier, and user edits
+                    # always survive.
+                    streaming_words = []          # tiny draft buffer
+                    streaming_main_words = []     # configured pass buffer
                     streaming_last_render = [0.0]
                     streaming_render_pending = [False]
+                    streaming_tick = [0]
+                    # Diagnostic logging — gated behind _PQ_STREAM_DIAG.
+                    # When False (default), _pq_stream_log is a no-op and
+                    # the log file is never touched.  Flip the flag at
+                    # the top of the file when you need to inspect what
+                    # the streaming merge is doing.
+                    if _PQ_STREAM_DIAG:
+                        _pq_stream_log_path = os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "_pq_stream.log")
+                        try:
+                            with open(_pq_stream_log_path, "w",
+                                      encoding="utf-8") as _f0:
+                                _f0.write(
+                                  "# Pull Quotes stream diagnostics — "
+                                  "one JSON line per render tick.\n")
+                        except Exception:
+                            pass
+
+                        def _pq_stream_log(event, **fields):
+                            try:
+                                rec = {"t":  round(
+                                            time.perf_counter() - t0, 2),
+                                       "ev": event}
+                                rec.update(fields)
+                                with open(_pq_stream_log_path, "a",
+                                          encoding="utf-8") as _f:
+                                    _f.write(json.dumps(rec) + "\n")
+                            except Exception:
+                                pass
+                    else:
+                        def _pq_stream_log(event, **fields):
+                            return
 
                     def _do_stream_render(s=session):
                         streaming_render_pending[0] = False
@@ -13108,14 +13787,52 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         # the final word list).
                         if getattr(self, "_pq_current_session",
                                    None) is s:
-                            # Merge the streamed buffer with the
-                            # current session transcript so user edits
-                            # made between ticks survive.  Without
-                            # this, every tick overwrote the user's
-                            # _src='user' words with the raw stream.
+                            # Three-way merge: tiny draft + configured
+                            # main + user edits already in the session.
+                            # User edits always survive; main wins over
+                            # tiny for any region the main pass has
+                            # reached; tiny shows ahead of the main
+                            # frontier so the user sees a moving
+                            # boundary instead of nothing.
                             current = s.get("transcript") or []
-                            s["transcript"] = App._pq_merge_refine(
-                                current, list(streaming_words))
+                            cur_user = sum(1 for w in current
+                                           if w.get("_src") == "user")
+                            cur_nonuser = sum(1 for w in current
+                                              if (w.get("_src") != "user"
+                                                  and not w.get("break")))
+                            tiny_snap = list(streaming_words)
+                            main_snap = list(streaming_main_words)
+                            merged = App._pq_merge_streams(
+                                tiny_snap, main_snap, current)
+                            streaming_tick[0] += 1
+                            _pq_stream_log("render",
+                                tick=streaming_tick[0],
+                                tiny_buf=len(tiny_snap),
+                                main_buf=len(main_snap),
+                                cur_total=len(current),
+                                cur_user=cur_user,
+                                cur_nonuser=cur_nonuser,
+                                merged=len(merged),
+                                merged_user=sum(
+                                    1 for w in merged
+                                    if w.get("_src") == "user"))
+                            s["transcript"] = merged
+                            # Streaming frontier — the further-along of
+                            # {main, tiny}.  Hides preserved user
+                            # edits past this point at render time so
+                            # they appear in place only once streaming
+                            # arrives at their audio position.
+                            _main_end = 0.0
+                            for _w in main_snap:
+                                if _w.get("break"): continue
+                                _e = float(_w.get("end", 0.0))
+                                if _e > _main_end: _main_end = _e
+                            _tiny_end_val = 0.0
+                            for _w in tiny_snap:
+                                if _w.get("break"): continue
+                                _e = float(_w.get("end", 0.0))
+                                if _e > _tiny_end_val: _tiny_end_val = _e
+                            _frontier = max(_main_end, _tiny_end_val)
                             # Capture the interactive state (cursor,
                             # selection, scroll, focus) BEFORE the
                             # re-render so Jordan can edit / scroll /
@@ -13123,14 +13840,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             # yanked back to the end on every tick.
                             state = self._pq_capture_text_state()
                             try:
-                                self._pq_render_transcript_text(s)
+                                self._pq_render_transcript_text(
+                                    s, user_frontier=_frontier)
                             except Exception:
                                 pass
                             else:
                                 self._pq_restore_text_state(state)
 
-                    def _stream_seg_cb(seg_words):
-                        streaming_words.extend(seg_words)
+                    def _schedule_stream_render():
                         now = time.perf_counter()
                         if (now - streaming_last_render[0] < 1.2
                                 or streaming_render_pending[0]):
@@ -13138,8 +13855,36 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         streaming_last_render[0] = now
                         streaming_render_pending[0] = True
                         # Schedule the render on the Tk main thread —
-                        # this callback runs in the worker thread.
+                        # this is called from worker threads.
                         self._ui(_do_stream_render)
+
+                    def _stream_seg_cb_tiny(seg_words):
+                        # Log timestamp range of the incoming segment
+                        # so we can see exactly what tiny is emitting.
+                        _real = [w for w in (seg_words or [])
+                                 if not w.get("break")]
+                        _pq_stream_log("seg_tiny",
+                            n=len(seg_words or []),
+                            n_real=len(_real),
+                            t0=(float(_real[0]["start"])
+                                if _real else None),
+                            t1=(float(_real[-1]["end"])
+                                if _real else None))
+                        streaming_words.extend(seg_words)
+                        _schedule_stream_render()
+
+                    def _stream_seg_cb_main(seg_words):
+                        _real = [w for w in (seg_words or [])
+                                 if not w.get("break")]
+                        _pq_stream_log("seg_main",
+                            n=len(seg_words or []),
+                            n_real=len(_real),
+                            t0=(float(_real[0]["start"])
+                                if _real else None),
+                            t1=(float(_real[-1]["end"])
+                                if _real else None))
+                        streaming_main_words.extend(seg_words)
+                        _schedule_stream_render()
 
                     # ── Decide whether (and how) to run a tiny draft pass
                     # When the user is actively viewing this session and
@@ -13161,9 +13906,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     configured_size = engines.get_active_model_size()
                     is_viewing_now = (getattr(self, "_pq_current_session",
                                                None) is session)
+                    # Progressive (tiny draft → configured refine) runs
+                    # any time the user is viewing AND the configured
+                    # model is bigger than tiny.  We used to skip it
+                    # when an existing transcript was present so a
+                    # re-transcribe wouldn't downgrade quality before
+                    # the configured pass caught up — but Jordan
+                    # explicitly wanted a draft ASAP on re-transcribe
+                    # too, and the merge keeps the prior content as
+                    # backdrop / user edits as sacred regardless.
                     do_progressive = (is_viewing_now
-                                       and configured_size != "tiny"
-                                       and not session.get("transcript"))
+                                       and configured_size != "tiny")
                     parallel_ok = engines.is_cuda_available()
 
                     # Per-pass thread storage when running parallel.
@@ -13182,7 +13935,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                     mix_path_ref, progress_cb=_on_seg_end,
                                     cancel_event=cancel_event,
                                     model_size="tiny",
-                                    segment_cb=_stream_seg_cb)
+                                    segment_cb=_stream_seg_cb_tiny)
                             else:
                                 speaker_labels = session.get("speakers") or {}
                                 tw = engines.transcribe_session_per_track(
@@ -13190,7 +13943,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                     progress_cb=_on_seg_end,
                                     cancel_event=cancel_event,
                                     model_size="tiny",
-                                    segment_cb=_stream_seg_cb)
+                                    segment_cb=_stream_seg_cb_tiny)
                             tiny_words_box[0] = tw
                             if tw and getattr(
                                     self, "_pq_current_session", None
@@ -13198,13 +13951,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 # Final render with the complete tiny
                                 # output (streaming may have rendered a
                                 # slightly stale view at last throttle).
-                                # Merge against the current session
-                                # transcript so any user edits made
-                                # during the stream survive this
-                                # overwrite.
-                                session["transcript"] = App._pq_merge_refine(
-                                    session.get("transcript") or [],
-                                    list(tw))
+                                # Three-way merge against user edits
+                                # AND any configured-pass words that
+                                # may have already streamed in.
+                                session["transcript"] = App._pq_merge_streams(
+                                    list(tw),
+                                    list(streaming_main_words),
+                                    session.get("transcript") or [])
                                 self._ui(lambda s=session:
                                           self._pq_preview_ready(s))
                         except engines.TranscriptionCancelled:
@@ -13230,7 +13983,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                         if do_progressive and parallel_ok:
                             # GPU: launch tiny in a sibling thread, then
-                            # run configured here in parallel.
+                            # run configured here in parallel.  Both
+                            # passes stream into their respective
+                            # buffers and the merge picks main over
+                            # tiny for any timestamp main has reached.
                             _set_phase("draft + refining (parallel)", "")
                             tiny_thread = threading.Thread(
                                 target=_run_tiny_pass,
@@ -13239,7 +13995,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             tiny_thread.start()
                             words = engines.transcribe_clip_verbatim(
                                 mix_path, progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb_main)
                             # Wait for tiny — almost always finished first
                             # but guarantee both done before merge.
                             tiny_thread.join()
@@ -13250,7 +14007,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             _set_phase("refining", "")
                             words = engines.transcribe_clip_verbatim(
                                 mix_path, progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb_main)
                         else:
                             # Non-progressive: stream the configured
                             # pass directly so the user sees text
@@ -13259,7 +14017,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             words = engines.transcribe_clip_verbatim(
                                 mix_path, progress_cb=_on_seg_end,
                                 cancel_event=cancel_event,
-                                segment_cb=_stream_seg_cb)
+                                segment_cb=_stream_seg_cb_main)
                     else:
                         # Multi-track — transcribe each independently so
                         # we know who said what (speaker = source file).
@@ -13274,7 +14032,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             words = engines.transcribe_session_per_track(
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb_main)
                             tiny_thread.join()
                         elif do_progressive:
                             _set_phase("draft (tiny)")
@@ -13284,7 +14043,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             words = engines.transcribe_session_per_track(
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                segment_cb=_stream_seg_cb_main)
                         else:
                             # Non-progressive multi-track: stream
                             # configured directly.
@@ -13294,7 +14054,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
                                 cancel_event=cancel_event,
-                                segment_cb=_stream_seg_cb)
+                                segment_cb=_stream_seg_cb_main)
                         # Build a mix purely for the playback cache so
                         # the user can hear both speakers when auditioning
                         # transcript regions.
@@ -13375,7 +14135,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     # its view.  Otherwise update the project row in place
                     # (if it's on screen) — no full re-render, no twitch.
                     if getattr(self, "_pq_current_session", None) is session:
+                        # Preserve cursor / selection / scroll across
+                        # the final render — the user may have been
+                        # reading partway through the streaming output
+                        # and shouldn't be yanked back to the top when
+                        # the run completes.
+                        _final_state = self._pq_capture_text_state()
                         self._pq_render_transcript_text(session)
+                        self._pq_restore_text_state(_final_state)
                         if (btn := getattr(self, "_pq_retx_btn", None)):
                             btn.config(text="⟳ RE-TRANSCRIBE", fg=TEXT)
                         if (lbl := getattr(self, "_pq_status_lbl", None)):
@@ -13408,7 +14175,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             lbl.config(
                                 text=("cancelled" if is_cancel else "error"),
                                 fg=(SUB if is_cancel else ERR))
+                        # Preserve cursor / selection / scroll on the
+                        # error-path render too — cancel mid-read
+                        # shouldn't jump the user away from where they
+                        # were looking.
+                        _err_state = self._pq_capture_text_state()
                         self._pq_render_transcript_text(session)
+                        self._pq_restore_text_state(_err_state)
                     elif getattr(self, "_pq_current_session", None) is None:
                         self._pq_update_project_row(session)
                     if is_mem:
@@ -13772,11 +14545,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if sys.platform == "win32":
             try:
                 import winsound
+                # Anchor the wall-clock instant we tell winsound to
+                # start, so the highlight tick can compute the
+                # playhead position from elapsed time + audio offset.
+                self._pq_play_clock_start = time.perf_counter()
+                self._pq_play_audio_in_s  = in_s
                 winsound.PlaySound(tf.name,
                                    winsound.SND_FILENAME | winsound.SND_ASYNC)
                 self._pq_playing = True
                 if (b := getattr(self, "_pq_play_btn", None)):
                     b.config(text="■ STOP")
+                # Kick off the karaoke highlight loop
+                self._pq_playback_highlight_tick()
                 # Schedule auto-restore of button text once playback ends
                 dur_ms = int(max(500, duration_s * 1000) + 300)
                 self.after(dur_ms, self._pq_stop_playback)
@@ -13786,10 +14566,66 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showinfo("Playback unsupported",
                 "Audio playback is only wired up for Windows in this build.")
 
+    def _pq_playback_highlight_tick(self):
+        """While playback is active, update the 'body_playing'
+        highlight to whichever word the playhead is currently inside
+        and scroll it into view.  Polls itself every ~60 ms — fast
+        enough to feel smooth, slow enough not to thrash Tk."""
+        if not getattr(self, "_pq_playing", False):
+            return
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is None:
+            return
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        start_clock = getattr(self, "_pq_play_clock_start", None)
+        audio_in_s  = getattr(self, "_pq_play_audio_in_s",  None)
+        if (word_idx and start_clock is not None
+                and audio_in_s is not None):
+            try:
+                playhead = audio_in_s + (
+                    time.perf_counter() - start_clock)
+                # Linear search is fine — _pq_word_index typically
+                # has a few hundred entries and we only run this 16x/s.
+                cur = None
+                for (s_abs, e_abs, w) in word_idx:
+                    ws = float(w.get("start", 0.0))
+                    we = float(w.get("end",   ws))
+                    if ws <= playhead < we:
+                        cur = (s_abs, e_abs)
+                        break
+                tx.tag_remove("body_playing", "1.0", "end")
+                if cur is not None:
+                    tx.tag_add(
+                        "body_playing",
+                        "1.0 + {}c".format(cur[0]),
+                        "1.0 + {}c".format(cur[1]))
+                    # Keep the playing word on screen without
+                    # snapping the user back to it on every tick if
+                    # they intentionally scrolled away — tx.see only
+                    # scrolls if the index is offscreen.
+                    tx.see("1.0 + {}c".format(cur[0]))
+            except tk.TclError:
+                pass
+        # Schedule next tick.  Cancel handle stored so stop can kill
+        # the loop immediately rather than waiting for the next poll.
+        self._pq_play_hi_after = self.after(
+            60, self._pq_playback_highlight_tick)
+
     def _pq_stop_playback(self):
         if not getattr(self, "_pq_playing", False):
             return
         self._pq_playing = False
+        # Cancel the highlight loop and clear any lingering tag.
+        if (after_id := getattr(self, "_pq_play_hi_after", None)):
+            try: self.after_cancel(after_id)
+            except Exception: pass
+            self._pq_play_hi_after = None
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is not None:
+            try:
+                tx.tag_remove("body_playing", "1.0", "end")
+            except tk.TclError:
+                pass
         if sys.platform == "win32":
             try:
                 import winsound

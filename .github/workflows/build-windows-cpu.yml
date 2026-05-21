@@ -27,10 +27,11 @@ jobs:
           python -m pip install pyinstaller
           python -m pip install -r requirements.txt
 
-      - name: Pre-download Whisper models (tiny / base / small)
-        # Bundling these three keeps the install size manageable while
-        # covering the practical choices for non-GPU users.  Medium and
-        # large-v3 still download on first use.
+      - name: Pre-download Whisper models (tiny only)
+        # Bundle just the tiny model so the installer stays small.
+        # Every other size (base / small / medium / large-v3)
+        # downloads on demand the first time the user picks it
+        # in the model picker.
         run: python _download_bundled_models.py
 
       - name: Download ffmpeg (Windows x64)

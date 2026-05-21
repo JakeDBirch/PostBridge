@@ -66,9 +66,12 @@ CHUNK_SILENCE_S      = 1.5    # silence duration (seconds) that triggers a chunk
 CHUNK_MAX_S          = 90     # max chunk length (seconds); longer chunks are force-split
 
 # ── Developer flags ────────────────────────────────────────────────────────────
-# Set DEV_DIAGNOSTIC = False before shipping a public build to strip the
-# algorithm diagnostic panel, DIAGNOSTIC button, and sidecar JSON writes.
-DEV_DIAGNOSTIC       = True
+# When True, exposes the DIAGNOSTIC button in Step-4 reconcile and writes
+# <output>_build_debug.json / <output>_diagnostic.txt sidecars next to
+# every AAF/XML export.  Useful for debugging the build pipeline but
+# leaves mystery files next to user-facing exports — keep False for any
+# build that ships to a non-dev user; flip True locally when debugging.
+DEV_DIAGNOSTIC       = False
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 # MeatEater dark theme — charcoal/near-black backgrounds, orange accent

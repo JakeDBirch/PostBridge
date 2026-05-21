@@ -7,6 +7,7 @@ __pycache__/
 .pb_cache/
 .bt_cache/
 _debug_run.log
+_pq_stream.log
 sync_preview_log.txt
 match_review_log.txt
 waveform_cache/
