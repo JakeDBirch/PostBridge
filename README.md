@@ -82,16 +82,21 @@ From the home screen, choose **PULL QUOTES**. Drop a folder, open an existing pr
 
 Each session is one or more audio files representing a single interview. Multi-track sessions (separate mics per speaker) get auto-diarized — each speaker labelled.
 
-Click **TRANSCRIBE** to run Whisper on the audio. The transcript renders as paragraphs with speaker headers and can be searched, edited, and annotated. If a cached transcript already exists alongside the source audio (`.pb_transcript.json`), PostBridge offers to use it instead of re-running Whisper.
+Click **TRANSCRIBE** to run Whisper on the audio. If a cached transcript already exists alongside the source audio (`.pb_transcript.json`), PostBridge prompts to **USE EXISTING** or **RE-TRANSCRIBE**. When re-transcribing, a *Preserve N edited words* checkbox keeps any prior user edits — they re-appear in place as the new transcription reaches their timestamps.
+
+**Progressive draft pass:** while you're viewing a session, PostBridge runs a tiny model first to get text on screen within seconds, then the configured (`small` / `medium` / `large-v3`) model refines on top. On GPU the two passes run in parallel; on CPU sequentially. Draft words render in muted grey; refined and user-edited words render solid. You can read and edit during the refine — your edits stick.
+
+The transcript renders as paragraphs with speaker headers and supports inline editing, margin notes, and full-text search (press the 🔍 toggle in the header to open the search bar).
 
 ### Step 3 — Lift quotes
 
 Select text in the transcript and right-click to:
 
 - **Copy as @PULL** — clipboard gets a script-ready block: `[TOKEN HH:MM:SS-HH:MM:SS]\n"<quote>"`
-- **Play selection** (Space) — auditions the audio
+- **Play selection** (Space) — auditions the audio; a warm orange highlight follows the playhead word-by-word and auto-scrolls to keep it in view
 - **Add margin note** (Ctrl+M) — annotate a passage without affecting the script output
-- **Edit selected text…** — fix Whisper transcription errors in place
+- **Edit selected text…** — fix Whisper transcription errors in place. Edited words are marked with a thin underline as a tracked-changes indicator
+- **Restore Whisper original** — appears when the selection contains user-edited words; one click splices the original Whisper text back in
 
 Paste straight into your PostBridge script. Timecodes are Whisper-precise — no further reconciliation needed for those pulls.
 
@@ -283,7 +288,7 @@ Inline dropdowns live next to the TRANSCRIBE button (Pull Quotes session view), 
 
 Your choice persists across sessions (saved to `~/.postbridge_prefs.json`). On the next transcription the new model loads — first-load is slower because the weights are downloaded if not already cached. GPU acceleration multiplies all of these by ~5–15×.
 
-**Bundled vs. on-demand:** PostBridge ships with only `tiny` pre-bundled (~75 MB) so the installer stays small enough to send via chat tools. On first launch, the app silently downloads `base` and then `small` in the background into `~/.postbridge_models/` so they're ready when you pick them later. `medium` and `large-v3` download on demand the first time you select them, then cache locally. All models persist across upgrades.
+**Bundled vs. on-demand:** PostBridge ships with only `tiny` pre-bundled (~75 MB) so the installer stays small enough to send via chat tools. Every other size — `base`, `small`, `medium`, `large-v3` — downloads on demand the first time you select it in the model picker, then caches locally to `~/.postbridge_models/`. Models persist across upgrades; the model picker shows a "downloading model — N MB" status the first time so you know it's not stuck. There's no background prefetch on launch — nothing downloads until you actually ask for it.
 
 ### Code-level settings
 
