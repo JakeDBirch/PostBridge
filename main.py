@@ -2372,7 +2372,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     pass
             return
         if getattr(self, 'workflow', None) == 'pull_quotes':
-            self._pq_save_episode_project(prompt_path=False)
+            # Standalone-session view: opened a .pb_session.json directly
+            # rather than a .pb_episode.json project, so the wrapper
+            # project has no file_path of its own.  Ctrl+S should save
+            # the session itself (which already has a _file_path) rather
+            # than prompting for a brand-new project file every press.
+            _proj = getattr(self, "_pq_project", None) or {}
+            _sessions = _proj.get("sessions") or []
+            if (not _proj.get("file_path")
+                    and len(_sessions) == 1
+                    and _sessions[0].get("_file_path")):
+                try:
+                    self._pq_save_session_file(_sessions[0])
+                except Exception:
+                    pass
+            else:
+                self._pq_save_episode_project(prompt_path=False)
             b = btn_ref[0] if btn_ref else None
             if b:
                 try:
