@@ -3589,13 +3589,45 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # 2 seconds; subsequent ticks fire every 2s via the after loop.
         self.after(100, _tick_resources)
 
+        # ── Transcription tasks panel ─────────────────────────────────
+        # Top panel: one row per transcription task (interview token's
+        # full-audio pass OR a single VO take).  Rows appear as their
+        # task starts, update in place as progress comes in, and freeze
+        # with a ✓ once done.  Whole panel collapses (pack_forget) when
+        # every task has reached a terminal state, giving the reconcile
+        # log all the remaining vertical space.
+        xc_hdr = tk.Frame(self.body, bg=BG)
+        xc_hdr.pack(fill="x", pady=(0, 2))
+        tk.Label(xc_hdr, text="TRANSCRIPTION", font=FL,
+                 bg=BG, fg=SUB).pack(side="left", padx=12)
+        self._xc_tasks_count_lbl = tk.Label(
+            xc_hdr, text="", font=FL, bg=BG, fg=SUB)
+        self._xc_tasks_count_lbl.pack(side="left", padx=(8, 0))
+
+        self._xc_tasks_frame = tk.Frame(
+            self.body, bg=SURF,
+            highlightbackground=BORDER, highlightthickness=1)
+        self._xc_tasks_frame.pack(fill="x", pady=(0, 8))
+        # Per-task widget refs live here so updates are surgical.
+        self._xc_tasks         = {}     # task_id -> state dict
+        self._xc_task_order    = []     # insertion order for stable layout
+        self._xc_task_widgets  = {}     # task_id -> widget dict
+        # Reset on each entry into Step 3.
+        self._xc_tasks_header  = xc_hdr
+        self._xc_tasks_visible = True
+
         log_frame = tk.Frame(self.body, bg=SURF3,
                              highlightbackground=BORDER, highlightthickness=1)
         log_frame.pack(fill="both", expand=True)
-        self._log = tk.Text(log_frame, bg=SURF3, fg=SUB, font=FB,
+        tk.Label(log_frame, text="RECONCILIATION", font=FL,
+                 bg=SURF3, fg=SUB, anchor="w", padx=8, pady=4
+                 ).pack(fill="x")
+        log_inner = tk.Frame(log_frame, bg=SURF3)
+        log_inner.pack(fill="both", expand=True)
+        self._log = tk.Text(log_inner, bg=SURF3, fg=SUB, font=FB,
                             relief="flat", bd=8, state="disabled",
                             height=20, wrap="word")
-        sb = _SlimScrollbar(log_frame, command=self._log.yview)
+        sb = _SlimScrollbar(log_inner, command=self._log.yview)
         self._log.configure(yscrollcommand=sb.set)
         self._log.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -3673,6 +3705,377 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     _DEBUG_LOG      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_debug_run.log")
     _DEBUG_LOG_LOCK = threading.Lock()   # serialise concurrent thread writes to the log file
 
+    # ── Step 3 transcription-tasks routing ────────────────────────────
+    # Regex patterns matched against every _log_line() message.  When
+    # a pattern matches, the message is consumed (kept out of the
+    # bottom reconciliation log) and routed into the top transcription
+    # tasks panel as a structured update.  Engines.py keeps emitting
+    # the same human-readable strings; this is purely a UI-side
+    # transformation, so engine code stays unchanged.
+    _XC_TOKEN_START_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+starting\s+(\d+)\s+pull")
+    _XC_TOKEN_MIXED_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+mixed\s+(\d+)\s+tracks?")
+    _XC_TOKEN_CACHED_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+using cached full-audio transcript "
+        r"\((\d+)\s+words\)")
+    _XC_TOKEN_FULL_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+\d+\s+pulls\s+\+\s+no cached transcript")
+    _XC_TOKEN_SILENCE_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+Detecting silence splits")
+    _XC_TOKEN_PROG_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+Transcribing\s+—\s+"
+        r"(\d+)s\s+of\s+(\d+)s\s+\((\d+)%\)")
+    _XC_TOKEN_DONE_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+full transcript ready\s+"
+        r"\((\d+)\s+words,\s+([\d.]+)s\)")
+    _XC_TOKEN_PULL_DONE_RE = re.compile(
+        r"^\s*\[(\w+)\]\s+done\s+—\s+(\d+)\s+pull")
+    _XC_VO_HEADER_RE = re.compile(
+        r"^\s*Transcribing VO Part\s+(\d+)\s+—\s+(\d+)\s+take")
+    _XC_VO_FRESH_RE = re.compile(
+        r"^\s*Part\s+(\d+)\s+Take\s+(\d+):\s+cache miss")
+    _XC_VO_CACHED_RE = re.compile(
+        r"^\s*Part\s+(\d+)\s+Take\s+(\d+):\s+(\d+)\s+words\s+\[cached\]")
+    _XC_VO_CHUNKS_RE = re.compile(
+        r"^\s*Part\s+(\d+)\s+Take\s+(\d+):\s+(\d+)\s+chunks\s+—\s+"
+        r"transcribing")
+    _XC_VO_DONE_RE = re.compile(
+        r"^\s*Part\s+(\d+)\s+Take\s+(\d+):\s+chunked done in\s+"
+        r"([\d.]+)s\s+\((\d+)\s+words\)")
+    # Noise: blob/save/no-video lines that follow VO_DONE — drop entirely.
+    _XC_VO_NOISE_RE = re.compile(
+        r"^\s*Part\s+\d+\s+Take\s+\d+:\s+(?:\d+\s+blobs|"
+        r"\d+\s+words\s+\[saved to cache\]|"
+        r"\d+\s+words\s+\(no video\))")
+
+    @staticmethod
+    def _xc_phase_icon(phase):
+        return {
+            "pending":          "⋯",
+            "mixing":           "⋯",
+            "silence-detect":   "⋯",
+            "transcribing":     "▸",
+            "done":             "✓",
+            "cached":           "⚡",
+            "error":            "⚠",
+        }.get(phase, "·")
+
+    @staticmethod
+    def _xc_phase_color(phase):
+        return {
+            "pending":          SUB,
+            "mixing":           SUB,
+            "silence-detect":   SUB,
+            "transcribing":     ACCENT,
+            "done":             SUCCESS,
+            "cached":           SUCCESS,
+            "error":            ERR,
+        }.get(phase, TEXT)
+
+    def _xc_task_ensure(self, task_id, label, category):
+        """Create the row for `task_id` if it doesn't already exist.
+        Returns the widget dict.  Idempotent."""
+        if task_id in self._xc_task_widgets:
+            return self._xc_task_widgets[task_id]
+        body = getattr(self, "_xc_tasks_frame", None)
+        if body is None:
+            return None
+        # Panel may have been collapsed after a prior all-done state;
+        # re-show it if a new task is starting.  Re-pack frame BEFORE
+        # the log container, then header BEFORE the frame, so layout
+        # ends up: header → tasks → log (top to bottom).
+        if not getattr(self, "_xc_tasks_visible", True):
+            try:
+                _log_outer = self._log.master.master
+                self._xc_tasks_frame.pack(fill="x", pady=(0, 8),
+                                          before=_log_outer)
+                self._xc_tasks_header.pack(fill="x", pady=(0, 2),
+                                           before=self._xc_tasks_frame)
+                self._xc_tasks_visible = True
+            except tk.TclError:
+                pass
+
+        row = tk.Frame(body, bg=SURF)
+        row.pack(fill="x", padx=8, pady=2)
+
+        icon_lbl = tk.Label(row, text="⋯", font=FBT,
+                             bg=SURF, fg=SUB, width=2, anchor="center")
+        icon_lbl.pack(side="left")
+
+        lbl_lbl = tk.Label(row, text=label, font=FBT,
+                            bg=SURF, fg=ACCENT,
+                            anchor="w", width=16, padx=4)
+        lbl_lbl.pack(side="left")
+
+        status_lbl = tk.Label(row, text="queued", font=FB,
+                               bg=SURF, fg=SUB, anchor="w")
+        status_lbl.pack(side="left", fill="x", expand=True)
+
+        pct_lbl = tk.Label(row, text="", font=FB,
+                            bg=SURF, fg=SUB, width=5, anchor="e")
+        pct_lbl.pack(side="right", padx=(4, 8))
+
+        bar_holder = tk.Frame(row, bg=SURF, width=120, height=6)
+        bar_holder.pack_propagate(False)
+        bar_holder.pack(side="right", padx=4)
+        bar = _FlatProgressBar(bar_holder, height=6,
+                                fill=ACCENT, bg=SURF2)
+        bar.pack(fill="both", expand=True)
+
+        widgets = {
+            "row":        row,
+            "icon_lbl":   icon_lbl,
+            "lbl_lbl":    lbl_lbl,
+            "status_lbl": status_lbl,
+            "pct_lbl":    pct_lbl,
+            "bar":        bar,
+            "category":   category,
+        }
+        self._xc_task_widgets[task_id] = widgets
+        self._xc_task_order.append(task_id)
+        self._xc_tasks[task_id] = {
+            "phase":  "pending",
+            "pct":    0,
+            "detail": "queued",
+        }
+        self._xc_update_count_label()
+        return widgets
+
+    def _xc_task_update(self, task_id, **updates):
+        """Update one task's phase / pct / detail and refresh its row."""
+        state = self._xc_tasks.get(task_id)
+        if state is None:
+            return
+        state.update(updates)
+        w = self._xc_task_widgets.get(task_id)
+        if w is None:
+            return
+        phase  = state.get("phase",  "pending")
+        pct    = state.get("pct",    0)
+        detail = state.get("detail", "")
+        try:
+            w["icon_lbl"].config(text=self._xc_phase_icon(phase),
+                                  fg=self._xc_phase_color(phase))
+            w["status_lbl"].config(text=detail,
+                                    fg=self._xc_phase_color(phase))
+            if phase in ("done", "cached"):
+                w["pct_lbl"].config(text="")
+                w["bar"].set(1, 1)
+            elif phase == "transcribing" and pct:
+                w["pct_lbl"].config(text="{}%".format(int(pct)))
+                w["bar"].set(pct, 100)
+            elif phase == "transcribing":
+                w["pct_lbl"].config(text="")
+                w["bar"].set(0, 1)
+            else:
+                w["pct_lbl"].config(text="")
+                w["bar"].set(0, 1)
+        except tk.TclError:
+            pass
+        self._xc_update_count_label()
+        self._xc_maybe_collapse()
+
+    def _xc_update_count_label(self):
+        """Show 'N tasks · M done' beside the TRANSCRIPTION header."""
+        lbl = getattr(self, "_xc_tasks_count_lbl", None)
+        if lbl is None:
+            return
+        n_total = len(self._xc_tasks)
+        n_done  = sum(1 for s in self._xc_tasks.values()
+                      if s.get("phase") in ("done", "cached"))
+        try:
+            if n_total:
+                lbl.config(text="({} task{} · {} done)".format(
+                    n_total, "s" if n_total != 1 else "", n_done))
+            else:
+                lbl.config(text="")
+        except tk.TclError:
+            pass
+
+    def _xc_maybe_collapse(self):
+        """Hide the transcription panel once every task has reached a
+        terminal phase.  Reverses itself in _xc_task_ensure if a new
+        task starts (e.g. user kicks off another reconcile run)."""
+        if not self._xc_tasks:
+            return
+        all_done = all(
+            s.get("phase") in ("done", "cached", "error")
+            for s in self._xc_tasks.values())
+        if all_done and getattr(self, "_xc_tasks_visible", True):
+            try:
+                self._xc_tasks_frame.pack_forget()
+                self._xc_tasks_header.pack_forget()
+                self._xc_tasks_visible = False
+            except tk.TclError:
+                pass
+
+    def _xc_reset(self):
+        """Clear all task rows + state.  Called at the start of each
+        reconcile run so a re-run doesn't accumulate stale rows."""
+        for w in list(self._xc_task_widgets.values()):
+            try:
+                w["row"].destroy()
+            except tk.TclError:
+                pass
+        self._xc_task_widgets = {}
+        self._xc_tasks        = {}
+        self._xc_task_order   = []
+        # Re-show the panel header in case a previous run left it
+        # collapsed.  Pack frame first (before log container) then
+        # header (before frame) for top-to-bottom ordering.
+        if getattr(self, "_xc_tasks_frame", None) is not None:
+            try:
+                if not self._xc_tasks_visible:
+                    _log_outer = self._log.master.master
+                    self._xc_tasks_frame.pack(
+                        fill="x", pady=(0, 8), before=_log_outer)
+                    self._xc_tasks_header.pack(
+                        fill="x", pady=(0, 2),
+                        before=self._xc_tasks_frame)
+                    self._xc_tasks_visible = True
+            except tk.TclError:
+                pass
+        self._xc_update_count_label()
+
+    def _xc_route_log(self, msg, color=None):
+        """Try to interpret `msg` as a transcription-task progress
+        message and update the top panel.  Returns True when the
+        message was consumed (don't echo to the bottom log) and False
+        otherwise."""
+        if not msg:
+            return False
+        if not hasattr(self, "_xc_tasks"):
+            return False
+        # — VO noise (blob counts / save confirmations / no-video) —
+        if self._XC_VO_NOISE_RE.match(msg):
+            return True
+
+        # — VO take patterns —
+        m = self._XC_VO_FRESH_RE.match(msg)
+        if m:
+            part, take = m.group(1), m.group(2)
+            tid = ("vo", part, take)
+            self._xc_task_ensure(
+                tid, "Part {} T{}".format(part, take), "vo")
+            self._xc_task_update(
+                tid, phase="pending", detail="cache miss · queued",
+                pct=0)
+            return True
+        m = self._XC_VO_CHUNKS_RE.match(msg)
+        if m:
+            part, take, nchunks = m.group(1), m.group(2), m.group(3)
+            tid = ("vo", part, take)
+            self._xc_task_ensure(
+                tid, "Part {} T{}".format(part, take), "vo")
+            self._xc_task_update(
+                tid, phase="transcribing",
+                detail="transcribing · {} chunks".format(nchunks),
+                pct=0)
+            return True
+        m = self._XC_VO_CACHED_RE.match(msg)
+        if m:
+            part, take, nwords = m.group(1), m.group(2), m.group(3)
+            tid = ("vo", part, take)
+            self._xc_task_ensure(
+                tid, "Part {} T{}".format(part, take), "vo")
+            self._xc_task_update(
+                tid, phase="cached",
+                detail="cached · {} words".format(nwords))
+            return True
+        m = self._XC_VO_DONE_RE.match(msg)
+        if m:
+            part, take, secs, nwords = m.groups()
+            tid = ("vo", part, take)
+            self._xc_task_ensure(
+                tid, "Part {} T{}".format(part, take), "vo")
+            self._xc_task_update(
+                tid, phase="done",
+                detail="done · {} words · {}s".format(nwords, secs))
+            return True
+        if self._XC_VO_HEADER_RE.match(msg):
+            # Informational ("Transcribing VO Part N — M takes...") —
+            # let it pass through to the log so the user sees the
+            # high-level grouping.  Don't claim the message.
+            return False
+
+        # — Interview-token patterns —
+        m = self._XC_TOKEN_PROG_RE.match(msg)
+        if m:
+            tok, cur_s, tot_s, pct = m.groups()
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="transcribing",
+                detail="transcribing · {}s of {}s".format(cur_s, tot_s),
+                pct=int(pct))
+            return True
+        m = self._XC_TOKEN_DONE_RE.match(msg)
+        if m:
+            tok, nwords, secs = m.groups()
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="done",
+                detail="done · {} words · {}s".format(nwords, secs))
+            return True
+        m = self._XC_TOKEN_CACHED_RE.match(msg)
+        if m:
+            tok, nwords = m.groups()
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="cached",
+                detail="cached · {} words".format(nwords))
+            return True
+        m = self._XC_TOKEN_FULL_RE.match(msg)
+        if m:
+            tok = m.group(1)
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="transcribing",
+                detail="transcribing full audio…",
+                pct=0)
+            return True
+        m = self._XC_TOKEN_SILENCE_RE.match(msg)
+        if m:
+            tok = m.group(1)
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="silence-detect",
+                detail="detecting silence splits…")
+            return True
+        m = self._XC_TOKEN_MIXED_RE.match(msg)
+        if m:
+            tok, n = m.group(1), m.group(2)
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            self._xc_task_update(
+                tid, phase="mixing",
+                detail="mixed {} tracks".format(n))
+            return True
+        m = self._XC_TOKEN_START_RE.match(msg)
+        if m:
+            tok, n_pulls = m.group(1), m.group(2)
+            tid = ("interview", tok)
+            self._xc_task_ensure(tid, "[{}]".format(tok), "interview")
+            # Only set "queued" if we haven't already advanced past it
+            # via mixed/silence/transcribing — multiple messages can
+            # land out of order.
+            state = self._xc_tasks.get(tid) or {}
+            if state.get("phase", "pending") == "pending":
+                self._xc_task_update(
+                    tid, phase="pending",
+                    detail="queued · {} pulls".format(n_pulls))
+            return True
+        # [TOKEN] done — N pull(s) completed is a RECONCILE-phase
+        # message, not transcription.  Let it pass through.
+        if self._XC_TOKEN_PULL_DONE_RE.match(msg):
+            return False
+        return False
+
     def _log_line(self, msg, color=None):
         # Also write to the run log file if one is open
         if getattr(self, "_run_log_fh", None):
@@ -3688,6 +4091,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _dlf.write(msg + "\n")
         except Exception:
             pass
+        # Route transcription progress messages to the top panel; if
+        # consumed there, don't double-print in the bottom log.
+        try:
+            consumed = self._xc_route_log(msg, color)
+        except Exception:
+            consumed = False
+        if consumed:
+            return
         def _do():
             self._log.configure(state="normal")
             tag = "c{}".format(abs(hash(color or "")))
@@ -3710,6 +4121,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Clear the debug mirror at the start of each run
         try:
             open(self._DEBUG_LOG, "w").close()
+        except Exception:
+            pass
+        # Clear any task rows left over from a prior run on the same
+        # Step 3 view (rare but possible if the user cancels and
+        # re-runs without leaving the screen).
+        try:
+            self._xc_reset()
         except Exception:
             pass
 
@@ -4780,6 +5198,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._cancel.set()
         self._dot_running = False
         self._log_line("Cancel requested — stopping after current items finish…", WARN)
+        # Mark any in-flight transcription tasks as cancelled so the
+        # top panel doesn't keep them pinned as "transcribing…" while
+        # the worker winds down.
+        try:
+            for tid, state in list(self._xc_tasks.items()):
+                if state.get("phase") in ("done", "cached", "error"):
+                    continue
+                self._xc_task_update(
+                    tid, phase="error",
+                    detail="cancelled")
+        except Exception:
+            pass
         # Disable the cancel button immediately so the user knows the click landed
         for w in self.body.winfo_children():
             if isinstance(w, tk.Frame):
