@@ -159,7 +159,7 @@ A live progress log shows per-clip status. A **resource monitor** above the log 
 
 **Script-conform editing:** when a full transcript is available, PostBridge aligns the script's quote text against the transcript and generates internal cuts for any words on tape that aren't in the script — e.g. "you know" or "um" survivors get cut automatically. Safe by design: if alignment confidence is low, falls back to single-segment match.
 
-**Text-fallback reconcile:** if a pull's timecodes are bad (in > out, or out-of-range), PostBridge does a fuzzy word-sequence search through the cached transcript to find the quote anyway. Lands the pull in "needs review" so you can verify.
+**Text-fallback reconcile:** PostBridge does a fuzzy word-sequence search through the cached transcript to find the quote anyway in three failure modes — syntactically bad timecodes (in > out), out-of-range timecodes (no words in the window), or **mis-pointed timecodes** (a valid range that happens to point at the wrong audio — usually a duplicate timecode copy-pasted across two different pulls). The mis-pointed case is detected by scoring how well the script quote fits the words inside the TC window; a poor local fit plus a clearly better match elsewhere triggers a snap to the better location. Any fallback lands the pull in "needs review" so you can verify.
 
 Status badges:
 - **ok** — strong match

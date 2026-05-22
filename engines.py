@@ -1763,6 +1763,48 @@ def reconcile_pull_from_session(pull, session_data):
                     in_s, out_s)
             return result
 
+    # ── Mis-pointed TCs guard ────────────────────────────────────────
+    # The previous block only catches in>out and out-of-range timecodes.
+    # It misses a third failure mode: TCs that ARE valid (in<out, words
+    # in range) but point at the WRONG audio — most commonly a
+    # duplicate timecode copy-pasted across two different pulls in the
+    # script.  Detect it by scoring how well the script quote fits the
+    # words actually inside the TC window.  If the local fit is poor
+    # AND the full transcript has a clearly better match elsewhere,
+    # snap the pull to that location and flag it as text-fallback so
+    # it lands in "needs review" with the right audio.
+    #
+    # Thresholds:
+    #   LOCAL_OK   — at/above this, trust the TCs even if global beats them
+    #   MARGIN     — global must beat local by at least this much
+    if not result.get("_text_fallback"):
+        quote_text_probe = pull.get("quote_text") or ""
+        if quote_text_probe:
+            LOCAL_OK = 0.30
+            MARGIN   = 0.20
+            local_fit = fuzzy_locate_quote(
+                overlapping, quote_text_probe, min_ratio=0.0)
+            local_ratio = local_fit[2] if local_fit else 0.0
+            if local_ratio < LOCAL_OK:
+                global_fit = fuzzy_locate_quote(
+                    transcript, quote_text_probe, min_ratio=0.5)
+                if (global_fit is not None
+                        and global_fit[2] >= local_ratio + MARGIN):
+                    fb_start, fb_end, ratio, matched_dicts = global_fit
+                    overlapping = matched_dicts
+                    in_s, out_s = fb_start, fb_end
+                    result["_diag"] = (
+                        "TCs pointed at wrong audio "
+                        "(local fit {:.0%} at [{:.1f},{:.1f}]); "
+                        "snapped via text-fallback "
+                        "({:.0%} overlap at [{:.1f},{:.1f}])".format(
+                            local_ratio,
+                            float(pull.get("in_seconds", 0.0)),
+                            float(pull.get("out_seconds", 0.0)),
+                            ratio, fb_start, fb_end)
+                    )
+                    result["_text_fallback"] = True
+
     # Snap to the actual word boundaries we found — gives Whisper-precise
     # in/out points instead of the (possibly rounded) script timecodes.
     snapped_in  = float(overlapping[0].get("start", in_s))
