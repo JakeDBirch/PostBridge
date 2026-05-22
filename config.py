@@ -29,6 +29,18 @@ FULL_TRANSCRIBE_CONCURRENCY = 4  # how many auto-promoted full-audio transcribes
                               # GPU% pinned high + workers near the limit
                               # means you're saturated; idle GPU and queued
                               # tokens means you can bump this higher.
+
+WHISPER_NUM_WORKERS = 4       # CTranslate2 worker pool size for the shared
+                              # WhisperModel.  Default of 1 makes concurrent
+                              # transcribe() calls (e.g. 7 VO chunked passes
+                              # + 1 full-audio interview all running at
+                              # once) serialise at the model layer, leaving
+                              # the GPU at ~30% utilisation even when many
+                              # threads are calling in parallel.  4 lets
+                              # multiple decodings share the GPU
+                              # concurrently — sized to match the FULL_
+                              # TRANSCRIBE_CONCURRENCY cap above so they
+                              # don't end up fighting each other.
 # ── Script-conform editing ──────────────────────────────────────────────────
 # When a pull has a full transcript available (PQ session or .pb_transcript
 # .json sidecar), reconcile aligns the script's quote_text against the

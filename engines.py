@@ -636,9 +636,15 @@ def get_model(size=None):
             #   - medium/large-v3 download on demand the first time
             #     the user picks them.
             _seed_bundled_models()
+            # num_workers > 1 lets concurrent transcribe() calls share
+            # the GPU instead of serialising in CTranslate2 — see
+            # config.WHISPER_NUM_WORKERS for the rationale.  Critical
+            # for reconcile runs where one full-audio interview pass
+            # is happening alongside several VO chunked transcribes.
             _model_cache[size] = WhisperModel(
                 size, device=device, compute_type=compute,
-                download_root=_persistent_models_dir())
+                download_root=_persistent_models_dir(),
+                num_workers=WHISPER_NUM_WORKERS)
         return _model_cache[size]
 
 def _clip_rms_db(wav_path):
