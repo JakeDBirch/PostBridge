@@ -3457,12 +3457,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                   bg=SURF, fg=TEXT, anchor="w")
         self._res_lbl.pack(side="left", padx=(6, 0))
 
-        # "?" help affordance opens an inline reference of what the
-        # numbers mean — easier than the user having to remember the
-        # signal table we walked through over chat.
+        # "?" help affordance sits inline next to the values it
+        # explains — packed left so it stays close to the readout
+        # instead of floating off at the far edge of the row.
         help_lbl = tk.Label(res_row, text=" ⓘ ", font=FB,
                              bg=SURF, fg=SUB, cursor="hand2")
-        help_lbl.pack(side="right")
+        help_lbl.pack(side="left", padx=(4, 0))
         help_lbl.bind("<Enter>",
                        lambda e, w=help_lbl: w.config(fg=ACCENT))
         help_lbl.bind("<Leave>",

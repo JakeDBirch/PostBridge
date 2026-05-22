@@ -1517,6 +1517,58 @@ def _base_result(pull):
 
 _PULL_ORDERING_LOOKBACK = 10.0  # seconds of slack before the cursor for interview pulls
 
+# Common contractions + spoken-vs-written equivalents.  Applied to BOTH
+# the script quote_text and each transcript word's lowercase form before
+# tokenization, so "I've" / "I have", "gonna" / "going to", "they're" /
+# "they are" all line up regardless of which form the script editor
+# used and which Whisper produced.  This reliably lifts the alignment
+# ratio on conversational interview content by a few percentage points
+# and recovers cases where a single contraction was the only blocker
+# to a clean script-conform match.
+#
+# Order matters: longer forms first so "wouldn't've" doesn't get
+# half-eaten by "wouldn't" before the trailing "'ve" is handled.
+_CONTRACTION_EXPANSIONS = [
+    ("won't",     "will not"),
+    ("can't",     "cannot"),
+    ("shan't",    "shall not"),
+    ("ain't",     "is not"),
+    ("y'all",     "you all"),
+    ("gonna",     "going to"),
+    ("wanna",     "want to"),
+    ("gotta",     "got to"),
+    ("kinda",     "kind of"),
+    ("sorta",     "sort of"),
+    ("lemme",     "let me"),
+    ("gimme",     "give me"),
+    ("dunno",     "do not know"),
+    ("'tis",      "it is"),
+    ("o'clock",   "oclock"),    # collapse so "o" + "clock" don't split
+    # — n't endings —
+    ("n't",       " not"),
+    # — 're / 'll / 've / 'd / 's / 'm —
+    ("'re",       " are"),
+    ("'ll",       " will"),
+    ("'ve",       " have"),
+    ("'d",        " would"),
+    ("'m",        " am"),
+    # "'s" is intentionally LEFT ALONE — it's ambiguous between "is"
+    # ("she's tall") and possessive ("Dr. Young's house").  Trying
+    # to expand it hurts more than it helps.
+]
+
+def _normalize_for_match(text):
+    """Apply spoken/written contraction equivalents to `text` (already
+    lowercased) so the tokenizer downstream produces aligned token
+    sequences for either form.  See _CONTRACTION_EXPANSIONS for the
+    rules and rationale."""
+    if not text:
+        return text
+    for src, dst in _CONTRACTION_EXPANSIONS:
+        text = text.replace(src, dst)
+    return text
+
+
 def fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5):
     """Find where ``quote_text`` lives inside ``transcript`` (a list of
     word dicts) using fuzzy word-sequence matching.  Returns
@@ -1535,8 +1587,12 @@ def fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5):
     """
     if not quote_text or not transcript:
         return None
-    # Clean target: lowercase, alphanum (matches transcribe_clip's word format)
-    target = re.findall(r"[a-z']+", quote_text.lower())
+    # Normalize contractions on the script side so "I've" lines up with
+    # transcript "I have" (and vice versa) — same logic applied to the
+    # transcript side below.
+    target = re.findall(
+        r"[a-z']+",
+        _normalize_for_match(quote_text.lower()))
     # Strip very short tokens that produce noise (single letters, common stopwords
     # contribute little signal at this scale).  Below 4 tokens is too short
     # to fuzzy-match safely.
@@ -1544,12 +1600,15 @@ def fuzzy_locate_quote(transcript, quote_text, min_ratio=0.5):
         return None
 
     # Build a parallel array of clean transcript words + their source dicts.
+    # A single contraction word ("I've") expands to multiple tokens
+    # ("i", "have") all pointing at the same source dict, so a match
+    # block that spans those still resolves to one word's timestamp.
     clean = []
     for w in transcript:
         if w.get("break"):
             continue
-        tok = re.sub(r"[^a-z']", "", (w.get("word") or "").lower())
-        if tok:
+        raw = _normalize_for_match((w.get("word") or "").lower())
+        for tok in re.findall(r"[a-z']+", raw):
             clean.append((tok, w))
     if len(clean) < len(target):
         return None
@@ -1616,17 +1675,25 @@ def script_conform_segments(transcript_words, quote_text,
     if not quote_text or not transcript_words:
         return None
 
-    script_tokens = re.findall(r"[a-z']+", quote_text.lower())
+    # Same contraction-normalisation as fuzzy_locate_quote — "I've" /
+    # "I have", "gonna" / "going to" all line up regardless of which
+    # form the script editor or Whisper used.  See _CONTRACTION_EXPANSIONS.
+    script_tokens = re.findall(
+        r"[a-z']+",
+        _normalize_for_match(quote_text.lower()))
     if len(script_tokens) < 4:
         return None
 
     # Parallel arrays: clean tokens + source dicts.  Skip "break" markers.
+    # Contraction words expand to multiple tokens, each pointing at the
+    # SAME source dict — block matches that span them still resolve to
+    # the original word's timestamps.
     trans = []
     for w in transcript_words:
         if w.get("break"):
             continue
-        tok = re.sub(r"[^a-z']", "", (w.get("word") or "").lower())
-        if tok:
+        raw = _normalize_for_match((w.get("word") or "").lower())
+        for tok in re.findall(r"[a-z']+", raw):
             trans.append((tok, w))
     if len(trans) < min_run:
         return None
