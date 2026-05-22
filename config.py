@@ -54,9 +54,16 @@ SCRIPT_CONFORM_MIN_RATIO   = 0.70  # minimum fraction of script tokens that must
 SCRIPT_CONFORM_MIN_RUN     = 2     # ignore matching blocks shorter than this
                                   # (1-token "matches" are usually coincidental
                                   # — "the", "and", "I" turn up everywhere)
-SCRIPT_CONFORM_MERGE_GAP_S = 0.4   # merge segments whose inter-cut gap is
+SCRIPT_CONFORM_MERGE_GAP_S = 0.8   # merge segments whose inter-cut gap is
                                   # shorter than this; Whisper's natural pauses
-                                  # within a sentence shouldn't become cuts
+                                  # within a sentence shouldn't become cuts.
+                                  # Bumped from 0.4 → 0.8 because most
+                                  # observed user edits in Step 4 were
+                                  # restoring sub-second pauses the algorithm
+                                  # had cut.  Editorial intent for those
+                                  # short pauses is "keep" not "remove";
+                                  # 0.8 s catches breaths and natural beats
+                                  # without merging real un-scripted asides.
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # seconds between parts in the sequence

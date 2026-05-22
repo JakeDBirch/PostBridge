@@ -1372,6 +1372,178 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         script_name = os.path.splitext(os.path.basename(self._script_path))[0]
         return os.path.join(cache, script_name + "_step4state.json")
 
+    def _conform_baseline_path(self):
+        """Sidecar that captures the conform output exactly as it was
+        the moment reconcile finished — before any user edits.  Pairs
+        with _s4_snapshot() (current state) to produce the user-edits
+        diff in _user_edits_diff_path()."""
+        cache = self._pb_cache_dir()
+        if not cache:
+            return None
+        script_name = os.path.splitext(
+            os.path.basename(self._script_path))[0]
+        return os.path.join(cache, script_name + "_conform_baseline.json")
+
+    def _user_edits_diff_path(self):
+        """Sidecar holding the per-pull diff between the conform
+        baseline (above) and the current Step 4 state.  Regenerated on
+        every _s4_save() so a post-session audit shows exactly where
+        the editor disagreed with the algorithm."""
+        cache = self._pb_cache_dir()
+        if not cache:
+            return None
+        script_name = os.path.splitext(
+            os.path.basename(self._script_path))[0]
+        return os.path.join(cache, script_name + "_user_edits.json")
+
+    def _write_conform_baseline(self):
+        """Snapshot self.results into the conform-baseline sidecar.
+        Called exactly once per fresh reconcile, immediately after the
+        worker finishes and BEFORE the user has any opportunity to
+        edit anything — this is the algorithm's output as ground truth
+        for the subsequent diff."""
+        path = self._conform_baseline_path()
+        if not path:
+            return
+        snap = {}
+        for r in getattr(self, "results", []) or []:
+            order = r.get("order")
+            if order is None:
+                continue
+            entry = {
+                "segments":   r.get("segments", []),
+                "rec_in_tc":  r.get("rec_in_tc",  ""),
+                "rec_out_tc": r.get("rec_out_tc", ""),
+                "rec_in_s":   r.get("rec_in_s",   0.0),
+                "rec_out_s":  r.get("rec_out_s",  0.0),
+                "status":     r.get("status",     ""),
+                "token":      r.get("token",      ""),
+                "is_vo":      bool(r.get("is_vo", False)),
+                "confidence": r.get("confidence", None),
+                # Fresh reconcile output starts unflagged on both axes.
+                "ignored":    False,
+                "accepted":   False,
+            }
+            if "gap_after_s" in r:
+                entry["gap_after_s"] = r["gap_after_s"]
+            snap[str(order)] = entry
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=2)
+        except Exception:
+            pass
+
+    def _compute_user_edits_diff(self):
+        """Compare the current _s4_snapshot() to the conform baseline
+        and write a structured diff sidecar.  Each pull where the user
+        touched anything (segment boundaries, accept/ignore toggle,
+        rec_in/rec_out adjustment) gets a per-field delta entry.
+
+        Also computes summary counters so a quick read shows the
+        aggregate scope of editor intervention (how many pulls touched,
+        net seconds added/removed via segment edits, etc.).
+        """
+        bl_path   = self._conform_baseline_path()
+        diff_path = self._user_edits_diff_path()
+        if not bl_path or not diff_path:
+            return
+        if not os.path.isfile(bl_path):
+            return
+        try:
+            with open(bl_path, "r", encoding="utf-8") as f:
+                baseline = json.load(f)
+        except Exception:
+            return
+        try:
+            current = self._s4_snapshot()
+        except Exception:
+            return
+
+        def _segs_total_dur(segs):
+            try:
+                return sum(max(0.0, float(s[1]) - float(s[0]))
+                           for s in segs)
+            except Exception:
+                return 0.0
+
+        pulls_changed = []
+        for order, cur in current.items():
+            base = baseline.get(order)
+            if not base:
+                continue
+            deltas = []
+            base_segs = base.get("segments") or []
+            cur_segs  = cur.get("segments")  or []
+            if base_segs != cur_segs:
+                base_dur = _segs_total_dur(base_segs)
+                cur_dur  = _segs_total_dur(cur_segs)
+                deltas.append({
+                    "field":            "segments",
+                    "before":           base_segs,
+                    "after":            cur_segs,
+                    "n_segs_delta":     len(cur_segs) - len(base_segs),
+                    "duration_delta_s": round(cur_dur - base_dur, 3),
+                })
+            for k in ("rec_in_s", "rec_out_s"):
+                try:
+                    delta_s = float(cur.get(k, 0.0)) - float(
+                        base.get(k, 0.0))
+                except Exception:
+                    delta_s = 0.0
+                # Ignore sub-50 ms wiggle (numeric noise from save/load
+                # round-trips); only real human-noticeable boundary
+                # adjustments count.
+                if abs(delta_s) > 0.05:
+                    deltas.append({
+                        "field":   k,
+                        "before":  base.get(k),
+                        "after":   cur.get(k),
+                        "delta_s": round(delta_s, 3),
+                    })
+            for k in ("accepted", "ignored"):
+                if cur.get(k) != base.get(k):
+                    deltas.append({
+                        "field":  k,
+                        "before": base.get(k),
+                        "after":  cur.get(k),
+                    })
+            if deltas:
+                pulls_changed.append({
+                    "order":      int(order),
+                    "token":      base.get("token", ""),
+                    "is_vo":      base.get("is_vo", False),
+                    "status":     base.get("status", ""),
+                    "confidence": base.get("confidence"),
+                    "deltas":     deltas,
+                })
+
+        summary = {
+            "n_pulls_total":   len(baseline),
+            "n_pulls_changed": len(pulls_changed),
+            "n_segment_edits": sum(
+                1 for p in pulls_changed for d in p["deltas"]
+                if d["field"] == "segments"),
+            "n_boundary_edits": sum(
+                1 for p in pulls_changed for d in p["deltas"]
+                if d["field"] in ("rec_in_s", "rec_out_s")),
+            "n_accepts": sum(
+                1 for p in pulls_changed for d in p["deltas"]
+                if d["field"] == "accepted" and d.get("after")),
+            "n_ignores": sum(
+                1 for p in pulls_changed for d in p["deltas"]
+                if d["field"] == "ignored" and d.get("after")),
+            "net_duration_delta_s": round(sum(
+                d.get("duration_delta_s", 0)
+                for p in pulls_changed for d in p["deltas"]
+                if d["field"] == "segments"), 3),
+        }
+        out = {"summary": summary, "pulls": pulls_changed}
+        try:
+            with open(diff_path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+        except Exception:
+            pass
+
     def _results_sidecar_path(self):
         cache = self._pb_cache_dir()
         if not cache:
@@ -1820,6 +1992,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             import json as _json
             with open(path, "w", encoding="utf-8") as f:
                 _json.dump(self._s4_snapshot(), f, indent=2)
+        except Exception:
+            pass
+        # Refresh the user-edits diff sidecar so a post-session audit
+        # has the latest snapshot of where the editor adjusted the
+        # algorithm's output.  Wrapped because we don't want a diff
+        # failure to block the primary state save.
+        try:
+            self._compute_user_edits_diff()
         except Exception:
             pass
 
@@ -5186,6 +5366,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # Mix files (_temp_mix_files) are intentionally kept alive here so the
         # waveform editor can use them during Step 4.  They are cleaned up at the
         # start of the next reconcile run, or when the window closes.
+        # Snapshot the conform output BEFORE any user edits so _s4_save
+        # can diff against it later — that diff is the telemetry that
+        # reveals where the algorithm and the editor systematically
+        # disagree.
+        try:
+            self._write_conform_baseline()
+        except Exception:
+            pass
         self.after(800, self._step4)
 
     def _cancel_reconcile(self):
