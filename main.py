@@ -3481,6 +3481,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         hint_lbl.pack(fill="x", pady=(0, 8))
 
         self._res_monitor_running = True
+        # Wall-clock anchor so each log sample has an elapsed-seconds
+        # stamp.  Lets you correlate utilisation dips with specific
+        # transcribe-start / transcribe-done events in the same file.
+        self._res_monitor_t0 = time.perf_counter()
 
         def _tick_resources():
             if not self._res_monitor_running:
@@ -3492,9 +3496,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
 
             parts = []
+            # Raw sample values for the file log (separate from the
+            # styled UI text below).
+            log_gpu  = None
+            log_vu   = None
+            log_vt   = None
+            log_ram  = None
+
             gpu = self._get_gpu_stats()
             if gpu is not None:
                 util, vused, vtotal = gpu
+                log_gpu, log_vu, log_vt = util, vused, vtotal
                 # Highlight in ACCENT when GPU is engaged so the user can
                 # see at a glance that CUDA is working.
                 gpu_color = ACCENT if util >= 30 else SUB
@@ -3507,6 +3519,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             ram = self._available_ram_bytes()
             if ram is not None:
                 ram_gb = ram / (1024 ** 3)
+                log_ram = ram_gb
                 ram_color = WARN if ram_gb < 4.0 else TEXT
                 parts.append(("  ·  RAM {:.1f} GB free".format(ram_gb),
                               ram_color))
@@ -3520,6 +3533,41 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._res_lbl.config(text=text, fg=fg)
             except tk.TclError:
                 return
+
+            # Mirror to _debug_run.log so a post-run audit can see the
+            # whole utilisation timeline.  Direct file write — bypasses
+            # the UI log so we don't spam Jordan with hundreds of [res]
+            # lines while she watches a run.
+            try:
+                bits = ["[res]",
+                        "t={:.0f}s".format(
+                            time.perf_counter() - self._res_monitor_t0)]
+                if log_gpu is not None:
+                    bits.append("GPU={}%".format(log_gpu))
+                    bits.append("VRAM={:.1f}/{:.1f}GB".format(
+                        log_vu, log_vt))
+                else:
+                    bits.append("GPU=n/a")
+                if log_ram is not None:
+                    bits.append("RAM={:.1f}GBfree".format(log_ram))
+                # Live worker counts come off self — same refs the gate
+                # uses inside _run_reconcile, so the readout is accurate
+                # whether the user toggles fast/background mid-run.
+                _act_ref = getattr(self,
+                    "_reconcile_live_active", None)
+                _lw_ref  = getattr(self,
+                    "_reconcile_live_workers", None)
+                bits.append("workers={}/{}".format(
+                    _act_ref[0] if _act_ref else "?",
+                    _lw_ref[0]  if _lw_ref  else "?"))
+                line = "  ".join(bits)
+                with self._DEBUG_LOG_LOCK:
+                    with open(self._DEBUG_LOG, "a",
+                              encoding="utf-8") as _f:
+                        _f.write(line + "\n")
+            except Exception:
+                pass
+
             self.after(2000, _tick_resources)
 
         # First tick fires immediately so the user doesn't see "..." for

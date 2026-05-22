@@ -15,15 +15,20 @@ AUTO_FULL_TRANSCRIBE_THRESHOLD = 5  # if a token has this many pulls or more AND
                               # audio load), so full-audio almost always wins
                               # at 5+ pulls.  Set to a very high number to
                               # disable the auto-promotion.
-FULL_TRANSCRIBE_CONCURRENCY = 2  # how many auto-promoted full-audio transcribes
+FULL_TRANSCRIBE_CONCURRENCY = 4  # how many auto-promoted full-audio transcribes
                               # may run simultaneously.  faster-whisper shares
                               # one global model and CTranslate2 serializes
-                              # internally on the GPU — running many in
-                              # parallel just causes contention and makes
-                              # each one orders of magnitude slower.  2 is
-                              # safe on an 8 GB GPU with the small model
-                              # (~600 MB VRAM × 2 = 1.2 GB used).  Set to 1
-                              # on CPU-only systems or low-VRAM GPUs.
+                              # internally — but on a modern GPU there's
+                              # plenty of headroom for several streams to
+                              # share it without thrashing.  4 is comfortable
+                              # on a mid-range NVIDIA (8 GB VRAM) with the
+                              # small model (~600 MB per instance ⇒ ~2.4 GB
+                              # used).  Set to 2 on a low-VRAM GPU or 1 on
+                              # CPU-only systems.  Monitor _debug_run.log
+                              # for [res] lines while a run is in flight —
+                              # GPU% pinned high + workers near the limit
+                              # means you're saturated; idle GPU and queued
+                              # tokens means you can bump this higher.
 # ── Script-conform editing ──────────────────────────────────────────────────
 # When a pull has a full transcript available (PQ session or .pb_transcript
 # .json sidecar), reconcile aligns the script's quote_text against the
