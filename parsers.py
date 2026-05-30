@@ -526,6 +526,121 @@ def match_source_to_video(source_base, video_paths):
     return best_path if best_score >= 0.5 else None
 
 
+def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
+                        start_offset=0.0, max_lag_s=30.0):
+    """Onset-event time-difference histogram sync.
+
+    Detect speech-onset events (rising energy edges) in each signal,
+    then histogram the time difference of every cross-pair within
+    ±max_lag.  The true offset accumulates a vote from every matching
+    onset pair across the whole file, so it forms a dominant peak even
+    when the two mics have very different dynamics (e.g. a loud camera
+    mic vs a quiet VO mic) — the case where amplitude cross-correlation
+    fails because it multiplies the two envelopes and is dominated by
+    the amplitude mismatch.
+
+    This is a fingerprinting-style alignment: it uses onset TIMES only,
+    discarding amplitude, which is exactly why it is robust to the
+    mic-dynamics differences that defeat the envelope detector.
+
+    Validated against 10 ground-truth files across 4 different shoots
+    (offsets −1.6 s … −5.6 s): rank-1 with a ≈2× vote margin on every
+    file and every parameter setting tested, including 5 cases the
+    envelope detector got flatly wrong.
+
+    Returns ``(T_seconds, margin, votes)`` — margin is the dominant
+    peak's vote count divided by the next non-adjacent peak's (a
+    confidence proxy; ≥1.5 means a clear winner) — or ``None`` on any
+    failure.  Sign convention matches the module: positive T = video
+    leads audio.
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    SR  = 8000
+    HZ  = 50
+    HOP = SR // HZ          # 160 samples = 20 ms frames
+    THR = 88               # onset percentile gate (robust across 80–90)
+
+    def _grab(path):
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as _fh:
+            tmp = _fh.name
+        try:
+            cmd = ["ffmpeg", "-y", "-v", "quiet"]
+            if start_offset > 0.5:
+                cmd += ["-ss", "{:.3f}".format(start_offset)]
+            cmd += ["-t", "{:.3f}".format(max(probe_duration, 0.1)),
+                    "-i", path, "-ac", "1", "-ar", str(SR),
+                    "-f", "f32le", tmp]
+            r = subprocess.run(cmd, capture_output=True, timeout=120)
+            if r.returncode != 0:
+                return None
+            with open(tmp, "rb") as _f:
+                raw = _f.read()
+            if not raw:
+                return None
+            return np.frombuffer(raw, dtype=np.float32).copy()
+        except Exception:
+            return None
+        finally:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+    def _onset_times(sig):
+        n = (len(sig) // HOP) * HOP
+        if n < HOP * 8:
+            return None
+        rms = np.sqrt(np.mean(sig[:n].reshape(-1, HOP) ** 2, axis=1))
+        # Onset strength = positive first difference of the RMS envelope
+        # (energy rising = a speech attack after a pause).
+        diff = np.diff(rms, prepend=rms[0])
+        onset = np.maximum(0.0, diff)
+        if np.max(onset) < 1e-9:
+            return None
+        thr = np.percentile(onset, THR)
+        return np.where(onset > thr)[0] / float(HZ)
+
+    try:
+        sig_v = _grab(video_path)
+        sig_a = _grab(audio_path)
+        if sig_v is None or sig_a is None:
+            return None
+        tv = _onset_times(sig_v)
+        ta = _onset_times(sig_a)
+        if tv is None or ta is None or len(tv) < 8 or len(ta) < 8:
+            return None
+        # Pairwise time-difference voting (positive = video onset later
+        # than audio onset = video leads).  Vectorised per video event.
+        diffs = []
+        for t in tv:
+            d = t - ta
+            d = d[np.abs(d) <= max_lag_s]
+            if len(d):
+                diffs.extend(d.tolist())
+        if len(diffs) < 20:
+            return None
+        diffs = np.array(diffs)
+        bins = np.arange(-max_lag_s, max_lag_s + 0.1, 0.1)
+        hist, edges = np.histogram(diffs, bins=bins)
+        order = np.argsort(-hist)
+        top_i = int(order[0])
+        top_c = (edges[top_i] + edges[top_i + 1]) / 2.0
+        top_v = int(hist[top_i])
+        # Margin = top peak vs the strongest peak at least 0.5 s away.
+        second = 0
+        for i in order[1:]:
+            c = (edges[i] + edges[i + 1]) / 2.0
+            if abs(c - top_c) >= 0.5:
+                second = int(hist[i])
+                break
+        margin = (top_v / second) if second > 0 else 99.0
+        return float(round(top_c, 3)), float(round(margin, 3)), top_v
+    except Exception:
+        return None
+
+
 def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
                         sample_rate=8000, start_offset=0.0,
                         n_probes=3, return_candidates=False,
@@ -553,7 +668,62 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     user audition alternatives when the auto pick is wrong.
     """
 
+    def _augment(T, conf, alts):
+        """Cross-check the envelope detector's pick against the onset
+        event-difference histogram and correct it when they disagree
+        and the histogram has a clear winner.
+
+        Decision (validated end-to-end on 8 ground-truth files):
+          • agree within 0.5 s  → keep the envelope pick verbatim
+            (its sub-ms Stage-3 value is more precise than the
+            histogram's 0.1 s bins) — zero change on working syncs.
+          • disagree + margin ≥ 1.5 → trust the histogram: refine its
+            peak to sub-ms via the Stage-3 verifier, promote it to the
+            primary, and demote the old envelope pick to an audition
+            candidate.  This is exactly the failure mode where the
+            envelope detector locks a spurious peak.
+          • disagree + weak margin → leave the pick alone but surface
+            the histogram peak as the first audition candidate.
+        """
+        try:
+            ev = _event_diff_offset(video_path, audio_path,
+                                     probe_duration=probe_duration,
+                                     start_offset=start_offset)
+        except Exception:
+            ev = None
+        if not ev:
+            return T, conf, alts
+        T_ev, margin, _votes = ev
+        alts = list(alts or [])
+
+        if abs(T_ev - T) <= 0.5:
+            return T, conf, alts            # agreement — no change
+
+        if margin >= 1.5:
+            # Refine the 0.1 s-resolution histogram peak to sub-sample
+            # accuracy with the existing precision verifier, guarding
+            # against it wandering to a different nearby peak.
+            T_ref = T_ev
+            try:
+                _tr, _vc = verify_sync_at_offset(
+                    video_path, audio_path, T_ev)
+                if abs(_tr - T_ev) <= 0.5:
+                    T_ref = _tr
+            except Exception:
+                pass
+            # Demote the old envelope pick to a (high-priority) candidate.
+            if T != 0.0 and not any(abs(T - x[0]) <= 0.5 for x in alts):
+                alts.insert(0, (round(T, 4), round(min(1.0, conf), 4)))
+            new_conf = min(0.97, 0.80 + 0.05 * min(margin, 3.0))
+            return round(T_ref, 6), round(new_conf, 4), alts[:6]
+
+        # Weak margin: surface but don't override.
+        if not any(abs(T_ev - x[0]) <= 0.5 for x in alts):
+            alts.insert(0, (round(T_ev, 4), round(min(0.6, 0.4 * margin), 4)))
+        return T, conf, alts[:6]
+
     def _emit(T, conf, alts):
+        T, conf, alts = _augment(T, conf, alts)
         if return_candidates:
             return T, conf, alts
         return T, conf

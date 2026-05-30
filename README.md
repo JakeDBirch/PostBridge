@@ -192,7 +192,7 @@ A grid shows each source clip from the AAF. For each source:
 - **Video file(s)** — assign one or more via the `[−] N [+]` counter. PostBridge probes all assigned files in parallel and promotes the highest-confidence match.
 - **Reference audio** — assign an ISO or mix file for waveform sync.
 - **☐ slate** — tick if production used a clapper/slate. Switches sync detection to GCC-PHAT weighting, which sharpens the slate transient peak instead of treating it as noise. Strongly recommended when available.
-- **SYNC** — runs multi-window cross-correlation. The algorithm probes 3 positions through the file (25/50/75 %) to avoid being misled by setup/teardown noise at the head, and arbitrates by consistency across probes.
+- **SYNC** — runs multi-window cross-correlation. The algorithm probes 3 positions through the file (25/50/75 %) to avoid being misled by setup/teardown noise at the head, and arbitrates by consistency across probes. The result is then cross-checked against an independent **onset-event histogram** (it aligns the timing of speech attacks rather than amplitude, so it stays accurate when the camera mic and reference mic have very different levels). When the two methods disagree and the histogram has a clear winner, PostBridge adopts the histogram's offset and demotes the cross-correlation pick to an audition candidate — this fixes the cases where amplitude correlation locks onto a spurious peak.
 
 The result shows the offset, a confidence percentage, and one of:
 
