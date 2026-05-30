@@ -8697,6 +8697,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_set_sync_state(base, "auto")
         self._aaf_refresh_try_next_btn(base)
 
+        # Live audition: if a QA preview is already playing for this
+        # source, re-extract + restart it at the NEW offset so the user
+        # hears the candidate immediately instead of having to stop and
+        # restart playback manually.  Only restart when this exact
+        # source is the one currently auditioning.
+        if getattr(self, "_aaf_qa_playing", None) == base:
+            try:
+                self._aaf_qa_stop()
+                self._aaf_qa_play(base)
+            except Exception:
+                pass
+
     def _aaf_do_sync(self, base, _sem=None):
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
