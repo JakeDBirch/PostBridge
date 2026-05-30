@@ -223,52 +223,15 @@ class SyncPreviewDialog:
             b.bind("<Leave>", lambda e, w=b: w.config(bg=SURF3))
             b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
 
-        # \u2500\u2500 Candidate audition row \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        # When auto-sync returned alternative offset candidates, surface a
-        # "Try next" button that cycles through them.  Useful when the
-        # primary auto pick is wrong but a runner-up xcorr peak is right \u2014
-        # the user can quickly audition each candidate visually + aurally
-        # instead of nudging a slider.
-        if len(self._candidates) > 1:
-            cand_row = tk.Frame(win, bg=BG)
-            cand_row.pack(fill="x", padx=12, pady=(6, 2))
-            tk.Label(cand_row,
-                     text="Auto-sync had {} candidates:".format(
-                         len(self._candidates)),
-                     font=FB, bg=BG, fg=SUB).pack(side="left")
-            self._cand_lbl = tk.Label(
-                cand_row,
-                text=self._candidate_label_text(),
-                font=FB, bg=BG, fg=TEXT)
-            self._cand_lbl.pack(side="left", padx=(4, 12))
+        # Candidate cycling lives on the Step 2 sync row now, NOT in
+        # this dialog -- keeps the dialog focused on manual nudging /
+        # waveform inspection.  The previous in-dialog "TRY NEXT" row
+        # also had its Accept/Cancel block accidentally indented INTO
+        # the _candidate_label_text helper after a return statement,
+        # leaving the dialog with no way to commit a change.  Fixed
+        # by moving the buttons back here.
 
-            nxt = tk.Label(cand_row, text="TRY NEXT \u25b6", font=FBT,
-                            bg=SURF3, fg=TEXT, cursor="hand2",
-                            padx=10, pady=4, bd=0,
-                            highlightbackground=BORDER,
-                            highlightthickness=1)
-            nxt.pack(side="left")
-            nxt.bind("<Enter>", lambda e, w=nxt: w.config(bg=ACCENT))
-            nxt.bind("<Leave>", lambda e, w=nxt: w.config(bg=SURF3))
-            nxt.bind("<ButtonRelease-1>",
-                     lambda e: self._cycle_candidate())
-        else:
-            self._cand_lbl = None
-
-    def _candidate_label_text(self):
-        """Format the candidate-row readout: 'showing #i of N \u00b7 -5.42 s
-        (conf 62%)'.  The auto-pick at index 0 is labelled 'auto' instead
-        of a confidence to avoid confusion (its conf is synthetic 1.0)."""
-        i = self._candidate_idx
-        n = len(self._candidates)
-        t, c = self._candidates[i]
-        if i == 0:
-            tail = "auto pick"
-        else:
-            tail = "{:+.3f} s   conf {:d}%".format(t, int(round(c * 100)))
-        return "  showing #{} of {}   \u00b7   {}".format(i + 1, n, tail)
-
-        # Accept / Cancel row
+        # ====== Accept / Cancel row =======================================
         bot = tk.Frame(win, bg=BG)
         bot.pack(fill="x", padx=12, pady=(10, 12))
 

@@ -7832,6 +7832,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._aaf_sync_btns[base] = sync_btn
                 self._aaf_refresh_sync_btn(base, sync_btn)
 
+                # ⏭ TRY NEXT — cycles through alternate sync candidates
+                # right here on the row so the user doesn't have to open
+                # ALIGN just to audition a runner-up.  Only visible when
+                # auto-sync produced one or more alternates; otherwise
+                # packed-hidden so the row width stays consistent.
+                nxt_btn = tk.Label(
+                    row1, text="⏭ NEXT", font=FB, bg=SURF3, fg=SUB,
+                    cursor="hand2", padx=6, pady=2, bd=0,
+                    highlightbackground=BORDER, highlightthickness=1)
+                nxt_btn.bind(
+                    "<Enter>", lambda e, w=nxt_btn: w.config(bg=ACCENT))
+                nxt_btn.bind(
+                    "<Leave>", lambda e, w=nxt_btn: w.config(bg=SURF3))
+                nxt_btn.bind(
+                    "<ButtonRelease-1>",
+                    lambda e, b=base: self._aaf_cycle_candidate(b))
+                if not hasattr(self, "_aaf_try_next_btns"):
+                    self._aaf_try_next_btns = {}
+                self._aaf_try_next_btns[base] = nxt_btn
+                # Pack only when there are alternates to audition.
+                self._aaf_refresh_try_next_btn(base)
+
                 # Audio dropdown trace (clear stale sync on ref change)
                 def _on_aud_change(*args, b=base, dv=aud_disp):
                     fn   = dv.get()
@@ -8582,6 +8604,99 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             btn.config(text=text, fg=SUB)
 
+
+    def _aaf_refresh_try_next_btn(self, base):
+        """Show / hide / restyle the inline TRY NEXT button on the
+        sync row.  Visible only when auto-sync produced one or more
+        alternate candidates; the label includes the cycle position
+        so the user always knows which candidate the offset column
+        currently reflects."""
+        btn = getattr(self, "_aaf_try_next_btns", {}).get(base)
+        if btn is None:
+            return
+        cands = getattr(self, "_aaf_source_sync_candidates", {}).get(
+            base, [])
+        if len(cands) <= 1:
+            try:
+                btn.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        idx = getattr(self, "_aaf_source_sync_cand_idx", {}).get(base, 0)
+        try:
+            btn.config(text="⏭ NEXT  ({}/{})".format(
+                idx + 1, len(cands)))
+            if not btn.winfo_ismapped():
+                sync_btn = self._aaf_sync_btns.get(base)
+                if sync_btn is not None and sync_btn.winfo_ismapped():
+                    btn.pack(side="left", padx=(2, 0), after=sync_btn)
+                else:
+                    btn.pack(side="left", padx=(2, 0))
+        except tk.TclError:
+            pass
+
+    def _aaf_cycle_candidate(self, base):
+        """Advance to the next sync candidate for `base` and apply its
+        offset to the row.  Wraps around to the primary auto pick
+        after the last alternate so the user can always return to the
+        starting state without re-running SYNC.
+
+        Cycling de-confirms the row (state -> "auto") since the
+        offset is now unaccepted relative to the new pick."""
+        if self._aaf_sync_locked_vars.get(
+                base, tk.BooleanVar()).get():
+            return
+        cands = getattr(self, "_aaf_source_sync_candidates", {}).get(
+            base, [])
+        if len(cands) <= 1:
+            return
+        if not hasattr(self, "_aaf_source_sync_cand_idx"):
+            self._aaf_source_sync_cand_idx = {}
+        idx_cur = self._aaf_source_sync_cand_idx.get(base, 0)
+        idx_new = (idx_cur + 1) % len(cands)
+        self._aaf_source_sync_cand_idx[base] = idx_new
+        offset, conf = cands[idx_new]
+
+        # Push to offset column
+        ov = self._aaf_source_offset_vars.get(base)
+        if ov:
+            try:
+                ov.set("{:.3f}".format(offset))
+            except tk.TclError:
+                pass
+
+        # Rebuild the SYNC button verdict label with the new offset
+        # and confidence.  Mirrors the tier logic in
+        # _aaf_do_sync._apply so the visual cue (verify recommended /
+        # required / etc.) tracks the candidate's confidence, not the
+        # primary's.
+        pct = int(conf * 100)
+        large = abs(offset) > 30.0
+        if large:
+            lbl = "⚠ {:.3f}s ({:d}%)  — verify ref audio!".format(
+                offset, pct)
+        elif conf >= 0.95:
+            lbl = "✓ {:.3f}s ({:d}%)".format(offset, pct)
+        elif conf >= 0.85:
+            lbl = "⚠ {:.3f}s ({:d}%)  — verify recommended".format(
+                offset, pct)
+        elif conf >= 0.50:
+            lbl = "⚠ {:.3f}s ({:d}%)  — verify required".format(
+                offset, pct)
+        else:
+            lbl = "⚠ {:.3f}s ({:d}%)  — low conf, must verify".format(
+                offset, pct)
+        lbl = "[{}/{}] ".format(idx_new + 1, len(cands)) + lbl
+
+        lv = self._aaf_source_sync_label_vars.get(base)
+        if lv:
+            lv.set(lbl)
+        btn = self._aaf_sync_btns.get(base)
+        if btn:
+            self._aaf_refresh_sync_btn(base, btn)
+        self._aaf_set_sync_state(base, "auto")
+        self._aaf_refresh_try_next_btn(base)
+
     def _aaf_do_sync(self, base, _sem=None):
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
@@ -8737,13 +8852,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if sync_var:
                     sync_var.set(True)
 
-                # Store alternative-offset candidates so the sync preview
-                # dialog can let the user audition them when the auto pick
-                # is wrong.
+                # Store the unified candidate list (primary auto pick at
+                # index 0, alternates after) plus the active cycle index
+                # so the inline TRY NEXT button can audition them
+                # without opening the ALIGN dialog.
                 if not hasattr(self, "_aaf_source_sync_candidates"):
                     self._aaf_source_sync_candidates = {}
-                self._aaf_source_sync_candidates[base] = list(
-                    alt_candidates or [])
+                if not hasattr(self, "_aaf_source_sync_cand_idx"):
+                    self._aaf_source_sync_cand_idx = {}
+                self._aaf_source_sync_candidates[base] = (
+                    [(float(offset), float(confidence))]
+                    + [(float(t), float(c))
+                       for (t, c) in (alt_candidates or [])
+                       if abs(float(t) - float(offset)) > 0.01])
+                self._aaf_source_sync_cand_idx[base] = 0
 
                 pct = int(confidence * 100)
                 # Confidence tiers calibrated from real-world false-positive
@@ -8773,6 +8895,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                 # Mark as auto-synced (amber dot) until manually confirmed
                 self._aaf_set_sync_state(base, "auto")
+                # Show / refresh the inline TRY NEXT button on the row
+                # so the user can cycle through alternates without
+                # opening ALIGN.
+                try:
+                    self._aaf_refresh_try_next_btn(base)
+                except Exception:
+                    pass
 
             self._ui(_apply)
 
@@ -8911,18 +9040,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try: prev.close()
             except Exception: pass
 
-        # Pass any auto-sync alternative candidates so the dialog can
-        # offer a "Try next candidate" affordance — saves the user from
-        # manually nudging the offset slider when the auto pick is wrong.
-        candidates = list(getattr(self, "_aaf_source_sync_candidates",
-                                   {}).get(base, []))
-
         dlg = SyncPreviewDialog(
             self, video_path, audio_path,
             initial_offset=offset,
             on_accept=_on_accept,
-            source_name=base,
-            candidates=candidates)
+            source_name=base)
         self._aaf_sync_previews[base] = dlg
 
     # ── Sync helpers ─────────────────────────────────────────────────────────
