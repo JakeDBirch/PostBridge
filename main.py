@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import hashlib
 import threading
 import queue
 import subprocess
@@ -178,6 +179,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.bind_all("<Control-s>",       lambda e: self._quick_save(self._footer_save_btn))
         self.bind_all("<Control-S>",       lambda e: self._save_as())
         self.bind_all("<Control-o>",       lambda e: self._open_session())
+
+        # Unsaved-work guard — signature of the last-saved (or freshly
+        # loaded) state.  _on_app_close compares it to the live state and
+        # prompts to save when they differ.
+        self._saved_signature = None
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
         self._home()
 
@@ -1347,6 +1354,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.results = self._pending_results
             del self._pending_results
             self.after(50, self._step4)
+        elif getattr(self, "_pending_mark_saved", False):
+            # Opened a session that lands at Step 2 (no saved Step 4
+            # state).  The restore is now complete and unchanged, so
+            # capture it as the clean baseline for the close prompt.
+            self._pending_mark_saved = False
+            self._mark_saved()
 
     def _setup_sidecar_path(self):
         if not hasattr(self, '_script_path') or not self._script_path:
@@ -2493,6 +2506,94 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
+    # ── Unsaved-work guard ─────────────────────────────────────────────
+    def _state_signature(self):
+        """Hash of the meaningful, savable state for the active workflow,
+        or None when a close could lose nothing (home screen, or a
+        workflow that already auto-saves everything).
+
+        Comparing this hash to the one captured at the last save/load is
+        more robust than scattering dirty-flag updates through every
+        mutation site — it can't drift out of sync with the real state.
+        """
+        wf = getattr(self, "workflow", None)
+        try:
+            if wf in ("script_session", "script_aaf"):
+                if not getattr(self, "_script_path", None):
+                    return None
+                data = self._build_full_session_data()
+            elif wf == "aaf_xml":
+                if getattr(self, "_aaf_data", None) is None:
+                    return None
+                data = self._aaf_build_setup_data()
+            elif wf == "pull_quotes":
+                proj = getattr(self, "_pq_project", None)
+                if not proj:
+                    return None
+                # Interview sessions auto-save their own JSON files on
+                # every edit, so transcript/notes changes are never lost.
+                # Only project-level membership (which sessions belong to
+                # the project + the title) can be lost on close, so the
+                # signature tracks just that — otherwise every transcript
+                # keystroke would falsely read as "unsaved project".
+                data = {
+                    "title": proj.get("title", ""),
+                    "sessions": sorted(
+                        s.get("_file_path", "")
+                        for s in proj.get("sessions", [])),
+                    "file_path": proj.get("file_path"),
+                }
+            else:
+                return None
+            blob = json.dumps(data, sort_keys=True, default=str)
+            return hashlib.md5(blob.encode("utf-8", "ignore")).hexdigest()
+        except Exception:
+            # Never let a signature failure block the close path; treat
+            # an un-hashable state as "not dirty" so close still works.
+            return None
+
+    def _mark_saved(self):
+        """Capture the current state as the clean baseline.  Call after
+        any successful save or load."""
+        self._saved_signature = self._state_signature()
+
+    def _is_dirty(self):
+        """True when there is meaningful state that differs from the last
+        saved/loaded baseline."""
+        sig = self._state_signature()
+        if sig is None:
+            return False
+        return sig != getattr(self, "_saved_signature", None)
+
+    def _on_app_close(self):
+        """WM_DELETE_WINDOW handler — prompt to save unsaved work."""
+        try:
+            dirty = self._is_dirty()
+        except Exception:
+            dirty = False
+        if not dirty:
+            self.destroy()
+            return
+        # Save / Don't Save / Cancel via the native yes/no/cancel box.
+        resp = messagebox.askyesnocancel(
+            "Unsaved changes",
+            "You have unsaved changes.\n\nSave before closing?",
+            default="yes", icon="warning")
+        if resp is None:
+            return                      # Cancel — keep the app open
+        if resp:                        # Yes — save first
+            try:
+                self._quick_save()
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+                return                  # stay open so work isn't lost
+            # If the save was itself cancelled (e.g. user dismissed a
+            # first-time Save As dialog), the state is still dirty —
+            # don't close and discard the work.
+            if self._is_dirty():
+                return
+        self.destroy()                  # No — discard and close
+
     def _build_full_session_data(self):
         """Return a complete session dict: setup + results + Step 4 state."""
         data = self._build_setup_data() if getattr(self, '_pool', None) else {}
@@ -2536,6 +2637,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 json.dump(self._build_full_session_data(), f,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._current_session_file = path
+            self._mark_saved()
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -2587,6 +2689,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             with open(self._current_session_file, "w", encoding="utf-8") as f:
                 json.dump(self._build_full_session_data(), f,
                           cls=self._numpy_safe_encoder(), indent=2)
+            self._mark_saved()
             b = btn_ref[0] if btn_ref else None
             if b:
                 try:
@@ -2771,6 +2874,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     "{}".format(aaf_path or "(none)"))
                 return
             self._pending_aaf_setup = data   # _aaf_step2 will restore after init
+            self._pending_mark_saved = True  # clean baseline after restore
             self._aaf_load(aaf_path)
             return
 
@@ -2864,6 +2968,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._export_fmt = None
         self._current_session_file = path   # future saves go back to this file
         self._restore_s4           = True   # signal _step4 to restore saved state
+        # One-shot: capture a clean baseline once the (deferred) restore
+        # finishes, so opening + closing an unchanged session doesn't
+        # falsely prompt "unsaved changes".  Honored at the Step 2 or
+        # Step 4 restore-completion point, then cleared.
+        self._pending_mark_saved   = True
 
         # Stash setup data — _step2 will pick it up after the pool is built
         self._pending_setup = data
@@ -6066,6 +6175,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # entry can reload the correct positions from the sidecar rather than
         # showing stale cache-reconciliation results.
         self._s4_save()
+
+        # One-shot clean baseline for an OPENED session that lands at
+        # Step 4.  Only fires on open-restore (flag set by _open_session),
+        # never on normal forward navigation — so reconciling and landing
+        # here still reads as unsaved until the user actually saves.
+        if getattr(self, "_pending_mark_saved", False):
+            self._pending_mark_saved = False
+            self._mark_saved()
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "← REDO", self._s4_redo_to_step2).pack(side="left")
@@ -9838,6 +9955,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             try:
                 with open(sidecar, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
+                self._mark_saved()
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
             return
@@ -9854,6 +9972,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        self._mark_saved()
 
     def _aaf_load_setup(self):
         path = filedialog.askopenfilename(
@@ -9981,6 +10100,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showwarning("Missing files",
                 "{} video file(s) from the saved setup were not found:\n{}".format(
                     len(missing), "\n".join(basename(p) for p in missing[:5])))
+
+        # Restore complete — capture the clean baseline for an opened
+        # AAF setup so closing an unchanged setup doesn't falsely prompt.
+        if getattr(self, "_pending_mark_saved", False):
+            self._pending_mark_saved = False
+            self._mark_saved()
 
     def _aaf_build_progress(self, pct, text):
         """Show/update the build progress bar.  pct is 0–100.  Thread-safe."""
@@ -10793,6 +10918,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     len(missing),
                     "\n".join("  • " + p for p in missing[:10])))
         self._pq_render_project_view()
+        self._mark_saved()   # freshly loaded == clean baseline
 
     def _pq_open_standalone_session(self, data, file_path):
         """Open a single Interview Session JSON without a project context.
@@ -10805,6 +10931,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "file_path": None,
         }
         self._pq_render_project_view()
+        self._mark_saved()   # freshly loaded == clean baseline
 
     def _pq_load_session_file(self, path):
         """Load an Interview Session JSON; return dict or None on error."""
@@ -10938,6 +11065,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
             project["file_path"] = path
+            self._mark_saved()
             self._pq_render_project_view()
         except Exception as e:
             messagebox.showerror("Save Episode Project failed", str(e))
