@@ -252,6 +252,161 @@ def get_audio_channels(path):
     except Exception:
         return 2
 
+# ── Split-clip join (gapless file-size splits → one continuous file) ─────────
+def _concat_stream_sig(path):
+    """Return a (video_sig, audio_sig) tuple describing a file's stream
+    format, used to verify two files are safe to stream-copy concat.
+    Each sig is a tuple of the format-defining fields; None if no stream."""
+    def _probe(stream, fields):
+        try:
+            r = subprocess.run(
+                _ffprobe_cmd() + ["-v", "quiet",
+                 "-select_streams", stream,
+                 "-show_entries", "stream=" + ",".join(fields),
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=15)
+            vals = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+            return tuple(vals) if vals else None
+        except Exception:
+            return None
+    v = _probe("v:0", ["codec_name", "width", "height", "pix_fmt"])
+    a = _probe("a:0", ["codec_name", "sample_rate", "channels"])
+    return v, a
+
+
+def probe_concat_compat(paths):
+    """Check whether `paths` can be losslessly stream-copy concatenated.
+
+    Gapless file-size splits of one recording share identical stream
+    parameters, so `-c copy` joins them perfectly.  Files from different
+    cameras / settings do NOT, and a stream-copy concat of those would
+    produce a broken file.  Returns (compatible: bool, reason: str).
+    """
+    if len(paths) < 2:
+        return False, "select at least two files to join"
+    sigs = [_concat_stream_sig(p) for p in paths]
+    first_v, first_a = sigs[0]
+    if first_v is None:
+        return False, "first file has no readable video stream"
+    for p, (v, a) in zip(paths[1:], sigs[1:]):
+        if v != first_v:
+            return (False,
+                    "{} has a different video format — these aren't "
+                    "splits of the same recording".format(basename(p)))
+        if a != first_a:
+            return (False,
+                    "{} has a different audio format — these aren't "
+                    "splits of the same recording".format(basename(p)))
+    return True, ""
+
+
+def _probe_codec(path, stream):
+    try:
+        r = subprocess.run(
+            _ffprobe_cmd() + ["-v", "quiet", "-select_streams", stream,
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15)
+        return (r.stdout.strip() or "").lower()
+    except Exception:
+        return ""
+
+
+def join_output_ext(paths):
+    """Recommended output extension for a join.  Professional cameras
+    often wrap PCM audio (pcm_s16be/le) in a .MP4 file, but the MP4/isom
+    container has no tag for PCM — remuxing it to .mp4 yields a broken
+    file.  .MOV holds h264/hevc + PCM cleanly, so PCM sources must join
+    to .mov.  Anything else keeps the source's own extension."""
+    a = _probe_codec(paths[0], "a:0") if paths else ""
+    if a.startswith("pcm"):
+        return ".mov"
+    ext = os.path.splitext(paths[0])[1].lower() if paths else ".mp4"
+    return ext or ".mp4"
+
+
+def concat_video_files(paths, out_path, progress_cb=None):
+    """Losslessly join `paths` (in order) into a single continuous file —
+    no re-encode.  Uses the ffmpeg concat demuxer with stream copy.
+
+    Two real-world gotchas, both handled here (verified against pro
+    interview footage — h264 + pcm_s16be + a timecode data track):
+      • PCM audio can't live in an .mp4/isom container, so the output
+        container is forced to .mov for PCM sources (see
+        join_output_ext).  Without this the audio is silently lost or
+        the file is unreadable.
+      • the camera's timecode DATA stream breaks the remux, so only the
+        video + audio streams are mapped (the data track is dropped —
+        harmless for editorial).
+
+    `progress_cb(fraction_0_to_1)` is called once at finish (the copy is
+    a single fast pass).  Returns (ok: bool, message: str, out_path: str)
+    — out_path is the ACTUAL path written, which may differ from the
+    requested one when the extension was corrected to .mov.
+    """
+    if len(paths) < 2:
+        return False, "need at least two files", out_path
+
+    # Force a container that can hold the source codecs.
+    want_ext = join_output_ext(paths)
+    root, ext = os.path.splitext(out_path)
+    if ext.lower() != want_ext:
+        out_path = root + want_ext
+
+    has_audio = bool(_probe_codec(paths[0], "a:0"))
+
+    listf = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            listf = f.name
+            for p in paths:
+                # concat demuxer: forward slashes (backslash is an escape
+                # char), single-quoted, embedded quotes escaped.
+                ap = os.path.abspath(p).replace("\\", "/").replace(
+                    "'", "'\\''")
+                f.write("file '{}'\n".format(ap))
+
+        # Map only video + audio (drop the camera's timecode/data track,
+        # which otherwise corrupts the output).  '?' = optional so a
+        # missing stream doesn't abort the join.
+        cmd = _ffmpeg_cmd() + ["-y", "-f", "concat", "-safe", "0",
+                               "-i", listf, "-map", "0:v:0?"]
+        if has_audio:
+            cmd += ["-map", "0:a:0?"]
+        cmd += ["-c", "copy", out_path]
+        r = subprocess.run(cmd, capture_output=True, timeout=3600)
+        if progress_cb:
+            try: progress_cb(1.0)
+            except Exception: pass
+
+        if r.returncode != 0:
+            tail = (r.stderr.decode("utf-8", "ignore")[-400:]
+                    if r.stderr else "")
+            return False, "ffmpeg failed:\n" + tail, out_path
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            return False, "output file was not created", out_path
+
+        # Verify the result is actually well-formed: a readable duration
+        # AND (when the source had audio) a surviving audio stream.
+        if (get_media_duration(out_path) or 0) <= 0.5:
+            return (False,
+                    "join produced an unreadable file (duration could "
+                    "not be read) — these clips may need a different "
+                    "container", out_path)
+        if has_audio and not _probe_codec(out_path, "a:0"):
+            return (False,
+                    "join dropped the audio track — these clips may need "
+                    "a different container", out_path)
+        return True, "", out_path
+    except Exception as e:
+        return False, str(e), out_path
+    finally:
+        if listf:
+            try: os.unlink(listf)
+            except Exception: pass
+
 # ── Transcript cache ───────────────────────────────────────────────────────────
 def _cache_path(media_path):
     if not _cache_dir:

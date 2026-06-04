@@ -6939,6 +6939,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_count_lbl.pack(side="right")
         self._btn(ph, "\u21bb REFRESH", self._aaf_refresh_pool,
                   small=True).pack(side="right", padx=(0, 4))
+        self._btn(ph, "\u26d3 JOIN SPLIT", self._aaf_join_split_dialog,
+                  small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FOLDER", self._aaf_browse_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FILES",  self._aaf_browse_files,
@@ -9758,6 +9760,208 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if hasattr(self, "_aaf_assign_frame"):
             self._rebuild_aaf_source_rows()
         self._aaf_update_seq_presets()
+
+    def _aaf_join_split_dialog(self):
+        """Join gapless file-size-split camera clips into one continuous
+        file (lossless stream-copy concat), then add it to the pool.
+
+        Cameras split long recordings at the FAT32 4 GB limit into
+        successive files that are byte-identical in format, so they
+        rejoin perfectly with `-c copy`.  Picking the pieces here and
+        joining them turns a split camera into a single continuous
+        source that syncs and lays out exactly like an un-split one.
+        """
+        pool = list(self._aaf_video_paths)
+        if len(pool) < 2:
+            messagebox.showinfo(
+                "Join Split Clips",
+                "Add at least two video files to the pool first.\n\n"
+                "Then check the successive pieces of a single camera "
+                "roll and join them into one continuous file.")
+            return
+        # Name order is the correct concat order for camera splits
+        # (CLIP_0001, CLIP_0002, …).
+        pool_sorted = sorted(pool, key=lambda p: basename(p).lower())
+
+        win = tk.Toplevel(self)
+        win.title("Join Split Clips")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.minsize(560, 420)
+
+        tk.Label(win, text="Join Split Camera Clips", font=FH,
+                 bg=BG, fg=TEXT, padx=20, pady=(14, 2)).pack(anchor="w")
+        tk.Label(win,
+                 text=("Check the successive pieces of ONE camera roll "
+                       "(file-size splits).  They join losslessly in the "
+                       "order shown — no re-encode."),
+                 font=FB, bg=BG, fg=SUB, padx=20, wraplength=520,
+                 justify="left").pack(anchor="w", pady=(0, 8))
+
+        # Bottom action row first so it survives a short window.
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(side="bottom", fill="x", padx=20, pady=(8, 14))
+        status_lbl = tk.Label(win, text="", font=FB, bg=BG, fg=SUB,
+                              padx=20, anchor="w", wraplength=520,
+                              justify="left")
+        status_lbl.pack(side="bottom", fill="x", pady=(0, 4))
+
+        # Scrollable checklist of pool files.
+        list_wrap = tk.Frame(win, bg=SURF2, padx=2, pady=2)
+        list_wrap.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        check_vars = {}
+        for p in pool_sorted:
+            v = tk.BooleanVar(value=False)
+            check_vars[p] = v
+            cb = tk.Checkbutton(
+                list_wrap, text="  " + basename(p), variable=v,
+                font=FB, bg=SURF2, fg=TEXT, selectcolor=SURF3,
+                activebackground=SURF2, activeforeground=TEXT,
+                anchor="w", highlightthickness=0, bd=0)
+            cb.pack(fill="x", anchor="w")
+
+        # Output path + remove-originals option.
+        opt = tk.Frame(win, bg=BG)
+        opt.pack(side="bottom", fill="x", padx=20, pady=(0, 4))
+        remove_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            opt, text="Remove the source pieces from the pool after joining",
+            variable=remove_var, font=FB, bg=BG, fg=TEXT,
+            selectcolor=SURF2, activebackground=BG, activeforeground=TEXT,
+            highlightthickness=0, bd=0).pack(anchor="w")
+
+        out_box = {"path": None}
+
+        def _selected():
+            return [p for p in pool_sorted if check_vars[p].get()]
+
+        def _default_out(sel):
+            base0 = os.path.splitext(basename(sel[0]))[0]
+            # Engine picks the right container (.mov for PCM-audio
+            # sources, else the source extension).
+            ext0  = engines.join_output_ext(sel)
+            return os.path.join(os.path.dirname(sel[0]),
+                                base0 + "_joined" + ext0)
+
+        _busy = {"running": False}
+
+        def _do_join():
+            if _busy["running"]:
+                return
+            sel = _selected()
+            if len(sel) < 2:
+                status_lbl.config(
+                    text="Check at least two files to join.", fg=WARN)
+                return
+            # Format-compatibility guard.
+            ok, reason = engines.probe_concat_compat(sel)
+            if not ok:
+                if not messagebox.askyesno(
+                        "Different formats",
+                        "{}\n\nThese may not be splits of the same "
+                        "recording.  A lossless join can still be "
+                        "attempted but the result may not play "
+                        "correctly.\n\nJoin anyway?".format(reason),
+                        default="no", icon="warning"):
+                    return
+            out_path = out_box["path"] or _default_out(sel)
+            if os.path.exists(out_path):
+                if not messagebox.askyesno(
+                        "Overwrite?",
+                        "{} already exists. Overwrite?".format(
+                            basename(out_path))):
+                    return
+
+            _busy["running"] = True
+            status_lbl.config(
+                text="Joining {} clips… (lossless, no re-encode)".format(
+                    len(sel)), fg=ACCENT)
+            join_btn.config(state="disabled")
+            cancel_btn.config(state="disabled")
+
+            def _worker():
+                ok2, msg, actual = engines.concat_video_files(sel, out_path)
+                def _finish():
+                    _busy["running"] = False
+                    try:
+                        cancel_btn.config(state="normal")
+                        join_btn.config(state="normal")
+                    except tk.TclError:
+                        return
+                    if not ok2:
+                        status_lbl.config(
+                            text="Join failed: " + (msg or "unknown error"),
+                            fg=ERR)
+                        return
+                    # Add joined file to the pool; remove sources if asked.
+                    if remove_var.get():
+                        for p in sel:
+                            self._aaf_remove_video_by_path(p)
+                    self._aaf_add_video(actual)
+                    win.grab_release(); win.destroy()
+                    note = ""
+                    if actual.lower().endswith(".mov") and not \
+                            out_path.lower().endswith(".mov"):
+                        note = ("\n\n(Saved as .mov — the source's PCM "
+                                "audio can't live in an .mp4 container.)")
+                    messagebox.showinfo(
+                        "Joined",
+                        "Created {}\n\nAdded to the video pool — assign "
+                        "and sync it like any single continuous "
+                        "file.{}".format(basename(actual), note))
+                self._ui(_finish)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _change_out():
+            sel = _selected()
+            init = out_box["path"] or (_default_out(sel) if len(sel) >= 1
+                                       else "joined.mp4")
+            p = filedialog.asksaveasfilename(
+                title="Save joined file as",
+                initialdir=os.path.dirname(init),
+                initialfile=os.path.basename(init),
+                defaultextension=os.path.splitext(init)[1] or ".mp4")
+            if p:
+                out_box["path"] = p
+                status_lbl.config(text="Output: " + basename(p), fg=SUB)
+
+        _W = 12
+        join_btn = self._btn(nav, "JOIN", _do_join, color=ACCENT, width=_W)
+        join_btn.pack(side="right")
+        cancel_btn = self._btn(nav, "CANCEL", win.destroy, width=_W)
+        cancel_btn.pack(side="right", padx=(0, 8))
+        self._btn(nav, "OUTPUT…", _change_out, width=_W).pack(side="left")
+
+        win.bind("<Escape>", lambda e: (not _busy["running"]) and win.destroy())
+        win.update_idletasks()
+        pw = self.winfo_width(); ph2 = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = max(560, win.winfo_reqwidth())
+        wh = max(420, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh, px + max(0, (pw - ww) // 2), py + max(0, (ph2 - wh) // 2)))
+
+    def _aaf_remove_video_by_path(self, path):
+        """Remove a pooled video by path, destroying its list row.  Used
+        by Join Split so the source pieces disappear from the pool."""
+        if path in self._aaf_video_paths:
+            self._aaf_video_paths.remove(path)
+        # Find and destroy the matching row (label text == basename).
+        bn = basename(path)
+        for w in list(self._aaf_file_list.winfo_children()):
+            try:
+                for child in w.winfo_children():
+                    if (isinstance(child, tk.Label)
+                            and child.cget("text") == bn):
+                        w.destroy()
+                        break
+            except tk.TclError:
+                pass
+        n = len(self._aaf_video_paths)
+        if hasattr(self, "_aaf_count_lbl"):
+            self._aaf_count_lbl.config(
+                text="{} file{}".format(n, "s" if n != 1 else ""))
 
     def _aaf_remove_unmatched(self):
         """Remove any pooled video files that aren't assigned to any source clip."""
