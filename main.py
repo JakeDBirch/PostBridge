@@ -2875,6 +2875,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return
             self._pending_aaf_setup = data   # _aaf_step2 will restore after init
             self._pending_mark_saved = True  # clean baseline after restore
+            self._pending_aaf_saved_path = path  # quick-saves return here
             self._aaf_load(aaf_path)
             return
 
@@ -6828,6 +6829,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_data = parsed
         self._aaf_path = os.path.abspath(path)
         self.workflow  = "aaf_xml"   # tells save/load routing which flow is active
+        # Fresh AAF — no chosen save file yet, so the first Ctrl+S prompts
+        # for a location (Save As).  Overwritten by _aaf_restore_setup when
+        # opening a previously-saved setup.
+        self._aaf_saved_path = None
         # Point the engine cache dir at a .pb_cache folder next to the AAF so
         # detect_rx_offset results persist across builds of the same session.
         engines._cache_dir = os.path.join(os.path.dirname(self._aaf_path), ".pb_cache")
@@ -10150,23 +10155,35 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         }
 
     def _aaf_save_setup(self, prompt=True):
-        """Save AAF setup. When prompt=False, writes silently to the sidecar path."""
-        data    = self._aaf_build_setup_data()
-        sidecar = self._aaf_sidecar_path()
+        """Save the AAF setup.
 
-        if not prompt and sidecar:
-            # Quick-save: overwrite sidecar directly, no dialog
+        Behaves like a normal app: the FIRST save prompts for a location
+        and name (Save As), and subsequent quick-saves (Ctrl+S) write
+        back to that chosen file silently.  `prompt=True` always shows
+        the dialog.  `_aaf_saved_path` holds the user-chosen file (None
+        until first saved or loaded from)."""
+        data  = self._aaf_build_setup_data()
+        saved = getattr(self, "_aaf_saved_path", None)
+
+        # Quick-save to a file the user has already chosen — no dialog.
+        if not prompt and saved:
             try:
-                with open(sidecar, "w", encoding="utf-8") as f:
+                with open(saved, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 self._mark_saved()
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
             return
 
-        # Save As: always prompt
-        init_dir  = os.path.dirname(sidecar)  if sidecar else ""
-        init_file = os.path.basename(sidecar) if sidecar else "aaf_setup.json"
+        # No chosen file yet (or explicit Save As) → prompt.  Suggest the
+        # AAF-adjacent <name>_setup.json as a default, but let the user
+        # put it wherever they like.
+        sidecar = self._aaf_sidecar_path()
+        init_dir  = (os.path.dirname(saved) if saved
+                     else (os.path.dirname(sidecar) if sidecar else ""))
+        init_file = (os.path.basename(saved) if saved
+                     else (os.path.basename(sidecar) if sidecar
+                           else "aaf_setup.json"))
         path = filedialog.asksaveasfilename(
             title="Save AAF setup",
             defaultextension=".json",
@@ -10174,9 +10191,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             initialdir=init_dir, initialfile=init_file)
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        self._mark_saved()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._aaf_saved_path = path   # future quick-saves go here
+            self._mark_saved()
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
 
     def _aaf_load_setup(self):
         path = filedialog.askopenfilename(
@@ -10189,6 +10210,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception as e:
             messagebox.showerror("Load failed", str(e)); return
         self._aaf_restore_setup(data)
+        # Quick-saves now write back to the file the user just loaded.
+        self._aaf_saved_path = path
 
     def _aaf_restore_setup(self, data):
         """Apply a saved AAF setup dict to the current Step 2 UI state."""
@@ -10304,6 +10327,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showwarning("Missing files",
                 "{} video file(s) from the saved setup were not found:\n{}".format(
                     len(missing), "\n".join(basename(p) for p in missing[:5])))
+
+        # Opened from a saved setup file — route future quick-saves back
+        # to it instead of prompting again.
+        _sp = getattr(self, "_pending_aaf_saved_path", None)
+        if _sp is not None:
+            self._aaf_saved_path = _sp
+            self._pending_aaf_saved_path = None
 
         # Restore complete — capture the clean baseline for an opened
         # AAF setup so closing an unchanged setup doesn't falsely prompt.
