@@ -313,6 +313,126 @@ def _probe_codec(path, stream):
         return ""
 
 
+def _probe_start_tc_secs(path, fps):
+    """File's embedded start timecode in seconds, or None."""
+    for ent in ("format_tags=timecode", "stream_tags=timecode"):
+        try:
+            r = subprocess.run(
+                _ffprobe_cmd() + ["-v", "quiet", "-show_entries", ent,
+                 "-of", "default=nw=1:nk=1", path],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=15)
+            for line in (r.stdout or "").splitlines():
+                m = re.match(r"\s*(\d+):(\d+):(\d+)[:;](\d+)", line)
+                if m:
+                    h, mi, s, ff = map(int, m.groups())
+                    return h * 3600 + mi * 60 + s + (
+                        ff / fps if fps and fps > 0 else 0.0)
+        except Exception:
+            pass
+    return None
+
+
+def _probe_creation_epoch(path):
+    """File's creation_time as a unix epoch (seconds), or None."""
+    try:
+        r = subprocess.run(
+            _ffprobe_cmd() + ["-v", "quiet",
+             "-show_entries", "format_tags=creation_time",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15)
+        lines = [l for l in (r.stdout or "").splitlines() if l.strip()]
+        if not lines:
+            return None
+        import datetime
+        txt = lines[0].strip().replace("Z", "+00:00")
+        try:
+            return datetime.datetime.fromisoformat(txt).timestamp()
+        except Exception:
+            m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})",
+                         txt)
+            if m:
+                return datetime.datetime(*map(int, m.groups())).timestamp()
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_hms(secs):
+    secs = max(0, int(secs or 0))
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return "{}h {:02d}m {:02d}s".format(h, m, s)
+    return "{}m {:02d}s".format(m, s)
+
+
+def probe_join_continuity(paths):
+    """Check that successive split pieces are time-contiguous before a
+    join, using embedded timecode (preferred) or creation_time.
+
+    Catches the common "incomplete join" mistakes: a missing MIDDLE
+    piece (gap), and wrong order / duplicates (overlap).  A missing
+    FIRST piece can't be detected from the files alone — but the
+    returned summary surfaces the first piece's start timecode and the
+    joined length so the user can sanity-check the front.
+
+    Returns (status, message, summary):
+      status  : 'ok' | 'gap' | 'unknown'
+      message : human-readable gap/order details ('' when ok)
+      summary : 'start TC HH:MM:SS · joined length …'
+    """
+    if len(paths) < 2:
+        return "ok", "", ""
+    info = []
+    for p in paths:
+        dur = get_media_duration(p) or 0.0
+        try:
+            _, _, fps = _probe_file_fps(p)
+        except Exception:
+            fps = 0.0
+        info.append({
+            "p":   p,
+            "dur": dur,
+            "tc":  _probe_start_tc_secs(p, fps),
+            "cr":  _probe_creation_epoch(p),
+        })
+
+    use_tc = all(i["tc"] is not None for i in info)
+    use_cr = (not use_tc) and all(i["cr"] is not None for i in info)
+    key    = "tc" if use_tc else ("cr" if use_cr else None)
+
+    total_dur = sum(i["dur"] for i in info)
+    if use_tc:
+        h = int((info[0]["tc"] or 0) // 3600)
+        m = int(((info[0]["tc"] or 0) % 3600) // 60)
+        s = int((info[0]["tc"] or 0) % 60)
+        summary = "start TC {:02d}:{:02d}:{:02d} · joined length {}".format(
+            h, m, s, _fmt_hms(total_dur))
+    else:
+        summary = "joined length {}".format(_fmt_hms(total_dur))
+
+    if key is None:
+        return "unknown", "", summary
+
+    TOL  = 2.0   # seconds of slack
+    gaps = []
+    for a, b in zip(info, info[1:]):
+        delta = b[key] - (a[key] + a["dur"])
+        if delta > TOL:
+            gaps.append("• {} gap before {} — a piece may be missing".format(
+                _fmt_hms(delta), basename(b["p"])))
+        elif delta < -TOL:
+            gaps.append(
+                "• {} overlaps the previous piece by {} "
+                "(wrong order or duplicate?)".format(
+                    basename(b["p"]), _fmt_hms(-delta)))
+    if gaps:
+        return "gap", "\n".join(gaps), summary
+    return "ok", "", summary
+
+
 def join_output_ext(paths):
     """Recommended output extension for a join.  Professional cameras
     often wrap PCM audio (pcm_s16be/le) in a .MP4 file, but the MP4/isom
@@ -3867,11 +3987,26 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
 
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
-                      mix_path=None, include_camera_audio=False):
+                      mix_path=None, include_camera_audio=False,
+                      warnings_out=None):
     fps        = seq_fps
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
     ctr     = 0
+
+    # Cache each video file's length in frames so a wildly-wrong sync
+    # offset (which would push a clip's in/out past the end of the
+    # media — Premiere rejects those as "invalid start/end" and SILENTLY
+    # DROPS the clip) can be clamped into range and reported instead.
+    _vfc_cache = {}
+    def _video_frame_count(vp):
+        if vp in _vfc_cache:
+            return _vfc_cache[vp]
+        d  = _probe_duration(vp) if vp else 0.0
+        fr = f2fr(d, fps) if d and d > 0 else None
+        _vfc_cache[vp] = fr
+        return fr
+    _oor_seen = set()   # source bases already warned (dedupe per source)
 
     v_tracks   = {tn: [] for tn in track_names}
     a_tracks   = {tn: [] for tn in track_names}
@@ -3942,6 +4077,29 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
+
+        # ── Out-of-range guard ────────────────────────────────────────
+        # When the sync offset is badly wrong (e.g. the joined footage is
+        # incomplete, or a clip that shouldn't have been synced), the
+        # video in/out can land outside the file.  Slide the window back
+        # into [0, file_length] — preserving its length — so the clip
+        # stays VISIBLE (and fixable) instead of being dropped on import,
+        # and record a one-per-source warning.
+        if vp:
+            _vfc = _video_frame_count(vp)
+            if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
+                _win = max(1, v_src_out - v_src_in)
+                v_src_in  = max(0, min(v_src_in, _vfc - _win))
+                v_src_out = min(_vfc, v_src_in + _win)
+                if v_src_out <= v_src_in:
+                    v_src_in, v_src_out = 0, min(_vfc, _win)
+                _base = clip.get("source_base") or os.path.basename(vp)
+                if warnings_out is not None and _base not in _oor_seen:
+                    _oor_seen.add(_base)
+                    warnings_out.append(
+                        "{}: sync offset {:+.1f}s places the clip outside "
+                        "{} — clamped into range (re-sync needed).".format(
+                            _base, v_offset, os.path.basename(vp)))
 
         if vp and tn in v_tracks:
             fid   = "file-v-{}".format(os.path.basename(vp).replace(" ", "_"))

@@ -10020,6 +10020,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         "correctly.\n\nJoin anyway?".format(reason),
                         default="no", icon="warning"):
                     return
+            # Continuity check — catch a missing middle piece or wrong
+            # order before joining.  The summary (start TC + length) is
+            # shown so the user can also spot a missing FIRST piece,
+            # which can't be detected from the files alone.
+            status_lbl.config(text="Checking continuity…", fg=SUB)
+            win.update_idletasks()
+            cstatus, cmsg, csummary = engines.probe_join_continuity(sel)
+            if cstatus == "gap":
+                if not messagebox.askyesno(
+                        "Possible gap or missing piece",
+                        "{}\n\n{}\n\nJoin anyway?".format(
+                            cmsg, csummary),
+                        default="no", icon="warning"):
+                    status_lbl.config(text="", fg=SUB)
+                    return
+            elif csummary:
+                # Surface the span so a missing front/end is noticeable.
+                status_lbl.config(text=csummary, fg=SUB)
             out_path = out_box["path"] or _default_out(sel)
             if os.path.exists(out_path):
                 if not messagebox.askyesno(
@@ -10060,11 +10078,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             out_path.lower().endswith(".mov"):
                         note = ("\n\n(Saved as .mov — the source's PCM "
                                 "audio can't live in an .mp4 container.)")
+                    span = ("\n\n" + csummary) if csummary else ""
                     messagebox.showinfo(
                         "Joined",
                         "Created {}\n\nAdded to the video pool — assign "
                         "and sync it like any single continuous "
-                        "file.{}".format(basename(actual), note))
+                        "file.{}{}\n\nSanity-check that length against the "
+                        "full recording — if it's short, a piece may be "
+                        "missing.".format(basename(actual), note, span))
                 self._ui(_finish)
 
             threading.Thread(target=_worker, daemon=True).start()
@@ -10779,13 +10800,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         pass
 
                 self._aaf_build_progress(80, "Building XML\u2026")
+                _oor_warnings = []
                 xmeml = engines.build_xml_from_pt(
                     clips_with_media,
                     track_names_ordered,
                     seq_name,
                     seq_w=_seq_w, seq_h=_seq_h, seq_fps=fps, seq_sr=sr,
                     mix_path=mix_path or None,
-                    include_camera_audio=cam_audio_v)
+                    include_camera_audio=cam_audio_v,
+                    warnings_out=_oor_warnings)
 
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
@@ -10795,6 +10818,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     self.out_path.set(out)
                     self._aaf_done(matched, unmatched,
                                    len(clips_with_media), clip_results)
+                    # Surface any clips whose sync offset placed them
+                    # outside their media \u2014 clamped (not dropped), but
+                    # they need a re-sync.
+                    if _oor_warnings:
+                        shown = _oor_warnings[:12]
+                        more  = len(_oor_warnings) - len(shown)
+                        messagebox.showwarning(
+                            "Sync offsets out of range",
+                            "These clips had a sync offset that placed them "
+                            "outside their video file.  They were clamped "
+                            "back in (so they import instead of being "
+                            "dropped), but they're mis-synced until "
+                            "re-synced:\n\n" + "\n".join(
+                                "\u2022 " + w for w in shown)
+                            + ("\n\u2026and {} more".format(more) if more else ""))
                 self._ui(_finish)
 
             except Exception as e:
