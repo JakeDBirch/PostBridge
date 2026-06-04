@@ -9790,7 +9790,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         win.minsize(560, 420)
 
         tk.Label(win, text="Join Split Camera Clips", font=FH,
-                 bg=BG, fg=TEXT, padx=20, pady=(14, 2)).pack(anchor="w")
+                 bg=BG, fg=TEXT, padx=20).pack(anchor="w", pady=(14, 2))
         tk.Label(win,
                  text=("Check the successive pieces of ONE camera roll "
                        "(file-size splits).  They join losslessly in the "
