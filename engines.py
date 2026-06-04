@@ -1291,6 +1291,58 @@ def mix_for_transcript(paths):
     return tmp_path
 
 
+def mix_reference_audio(paths, out_path, sample_rate=48000):
+    """Sum time-synchronous audio files into one reference WAV for
+    dual-system sync.
+
+    Use case: a 4-person interview where an on-camera GROUP mic matches
+    the SUM of the individual lav tracks far better than any single lav.
+    Syncing each camera against this aggregate locks cleanly (every
+    speaker's onsets are present in both the camera mic and the mix).
+
+    Straight aligned sum: each input is decoded to mono at `sample_rate`,
+    padded to the longest, summed from sample 0, then peak-normalised.
+    Assumes the inputs START at the same instant — true for a
+    synchronous multitrack recording (the normal case).  Returns
+    (ok: bool, message: str).
+    """
+    import numpy as np
+    if len(paths) < 2:
+        return False, "select at least two tracks to mix"
+    try:
+        decoded = []
+        maxlen  = 0
+        for p in paths:
+            cmd = _ffmpeg_cmd() + ["-v", "quiet", "-i", p, "-ac", "1",
+                                   "-ar", str(int(sample_rate)),
+                                   "-f", "f32le", "-"]
+            r = subprocess.run(cmd, capture_output=True, timeout=1800)
+            if r.returncode != 0 or not r.stdout:
+                return False, "could not decode " + basename(p)
+            arr = np.frombuffer(r.stdout, dtype=np.float32).copy()
+            if len(arr) == 0:
+                return False, basename(p) + " decoded to empty audio"
+            decoded.append(arr)
+            maxlen = max(maxlen, len(arr))
+        mix = np.zeros(maxlen, dtype=np.float64)
+        for arr in decoded:
+            mix[:len(arr)] += arr
+        peak = float(np.max(np.abs(mix))) if maxlen else 0.0
+        if peak > 1e-9:
+            mix = mix / peak * 0.9      # headroom, never clips
+        pcm = (np.clip(mix, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(out_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(sample_rate))
+            w.writeframes(pcm.tobytes())
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            return False, "output file was not created"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def detect_sync_via_whisper(video_path, audio_path, probe_duration=120.0):
     """
     Find the sync offset between a video file's embedded camera audio and a

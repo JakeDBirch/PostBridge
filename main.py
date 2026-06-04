@@ -7001,6 +7001,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_audio_count_lbl.pack(side="right")
         self._btn(aph, "\u21bb REFRESH", self._aaf_refresh_pool,
                   small=True).pack(side="right", padx=(0, 4))
+        self._btn(aph, "\u26d3 MIX TO REF", self._aaf_mix_reference_dialog,
+                  small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FOLDER", self._aaf_browse_audio_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FILES",  self._aaf_browse_audio_files,
@@ -9677,6 +9679,155 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         n = len(self._aaf_audio_paths)
         self._aaf_audio_count_lbl.config(
             text="{} file{}".format(n, "s" if n != 1 else ""))
+
+    def _aaf_mix_reference_dialog(self):
+        """Sum several synchronous reference tracks into one aggregate
+        WAV for dual-system sync.
+
+        An on-camera GROUP mic matches the SUM of the individual lav
+        tracks far better than any single lav, so syncing a camera
+        against this mix locks cleanly — and you get a correct,
+        independent offset for each camera.
+        """
+        pool = list(self._aaf_audio_paths)
+        if len(pool) < 2:
+            messagebox.showinfo(
+                "Mix to Reference",
+                "Add at least two reference audio tracks first (e.g. your "
+                "individual lav files).\n\nThen mix them into one aggregate "
+                "that a camera's group mic can sync against.")
+            return
+        pool_sorted = sorted(pool, key=lambda p: basename(p).lower())
+
+        win = tk.Toplevel(self)
+        win.title("Mix to Reference")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        win.minsize(560, 420)
+
+        tk.Label(win, text="Mix Reference Tracks", font=FH,
+                 bg=BG, fg=TEXT, padx=20).pack(anchor="w", pady=(14, 2))
+        tk.Label(win,
+                 text=("Check the synchronous tracks to sum into one "
+                       "aggregate (e.g. all 4 lavs).  A camera's group "
+                       "mic matches this mix far better than any single "
+                       "track, so sync locks cleanly.  Assumes the tracks "
+                       "start at the same instant."),
+                 font=FB, bg=BG, fg=SUB, padx=20, wraplength=520,
+                 justify="left").pack(anchor="w", pady=(0, 8))
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(side="bottom", fill="x", padx=20, pady=(8, 14))
+        status_lbl = tk.Label(win, text="", font=FB, bg=BG, fg=SUB,
+                              padx=20, anchor="w", wraplength=520,
+                              justify="left")
+        status_lbl.pack(side="bottom", fill="x", pady=(0, 4))
+
+        list_wrap = tk.Frame(win, bg=SURF2, padx=2, pady=2)
+        list_wrap.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        check_vars = {}
+        for p in pool_sorted:
+            v = tk.BooleanVar(value=True)   # default: mix all (the common case)
+            check_vars[p] = v
+            tk.Checkbutton(
+                list_wrap, text="  " + basename(p), variable=v,
+                font=FB, bg=SURF2, fg=TEXT, selectcolor=SURF3,
+                activebackground=SURF2, activeforeground=TEXT,
+                anchor="w", highlightthickness=0, bd=0).pack(
+                    fill="x", anchor="w")
+
+        out_box = {"path": None}
+
+        def _selected():
+            return [p for p in pool_sorted if check_vars[p].get()]
+
+        def _default_out(sel):
+            d = os.path.dirname(sel[0])
+            stem = getattr(self, "_aaf_data", {}).get("session_name") \
+                if getattr(self, "_aaf_data", None) else None
+            stem = stem or "reference"
+            stem = re.sub(r"[^A-Za-z0-9_\- ]+", "_", stem)
+            return os.path.join(d, stem + "_mix.wav")
+
+        _busy = {"running": False}
+
+        def _do_mix():
+            if _busy["running"]:
+                return
+            sel = _selected()
+            if len(sel) < 2:
+                status_lbl.config(text="Check at least two tracks.",
+                                  fg=WARN)
+                return
+            out_path = out_box["path"] or _default_out(sel)
+            if os.path.exists(out_path) and not messagebox.askyesno(
+                    "Overwrite?",
+                    "{} already exists. Overwrite?".format(
+                        basename(out_path))):
+                return
+            _busy["running"] = True
+            status_lbl.config(
+                text="Mixing {} tracks…".format(len(sel)), fg=ACCENT)
+            mix_btn.config(state="disabled")
+            cancel_btn.config(state="disabled")
+
+            def _worker():
+                ok, msg = engines.mix_reference_audio(sel, out_path)
+                def _finish():
+                    _busy["running"] = False
+                    try:
+                        cancel_btn.config(state="normal")
+                        mix_btn.config(state="normal")
+                    except tk.TclError:
+                        return
+                    if not ok:
+                        status_lbl.config(
+                            text="Mix failed: " + (msg or "unknown error"),
+                            fg=ERR)
+                        return
+                    self._aaf_add_audio(out_path)
+                    win.grab_release(); win.destroy()
+                    messagebox.showinfo(
+                        "Mixed",
+                        "Created {}\n\nAdded to the reference-audio pool — "
+                        "assign it as the SYNC reference for each camera, "
+                        "then sync each (they'll get their own "
+                        "offset).".format(basename(out_path)))
+                self._ui(_finish)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _change_out():
+            sel = _selected()
+            init = out_box["path"] or (_default_out(sel) if sel
+                                       else "reference_mix.wav")
+            p = filedialog.asksaveasfilename(
+                title="Save mixed reference as",
+                initialdir=os.path.dirname(init),
+                initialfile=os.path.basename(init),
+                defaultextension=".wav",
+                filetypes=[("WAV", "*.wav"), ("All", "*.*")])
+            if p:
+                out_box["path"] = p
+                status_lbl.config(text="Output: " + basename(p), fg=SUB)
+
+        _W = 12
+        mix_btn = self._btn(nav, "MIX", _do_mix, color=ACCENT, width=_W)
+        mix_btn.pack(side="right")
+        cancel_btn = self._btn(nav, "CANCEL", win.destroy, width=_W)
+        cancel_btn.pack(side="right", padx=(0, 8))
+        self._btn(nav, "OUTPUT…", _change_out, width=_W).pack(side="left")
+
+        win.bind("<Escape>",
+                 lambda e: (not _busy["running"]) and win.destroy())
+        win.update_idletasks()
+        pw = self.winfo_width(); ph2 = self.winfo_height()
+        px = self.winfo_rootx(); py = self.winfo_rooty()
+        ww = max(560, win.winfo_reqwidth())
+        wh = max(420, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh, px + max(0, (pw - ww) // 2),
+            py + max(0, (ph2 - wh) // 2)))
 
     def _aaf_browse_audio_files(self):
         exts = sorted(MEDIA_EXTS)
