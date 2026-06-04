@@ -8283,6 +8283,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         extra_evs = self._aaf_source_extra_vars.get(base, [])
         n_slots   = self._aaf_source_slot_counts.get(base, 1)
 
+        # First listbox row is an explicit un-assign sentinel.  Without
+        # it there was no way to clear a wrongly-assigned video — a
+        # SINGLE-select listbox always keeps one item picked, and a
+        # MULTIPLE one needs a "clear" affordance.  Clicking this row
+        # (single mode) or selecting it (multi mode) un-assigns.
+        _NONE_ROW = "  ⊘  (none — unassign)"
+
         current_set = set()
         if sv.get() != "— no video —":
             current_set.add(sv.get())
@@ -8324,32 +8331,38 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             highlightthickness=0, bd=0, relief="flat",
             activestyle="dotbox",
             yscrollcommand=sb.set,
-            height=min(len(options_bn), _max_rows),
+            height=min(len(options_bn) + 1, _max_rows),
             width=int(_lb_w // 9),
         )
         sb.config(command=lb.yview)
         lb.pack(side="left", fill="both", expand=True)
-        if len(options_bn) > _max_rows:
+        if len(options_bn) + 1 > _max_rows:
             sb.pack(side="right", fill="y")
 
+        # Row 0 = un-assign sentinel; rows 1.. = the video files.  File
+        # index i therefore lives at listbox index i+1.
+        lb.insert(tk.END, _NONE_ROW)
         for bn in options_bn:
             lb.insert(tk.END, "  " + bn)
         for i, bn in enumerate(options_bn):
             if bn in current_set:
-                lb.selection_set(i)
+                lb.selection_set(i + 1)
 
         def _scroll(e):
             lb.yview_scroll(int(-1 * (e.delta / 120)), "units")
         lb.bind("<MouseWheel>", _scroll)
 
         def _enforce_max(e):
-            """Block selection of a new item once N slots are filled."""
+            """Block selection of a new item once N slots are filled.
+            The sentinel row (index 0) is always allowed — it clears."""
             if n_slots <= 1:
                 return   # SINGLE mode handles itself
             idx = lb.nearest(e.y)
-            if idx < 0 or idx >= len(options_bn):
-                return
-            if len(lb.curselection()) >= n_slots and idx not in lb.curselection():
+            if idx <= 0 or idx > len(options_bn):
+                return   # sentinel row or out of range — always allow
+            # Count only real file rows (index >= 1) toward the cap.
+            real_sel = [i for i in lb.curselection() if i >= 1]
+            if len(real_sel) >= n_slots and idx not in lb.curselection():
                 return "break"   # at capacity and this item isn't selected — block
         lb.bind("<ButtonPress-1>", _enforce_max, add=True)
 
@@ -8369,7 +8382,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _closed[0] = True
 
             # ── Assign selected files to existing slots — counter unchanged ──
-            selected = [options_bn[i] for i in lb.curselection()]
+            # Row 0 is the un-assign sentinel: if it's in the selection,
+            # treat the whole thing as "clear".  Otherwise map listbox
+            # rows back to files (file i is at listbox index i+1).
+            _sel = lb.curselection()
+            if 0 in _sel:
+                selected = []
+            else:
+                selected = [options_bn[i - 1] for i in _sel if i >= 1]
             selected = selected[:n_slots]          # clamp to N — never exceeds
 
             # Ensure extra_vars list matches current N (may have drifted)
