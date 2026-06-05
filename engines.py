@@ -1,5 +1,20 @@
 import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
 
+# All media subprocesses (ffmpeg / ffprobe) go through _run so the child
+# console window is suppressed on Windows.  In the bundled windowed
+# build there is no parent console, so every child spawns its OWN — a
+# black window flashes on each call, and several fire per transcription.
+# On multi-monitor setups that repeated spawn has been observed to blank
+# a secondary display (reported by a user on Intel graphics).
+# CREATE_NO_WINDOW stops the child console from ever being created.
+_real_run = subprocess.run
+_CREATE_NO_WINDOW = 0x08000000
+
+def _run(cmd, **kwargs):
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+    return _real_run(cmd, **kwargs)
+
 
 def _safe_net_call(fn, default, _timeout=2.0):
     """
@@ -150,7 +165,7 @@ def extract_window(media_path, start_s, end_s, out_path):
         out_path
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
+        r = _run(cmd, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
         if r.returncode == 0:
             return True, None
         err = (r.stderr or r.stdout or "").strip()
@@ -169,7 +184,7 @@ def extract_window(media_path, start_s, end_s, out_path):
                 "-vn",
                 out_path
             ]
-            r2 = subprocess.run(cmd2, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
+            r2 = _run(cmd2, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
             if r2.returncode == 0:
                 return True, None
             err = (r2.stderr or r2.stdout or "").strip() or err
@@ -195,7 +210,7 @@ def extract_mono_pcm(media_path, sample_rate=8000):
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-vn", "pipe:1",
     ]
-    r = subprocess.run(cmd, capture_output=True, timeout=600)
+    r = _run(cmd, capture_output=True, timeout=600)
     if r.returncode != 0:
         raise RuntimeError(
             "ffmpeg failed extracting PCM from {}:\n{}".format(
@@ -220,7 +235,7 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
         "-acodec", "pcm_s16le",
         "-vn", out_wav_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    r = _run(cmd, capture_output=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(
             "ffmpeg failed extracting segment from {}:\n{}".format(
@@ -231,7 +246,7 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
 
 def get_media_duration(path):
     try:
-        r = subprocess.run(
+        r = _run(
             _ffprobe_cmd() + ["-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
@@ -241,7 +256,7 @@ def get_media_duration(path):
 
 def get_audio_channels(path):
     try:
-        r = subprocess.run(
+        r = _run(
             _ffprobe_cmd() + ["-v", "quiet",
              "-select_streams", "a:0",
              "-show_entries", "stream=channels",
@@ -259,7 +274,7 @@ def _concat_stream_sig(path):
     Each sig is a tuple of the format-defining fields; None if no stream."""
     def _probe(stream, fields):
         try:
-            r = subprocess.run(
+            r = _run(
                 _ffprobe_cmd() + ["-v", "quiet",
                  "-select_streams", stream,
                  "-show_entries", "stream=" + ",".join(fields),
@@ -303,7 +318,7 @@ def probe_concat_compat(paths):
 
 def _probe_codec(path, stream):
     try:
-        r = subprocess.run(
+        r = _run(
             _ffprobe_cmd() + ["-v", "quiet", "-select_streams", stream,
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
             capture_output=True, text=True,
@@ -317,7 +332,7 @@ def _probe_start_tc_secs(path, fps):
     """File's embedded start timecode in seconds, or None."""
     for ent in ("format_tags=timecode", "stream_tags=timecode"):
         try:
-            r = subprocess.run(
+            r = _run(
                 _ffprobe_cmd() + ["-v", "quiet", "-show_entries", ent,
                  "-of", "default=nw=1:nk=1", path],
                 capture_output=True, text=True,
@@ -336,7 +351,7 @@ def _probe_start_tc_secs(path, fps):
 def _probe_creation_epoch(path):
     """File's creation_time as a unix epoch (seconds), or None."""
     try:
-        r = subprocess.run(
+        r = _run(
             _ffprobe_cmd() + ["-v", "quiet",
              "-show_entries", "format_tags=creation_time",
              "-of", "default=nw=1:nk=1", path],
@@ -496,7 +511,7 @@ def concat_video_files(paths, out_path, progress_cb=None):
         if has_audio:
             cmd += ["-map", "0:a:0?"]
         cmd += ["-c", "copy", out_path]
-        r = subprocess.run(cmd, capture_output=True, timeout=3600)
+        r = _run(cmd, capture_output=True, timeout=3600)
         if progress_cb:
             try: progress_cb(1.0)
             except Exception: pass
@@ -930,7 +945,7 @@ def _clip_rms_db(wav_path):
             "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
             "-f", "null", "-"
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=15,
+        r = _run(cmd, capture_output=True, timeout=15,
                            text=True, encoding="utf-8", errors="replace")
         for line in (r.stdout + r.stderr).splitlines():
             if "RMS_level" in line and "=" in line:
@@ -1278,7 +1293,7 @@ def _mix_decode(path):
         "-y", "-i", path,
         "-ar", str(_MIX_SR), "-ac", "1", "-f", "s16le", "pipe:1",
     ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    r = _run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         raise RuntimeError(
             "mix decode failed for {!r}: {}".format(
@@ -1343,7 +1358,7 @@ def _mix_dynaudnorm(path):
             _MIX_DYN_FRAME_MS, _MIX_DYN_GAUSS, _MIX_DYN_PEAK, _MIX_DYN_MAX_GAIN),
         tmp,
     ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    r = _run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         raise RuntimeError(
             "dynaudnorm failed: " + r.stderr.decode(errors="replace")
@@ -1436,7 +1451,7 @@ def mix_reference_audio(paths, out_path, sample_rate=48000):
             cmd = _ffmpeg_cmd() + ["-v", "quiet", "-i", p, "-ac", "1",
                                    "-ar", str(int(sample_rate)),
                                    "-f", "f32le", "-"]
-            r = subprocess.run(cmd, capture_output=True, timeout=1800)
+            r = _run(cmd, capture_output=True, timeout=1800)
             if r.returncode != 0 or not r.stdout:
                 return False, "could not decode " + basename(p)
             arr = np.frombuffer(r.stdout, dtype=np.float32).copy()
@@ -1498,7 +1513,7 @@ def detect_sync_via_whisper(video_path, audio_path, probe_duration=120.0):
             "-ac", "1", "-ar", "16000",
             "-acodec", "pcm_s16le", "-vn", dst,
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        r = _run(cmd, capture_output=True, timeout=180)
         if r.returncode != 0:
             raise RuntimeError(
                 "ffmpeg failed extracting probe from {}:\n{}".format(
@@ -2552,7 +2567,7 @@ def detect_speech_blobs(audio_path,
         "pipe:1",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        r = _run(cmd, capture_output=True, timeout=300)
         if r.returncode != 0:
             return None
         data = np.frombuffer(r.stdout, dtype=np.float32)
@@ -2739,7 +2754,7 @@ def detect_silence_splits(audio_path, silence_db=None,
         "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        r = _run(cmd, capture_output=True, timeout=300)
         if r.returncode != 0:
             return None
         data = np.frombuffer(r.stdout, dtype=np.float32)
@@ -3136,7 +3151,7 @@ def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
                 '-f', 'f32le',
                 tmp
             ]
-            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            r = _run(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
             with open(tmp, 'rb') as _f:
@@ -3190,7 +3205,7 @@ def _extract_mono(src_path, duration, out_sr):
             '-f', 'f32le',
             tmp
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=300,
+        r = _run(cmd, capture_output=True, timeout=300,
                            encoding='utf-8', errors='replace')
         if r.returncode != 0:
             return None
@@ -3222,7 +3237,7 @@ def _probe_duration(path):
             '-v', 'quiet', '-show_entries', 'format=duration',
             '-of', 'csv=p=0', path
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=30,
+        r = _run(cmd, capture_output=True, timeout=30,
                            encoding='utf-8', errors='replace')
         dur = float(r.stdout.strip())
     except Exception:
@@ -3432,7 +3447,7 @@ def probe_media_settings(all_paths):
         if not path or not os.path.exists(path):
             continue
         try:
-            r = subprocess.run(
+            r = _run(
                 _ffprobe_cmd() + ["-v", "quiet",
                  "-select_streams", "v:0",
                  "-show_entries", "stream=width,height,r_frame_rate",
@@ -3451,7 +3466,7 @@ def probe_media_settings(all_paths):
                             best_fps = fps
                     except Exception:
                         pass
-            r2 = subprocess.run(
+            r2 = _run(
                 _ffprobe_cmd() + ["-v", "quiet",
                  "-select_streams", "a:0",
                  "-show_entries", "stream=sample_rate",
@@ -3856,7 +3871,7 @@ def _probe_file_fps(path):
     if not path or not os.path.isfile(path):
         return ("n/a", "n/a", 0.0)
     try:
-        r = subprocess.run(
+        r = _run(
             _ffprobe_cmd() + ["-v", "quiet", "-select_streams", "v:0",
              "-show_entries", "stream=r_frame_rate,avg_frame_rate",
              "-of", "csv=p=0", path],
@@ -4674,7 +4689,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     wav_path,
                 ]
                 try:
-                    r = subprocess.run(cmd, capture_output=True, timeout=600)
+                    r = _run(cmd, capture_output=True, timeout=600)
                     if r.returncode != 0:
                         wav_path = src   # fall back to original on ffmpeg error
                 except Exception:

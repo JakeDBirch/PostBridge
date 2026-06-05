@@ -8106,7 +8106,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     result = subprocess.run(
                         ["ffprobe", "-v", "quiet", "-print_format", "json",
                          "-show_streams", vp],
-                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+                        creationflags=(0x08000000 if sys.platform == "win32" else 0))
                     info = _json.loads(result.stdout)
                     for stream in info.get("streams", []):
                         if stream.get("codec_type") != "video":
