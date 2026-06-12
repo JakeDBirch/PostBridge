@@ -190,7 +190,7 @@ Export your Pro Tools session as AAF (**File → Export → As AAF**, **Link to 
 A grid shows each source clip from the AAF. For each source:
 
 - **Video file(s)** — assign one or more via the `[−] N [+]` counter. PostBridge probes all assigned files in parallel and promotes the highest-confidence match. To clear a wrong assignment, pick **⊘ (none — unassign)** at the top of the picker.
-- **⛓ JOIN SPLIT** (pool header) — cameras split long recordings into successive files at the 4 GB FAT32 limit. This losslessly rejoins them (no re-encode) into one continuous file and adds it to the pool, so a split camera syncs and lays out exactly like an un-split one. Handles the awkward real-world cases automatically: PCM-audio sources are written to `.mov` (the `.mp4` container can't hold PCM), and the camera's timecode data track — which otherwise corrupts a stream-copy remux — is dropped. Before joining it runs a **continuity check** (using embedded timecode) that warns if a piece is missing in the middle or the pieces are out of order, and reports the joined length + start timecode so a missing first/last piece is easy to spot.
+- **⛓ JOIN SPLIT** (pool header) — cameras split long recordings into successive files at the 4 GB FAT32 limit. This losslessly rejoins them (no re-encode) into one continuous file and adds it to the pool, so a split camera syncs and lays out exactly like an un-split one. Handles the awkward real-world cases automatically: PCM-audio sources are written to `.mov` (the `.mp4` container can't hold PCM), and the camera's timecode data track — which otherwise corrupts a stream-copy remux — is dropped. Before joining it runs a **continuity check** (using embedded timecode) that warns if a piece is missing in the middle or the pieces are out of order, and reports the joined length + start timecode so a missing first/last piece is easy to spot. After joining it cross-checks the result's duration against the sum of the inputs and flags a shortfall — the tell-tale that a segment was silently dropped.
 - **Reference audio** — assign an ISO or mix file for waveform sync. **⛓ MIX TO REF** (pool header) sums several synchronous tracks into one aggregate — when an on-camera *group* mic matches the sum of the individual lavs better than any single one, sync each camera against this mix and it locks cleanly. Each camera still gets its own independent offset.
 - **☐ slate** — tick if production used a clapper/slate. Switches sync detection to GCC-PHAT weighting, which sharpens the slate transient peak instead of treating it as noise. Strongly recommended when available.
 - **SYNC** — runs multi-window cross-correlation. The algorithm probes 3 positions through the file (25/50/75 %) to avoid being misled by setup/teardown noise at the head, and arbitrates by consistency across probes. The result is then cross-checked against an independent **onset-event histogram** (it aligns the timing of speech attacks rather than amplitude, so it stays accurate when the camera mic and reference mic have very different levels). When the two methods disagree and the histogram has a clear winner, PostBridge adopts the histogram's offset and demotes the cross-correlation pick to an audition candidate — this fixes the cases where amplitude correlation locks onto a spurious peak.
@@ -202,7 +202,9 @@ The result shows the offset, a confidence percentage, and one of:
 - **⚠ verify required** (50–84 %)
 - **⚠ low conf, must verify** (< 50 %)
 
-Click **ALIGN** to open the waveform alignment dialog. If auto-sync returned alternative candidates (runner-up cross-correlation peaks), a **TRY NEXT ▶** button cycles through them — each candidate shows its offset and confidence so you can scan before auditioning. Adjust the offset visually, audition with the play buttons, and accept.
+When auto-sync produces runner-up candidates (alternate cross-correlation peaks), a **⏭ NEXT** button appears right on the source row — cycle through the alternates and audition each one without leaving Step 2. The button hides itself when there's nothing to cycle, so the row stays uncluttered.
+
+Click **ALIGN** to open the waveform dialog for manual work: nudge the offset visually, audition the mix and the reference with the play buttons, and accept.
 
 Sync results are cached to disk — re-running is fast.
 
@@ -259,14 +261,16 @@ The `.pb_transcript.json` sidecars are shared between workflows: transcribing in
 
 **Cross-machine handoff:** Session files open on a different computer. If PostBridge detects paths from a different OS, it prompts to locate your Video and Audio folders and remaps everything automatically.
 
+**Closing safely:** closing the window with unsaved changes prompts to Save / Don't Save / Cancel (a first save behaves like Save As). If a transcription or reconcile is still running, PostBridge warns before closing so an in-flight pass isn't silently abandoned.
+
 ---
 
 ## Supported File Types
 
 | Category | Extensions |
 |---|---|
-| Video | `.mp4 .mov .mxf .avi .mkv .m4v .mpg .mpeg .ts .mts .m2ts .wmv .r3d .braw` |
-| Audio | `.wav .aif .aiff .bwf .rf64 .mp3 .m4a .aac .flac .ogg .opus .caf` |
+| Video | `.mp4 .mov .mxf .avi .mkv .m4v .mpg .mpeg .ts .mts .m2ts .wmv .flv .webm .ogv .3gp .dv .r3d .braw .ari` |
+| Audio | `.wav .aif .aiff .bwf .rf64 .mp3 .m4a .aac .flac .ogg .opus .wma .caf` |
 | Script | `.txt` (PostBridge bracketed format) |
 | AAF | `.aaf` (Pro Tools, Link to Source Media) |
 | Output | `.aaf` `.xml` `.json` |
@@ -302,7 +306,8 @@ Most other settings live in `config.py` and require a code edit:
 | `MAX_EXTRACT_S` | `600` | Maximum extraction window — guards against sentinel out-points |
 | `MAX_ITEM_STALL_S` | `300` | Reconcile stall watchdog before abandoning a token batch |
 | `AUTO_FULL_TRANSCRIBE_THRESHOLD` | `5` | Pulls per token that trigger full-audio transcribe (vs per-pull) |
-| `FULL_TRANSCRIBE_CONCURRENCY` | `2` | Concurrent full-audio transcribes — drop to 1 on CPU or low-VRAM GPU |
+| `FULL_TRANSCRIBE_CONCURRENCY` | `4` | Concurrent full-audio transcribes — drop to 2 on a low-VRAM GPU or 1 on CPU |
+| `WHISPER_NUM_WORKERS` | `4` | CTranslate2 worker-pool size for the shared model — lets concurrent transcribe() calls share the GPU instead of serialising |
 | `SCRIPT_CONFORM_ENABLED` | `True` | Master switch for auto-cut script-conform editing |
 | `SCRIPT_CONFORM_MIN_RATIO` | `0.70` | Min fraction of script tokens that must align for cuts to be trusted |
 | `MATCH_THRESH` | `0.55` | Minimum word-overlap score to accept a pull match (per-pull path) |
