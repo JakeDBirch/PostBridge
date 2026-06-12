@@ -8,10 +8,22 @@ import os, re, ntpath, sys, subprocess
 # go through this wrapper.
 _CREATE_NO_WINDOW = 0x08000000
 
+def _hidden_startupinfo():
+    """STARTUPINFO that hides the child window — belt-and-suspenders
+    alongside CREATE_NO_WINDOW.  CREATE_NO_WINDOW alone is normally
+    enough to stop a console app (ffmpeg/ffprobe) flashing a window, but
+    some Windows/driver combinations still flash without an explicit
+    SW_HIDE; setting both is the most robust documented approach."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si
+
 def run_hidden(cmd, **kwargs):
-    """subprocess.run with the child console suppressed on Windows."""
+    """subprocess.run with the child console fully suppressed on Windows."""
     if sys.platform == "win32":
         kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+        kwargs.setdefault("startupinfo", _hidden_startupinfo())
     return subprocess.run(cmd, **kwargs)
 
 def basename(p):

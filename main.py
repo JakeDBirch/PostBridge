@@ -7452,33 +7452,24 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                               highlightbackground=BORDER, highlightthickness=1)
         list_outer.pack(fill="both", expand=True, pady=(0, 12))
 
+        # Column header — pinned at the top of the panel.
         if not is_empty:
             hdr = tk.Frame(list_outer, bg=SURF3)
-            hdr.pack(fill="x")
+            hdr.pack(side="top", fill="x")
             for txt, w_ in [("TOKEN", 16), ("FILES", 8),
                             ("WORDS", 12), ("STATUS", 28)]:
                 tk.Label(hdr, text=txt, font=FL, bg=SURF3, fg=SUB,
                          anchor="w", padx=12, pady=6, width=w_
                          ).pack(side="left")
-            for s in project["sessions"]:
-                self._pq_render_session_row(list_outer, s)
-        else:
-            # Empty-state copy — sits above the add affordance.
-            tk.Label(list_outer,
-                     text="\n  No interview sessions yet.",
-                     font=FBT, bg=SURF, fg=TEXT,
-                     anchor="w", padx=20).pack(anchor="w")
-            tk.Label(list_outer,
-                     text="  Drop interview media into a session, transcribe it,\n"
-                          "  and copy quotes as ready-to-paste @PULL blocks.\n",
-                     font=FB, bg=SURF, fg=SUB,
-                     anchor="w", padx=20, justify="left",
-                     pady=(4)).pack(anchor="w")
 
-        # Always-last row inside the panel — uses self._btn so click +
-        # hover behaviour matches every other button in the app.
+        # "+ ADD INTERVIEW SESSION" — built and pinned to the BOTTOM of the
+        # panel BEFORE the (scrollable) row area, so it stays reachable no
+        # matter how many sessions the project has.  It used to be packed
+        # after the rows with no scroll region, so a project with many
+        # sessions pushed it past the bottom of the window with no way to
+        # reach it (reported by a user with 12 sessions).
         add_pad = tk.Frame(list_outer, bg=SURF2 if is_empty else SURF)
-        add_pad.pack(fill="x")
+        add_pad.pack(side="bottom", fill="x")
         add_inner = tk.Frame(add_pad, bg=add_pad.cget("bg"))
         add_inner.pack(padx=14, pady=14, anchor="w")
         self._btn(add_inner,
@@ -7490,6 +7481,32 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                      text="    ← start here",
                      font=FB, bg=add_pad.cget("bg"), fg=SUB
                      ).pack(side="left")
+
+        if not is_empty:
+            # Session rows go in a scrollable area filling the space between
+            # the pinned header and the pinned add button.  _scroll_frame
+            # defaults to the app BG; tint it SURF so empty space below the
+            # rows matches the panel instead of showing a dark void.
+            rows_host = self._scroll_frame(list_outer)
+            try:
+                rows_host.config(bg=SURF)
+                self._last_scroll_canvas.config(bg=SURF)
+            except (AttributeError, tk.TclError):
+                pass
+            for s in project["sessions"]:
+                self._pq_render_session_row(rows_host, s)
+        else:
+            # Empty-state copy — sits above the add affordance.
+            tk.Label(list_outer,
+                     text="\n  No interview sessions yet.",
+                     font=FBT, bg=SURF, fg=TEXT,
+                     anchor="w", padx=20).pack(side="top", anchor="w")
+            tk.Label(list_outer,
+                     text="  Drop interview media into a session, transcribe it,\n"
+                          "  and copy quotes as ready-to-paste @PULL blocks.\n",
+                     font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=20, justify="left",
+                     pady=(4)).pack(side="top", anchor="w")
 
         # Incremental status-cell updates while any session is transcribing.
         # No full re-render → no flicker.
