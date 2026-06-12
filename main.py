@@ -44,7 +44,8 @@ _PQ_STREAM_DIAG = False
 # Import our custom modules!
 from config import *
 from config import _SANS
-from utils import basename, secs_tc, tc_secs, is_video, is_audio, is_media, MEDIA_EXTS, VIDEO_EXTS, parse_dnd
+from utils import (basename, secs_tc, tc_secs, is_video, is_audio, is_media,
+                   MEDIA_EXTS, VIDEO_EXTS, parse_dnd, run_hidden)
 from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
@@ -950,6 +951,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             f()
         w.bind("<Button-1>", _press)
         return w
+
+    def _center_dialog(self, win, min_w=560, min_h=420):
+        """Size a Toplevel to its requested size (no smaller than
+        min_w × min_h) and centre it over the main window."""
+        win.update_idletasks()
+        pw = self.winfo_width();  ph = self.winfo_height()
+        px = self.winfo_rootx();  py = self.winfo_rooty()
+        ww = max(min_w, win.winfo_reqwidth())
+        wh = max(min_h, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            ww, wh,
+            px + max(0, (pw - ww) // 2),
+            py + max(0, (ph - wh) // 2)))
 
     def _section(self, text):
         f = tk.Frame(self.body, bg=BG)
@@ -3279,17 +3293,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         Shells out to nvidia-smi (always present with the driver).  The
         call typically completes in 50-200 ms — fine for a 2 s poll."""
         try:
-            kwargs = {"timeout": 2.0}
-            if sys.platform == "win32":
-                # Hide the console window the subprocess would otherwise flash
-                kwargs["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
-            out = subprocess.check_output(
+            out = run_hidden(
                 ["nvidia-smi",
                  "--query-gpu=utilization.gpu,memory.used,memory.total",
                  "--format=csv,noheader,nounits"],
-                stderr=subprocess.DEVNULL,
-                **kwargs,
-            ).decode("utf-8", errors="ignore").strip()
+                capture_output=True, timeout=2.0,
+            ).stdout.decode("utf-8", errors="ignore").strip()
             # nvidia-smi can emit multiple lines for multi-GPU boxes — take
             # the first line (primary GPU).
             first = out.splitlines()[0]
@@ -8103,11 +8112,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             best_rank = len(priority)
             for vp in paths:
                 try:
-                    result = subprocess.run(
+                    result = run_hidden(
                         ["ffprobe", "-v", "quiet", "-print_format", "json",
                          "-show_streams", vp],
-                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
-                        creationflags=(0x08000000 if sys.platform == "win32" else 0))
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
                     info = _json.loads(result.stdout)
                     for stream in info.get("streams", []):
                         if stream.get("codec_type") != "video":
@@ -9821,14 +9829,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         win.bind("<Escape>",
                  lambda e: (not _busy["running"]) and win.destroy())
-        win.update_idletasks()
-        pw = self.winfo_width(); ph2 = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(560, win.winfo_reqwidth())
-        wh = max(420, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh, px + max(0, (pw - ww) // 2),
-            py + max(0, (ph2 - wh) // 2)))
+        self._center_dialog(win)
 
     def _aaf_browse_audio_files(self):
         exts = sorted(MEDIA_EXTS)
@@ -10112,13 +10113,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._btn(nav, "OUTPUT…", _change_out, width=_W).pack(side="left")
 
         win.bind("<Escape>", lambda e: (not _busy["running"]) and win.destroy())
-        win.update_idletasks()
-        pw = self.winfo_width(); ph2 = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(560, win.winfo_reqwidth())
-        wh = max(420, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh, px + max(0, (pw - ww) // 2), py + max(0, (ph2 - wh) // 2)))
+        self._center_dialog(win)
 
     def _aaf_remove_video_by_path(self, path):
         """Remove a pooled video by path, destroying its list row.  Used

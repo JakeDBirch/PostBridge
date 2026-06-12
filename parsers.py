@@ -3,7 +3,7 @@ import re
 import subprocess
 import tempfile
 import json
-from utils import tc_secs, basename
+from utils import tc_secs, basename, run_hidden
 
 # ── Script parser ───────────────────────────────────────────────────────────────────────────
 #
@@ -574,7 +574,7 @@ def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
             cmd += ["-t", "{:.3f}".format(max(probe_duration, 0.1)),
                     "-i", path, "-ac", "1", "-ar", str(SR),
                     "-f", "f32le", tmp]
-            r = subprocess.run(cmd, capture_output=True, timeout=120)
+            r = run_hidden(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
             with open(tmp, "rb") as _f:
@@ -897,7 +897,7 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
                     "-ar", str(int(out_sr)),
                     "-f",  "f32le",
                     tmp]
-            r = subprocess.run(cmd, capture_output=True, timeout=120)
+            r = run_hidden(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
             with open(tmp, "rb") as _fh:
@@ -1608,7 +1608,7 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
             cmd += ["-t", "{:.3f}".format(max(t_dur, 0.1)),
                     "-i", path, "-ac", "1", "-ar", str(int(out_sr)),
                     "-f", "f32le", tmp]
-            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            r = run_hidden(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
             with open(tmp, "rb") as _fh:
@@ -1723,7 +1723,7 @@ def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=80
         raise RuntimeError("numpy is required.\nRun:  pip install numpy")
 
     def _extract(src, dst):
-        r = subprocess.run(
+        r = run_hidden(
             ["ffmpeg", "-y",
              "-t", str(search_secs),
              "-i", src,

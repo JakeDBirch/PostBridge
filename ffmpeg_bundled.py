@@ -8,6 +8,7 @@ import ssl
 import sys
 import stat
 import subprocess
+from utils import run_hidden
 import urllib.request
 
 # Shaka-project static builds (n7.1-2): one ffmpeg + one ffprobe per platform
@@ -65,7 +66,7 @@ def _platform_key():
 
 def _system_ffmpeg_ok():
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        r = run_hidden(["ffmpeg", "-version"], capture_output=True, timeout=5)
         return r.returncode == 0
     except Exception:
         return False
@@ -73,7 +74,7 @@ def _system_ffmpeg_ok():
 
 def _system_ffprobe_ok():
     try:
-        r = subprocess.run(["ffprobe", "-version"], capture_output=True, timeout=5)
+        r = run_hidden(["ffprobe", "-version"], capture_output=True, timeout=5)
         return r.returncode == 0
     except Exception:
         return False
@@ -84,7 +85,7 @@ def _brew_ffmpeg_paths():
     if sys.platform != "darwin":
         return None, None
     try:
-        r = subprocess.run(
+        r = run_hidden(
             ["brew", "--prefix", "ffmpeg"],
             capture_output=True,
             text=True,
@@ -290,11 +291,11 @@ def check_ffmpeg():
     global _last_ensure_error
     try:
         cmd = get_ffmpeg_cmd()
-        r = subprocess.run(cmd + ["-version"], capture_output=True, timeout=10)
+        r = run_hidden(cmd + ["-version"], capture_output=True, timeout=10)
         if r.returncode != 0:
             return False, "ffmpeg failed to run"
         cmd_p = get_ffprobe_cmd()
-        r2 = subprocess.run(cmd_p + ["-version"], capture_output=True, timeout=10)
+        r2 = run_hidden(cmd_p + ["-version"], capture_output=True, timeout=10)
         if r2.returncode != 0:
             return False, "ffprobe failed to run"
         return True, ""

@@ -1,4 +1,18 @@
-import os, re, ntpath, sys
+import os, re, ntpath, sys, subprocess
+
+# Single point of control for child-process console suppression.  In the
+# bundled WINDOWED build there is no parent console, so every subprocess
+# (ffmpeg / ffprobe / nvidia-smi) would otherwise spawn its own — a black
+# window flashing per call, observed to blank a secondary monitor on one
+# user's Intel-graphics setup.  Every media subprocess in the app should
+# go through this wrapper.
+_CREATE_NO_WINDOW = 0x08000000
+
+def run_hidden(cmd, **kwargs):
+    """subprocess.run with the child console suppressed on Windows."""
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
 
 def basename(p):
     return ntpath.basename(p) or os.path.basename(p)

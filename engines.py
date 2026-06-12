@@ -1,19 +1,9 @@
 import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
-# console window is suppressed on Windows.  In the bundled windowed
-# build there is no parent console, so every child spawns its OWN — a
-# black window flashes on each call, and several fire per transcription.
-# On multi-monitor setups that repeated spawn has been observed to blank
-# a secondary display (reported by a user on Intel graphics).
-# CREATE_NO_WINDOW stops the child console from ever being created.
-_real_run = subprocess.run
-_CREATE_NO_WINDOW = 0x08000000
-
-def _run(cmd, **kwargs):
-    if sys.platform == "win32":
-        kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
-    return _real_run(cmd, **kwargs)
+# console window is suppressed on Windows (see utils.run_hidden — the
+# single shared mechanism, also used by parsers / ffmpeg_bundled / main).
+from utils import run_hidden as _run
 
 
 def _safe_net_call(fn, default, _timeout=2.0):
@@ -483,13 +473,18 @@ def concat_video_files(paths, out_path, progress_cb=None):
     if len(paths) < 2:
         return False, "need at least two files", out_path
 
-    # Force a container that can hold the source codecs.
-    want_ext = join_output_ext(paths)
+    # Probe the first file's audio codec ONCE — it determines both the
+    # container (PCM must go to .mov, see join_output_ext) and whether
+    # an audio stream gets mapped at all.
+    acodec    = _probe_codec(paths[0], "a:0")
+    has_audio = bool(acodec)
+    if acodec.startswith("pcm"):
+        want_ext = ".mov"
+    else:
+        want_ext = os.path.splitext(paths[0])[1].lower() or ".mp4"
     root, ext = os.path.splitext(out_path)
     if ext.lower() != want_ext:
         out_path = root + want_ext
-
-    has_audio = bool(_probe_codec(paths[0], "a:0"))
 
     listf = None
     try:
@@ -1445,8 +1440,11 @@ def mix_reference_audio(paths, out_path, sample_rate=48000):
     if len(paths) < 2:
         return False, "select at least two tracks to mix"
     try:
-        decoded = []
-        maxlen  = 0
+        # Accumulate incrementally — decode one track, add it into the
+        # running sum, free it.  Holding every decoded track at once
+        # costs ~11.5 MB per track-minute (4 one-hour lavs ≈ 2.8 GB);
+        # this keeps peak memory at one track + the accumulator.
+        mix = np.zeros(0, dtype=np.float64)
         for p in paths:
             cmd = _ffmpeg_cmd() + ["-v", "quiet", "-i", p, "-ac", "1",
                                    "-ar", str(int(sample_rate)),
@@ -1454,15 +1452,15 @@ def mix_reference_audio(paths, out_path, sample_rate=48000):
             r = _run(cmd, capture_output=True, timeout=1800)
             if r.returncode != 0 or not r.stdout:
                 return False, "could not decode " + basename(p)
-            arr = np.frombuffer(r.stdout, dtype=np.float32).copy()
+            arr = np.frombuffer(r.stdout, dtype=np.float32)
             if len(arr) == 0:
                 return False, basename(p) + " decoded to empty audio"
-            decoded.append(arr)
-            maxlen = max(maxlen, len(arr))
-        mix = np.zeros(maxlen, dtype=np.float64)
-        for arr in decoded:
+            if len(arr) > len(mix):
+                mix = np.concatenate(
+                    [mix, np.zeros(len(arr) - len(mix), dtype=np.float64)])
             mix[:len(arr)] += arr
-        peak = float(np.max(np.abs(mix))) if maxlen else 0.0
+            del r, arr
+        peak = float(np.max(np.abs(mix))) if len(mix) else 0.0
         if peak > 1e-9:
             mix = mix / peak * 0.9      # headroom, never clips
         pcm = (np.clip(mix, -1.0, 1.0) * 32767).astype(np.int16)
