@@ -2657,8 +2657,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _quick_save(self, btn_ref=None):
         """Save to the current session file; prompt for a path on the first save."""
-        if getattr(self, 'workflow', None) == 'aaf_xml':
-            self._aaf_save_setup(prompt=False)
+        def _flash_saved():
+            # Show SAVED \u2713 only when a save actually happened \u2014 a
+            # cancelled Save-As dialog must not read as success.
             b = btn_ref[0] if btn_ref else None
             if b:
                 try:
@@ -2666,6 +2667,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     self.after(1800, lambda: b.config(text="SAVE"))
                 except Exception:
                     pass
+
+        if getattr(self, 'workflow', None) == 'aaf_xml':
+            if self._aaf_save_setup(prompt=False):
+                _flash_saved()
             return
         if getattr(self, 'workflow', None) == 'pull_quotes':
             # Standalone-session view: opened a .pb_session.json directly
@@ -2675,22 +2680,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             # than prompting for a brand-new project file every press.
             _proj = getattr(self, "_pq_project", None) or {}
             _sessions = _proj.get("sessions") or []
+            ok = False
             if (not _proj.get("file_path")
                     and len(_sessions) == 1
                     and _sessions[0].get("_file_path")):
                 try:
-                    self._pq_save_session_file(_sessions[0])
+                    ok = bool(self._pq_save_session_file(_sessions[0]))
                 except Exception:
-                    pass
+                    ok = False
             else:
-                self._pq_save_episode_project(prompt_path=False)
-            b = btn_ref[0] if btn_ref else None
-            if b:
-                try:
-                    b.config(text="SAVED \u2713")
-                    self.after(1800, lambda: b.config(text="SAVE"))
-                except Exception:
-                    pass
+                ok = bool(self._pq_save_episode_project(prompt_path=False))
+            if ok:
+                _flash_saved()
             return
         if not getattr(self, '_script_path', None):
             messagebox.showinfo("Nothing to save", "No session is open yet.")
@@ -6975,6 +6976,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Body starts collapsed
         self._aaf_video_paths = []
+        self._aaf_video_rows  = {}   # full path → row Frame (identity, not label text)
         self._aaf_file_list   = tk.Frame(v_body, bg=SURF)
         self._aaf_file_list.pack(fill="x", padx=12)
 
@@ -9902,6 +9904,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       cursor="hand2", padx=4)
         rm.pack(side="right")
         rm.bind("<Button-1>", lambda e, p=path, r=row: self._aaf_remove_video(p, r))
+        # Register by FULL PATH so removal is keyed to identity, never to
+        # the displayed basename (two pool files can share a basename).
+        if not hasattr(self, "_aaf_video_rows"):
+            self._aaf_video_rows = {}
+        self._aaf_video_rows[path] = row
         if not _batch:
             n = len(self._aaf_video_paths)
             self._aaf_count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
@@ -9912,6 +9919,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _aaf_remove_video(self, path, row):
         if path in self._aaf_video_paths:
             self._aaf_video_paths.remove(path)
+        getattr(self, "_aaf_video_rows", {}).pop(path, None)
         row.destroy()
         n = len(self._aaf_video_paths)
         self._aaf_count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
@@ -10117,18 +10125,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_remove_video_by_path(self, path):
         """Remove a pooled video by path, destroying its list row.  Used
-        by Join Split so the source pieces disappear from the pool."""
+        by Join Split so the source pieces disappear from the pool.
+
+        The row is looked up in the path→row registry — never by the
+        displayed basename, which is ambiguous when two pool files from
+        different folders share a filename (typical for camera cards)."""
         if path in self._aaf_video_paths:
             self._aaf_video_paths.remove(path)
-        # Find and destroy the matching row (label text == basename).
-        bn = basename(path)
-        for w in list(self._aaf_file_list.winfo_children()):
+        row = getattr(self, "_aaf_video_rows", {}).pop(path, None)
+        if row is not None:
             try:
-                for child in w.winfo_children():
-                    if (isinstance(child, tk.Label)
-                            and child.cget("text") == bn):
-                        w.destroy()
-                        break
+                row.destroy()
             except tk.TclError:
                 pass
         n = len(self._aaf_video_paths)
@@ -10155,24 +10162,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             + ("\n…and {} more".format(len(to_remove) - 10) if len(to_remove) > 10 else "")))
         if not messagebox.askyesno("Remove Unmatched", msg):
             return
-        # Destroy the file list rows for removed paths, then rebuild
+        # Destroy the file list rows for removed paths, then rebuild the
+        # survivors through _aaf_add_video so the path\u2192row registry stays
+        # coherent (an inline re-render here used to bypass it).
         for w in self._aaf_file_list.winfo_children():
             w.destroy()
-        self._aaf_video_paths = [p for p in self._aaf_video_paths
-                                  if p not in to_remove]
-        # Re-render the remaining file rows
-        for path in self._aaf_video_paths:
-            row = tk.Frame(self._aaf_file_list, bg=SURF2,
-                           highlightbackground=BORDER, highlightthickness=1)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text="VIDEO", font=("Courier New", 9, "bold"),
-                     bg="#2a3d2a", fg=SUCCESS, padx=5, pady=3).pack(side="left")
-            tk.Label(row, text=basename(path), font=FB, bg=SURF2, fg=TEXT,
-                     padx=6, anchor="w").pack(side="left", fill="x", expand=True)
-            rm = tk.Label(row, text=" \u2715 ", font=FB, bg=SURF2, fg=SUB,
-                          cursor="hand2", padx=4)
-            rm.pack(side="right")
-            rm.bind("<Button-1>", lambda e, p=path, r=row: self._aaf_remove_video(p, r))
+        remaining = [p for p in self._aaf_video_paths if p not in to_remove]
+        self._aaf_video_paths = []
+        self._aaf_video_rows  = {}
+        for path in remaining:
+            self._aaf_add_video(path, _batch=True)
         n = len(self._aaf_video_paths)
         self._aaf_count_lbl.config(text="{} file{}".format(n, "s" if n != 1 else ""))
         self._rebuild_aaf_source_rows()
@@ -10329,7 +10328,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         and name (Save As), and subsequent quick-saves (Ctrl+S) write
         back to that chosen file silently.  `prompt=True` always shows
         the dialog.  `_aaf_saved_path` holds the user-chosen file (None
-        until first saved or loaded from)."""
+        until first saved or loaded from).
+
+        Returns True only when a file was actually written — callers use
+        this to decide whether to show "SAVED" feedback (a cancelled
+        Save-As dialog must NOT read as a successful save)."""
         data  = self._aaf_build_setup_data()
         saved = getattr(self, "_aaf_saved_path", None)
 
@@ -10339,9 +10342,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 with open(saved, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 self._mark_saved()
+                return True
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
-            return
+            return False
 
         # No chosen file yet (or explicit Save As) → prompt.  Suggest the
         # AAF-adjacent <name>_setup.json as a default, but let the user
@@ -10358,14 +10362,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             filetypes=[("JSON","*.json"),("All","*.*")],
             initialdir=init_dir, initialfile=init_file)
         if not path:
-            return
+            return False                  # user cancelled — nothing saved
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             self._aaf_saved_path = path   # future quick-saves go here
             self._mark_saved()
+            return True
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
+            return False
 
     def _aaf_load_setup(self):
         path = filedialog.askopenfilename(
@@ -10378,8 +10384,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except Exception as e:
             messagebox.showerror("Load failed", str(e)); return
         self._aaf_restore_setup(data)
-        # Quick-saves now write back to the file the user just loaded.
+        # Quick-saves now write back to the file the user just loaded, and
+        # the freshly-restored state is the clean baseline — without this,
+        # closing an untouched setup falsely prompts "unsaved changes".
         self._aaf_saved_path = path
+        self._mark_saved()
 
     def _aaf_restore_setup(self, data):
         """Apply a saved AAF setup dict to the current Step 2 UI state."""
@@ -11451,15 +11460,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                             "{}.pb_session.json".format(token))
 
     def _pq_save_episode_project(self, prompt_path=False):
-        """Write the Episode Project JSON.  Prompts on first save."""
+        """Write the Episode Project JSON.  Prompts on first save.
+        Returns True only when a file was actually written — callers use
+        this to gate "SAVED" feedback (a cancelled dialog is not a save)."""
         project = getattr(self, "_pq_project", None)
         if not project:
-            return
+            return False
         # Refuse to save until the project actually has sessions on disk.
         if not project["sessions"]:
             messagebox.showinfo("Nothing to save",
                 "Add at least one Interview Session before saving the project.")
-            return
+            return False
         path = project.get("file_path")
         if prompt_path or not path:
             suggested = re.sub(r"[^A-Za-z0-9_\- ]+", "_",
@@ -11472,7 +11483,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            ("JSON", "*.json"),
                            ("All", "*.*")])
             if not path:
-                return
+                return False
         payload = {
             "version":  1,
             "workflow": "episode_project",
@@ -11486,8 +11497,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             project["file_path"] = path
             self._mark_saved()
             self._pq_render_project_view()
+            return True
         except Exception as e:
             messagebox.showerror("Save Episode Project failed", str(e))
+            return False
 
     # ── Project view ─────────────────────────────────────────────────────────
 
