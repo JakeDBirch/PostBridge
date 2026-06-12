@@ -10043,86 +10043,117 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 status_lbl.config(
                     text="Check at least two files to join.", fg=WARN)
                 return
-            # Format-compatibility guard.
-            ok, reason = engines.probe_concat_compat(sel)
-            if not ok:
-                if not messagebox.askyesno(
-                        "Different formats",
-                        "{}\n\nThese may not be splits of the same "
-                        "recording.  A lossless join can still be "
-                        "attempted but the result may not play "
-                        "correctly.\n\nJoin anyway?".format(reason),
-                        default="no", icon="warning"):
-                    return
-            # Continuity check — catch a missing middle piece or wrong
-            # order before joining.  The summary (start TC + length) is
-            # shown so the user can also spot a missing FIRST piece,
-            # which can't be detected from the files alone.
-            status_lbl.config(text="Checking continuity…", fg=SUB)
-            win.update_idletasks()
-            cstatus, cmsg, csummary = engines.probe_join_continuity(sel)
-            if cstatus == "gap":
-                if not messagebox.askyesno(
-                        "Possible gap or missing piece",
-                        "{}\n\n{}\n\nJoin anyway?".format(
-                            cmsg, csummary),
-                        default="no", icon="warning"):
-                    status_lbl.config(text="", fg=SUB)
-                    return
-            elif csummary:
-                # Surface the span so a missing front/end is noticeable.
-                status_lbl.config(text=csummary, fg=SUB)
-            out_path = out_box["path"] or _default_out(sel)
-            if os.path.exists(out_path):
-                if not messagebox.askyesno(
-                        "Overwrite?",
-                        "{} already exists. Overwrite?".format(
-                            basename(out_path))):
-                    return
 
+            # Stage 1 — preflight probes on a WORKER thread.  Compat +
+            # continuity + default-name probing spawn ~15-20 ffprobe
+            # processes; running them on the Tk thread froze the
+            # dialog for seconds after clicking JOIN.
             _busy["running"] = True
-            status_lbl.config(
-                text="Joining {} clips… (lossless, no re-encode)".format(
-                    len(sel)), fg=ACCENT)
             join_btn.config(state="disabled")
             cancel_btn.config(state="disabled")
+            status_lbl.config(
+                text="Checking {} files…".format(len(sel)), fg=SUB)
 
-            def _worker():
-                ok2, msg, actual = engines.concat_video_files(sel, out_path)
-                def _finish():
-                    _busy["running"] = False
-                    try:
-                        cancel_btn.config(state="normal")
-                        join_btn.config(state="normal")
-                    except tk.TclError:
-                        return
-                    if not ok2:
-                        status_lbl.config(
-                            text="Join failed: " + (msg or "unknown error"),
-                            fg=ERR)
-                        return
-                    # Add joined file to the pool; remove sources if asked.
-                    if remove_var.get():
-                        for p in sel:
-                            self._aaf_remove_video_by_path(p)
-                    self._aaf_add_video(actual)
-                    win.grab_release(); win.destroy()
-                    note = ""
-                    if actual.lower().endswith(".mov") and not \
-                            out_path.lower().endswith(".mov"):
-                        note = ("\n\n(Saved as .mov — the source's PCM "
-                                "audio can't live in an .mp4 container.)")
-                    span = ("\n\n" + csummary) if csummary else ""
-                    messagebox.showinfo(
-                        "Joined",
-                        "Created {}\n\nAdded to the video pool — assign "
-                        "and sync it like any single continuous "
-                        "file.{}{}\n\nSanity-check that length against the "
-                        "full recording — if it's short, a piece may be "
-                        "missing.".format(basename(actual), note, span))
-                self._ui(_finish)
+            def _preflight():
+                ok, reason = engines.probe_concat_compat(sel)
+                cstatus, cmsg, csummary = engines.probe_join_continuity(sel)
+                out_default = out_box["path"] or _default_out(sel)
+                self._ui(lambda: _confirm(ok, reason, cstatus, cmsg,
+                                          csummary, out_default))
 
-            threading.Thread(target=_worker, daemon=True).start()
+            def _confirm(ok, reason, cstatus, cmsg, csummary, out_path):
+                # Back on the Tk thread: release the busy lock so a "No"
+                # answer leaves a usable dialog, then walk the
+                # confirmation dialogs in order.
+                _busy["running"] = False
+                try:
+                    join_btn.config(state="normal")
+                    cancel_btn.config(state="normal")
+                except tk.TclError:
+                    return            # dialog was torn down mid-preflight
+                if not ok:
+                    if not messagebox.askyesno(
+                            "Different formats",
+                            "{}\n\nThese may not be splits of the same "
+                            "recording.  A lossless join can still be "
+                            "attempted but the result may not play "
+                            "correctly.\n\nJoin anyway?".format(reason),
+                            default="no", icon="warning"):
+                        status_lbl.config(text="", fg=SUB)
+                        return
+                # Continuity — catch a missing middle piece or wrong
+                # order before joining.  The summary (start TC + length)
+                # is shown so the user can also spot a missing FIRST
+                # piece, which can't be detected from the files alone.
+                if cstatus == "gap":
+                    if not messagebox.askyesno(
+                            "Possible gap or missing piece",
+                            "{}\n\n{}\n\nJoin anyway?".format(
+                                cmsg, csummary),
+                            default="no", icon="warning"):
+                        status_lbl.config(text="", fg=SUB)
+                        return
+                elif csummary:
+                    # Surface the span so a missing front/end is visible.
+                    status_lbl.config(text=csummary, fg=SUB)
+                if os.path.exists(out_path):
+                    if not messagebox.askyesno(
+                            "Overwrite?",
+                            "{} already exists. Overwrite?".format(
+                                basename(out_path))):
+                        return
+                _start_join(sel, out_path, csummary)
+
+            def _start_join(sel, out_path, csummary):
+                _busy["running"] = True
+                status_lbl.config(
+                    text="Joining {} clips… (lossless, no re-encode)".format(
+                        len(sel)), fg=ACCENT)
+                join_btn.config(state="disabled")
+                cancel_btn.config(state="disabled")
+
+                def _worker():
+                    ok2, msg, actual = engines.concat_video_files(sel, out_path)
+                    def _finish():
+                        _busy["running"] = False
+                        try:
+                            cancel_btn.config(state="normal")
+                            join_btn.config(state="normal")
+                        except tk.TclError:
+                            return
+                        if not ok2:
+                            status_lbl.config(
+                                text="Join failed: " + (msg or "unknown error"),
+                                fg=ERR)
+                            return
+                        # Add joined file to the pool; remove sources if asked.
+                        if remove_var.get():
+                            for p in sel:
+                                self._aaf_remove_video_by_path(p)
+                        self._aaf_add_video(actual)
+                        win.grab_release(); win.destroy()
+                        note = ""
+                        if (actual.lower().endswith(".mov")
+                                and not out_path.lower().endswith(".mov")):
+                            note = ("\n\n(Saved as .mov — the source's PCM "
+                                    "audio can't live in an .mp4 container.)")
+                        # Engine-level caution (e.g. joined duration not
+                        # matching the sum of the inputs).
+                        if msg:
+                            note += "\n\n⚠ " + msg
+                        span = ("\n\n" + csummary) if csummary else ""
+                        messagebox.showinfo(
+                            "Joined",
+                            "Created {}\n\nAdded to the video pool — assign "
+                            "and sync it like any single continuous "
+                            "file.{}{}\n\nSanity-check that length against the "
+                            "full recording — if it's short, a piece may be "
+                            "missing.".format(basename(actual), note, span))
+                    self._ui(_finish)
+
+                threading.Thread(target=_worker, daemon=True).start()
+
+            threading.Thread(target=_preflight, daemon=True).start()
 
         def _change_out():
             sel = _selected()

@@ -306,16 +306,26 @@ def probe_concat_compat(paths):
     return True, ""
 
 
+_codec_cache = {}   # (path, stream) → codec name; codecs never change mid-session
+
 def _probe_codec(path, stream):
+    """Codec name of the given stream, memoised per (path, stream).
+    The memo collapses the duplicate spawn between join_output_ext
+    (the dialog's default-name probe) and concat_video_files."""
+    key = (path, stream)
+    if key in _codec_cache:
+        return _codec_cache[key]
     try:
         r = _run(
             _ffprobe_cmd() + ["-v", "quiet", "-select_streams", stream,
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=15)
-        return (r.stdout.strip() or "").lower()
+        out = (r.stdout.strip() or "").lower()
     except Exception:
-        return ""
+        return ""    # transient failure — do NOT cache, retry next call
+    _codec_cache[key] = out
+    return out
 
 
 def _probe_start_tc_secs(path, fps):
@@ -520,7 +530,8 @@ def concat_video_files(paths, out_path, progress_cb=None):
 
         # Verify the result is actually well-formed: a readable duration
         # AND (when the source had audio) a surviving audio stream.
-        if (get_media_duration(out_path) or 0) <= 0.5:
+        out_dur = get_media_duration(out_path) or 0
+        if out_dur <= 0.5:
             return (False,
                     "join produced an unreadable file (duration could "
                     "not be read) — these clips may need a different "
@@ -529,7 +540,29 @@ def concat_video_files(paths, out_path, progress_cb=None):
             return (False,
                     "join dropped the audio track — these clips may need "
                     "a different container", out_path)
-        return True, "", out_path
+
+        # Duration sanity: a stream-copy concat's length should match the
+        # sum of the inputs to within a few frames.  If the output is
+        # materially short, a segment was silently dropped by the demuxer
+        # (a codec/parameter mismatch ffmpeg skipped rather than aborted
+        # on) — exactly the "joined clip is much shorter than expected"
+        # failure the user hit, where one piece never made it into the
+        # bin.  Surface it as a caution (ok stays True — the file is
+        # valid, just possibly incomplete) so the caller can warn.
+        warn = ""
+        in_durs = [get_media_duration(p) or 0 for p in paths]
+        if all(d > 0 for d in in_durs):
+            expected = sum(in_durs)
+            shortfall = expected - out_dur
+            # Tolerate a couple of seconds of container/edit-list slack
+            # and a 1 % relative wobble before crying foul.
+            if shortfall > max(2.0, 0.01 * expected):
+                warn = ("joined length {} is {} shorter than the sum of "
+                        "the inputs ({}) — a segment may have been dropped; "
+                        "check that every piece is present".format(
+                            secs_tc(out_dur), secs_tc(shortfall),
+                            secs_tc(expected)))
+        return True, warn, out_path
     except Exception as e:
         return False, str(e), out_path
     finally:
