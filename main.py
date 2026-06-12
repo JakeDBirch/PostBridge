@@ -4394,15 +4394,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     _dlf.write(msg + "\n")
         except Exception:
             pass
-        # Route transcription progress messages to the top panel; if
-        # consumed there, don't double-print in the bottom log.
-        try:
-            consumed = self._xc_route_log(msg, color)
-        except Exception:
-            consumed = False
-        if consumed:
-            return
+        # Everything below touches Tk widgets — the transcription panel
+        # (via _xc_route_log → _xc_task_ensure/_update, which create and
+        # config rows) AND the bottom log — so it MUST run on the main
+        # thread.  _log_line is called from reconcile/VO worker threads,
+        # where touching Tk directly is a latent crash.  Route-then-log
+        # in ONE marshalled callback so the "consumed → don't double-print"
+        # decision and the log write stay ordered and consistent.
         def _do():
+            try:
+                consumed = self._xc_route_log(msg, color)
+            except Exception:
+                consumed = False
+            if consumed:
+                return
             self._log.configure(state="normal")
             tag = "c{}".format(abs(hash(color or "")))
             if color:
@@ -4428,11 +4433,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             pass
         # Clear any task rows left over from a prior run on the same
         # Step 3 view (rare but possible if the user cancels and
-        # re-runs without leaving the screen).
-        try:
-            self._xc_reset()
-        except Exception:
-            pass
+        # re-runs without leaving the screen).  _run_reconcile is a
+        # worker thread and _xc_reset destroys/re-packs Tk widgets, so
+        # marshal it onto the main thread (its internal guards handle a
+        # torn-down panel).
+        self._ui(self._xc_reset)
 
         # ── Build transcript_sources: mix multi-file tokens to a temp WAV ────
         # Single-file tokens pass through unchanged.  Mix files from the previous
@@ -6878,6 +6883,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_sources            = sorted(sources.keys())
         self._aaf_source_tracks      = sources     # base_name -> set of track names
         self._aaf_source_clip_counts = clip_counts # base_name -> total clip count
+
+        # Prune per-source state left over from a previously-opened AAF.
+        # These dicts are keyed by source base and are DELIBERATELY
+        # persistent across row rebuilds / page-mode toggles (so user
+        # assignments survive those), so they are NOT in the rebuild
+        # reset block — but a NEW AAF load must drop entries for sources
+        # that no longer exist, or they leak into this session's saved
+        # setup and can mis-restore onto a source the new AAF lacks.
+        # Only non-current keys are dropped, so same-AAF reloads are a
+        # no-op and current assignments are untouched.
+        _live = set(self._aaf_sources)
+        for _dname in (
+                "_aaf_source_file_vars", "_aaf_source_extra_vars",
+                "_aaf_source_sync_vars", "_aaf_source_syncaudio_vars",
+                "_aaf_source_offset_vars", "_aaf_source_sync_label_vars",
+                "_aaf_source_audio_disp_vars", "_aaf_source_slot_counts",
+                "_aaf_source_sync_cand_idx", "_aaf_source_has_slate_vars",
+                "_aaf_sync_state_vars", "_aaf_needs_sync_vars",
+                "_aaf_sync_locked_vars"):
+            _d = getattr(self, _dname, None)
+            if isinstance(_d, dict):
+                for _stale in [k for k in _d if k not in _live]:
+                    _d.pop(_stale, None)
         # Reset column widths so they recompute from new content on next visit
         if hasattr(self, "_aaf_col_widths"):
             del self._aaf_col_widths
@@ -10349,8 +10377,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "aaf":         getattr(self, "_aaf_path", ""),
             "video_paths": self._aaf_video_paths,
             "audio_paths": self._aaf_audio_paths,
-            "assignments": {base: sv.get()
-                            for base, sv in self._aaf_source_file_vars.items()},
+            # Bound by the CURRENT source set — _aaf_source_file_vars is
+            # never pruned across AAF loads, so iterating it directly would
+            # leak assignments for sources from a previously-opened AAF
+            # into this setup's saved JSON (and mis-restore them later).
+            "assignments": {base: self._aaf_source_file_vars[base].get()
+                            for base in self._aaf_sources
+                            if base in self._aaf_source_file_vars},
             "slot_counts": {base: getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
                             for base in self._aaf_sources
                             if getattr(self, "_aaf_source_slot_counts", {}).get(base, 1) > 1},
