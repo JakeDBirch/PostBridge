@@ -61,23 +61,12 @@ class SyncPreviewDialog:
     """
 
     def __init__(self, parent, video_path, audio_path, initial_offset=0.0,
-                 on_accept=None, source_name="", candidates=None):
+                 on_accept=None, source_name=""):
         self._parent = parent
         self._vp = video_path
         self._ap = audio_path
         self._on_accept = on_accept
         self._sr = _SR
-
-        # Auto-sync alternative candidates ((T_secs, conf), ...) the user
-        # can audition when the auto pick is wrong.  The "Try next candidate"
-        # button cycles through this list.  An entry for the initial offset
-        # is prepended so the user can come back to it.
-        self._candidates = [(float(initial_offset), 1.0)] + [
-            (float(t), float(c))
-            for (t, c) in (candidates or [])
-            if abs(float(t) - float(initial_offset)) > 0.01
-        ]
-        self._candidate_idx = 0
 
         # Offset state (in samples at _SR).
         # Internally stored negated relative to the semantic v_offset so that
@@ -225,11 +214,7 @@ class SyncPreviewDialog:
 
         # Candidate cycling lives on the Step 2 sync row now, NOT in
         # this dialog -- keeps the dialog focused on manual nudging /
-        # waveform inspection.  The previous in-dialog "TRY NEXT" row
-        # also had its Accept/Cancel block accidentally indented INTO
-        # the _candidate_label_text helper after a return statement,
-        # leaving the dialog with no way to commit a change.  Fixed
-        # by moving the buttons back here.
+        # waveform inspection.
 
         # ====== Accept / Cancel row =======================================
         bot = tk.Frame(win, bg=BG)
@@ -518,29 +503,6 @@ class SyncPreviewDialog:
             return
         self._offset_samples += frames * _NUDGE_SAMP
         self._offset_var.set(self._fmt_offset())
-        self._draw()
-
-    def _cycle_candidate(self):
-        """Advance to the next auto-sync candidate offset (cycles back to
-        the start when the list is exhausted).  Updates the waveform view
-        and the offset readout so the user can audition the alternative
-        visually + via the playback row."""
-        if len(self._candidates) <= 1:
-            return
-        self._stop()
-        self._candidate_idx = (self._candidate_idx + 1) % len(self._candidates)
-        t_secs, _conf = self._candidates[self._candidate_idx]
-        self._offset_samples = -int(round(t_secs * _SR))
-        if hasattr(self, "_offset_var"):
-            try:
-                self._offset_var.set(self._fmt_offset())
-            except Exception:
-                pass
-        if self._cand_lbl is not None:
-            try:
-                self._cand_lbl.config(text=self._candidate_label_text())
-            except Exception:
-                pass
         self._draw()
 
     # ── Playback ──────────────────────────────────────────────────────────

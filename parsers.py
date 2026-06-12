@@ -684,6 +684,15 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
             envelope detector locks a spurious peak.
           • disagree + weak margin → leave the pick alone but surface
             the histogram peak as the first audition candidate.
+
+        Cost note: the cross-check adds two ffmpeg PCM decodes per
+        sync even when the detectors agree.  A confidence gate (skip
+        when conf ≥ 0.95) was evaluated and REJECTED against the full
+        sync_corrections.jsonl dataset: wrong auto-picks exist at
+        final_conf = 1.0 (Blyth Part 2, Dustin Intro/Part 5), so no
+        confidence level safely exempts the envelope detector from
+        the cross-check.  The decode cost is the price of the
+        accuracy win — do not re-add a gate without new evidence.
         """
         try:
             ev = _event_diff_offset(video_path, audio_path,
