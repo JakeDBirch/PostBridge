@@ -529,17 +529,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                   ).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
 
-        win.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_rootx(), self.winfo_rooty()
         # Wider default so the notes column has room to breathe instead
         # of wrapping every line.  Caller can drag tighter if they want.
-        ww = max(1080, win.winfo_reqwidth())
-        wh = max(420, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        self._center_dialog(win, 1080, 420)
 
     def _is_transcription_running(self):
         """Return True if any transcription is currently in flight.
@@ -3277,15 +3269,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                   ).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
 
-        win.update_idletasks()
-        pw = self.winfo_width(); ph = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(760, win.winfo_reqwidth())
-        wh = max(480, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        self._center_dialog(win, 760, 480)
 
     def _get_gpu_stats(self):
         """Return (utilization_pct, vram_used_gb, vram_total_gb) for the
@@ -13438,15 +13422,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             win.bind(seq, _save_and_break)
         win.bind("<Escape>", lambda e: win.destroy())
 
-        win.update_idletasks()
-        pw = self.winfo_width(); ph = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(560, win.winfo_reqwidth())
-        wh = max(320, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        self._center_dialog(win, 560, 320)
         self.wait_window(win)
 
     def _pq_selection_has_user_edits(self):
@@ -13686,15 +13662,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         ent.bind("<Control-KP_Enter>",     _save)
         win.bind("<Escape>", lambda e: win.destroy())
 
-        win.update_idletasks()
-        pw = self.winfo_width(); ph = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(560, win.winfo_reqwidth())
-        wh = max(380, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        self._center_dialog(win, 560, 380)
         self.wait_window(win)
 
     def _pq_update_notes_wraplength(self, canvas_width):
@@ -14676,15 +14644,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         win.bind("<Escape>", lambda e: _pick("cancel"))
 
-        win.update_idletasks()
-        pw = self.winfo_width(); ph = self.winfo_height()
-        px = self.winfo_rootx(); py = self.winfo_rooty()
-        ww = max(580, win.winfo_reqwidth())
-        wh = max(240, win.winfo_reqheight())
-        win.geometry("{}x{}+{}+{}".format(
-            ww, wh,
-            px + max(0, (pw - ww) // 2),
-            py + max(0, (ph - wh) // 2)))
+        self._center_dialog(win, 580, 240)
         self.wait_window(win)
 
         # Re-transcribe ALWAYS visually wipes — Jordan explicitly
