@@ -2573,6 +2573,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _on_app_close(self):
         """WM_DELETE_WINDOW handler — prompt to save unsaved work."""
+        # In-flight work guard.  Transcription / reconcile run on worker
+        # threads whose results aren't part of _state_signature until
+        # they land, so the dirty-check below can't see them — closing
+        # now would silently kill the worker and lose the run.  Warn
+        # first.  (Checked before the dirty prompt so the user isn't
+        # asked two questions when both apply — abandoning the run is
+        # the bigger decision.)
+        try:
+            running = self._is_transcription_running()
+        except Exception:
+            running = False
+        if running:
+            if not messagebox.askyesno(
+                    "Work in progress",
+                    "A transcription is still running.\n\nClosing now will "
+                    "abandon it and lose any results not yet saved.\n\n"
+                    "Close anyway?",
+                    default="no", icon="warning"):
+                return
         try:
             dirty = self._is_dirty()
         except Exception:
