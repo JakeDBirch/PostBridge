@@ -1436,10 +1436,14 @@ def mix_reference_audio(paths, out_path, sample_rate=48000):
     synchronous multitrack recording (the normal case).  Returns
     (ok: bool, message: str).
     """
-    import numpy as np
     if len(paths) < 2:
         return False, "select at least two tracks to mix"
     try:
+        # numpy import lives INSIDE the try so a missing install returns
+        # (False, msg) per the contract instead of raising into the
+        # dialog's worker thread (which would die silently and leave the
+        # Mix dialog stuck on "Mixing…").
+        import numpy as np
         # Accumulate incrementally — decode one track, add it into the
         # running sum, free it.  Holding every decoded track at once
         # costs ~11.5 MB per track-minute (4 one-hour lavs ≈ 2.8 GB);

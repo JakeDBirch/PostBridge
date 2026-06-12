@@ -6820,16 +6820,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._aaf_step1_next_added = True
 
     def _aaf_load(self, path):
-        if not path or not os.path.isfile(path): return
+        def _clear_pending_restore():
+            # _open_session arms these for THIS load.  If the load fails
+            # they must not survive \u2014 a stale _pending_aaf_setup would
+            # silently restore the wrong setup onto the next AAF the user
+            # opens, and a stale _pending_aaf_saved_path would route that
+            # AAF's quick-saves into the previous setup's file.
+            self._pending_aaf_setup      = None
+            self._pending_aaf_saved_path = None
+            self._pending_mark_saved     = False
+
+        if not path or not os.path.isfile(path):
+            _clear_pending_restore()
+            return
         if hasattr(self, "_aaf_s1"):
             self._aaf_s1.config(text="Parsing AAF\u2026", fg=SUB)
             self.update_idletasks()
         try:
             parsed = parse_aaf_session(path)
         except Exception as e:
+            _clear_pending_restore()
             messagebox.showerror("AAF Error", str(e)); return
 
         if not parsed["tracks"]:
+            _clear_pending_restore()
             messagebox.showerror("No Tracks",
                 "No audio tracks found in this AAF.\n"
                 "Make sure the session has track EDL data and was exported\n"
@@ -7316,6 +7330,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_sync_dot_labels.clear()
         self._aaf_qa_btns = getattr(self, "_aaf_qa_btns", {})
         self._aaf_qa_btns.clear()
+        self._aaf_try_next_btns = getattr(self, "_aaf_try_next_btns", {})
+        self._aaf_try_next_btns.clear()
         self._aaf_confirm_btns = getattr(self, "_aaf_confirm_btns", {})
         self._aaf_confirm_btns.clear()
         self._aaf_lock_btns = getattr(self, "_aaf_lock_btns", {})
@@ -9823,14 +9839,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 status_lbl.config(text="Output: " + basename(p), fg=SUB)
 
         _W = 12
+        def _close(_e=None):
+            # Release the modal grab BEFORE destroying — relying on Tk's
+            # implicit release-on-destroy is fragile across platforms.
+            if _busy["running"]:
+                return
+            try: win.grab_release()
+            except tk.TclError: pass
+            win.destroy()
+
         mix_btn = self._btn(nav, "MIX", _do_mix, color=ACCENT, width=_W)
         mix_btn.pack(side="right")
-        cancel_btn = self._btn(nav, "CANCEL", win.destroy, width=_W)
+        cancel_btn = self._btn(nav, "CANCEL", _close, width=_W)
         cancel_btn.pack(side="right", padx=(0, 8))
         self._btn(nav, "OUTPUT…", _change_out, width=_W).pack(side="left")
 
-        win.bind("<Escape>",
-                 lambda e: (not _busy["running"]) and win.destroy())
+        win.bind("<Escape>", _close)
         self._center_dialog(win)
 
     def _aaf_browse_audio_files(self):
@@ -10114,13 +10138,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 status_lbl.config(text="Output: " + basename(p), fg=SUB)
 
         _W = 12
+        def _close(_e=None):
+            # Release the modal grab BEFORE destroying — relying on Tk's
+            # implicit release-on-destroy is fragile across platforms.
+            if _busy["running"]:
+                return
+            try: win.grab_release()
+            except tk.TclError: pass
+            win.destroy()
+
         join_btn = self._btn(nav, "JOIN", _do_join, color=ACCENT, width=_W)
         join_btn.pack(side="right")
-        cancel_btn = self._btn(nav, "CANCEL", win.destroy, width=_W)
+        cancel_btn = self._btn(nav, "CANCEL", _close, width=_W)
         cancel_btn.pack(side="right", padx=(0, 8))
         self._btn(nav, "OUTPUT…", _change_out, width=_W).pack(side="left")
 
-        win.bind("<Escape>", lambda e: (not _busy["running"]) and win.destroy())
+        win.bind("<Escape>", _close)
         self._center_dialog(win)
 
     def _aaf_remove_video_by_path(self, path):
