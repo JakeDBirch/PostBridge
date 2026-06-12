@@ -7345,6 +7345,38 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         "#2b2516", "#162b2b", "#261626"]
     _UNASSIGNED_ROW  = "#2a1a08"
 
+    def _aaf_vid_label(self, path):
+        """Collision-free display label for a video-pool path, used as the
+        STABLE 1:1 key for that path everywhere the pool is shown or
+        resolved (dropdown options, the assignment picker, and every
+        {label: path} resolution map for sync / align / QA / build).
+
+        The bare basename is NOT a safe key: multicam shoots routinely
+        name files identically on every card (C0001.MP4 on card A *and*
+        card B), and the pool dedups only by full path — so two distinct
+        files share a basename.  A basename-keyed lookup then collapses
+        them last-one-wins, and a source assigned card A's clip silently
+        syncs/exports against card B's.  When (and only when) a basename
+        collides in the pool, this disambiguates by parent folder, then
+        by a stable index, so the returned label maps back to exactly one
+        path.  With no collision the label IS the basename, so behaviour
+        is unchanged for the common case."""
+        bn   = basename(path)
+        pool = getattr(self, "_aaf_video_paths", [])
+        twins = [p for p in pool if basename(p) == bn]
+        if len(twins) <= 1:
+            return bn
+        parent = os.path.basename(os.path.dirname(path)) or os.path.dirname(path)
+        same_parent = [p for p in twins
+                       if (os.path.basename(os.path.dirname(p))
+                           or os.path.dirname(p)) == parent]
+        if len(same_parent) > 1:
+            # Parent folders also collide — fall back to a stable index
+            # (position among the twins, which is deterministic for a
+            # given pool ordering).
+            return "{}  ·  {} ({})".format(bn, parent, twins.index(path) + 1)
+        return "{}  ·  {}".format(bn, parent)
+
     def _rebuild_aaf_source_rows(self):
         """Rebuild per-source rows; layout depends on current page mode."""
         for w in self._aaf_assign_frame.winfo_children():
@@ -7401,7 +7433,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             _trk_strs = [", ".join(sorted(getattr(self, "_aaf_source_tracks", {}).get(b, set())))
                          for b in _sources]
             _trk_nat  = max((len(t) for t in _trk_strs), default=8) * _ppc + 30
-            _vid_fns  = [basename(p) for p in getattr(self, "_aaf_video_paths", [])]
+            _vid_fns  = [self._aaf_vid_label(p) for p in getattr(self, "_aaf_video_paths", [])]
             _vid_nat  = max((len(fn) for fn in _vid_fns), default=20) * _ppc + 80
             _aud_fns  = [basename(p) for p in getattr(self, "_aaf_audio_paths", [])]
             _aud_nat  = max((len(fn) for fn in _aud_fns), default=20) * _ppc + 40
@@ -7569,11 +7601,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                         _cc[_b] = _cc.get(_b, 0) + 1
             self._aaf_source_clip_counts = _cc
 
-        options      = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        options      = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         aud_options  = ["— no audio —"] + [basename(p) for p in self._aaf_audio_paths]
         aud_by_name  = {basename(p): p for p in self._aaf_audio_paths}
 
-        vid_fns   = [basename(p) for p in self._aaf_video_paths]
+        vid_fns   = [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         vid_color = {fn: self._ASSIGN_PALETTE[i % len(self._ASSIGN_PALETTE)]
                      for i, fn in enumerate(vid_fns)}
 
@@ -8267,7 +8299,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
-        vid_options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        vid_options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
 
         for base in self._aaf_sources:
@@ -8460,7 +8492,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         assignments change.  When N=1 the listbox uses SINGLE select mode;
         when N>1 it uses MULTIPLE.  Selected files are clamped to N slots.
         """
-        options_bn = [basename(p) for p in self._aaf_video_paths]
+        options_bn = [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         if not options_bn:
             return
         sv        = self._aaf_source_file_vars[base]
@@ -8691,7 +8723,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             used_vid_fns.update(
                 ev.get() for ev in _evs if ev.get() not in ("— no video —", ""))
         dead_vids = [p for p in self._aaf_video_paths
-                     if basename(p) not in used_vid_fns]
+                     if self._aaf_vid_label(p) not in used_vid_fns]
 
         # 3 — audio pool files not used as sync reference by any source
         used_aud_paths = {sv.get() for sv in self._aaf_source_syncaudio_vars.values()
@@ -8941,7 +8973,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         # For N>1 files, sync is run against every file and the best confidence
         # winner is promoted to slot-1 — the user doesn't need to know which
         # file has the relevant audio in advance.
-        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        path_by_fn = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
         _all_vps = []
         fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
         if fn != "— no video —" and fn in path_by_fn:
@@ -9138,7 +9170,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showwarning("No Video",
                 "Assign a video file to this source before opening alignment.")
             return
-        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        path_by_fn = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
         vp = path_by_fn.get(fn)
         if not vp:
             return
@@ -9345,7 +9377,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._aaf_hidden_sources = set(snap.get("hidden_sources", []))
 
         # Re-create any vars that were removed
-        options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         for b in saved_sources:
             if b not in self._aaf_source_file_vars:
                 self._aaf_source_file_vars[b]       = tk.StringVar(value="— no video —")
@@ -9560,7 +9592,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             messagebox.showwarning("No Video",
                 "Assign a video file to this source before QA playback.")
             return
-        path_by_fn = {basename(p): p for p in self._aaf_video_paths}
+        path_by_fn = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
         vp = path_by_fn.get(fn)
         if not vp:
             return
@@ -10245,7 +10277,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         for _evs in getattr(self, "_aaf_source_extra_vars", {}).values():
             assigned_fns.update(ev.get() for ev in _evs if ev.get() != "— no video —")
         to_remove = [p for p in self._aaf_video_paths
-                     if basename(p) not in assigned_fns]
+                     if self._aaf_vid_label(p) not in assigned_fns]
         if not to_remove:
             messagebox.showinfo("Remove Unmatched",
                                 "All files in the pool are currently assigned.")
@@ -10516,7 +10548,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # ── Restore assignments and sync state (before the single rebuild) ────
         assignments = data.get("assignments", {})
-        options = ["— no video —"] + [basename(p) for p in self._aaf_video_paths]
+        options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         for base, fn in assignments.items():
             if base in self._aaf_source_file_vars and fn in options:
                 self._aaf_source_file_vars[base].set(fn)
@@ -10636,7 +10668,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _aaf_build(self):
         vpaths = self._aaf_video_paths
-        path_by_fn = {basename(p): p for p in vpaths}
+        path_by_fn = {self._aaf_vid_label(p): p for p in vpaths}
 
         try:
             fps = float(self._aaf_fps_var.get())
