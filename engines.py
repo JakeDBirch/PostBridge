@@ -234,28 +234,36 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     return True
 
 
-def get_media_duration(path):
+def _ffprobe_csv(path, entries, select=None, timeout=10):
+    """Run a single-value `-of csv=p=0` ffprobe query and return the
+    stripped stdout, or None on any failure (missing file, timeout,
+    non-zero exit).  Centralises the -v quiet / encoding / errors /
+    timeout boilerplate every scalar probe used to repeat verbatim.
+
+    None (failure) is kept distinct from "" (probe ran, value empty)
+    so callers like _probe_codec can avoid caching a transient miss."""
+    cmd = _ffprobe_cmd() + ["-v", "quiet"]
+    if select:
+        cmd += ["-select_streams", select]
+    cmd += ["-show_entries", entries, "-of", "csv=p=0", path]
     try:
-        r = _run(
-            _ffprobe_cmd() + ["-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-        return float(r.stdout.strip())
+        r = _run(cmd, capture_output=True, text=True,
+                 encoding="utf-8", errors="replace", timeout=timeout)
+        return (r.stdout or "").strip()
     except Exception:
         return None
 
-def get_audio_channels(path):
+
+def get_media_duration(path):
+    out = _ffprobe_csv(path, "format=duration")
     try:
-        r = _run(
-            _ffprobe_cmd() + ["-v", "quiet",
-             "-select_streams", "a:0",
-             "-show_entries", "stream=channels",
-             "-of", "csv=p=0", path],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-        val = r.stdout.strip()
-        return int(val) if val.isdigit() else 2
-    except Exception:
-        return 2
+        return float(out)
+    except (TypeError, ValueError):
+        return None
+
+def get_audio_channels(path):
+    out = _ffprobe_csv(path, "stream=channels", select="a:0")
+    return int(out) if out and out.isdigit() else 2
 
 # ── Split-clip join (gapless file-size splits → one continuous file) ─────────
 def _concat_stream_sig(path):
@@ -315,15 +323,10 @@ def _probe_codec(path, stream):
     key = (path, stream)
     if key in _codec_cache:
         return _codec_cache[key]
-    try:
-        r = _run(
-            _ffprobe_cmd() + ["-v", "quiet", "-select_streams", stream,
-             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=15)
-        out = (r.stdout.strip() or "").lower()
-    except Exception:
+    out = _ffprobe_csv(path, "stream=codec_name", select=stream, timeout=15)
+    if out is None:
         return ""    # transient failure — do NOT cache, retry next call
+    out = out.lower()
     _codec_cache[key] = out
     return out
 
@@ -3267,16 +3270,9 @@ def _probe_duration(path):
     cached = _duration_cache.get(key)
     if cached is not None and abs(cached[0] - mtime) < 1:
         return cached[1]
-    try:
-        cmd = _ffprobe_cmd() + [
-            '-v', 'quiet', '-show_entries', 'format=duration',
-            '-of', 'csv=p=0', path
-        ]
-        r = _run(cmd, capture_output=True, timeout=30,
-                           encoding='utf-8', errors='replace')
-        dur = float(r.stdout.strip())
-    except Exception:
-        dur = 0
+    # Same probe as get_media_duration but with a caching layer and a
+    # 0-on-failure contract (callers here do arithmetic on the result).
+    dur = get_media_duration(path) or 0
     _duration_cache[key] = (mtime, dur)
     return dur
 
@@ -3482,13 +3478,9 @@ def probe_media_settings(all_paths):
         if not path or not os.path.exists(path):
             continue
         try:
-            r = _run(
-                _ffprobe_cmd() + ["-v", "quiet",
-                 "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height,r_frame_rate",
-                 "-of", "csv=p=0", path],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-            for line in (r.stdout or "").strip().splitlines():
+            for line in (_ffprobe_csv(
+                    path, "stream=width,height,r_frame_rate",
+                    select="v:0") or "").splitlines():
                 parts = [p.strip() for p in line.split(",") if p.strip()]
                 if len(parts) >= 3:
                     try:
@@ -3501,13 +3493,8 @@ def probe_media_settings(all_paths):
                             best_fps = fps
                     except Exception:
                         pass
-            r2 = _run(
-                _ffprobe_cmd() + ["-v", "quiet",
-                 "-select_streams", "a:0",
-                 "-show_entries", "stream=sample_rate",
-                 "-of", "csv=p=0", path],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-            for line in (r2.stdout or "").strip().splitlines():
+            for line in (_ffprobe_csv(
+                    path, "stream=sample_rate", select="a:0") or "").splitlines():
                 try:
                     sr = int(line.strip())
                     if sr > best_sr:
@@ -3905,23 +3892,19 @@ def _probe_file_fps(path):
     """Return (r_frame_rate_str, avg_frame_rate_str, fps_float) for a video file."""
     if not path or not os.path.isfile(path):
         return ("n/a", "n/a", 0.0)
-    try:
-        r = _run(
-            _ffprobe_cmd() + ["-v", "quiet", "-select_streams", "v:0",
-             "-show_entries", "stream=r_frame_rate,avg_frame_rate",
-             "-of", "csv=p=0", path],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-        parts = [p.strip() for p in (r.stdout or "").strip().split(",") if p.strip()]
-        rfr = parts[0] if len(parts) >= 1 else "n/a"
-        afr = parts[1] if len(parts) >= 2 else "n/a"
-        try:
-            num, den = rfr.split("/")
-            fps_f = int(num) / int(den)
-        except Exception:
-            fps_f = 0.0
-        return (rfr, afr, fps_f)
-    except Exception:
+    out = _ffprobe_csv(path, "stream=r_frame_rate,avg_frame_rate",
+                       select="v:0")
+    if out is None:
         return ("error", "error", 0.0)
+    parts = [p.strip() for p in out.split(",") if p.strip()]
+    rfr = parts[0] if len(parts) >= 1 else "n/a"
+    afr = parts[1] if len(parts) >= 2 else "n/a"
+    try:
+        num, den = rfr.split("/")
+        fps_f = int(num) / int(den)
+    except Exception:
+        fps_f = 0.0
+    return (rfr, afr, fps_f)
 
 
 def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
