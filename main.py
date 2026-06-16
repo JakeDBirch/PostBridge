@@ -11943,19 +11943,19 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         if first_s is not None and last_e is not None:
             try:
-                # Walk back to include the speaker label that introduces
-                # the first selected word (if there is one).  A speaker
-                # label sits at the start of a logical line and ends in
-                # ":\n" — easiest: extend selection start to the line
-                # start of the previous newline-separated speaker block.
-                # In practice, we just extend to the start of the line
-                # that contains the first word.  If a speaker label
-                # appears at column 0 of that line, it'll come along.
+                # Use the selection bounds expanded to whole words so a
+                # partial-word click doesn't truncate mid-token.  The old
+                # code also snapped start back via "linestart", intending
+                # to grab a leading speaker label — but Tk's "linestart"
+                # walks to the LOGICAL line start (the previous newline),
+                # and rendered paragraphs have no internal newlines under
+                # wrap="word", so the snap captured the ENTIRE paragraph
+                # whenever the user selected a sentence inside one
+                # (reported).  Drop it: the [TOKEN HH:MM:SS-HH:MM:SS]
+                # header already encodes the speaker, so the body
+                # doesn't need a leading "BRYAN1:" prefix.
                 start_idx = "1.0+{}c".format(first_s)
                 end_idx   = "1.0+{}c".format(last_e)
-                # Snap start back to the beginning of its line so a
-                # leading speaker label is included.
-                start_idx = tx.index(start_idx + " linestart")
                 body = tx.get(start_idx, end_idx)
             except tk.TclError:
                 body = tx.get(sel_first, sel_last)
