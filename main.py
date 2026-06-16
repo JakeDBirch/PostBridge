@@ -8367,14 +8367,37 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "Alt_L", "Alt_R", "Meta_L", "Meta_R", "Caps_Lock",
             "Num_Lock", "Scroll_Lock",
         }
+        # Ctrl keys the Text widget binds to BUILT-IN editing (emacs
+        # style) that would mutate the buffer: Ctrl+D delete-char,
+        # Ctrl+H backspace, Ctrl+K kill-line, Ctrl+O open-line,
+        # Ctrl+T transpose.  Everything else with Ctrl is allowed so the
+        # wired shortcuts (Ctrl+C copy, Ctrl+A select-all, Ctrl+S save,
+        # Ctrl+M margin note, …) keep working.
+        CTRL_EDIT_KEYSYMS = {"d", "h", "k", "o", "t"}
         def _maybe_block_edit(event):
             if event.keysym in ALLOWED_KEYSYMS:
                 return None
             ctrl_pressed = (event.state & 0x4) != 0
             if ctrl_pressed:
+                if event.keysym.lower() in CTRL_EDIT_KEYSYMS:
+                    return "break"
                 return None
             return "break"
         tx_text.bind("<KeyPress>", _maybe_block_edit)
+
+        # Block clipboard mutations of the read-only transcript.  Typing
+        # and Delete/BackSpace are already stopped above, but the Text
+        # widget's class-level virtual events still fire: an accidental
+        # Ctrl+V (paste) could drop clipboard text over the selection
+        # (reported — easy to hit instead of Ctrl+C), and Ctrl+X (cut) /
+        # middle-click paste are the same hazard.  Copy and Select-All
+        # stay enabled.  Returning "break" from the instance binding
+        # preempts the class binding that performs the edit.
+        # <<PasteSelection>> covers X11 middle-click paste; the rest cover
+        # Ctrl+V / Ctrl+X / Clear on every platform.
+        for _mut_evt in ("<<Paste>>", "<<PasteSelection>>",
+                         "<<Cut>>", "<<Clear>>"):
+            tx_text.bind(_mut_evt, lambda e: "break")
 
         # Right-click context menu — the only way to mutate the
         # transcript.  Always offers the actions that make sense on
@@ -11900,6 +11923,14 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         in_s  = float(selected[0].get("start", 0))
         out_s = float(selected[-1].get("end", in_s))
+        # PostBridge timecodes are integer seconds (the parser rejects a
+        # fractional part).  Round to the NEAREST second instead of
+        # truncating: the old secs_tc(...).split(".")[0] floored every
+        # value, which pushed the IN point EARLIER than the spoken word —
+        # up to a full second (reported) — and clipped the tail at OUT.
+        # Nearest rounding removes that systematic early bias on both edges.
+        in_tc  = secs_tc(round(in_s)).split(".")[0]
+        out_tc = secs_tc(round(out_s)).split(".")[0]
 
         # Pull body verbatim from the rendered transcript so what the
         # user copies matches what they see — speaker labels, paragraph
@@ -11938,8 +11969,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         block = "[{} {}-{}]\n{}\n".format(
             session.get("token", "?"),
-            secs_tc(in_s).split(".")[0],
-            secs_tc(out_s).split(".")[0],
+            in_tc, out_tc,
             body)
         self.clipboard_clear()
         self.clipboard_append(block)
@@ -11951,9 +11981,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             prev_text = lbl.cget("text")
             prev_fg   = lbl.cget("fg")
             lbl.config(
-                text="✓ @PULL copied  [{}–{}]".format(
-                    secs_tc(in_s).split(".")[0],
-                    secs_tc(out_s).split(".")[0]),
+                text="✓ @PULL copied  [{}–{}]".format(in_tc, out_tc),
                 fg=SUCCESS)
             self.after(2000,
                        lambda: lbl.config(text=prev_text, fg=prev_fg))
