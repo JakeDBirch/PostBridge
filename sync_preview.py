@@ -30,7 +30,9 @@ from engines import extract_mono_pcm, extract_audio_segment
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SR           = 8000       # extraction sample rate for waveform display
 _PLAYBACK_SR  = 44100      # extraction sample rate for playback clips
-_PLAY_DUR     = 3.0        # playback clip duration (seconds)
+_PLAY_DUR_OPTIONS = [3.0, 10.0, 30.0, 60.0, 120.0]   # cyclable durations
+_PLAY_DUR_DEFAULT = 1                                # index into _PLAY_DUR_OPTIONS -> 10s
+_PLAYHEAD_COLOR = "#e070c0"
 _FRAME_S      = 1.0 / 60   # one frame at 60 fps
 _NUDGE_SAMP   = int(_FRAME_S * _SR)  # samples per single-frame nudge
 
@@ -88,6 +90,15 @@ class SyncPreviewDialog:
         # Drag state
         self._drag_x0 = None
         self._drag_offset0 = 0
+
+        # Playback state
+        # _play_dur_idx cycles through _PLAY_DUR_OPTIONS via the Duration
+        # button.  _playhead_s is the ref-time second the user right-
+        # clicked on; when set, all play buttons start from there instead
+        # of the centre of the current view.  Right-click drops a
+        # playhead; SHIFT+right-click clears it.
+        self._play_dur_idx = _PLAY_DUR_DEFAULT
+        self._playhead_s   = None
 
         # Temp dir for playback clips
         self._tmp_dir = tempfile.mkdtemp(prefix="pb_sync_")
@@ -156,6 +167,10 @@ class SyncPreviewDialog:
         self._cv.bind("<ButtonRelease-1>", self._on_drag_end)
         self._cv.bind("<MouseWheel>", self._on_scroll)
         self._cv.bind("<Configure>", self._on_canvas_resize)
+        # Right-click drops the playhead at the click position; SHIFT
+        # +right-click clears it (returns to view-centre play).
+        self._cv.bind("<Button-3>",       self._on_set_playhead)
+        self._cv.bind("<Shift-Button-3>", lambda e: self._clear_playhead())
 
         # Zoom + offset row
         ctrl = tk.Frame(win, bg=BG)
@@ -211,6 +226,30 @@ class SyncPreviewDialog:
             b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT))
             b.bind("<Leave>", lambda e, w=b: w.config(bg=SURF3))
             b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
+
+        # Duration cycler \u2014 click to step through _PLAY_DUR_OPTIONS.
+        # Default 10 s; larger values let the user actually identify
+        # what they're hearing when the two sources are wildly off and
+        # they're listening for a landmark, not A/B-ing alignment.
+        tk.Frame(play_row, bg=BG, width=16).pack(side="left")
+        tk.Label(play_row, text="Duration:", fg=SUB, bg=BG,
+                 font=FB).pack(side="left")
+        self._dur_var = tk.StringVar(value=self._fmt_play_dur())
+        dur_btn = tk.Label(play_row, textvariable=self._dur_var, font=FBT,
+                           bg=SURF3, fg=TEXT, cursor="hand2",
+                           padx=8, pady=2, bd=0, width=6, anchor="center",
+                           highlightbackground=BORDER, highlightthickness=1)
+        dur_btn.pack(side="left", padx=(4, 6))
+        dur_btn.bind("<Enter>", lambda e: dur_btn.config(bg=ACCENT))
+        dur_btn.bind("<Leave>", lambda e: dur_btn.config(bg=SURF3))
+        dur_btn.bind("<ButtonRelease-1>", lambda e: self._cycle_play_dur())
+
+        # Playhead readout \u2014 shows where right-click set the start point.
+        # "from view" when no playhead is set, "@ MM:SS.ms" when one is.
+        # Hint: "right-click waveform to set, shift+right-click to clear".
+        self._playhead_var = tk.StringVar(value=self._fmt_playhead())
+        tk.Label(play_row, textvariable=self._playhead_var, fg=SUB, bg=BG,
+                 font=FB).pack(side="left", padx=(6, 0))
 
         # Candidate cycling lives on the Step 2 sync row now, NOT in
         # this dialog -- keeps the dialog focused on manual nudging /
@@ -400,6 +439,20 @@ class SyncPreviewDialog:
         # ── Centre line ───────────────────────────────────────────────────
         cv.create_line(0, mid, w, mid, fill=BORDER, dash=(2, 4))
 
+        # ── Playhead marker ──────────────────────────────────────────────
+        # Draw at the user-set playhead position (if any), even when the
+        # marker is off-screen we just don't draw it but keep the state —
+        # scrolling back into view re-reveals it.
+        if self._playhead_s is not None:
+            ph_sample = int(self._playhead_s * self._sr)
+            ph_x = (ph_sample - vs) // spp
+            if 0 <= ph_x <= w:
+                cv.create_line(ph_x, 0, ph_x, h - 20,
+                               fill=_PLAYHEAD_COLOR, width=2)
+                # Small triangle handle at the top so it's obvious
+                cv.create_polygon(ph_x - 5, 0, ph_x + 5, 0, ph_x, 7,
+                                  fill=_PLAYHEAD_COLOR, outline="")
+
         # ── Time axis ─────────────────────────────────────────────────────
         total_view_s = (w * spp) / self._sr
         # Choose a nice tick interval
@@ -507,6 +560,46 @@ class SyncPreviewDialog:
 
     # ── Playback ──────────────────────────────────────────────────────────
 
+    # ── Playback helpers ──────────────────────────────────────────────────
+
+    def _play_dur(self):
+        """Current play duration in seconds (from the duration cycler)."""
+        return _PLAY_DUR_OPTIONS[self._play_dur_idx]
+
+    def _fmt_play_dur(self):
+        d = self._play_dur()
+        return "{:g}s".format(d)
+
+    def _cycle_play_dur(self):
+        self._play_dur_idx = (self._play_dur_idx + 1) % len(_PLAY_DUR_OPTIONS)
+        if hasattr(self, "_dur_var"):
+            self._dur_var.set(self._fmt_play_dur())
+
+    def _fmt_playhead(self):
+        if self._playhead_s is None:
+            return "  · from view centre (right-click waveform to set)"
+        s = self._playhead_s
+        m = int(s // 60)
+        return "  · @ {}:{:06.3f}  (shift+right-click clears)".format(m, s - m * 60)
+
+    def _on_set_playhead(self, event):
+        """Right-click: set the playhead at the clicked x-position (mapped
+        to ref-time seconds via the current view + samples-per-pixel)."""
+        if self._ref_samples is None:
+            return
+        x = max(0, min(self._canvas_w, event.x))
+        sample_pos = self._view_start + x * self._samples_per_px
+        self._playhead_s = max(0.0, sample_pos / self._sr)
+        if hasattr(self, "_playhead_var"):
+            self._playhead_var.set(self._fmt_playhead())
+        self._draw()
+
+    def _clear_playhead(self):
+        self._playhead_s = None
+        if hasattr(self, "_playhead_var"):
+            self._playhead_var.set(self._fmt_playhead())
+        self._draw()
+
     def _play_mix(self):
         self._play(mix=True)
 
@@ -517,16 +610,24 @@ class SyncPreviewDialog:
         self._play(vid_only=True)
 
     def _play(self, mix=False, ref_only=False, vid_only=False):
-        """Extract + play a short clip centred on the current view."""
+        """Extract + play a clip whose start is either the user-set
+        playhead (right-click) or the centre of the current view, and
+        whose length is the current Duration setting."""
         if self._ref_samples is None:
             return
         self._stop()
-        _log.info("play requested  mix=%s ref=%s vid=%s", mix, ref_only, vid_only)
+        play_dur = self._play_dur()
+        _log.info("play requested  mix=%s ref=%s vid=%s  dur=%.1fs  playhead=%s",
+                  mix, ref_only, vid_only, play_dur, self._playhead_s)
 
-        # Centre of current view in ref-time seconds
-        centre_s = (self._view_start +
-                    self._canvas_w * self._samples_per_px // 2) / self._sr
-        ref_start = max(0.0, centre_s - _PLAY_DUR / 2)
+        # Resolve start in ref-time seconds.  Playhead wins; otherwise
+        # we centre the clip on the current view.
+        if self._playhead_s is not None:
+            ref_start = max(0.0, self._playhead_s)
+        else:
+            centre_s = (self._view_start +
+                        self._canvas_w * self._samples_per_px // 2) / self._sr
+            ref_start = max(0.0, centre_s - play_dur / 2)
         vid_start = max(0.0, ref_start - self._offset_samples / self._sr)
 
         def _extract_and_play():
@@ -541,10 +642,10 @@ class SyncPreviewDialog:
                 _log.info("extracting segments  ref_start=%.2f  vid_start=%.2f",
                           ref_start, vid_start)
                 if not vid_only:
-                    extract_audio_segment(self._ap, ref_start, _PLAY_DUR,
+                    extract_audio_segment(self._ap, ref_start, play_dur,
                                           ref_wav, sample_rate=_PLAYBACK_SR)
                 if not ref_only:
-                    extract_audio_segment(self._vp, vid_start, _PLAY_DUR,
+                    extract_audio_segment(self._vp, vid_start, play_dur,
                                           vid_wav, sample_rate=_PLAYBACK_SR)
 
                 # Read WAVs into arrays
