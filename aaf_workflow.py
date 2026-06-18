@@ -1160,6 +1160,13 @@ class AafWorkflowMixin:
                         except Exception: pass
                 def _on_vid_change(*args, c=container, s=sv, b=base):
                     _apply_color(c, _row_bg(s.get()))
+                    # Keep the button label in sync with the StringVar too —
+                    # the trace previously only refreshed the background,
+                    # so _aaf_auto_match (which writes sv directly) and any
+                    # other programmatic sv.set() left the label stuck at
+                    # its row-construction value (reported: bg updated,
+                    # label still "— no video —" until picker round-trip).
+                    self._aaf_refresh_vid_btn_label(b)
                     # If this source had a locked/completed sync, invalidate it —
                     # the assignment changed so the old sync result is stale.
                     lkv = self._aaf_sync_locked_vars.get(b)
@@ -1587,6 +1594,43 @@ class AafWorkflowMixin:
         except Exception:
             pass
 
+    def _aaf_refresh_vid_btn_label(self, base):
+        """Refresh the per-source video-assign button label + N-counter
+        colour from the current _aaf_source_file_vars[base] /
+        _aaf_source_extra_vars state.  Called from both the picker's
+        in-place apply AND the sv 'write' trace so any sv change — manual
+        (picker) or programmatic (_aaf_auto_match, restore-setup) —
+        updates the visible label.  Without this, auto-match set sv and
+        updated the row's background colour via the existing trace but
+        left the button text reading '— no video —' until the user
+        round-tripped the picker (reported)."""
+        btn_lbl = getattr(self, "_aaf_vid_btn_labels", {}).get(base)
+        if not (btn_lbl and btn_lbl.winfo_exists()):
+            return
+        sv = self._aaf_source_file_vars.get(base)
+        if sv is None:
+            return
+        evs     = self._aaf_source_extra_vars.get(base, [])
+        n_slots = self._aaf_source_slot_counts.get(base, 1)
+        n_filled = ((1 if sv.get() != "— no video —" else 0)
+                    + sum(1 for ev in evs if ev.get() != "— no video —"))
+        partial  = n_slots > 1 and n_filled < n_slots
+        if n_slots == 1:
+            new_text = sv.get()
+        else:
+            _cc = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+            new_text = "{}/{} files".format(n_filled, n_slots)
+            if _cc > 0:
+                new_text += "  ·  {} clips".format(_cc)
+        new_fg = WARN if partial else (SUB if sv.get() == "— no video —" else TEXT)
+        try:
+            btn_lbl.config(text=new_text, fg=new_fg)
+            n_lbl = getattr(self, "_aaf_ctr_n_labels", {}).get(base)
+            if n_lbl and n_lbl.winfo_exists():
+                n_lbl.config(fg=WARN if partial else TEXT)
+        except tk.TclError:
+            pass
+
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
         vid_options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
@@ -1917,28 +1961,18 @@ class AafWorkflowMixin:
             popup.grab_release()
             popup.destroy()
 
-            # ── In-place label update — no full row rebuild ───────────────────
-            try:
-                btn_lbl = getattr(self, "_aaf_vid_btn_labels", {}).get(base)
-                if btn_lbl and btn_lbl.winfo_exists():
-                    n_filled = (1 if sv.get() != "— no video —" else 0) + sum(
-                        1 for ev in evs if ev.get() != "— no video —")
-                    partial  = n_slots > 1 and n_filled < n_slots
-                    if n_slots == 1:
-                        new_text = sv.get()
-                    else:
-                        _cc = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
-                        new_text = "{}/{} files".format(n_filled, n_slots)
-                        if _cc > 0:
-                            new_text += "  ·  {} clips".format(_cc)
-                    new_fg   = WARN if partial else (SUB if sv.get() == "— no video —" else TEXT)
-                    btn_lbl.config(text=new_text, fg=new_fg)
-                    n_lbl = getattr(self, "_aaf_ctr_n_labels", {}).get(base)
-                    if n_lbl and n_lbl.winfo_exists():
-                        n_lbl.config(fg=WARN if partial else TEXT)
-                    return
-            except Exception:
-                pass
+            # In-place label update via the shared helper (also used by
+            # the sv 'write' trace, so picker apply + programmatic
+            # auto-match both keep the label in sync with sv).  If the
+            # button widget is gone, fall back to a full row rebuild.
+            btn_lbl = getattr(self, "_aaf_vid_btn_labels", {}).get(base)
+            if btn_lbl and btn_lbl.winfo_exists():
+                # The sv.set() calls above already fired the 'write'
+                # trace which called the helper, but call it again here
+                # in case any path bypassed the trace (e.g. setting sv
+                # to the same value it already had — Tk skips the trace).
+                self._aaf_refresh_vid_btn_label(base)
+                return
             self._rebuild_aaf_source_rows()
 
         def _cancel():
