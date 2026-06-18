@@ -4118,21 +4118,51 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # into [0, file_length] — preserving its length — so the clip
         # stays VISIBLE (and fixable) instead of being dropped on import,
         # and record a one-per-source warning.
+        #
+        # Tolerance: benign sub-frame overshoots (ffprobe container-
+        # duration vs round(src_out_s × fps) mismatch, PT trim landing
+        # at the last audio sample, a small authored fade-tail that
+        # spills past the source) happen routinely even when no sync is
+        # needed at all — e.g. when the audio was derived from the same
+        # video file the AAF references.  They get clamped silently;
+        # we only WARN above 12 frames (~400 ms at 30 fps), which is
+        # comfortably below any meaningful sync miss.
+        _OOR_TOL_FR = 12
         if vp:
             _vfc = _video_frame_count(vp)
             if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
                 _win = max(1, v_src_out - v_src_in)
+                _overshoot = max(-v_src_in, v_src_out - _vfc, 0)
                 v_src_in  = max(0, min(v_src_in, _vfc - _win))
                 v_src_out = min(_vfc, v_src_in + _win)
                 if v_src_out <= v_src_in:
                     v_src_in, v_src_out = 0, min(_vfc, _win)
                 _base = clip.get("source_base") or os.path.basename(vp)
-                if warnings_out is not None and _base not in _oor_seen:
+                if (warnings_out is not None
+                        and _overshoot > _OOR_TOL_FR
+                        and _base not in _oor_seen):
                     _oor_seen.add(_base)
-                    warnings_out.append(
-                        "{}: sync offset {:+.1f}s places the clip outside "
-                        "{} — clamped into range (re-sync needed).".format(
-                            _base, v_offset, os.path.basename(vp)))
+                    # When |v_offset| is below one frame the warning
+                    # text shouldn't blame the sync offset — that
+                    # produced the misleading "sync offset -0.0s places
+                    # the clip outside …" popup users saw on audio-
+                    # derived-from-video sources.  Pick the message
+                    # based on what the data actually says.
+                    _ov_s   = _overshoot / fps if fps else 0.0
+                    _vbn    = os.path.basename(vp)
+                    _frame_s = 1.0 / fps if fps else 1.0
+                    if abs(v_offset) < _frame_s:
+                        warnings_out.append(
+                            "{}: clip extends {:+.3f}s past the end of {} — "
+                            "last {} frames clamped (no sync offset applied; "
+                            "check that the video covers the full audio "
+                            "range, or trim the clip in Pro Tools).".format(
+                                _base, _ov_s, _vbn, _overshoot))
+                    else:
+                        warnings_out.append(
+                            "{}: sync offset {:+.3f}s places the clip outside "
+                            "{} — clamped into range (re-sync needed).".format(
+                                _base, v_offset, _vbn))
 
         if vp and tn in v_tracks:
             fid   = "file-v-{}".format(os.path.basename(vp).replace(" ", "_"))
