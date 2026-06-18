@@ -189,7 +189,8 @@ class AafWorkflowMixin:
                 "_aaf_source_sync_vars", "_aaf_source_syncaudio_vars",
                 "_aaf_source_offset_vars", "_aaf_source_sync_label_vars",
                 "_aaf_source_audio_disp_vars", "_aaf_source_slot_counts",
-                "_aaf_source_sync_cand_idx", "_aaf_source_has_slate_vars",
+                "_aaf_source_sync_cand_idx", "_aaf_source_sync_candidates",
+                "_aaf_source_has_slate_vars",
                 "_aaf_sync_state_vars", "_aaf_needs_sync_vars",
                 "_aaf_sync_locked_vars"):
             _d = getattr(self, _dname, None)
@@ -1207,6 +1208,12 @@ class AafWorkflowMixin:
                         lv = self._aaf_source_sync_label_vars.get(b)
                         if lv: lv.set("")
                         self._aaf_set_sync_state(b, "")
+                        # Drop the now-stale candidate list too — they
+                        # were measured against the previous video.
+                        # Without this, TRY NEXT remains visible and
+                        # clicking it applies an offset that doesn't
+                        # match the freshly-picked video.
+                        self._aaf_clear_sync_candidates(b)
                         # Refresh sync-tab row so lock icon updates immediately
                         self._ui(self._rebuild_aaf_source_rows)
                 sv.trace_add("write", _on_vid_change)
@@ -1393,17 +1400,38 @@ class AafWorkflowMixin:
                 # Pack only when there are alternates to audition.
                 self._aaf_refresh_try_next_btn(base)
 
-                # Audio dropdown trace (clear stale sync on ref change)
+                # Audio dropdown trace — keep the canonical full-path var
+                # in sync with the displayed label AND fully invalidate
+                # any prior sync state for this source.  Mirror of the
+                # _on_vid_change invalidation: changing the reference
+                # audio invalidates the offset just as fully as changing
+                # the video does.  The previous version only cleared the
+                # sync label, leaving offset / sync_var / state dot /
+                # lock / candidates stale — TRY NEXT would still cycle
+                # offsets measured against the previous reference audio.
                 def _on_aud_change(*args, b=base, dv=aud_disp):
                     fn   = dv.get()
                     full = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}.get(fn, "")
                     self._aaf_source_syncaudio_vars[b].set(full)
-                    lv = self._aaf_source_sync_label_vars.get(b)
-                    if lv and lv.get():
-                        lv.set("")
+                    lkv = self._aaf_sync_locked_vars.get(b)
+                    was_locked = lkv and lkv.get()
+                    ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
+                    lv  = self._aaf_source_sync_label_vars.get(b)
+                    had_label = lv and lv.get()
+                    if was_locked or ssv or had_label:
+                        if lkv: lkv.set(False)
+                        ov = self._aaf_source_offset_vars.get(b)
+                        if ov: ov.set("0.000")
+                        sv2 = self._aaf_source_sync_vars.get(b)
+                        if sv2: sv2.set(False)
+                        if lv: lv.set("")
+                        self._aaf_set_sync_state(b, "")
+                        self._aaf_clear_sync_candidates(b)
                         btn_ = self._aaf_sync_btns.get(b)
                         if btn_:
                             self._aaf_refresh_sync_btn(b, btn_)
+                        # Refresh row layout so lock icon / state colour update.
+                        self._ui(self._rebuild_aaf_source_rows)
                 aud_disp.trace_add("write", _on_aud_change)
 
         # Show placeholder when SYNC page has nothing to display
@@ -2929,6 +2957,24 @@ class AafWorkflowMixin:
         self._aaf_push_undo(base)
         self._aaf_apply_lock(base, not current)
 
+    def _aaf_clear_sync_candidates(self, base):
+        """Drop the per-source sync candidate list + cycle index and
+        refresh the inline TRY NEXT button.  Candidates are measured
+        against a SPECIFIC (video, audio) pair — when either changes, or
+        sync is reset/invalidated, the stored candidates are stale and
+        clicking TRY NEXT would otherwise apply an offset measured
+        against the previous file."""
+        cands = getattr(self, "_aaf_source_sync_candidates", None)
+        if cands is not None:
+            cands.pop(base, None)
+        idx = getattr(self, "_aaf_source_sync_cand_idx", None)
+        if idx is not None:
+            idx.pop(base, None)
+        try:
+            self._aaf_refresh_try_next_btn(base)
+        except Exception:
+            pass
+
     def _aaf_reset_sync(self, base):
         """Reset sync state for *base* back to zero."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
@@ -2941,6 +2987,10 @@ class AafWorkflowMixin:
         lv = self._aaf_source_sync_label_vars.get(base)
         if lv: lv.set("")
         self._aaf_set_sync_state(base, "")
+        # Drop stale candidates + hide the inline TRY NEXT — they were
+        # measured against this base's previous sync run, so cycling
+        # would apply a now-irrelevant offset.
+        self._aaf_clear_sync_candidates(base)
         btn = self._aaf_sync_btns.get(base)
         if btn:
             self._aaf_refresh_sync_btn(base, btn)
