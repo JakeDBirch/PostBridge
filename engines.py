@@ -4119,27 +4119,38 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # stays VISIBLE (and fixable) instead of being dropped on import,
         # and record a one-per-source warning.
         #
-        # Tolerance: benign sub-frame overshoots (ffprobe container-
-        # duration vs round(src_out_s × fps) mismatch, PT trim landing
-        # at the last audio sample, a small authored fade-tail that
-        # spills past the source) happen routinely even when no sync is
-        # needed at all — e.g. when the audio was derived from the same
-        # video file the AAF references.  They get clamped silently;
-        # we only WARN above 12 frames (~400 ms at 30 fps), which is
-        # comfortably below any meaningful sync miss.
+        # CONTENT vs FADE-EXTENSION: v_src_in/out above already include
+        # head_ext (fade-in extension) and fo_fr (fade-out extension)
+        # baked in.  Those extensions request additional source room
+        # AROUND the user's authored content so Premiere can render the
+        # fade envelope cleanly — they don't represent content that
+        # has to be there.  A clip whose AUTHORED CONTENT ends at the
+        # video boundary and has, say, a 4 s authored fade-out will
+        # have v_src_out push 4 s past _vfc; Premiere will just render
+        # the last bit of fade against silence, which is benign.
+        # Measure overshoot on the CONTENT (pre-extension) bounds so
+        # we only warn when the authored range really doesn't fit.
+        # Above 12 frames (~400 ms) is the threshold for warning; real
+        # sync misses overshoot by tens to thousands of frames.
         _OOR_TOL_FR = 12
         if vp:
             _vfc = _video_frame_count(vp)
             if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
+                # Content-only bounds (strip the fade extensions back off).
+                _content_in  = f2fr(src_in_s + v_offset,  fps)
+                _content_out = f2fr(src_out_s + v_offset, fps)
+                _content_overshoot = max(
+                    -_content_in,                  # head before video frame 0
+                    _content_out - _vfc,           # tail past video end
+                    0)
                 _win = max(1, v_src_out - v_src_in)
-                _overshoot = max(-v_src_in, v_src_out - _vfc, 0)
                 v_src_in  = max(0, min(v_src_in, _vfc - _win))
                 v_src_out = min(_vfc, v_src_in + _win)
                 if v_src_out <= v_src_in:
                     v_src_in, v_src_out = 0, min(_vfc, _win)
                 _base = clip.get("source_base") or os.path.basename(vp)
                 if (warnings_out is not None
-                        and _overshoot > _OOR_TOL_FR
+                        and _content_overshoot > _OOR_TOL_FR
                         and _base not in _oor_seen):
                     _oor_seen.add(_base)
                     # When |v_offset| is below one frame the warning
@@ -4148,16 +4159,18 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                     # the clip outside …" popup users saw on audio-
                     # derived-from-video sources.  Pick the message
                     # based on what the data actually says.
-                    _ov_s   = _overshoot / fps if fps else 0.0
-                    _vbn    = os.path.basename(vp)
+                    _ov_s    = _content_overshoot / fps if fps else 0.0
+                    _vbn     = os.path.basename(vp)
                     _frame_s = 1.0 / fps if fps else 1.0
                     if abs(v_offset) < _frame_s:
                         warnings_out.append(
-                            "{}: clip extends {:+.3f}s past the end of {} — "
-                            "last {} frames clamped (no sync offset applied; "
-                            "check that the video covers the full audio "
-                            "range, or trim the clip in Pro Tools).".format(
-                                _base, _ov_s, _vbn, _overshoot))
+                            "{}: authored clip range extends {:+.3f}s past "
+                            "the end of {} — last {} frames clamped (no "
+                            "sync offset applied; the audio's source range "
+                            "doesn't fit inside the video — trim the clip "
+                            "in Pro Tools or use a video that covers the "
+                            "full range).".format(
+                                _base, _ov_s, _vbn, _content_overshoot))
                     else:
                         warnings_out.append(
                             "{}: sync offset {:+.3f}s places the clip outside "
