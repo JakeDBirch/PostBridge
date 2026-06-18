@@ -635,24 +635,25 @@ class AafWorkflowMixin:
                         "#2b2516", "#162b2b", "#261626"]
     _UNASSIGNED_ROW  = "#2a1a08"
 
-    def _aaf_vid_label(self, path):
-        """Collision-free display label for a video-pool path, used as the
-        STABLE 1:1 key for that path everywhere the pool is shown or
-        resolved (dropdown options, the assignment picker, and every
-        {label: path} resolution map for sync / align / QA / build).
+    def _aaf_pool_label(self, path, pool):
+        """Collision-free display label for `path` against a given media
+        pool (list of full paths).  Used as the STABLE 1:1 key for the
+        path everywhere the pool is shown or resolved (dropdown options,
+        the assignment picker, and every {label: path} resolution map
+        for sync / align / QA / build).
 
         The bare basename is NOT a safe key: multicam shoots routinely
         name files identically on every card (C0001.MP4 on card A *and*
-        card B), and the pool dedups only by full path — so two distinct
-        files share a basename.  A basename-keyed lookup then collapses
-        them last-one-wins, and a source assigned card A's clip silently
-        syncs/exports against card B's.  When (and only when) a basename
-        collides in the pool, this disambiguates by parent folder, then
-        by a stable index, so the returned label maps back to exactly one
-        path.  With no collision the label IS the basename, so behaviour
-        is unchanged for the common case."""
-        bn   = basename(path)
-        pool = getattr(self, "_aaf_video_paths", [])
+        card B; scratch.wav on every cam), and the pool dedups only by
+        full path — so two distinct files share a basename.  A
+        basename-keyed lookup then collapses them last-one-wins, and a
+        source assigned card A's clip silently syncs/exports against
+        card B's.  When (and only when) a basename collides in the pool,
+        this disambiguates by parent folder, then by a stable index, so
+        the returned label maps back to exactly one path.  With no
+        collision the label IS the basename, so behaviour is unchanged
+        for the common case."""
+        bn = basename(path)
         twins = [p for p in pool if basename(p) == bn]
         if len(twins) <= 1:
             return bn
@@ -666,6 +667,24 @@ class AafWorkflowMixin:
             # given pool ordering).
             return "{}  ·  {} ({})".format(bn, parent, twins.index(path) + 1)
         return "{}  ·  {}".format(bn, parent)
+
+    def _aaf_vid_label(self, path):
+        """Collision-free display label for a video-pool path (see _aaf_pool_label)."""
+        return self._aaf_pool_label(path, getattr(self, "_aaf_video_paths", []))
+
+    def _aaf_aud_label(self, path):
+        """Collision-free display label for an audio-pool path.
+
+        Sister of _aaf_vid_label.  Without this, the reference-audio
+        dropdown showed bare basenames and the on-change trace re-resolved
+        the display string to a full path via a {basename: path} dict —
+        when two pool files shared a basename (e.g. `scratch.wav` on every
+        camera card) the dict collapsed last-one-wins and every source
+        that picked that filename pointed at the SAME physical file.  The
+        canonical full path is stored in _aaf_source_syncaudio_vars, so
+        making the display label injective is what actually disambiguates
+        the user's choice end-to-end."""
+        return self._aaf_pool_label(path, getattr(self, "_aaf_audio_paths", []))
 
     def _rebuild_aaf_source_rows(self):
         """Rebuild per-source rows; layout depends on current page mode."""
@@ -892,8 +911,8 @@ class AafWorkflowMixin:
             self._aaf_source_clip_counts = _cc
 
         options      = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
-        aud_options  = ["— no audio —"] + [basename(p) for p in self._aaf_audio_paths]
-        aud_by_name  = {basename(p): p for p in self._aaf_audio_paths}
+        aud_options  = ["— no audio —"] + [self._aaf_aud_label(p) for p in self._aaf_audio_paths]
+        aud_by_name  = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}
 
         vid_fns   = [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         vid_color = {fn: self._ASSIGN_PALETTE[i % len(self._ASSIGN_PALETTE)]
@@ -969,9 +988,15 @@ class AafWorkflowMixin:
                 sv.set("— no video —")
 
             # ── Audio display var — recreated fresh each rebuild ───────────────
+            # Use _aaf_aud_label so the displayed string matches the dropdown
+            # options (which now go through the same label) on a basename
+            # collision; bare basename here would leave the picker showing a
+            # value the dropdown doesn't recognize.
             cur_full  = self._aaf_source_syncaudio_vars[base].get()
-            cur_bn    = basename(cur_full) if cur_full else ""
-            aud_disp  = tk.StringVar(value=cur_bn if cur_bn else "— no audio —")
+            cur_lbl   = (self._aaf_aud_label(cur_full)
+                         if cur_full and cur_full in self._aaf_audio_paths
+                         else "")
+            aud_disp  = tk.StringVar(value=cur_lbl if cur_lbl else "— no audio —")
             self._aaf_source_audio_disp_vars[base] = aud_disp
 
             # Skip hidden sources (shown in collapsible section below)
@@ -1370,7 +1395,7 @@ class AafWorkflowMixin:
                 # Audio dropdown trace (clear stale sync on ref change)
                 def _on_aud_change(*args, b=base, dv=aud_disp):
                     fn   = dv.get()
-                    full = {basename(p): p for p in self._aaf_audio_paths}.get(fn, "")
+                    full = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}.get(fn, "")
                     self._aaf_source_syncaudio_vars[b].set(full)
                     lv = self._aaf_source_sync_label_vars.get(b)
                     if lv and lv.get():
@@ -1634,19 +1659,27 @@ class AafWorkflowMixin:
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
         vid_options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
-        aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
+        aud_by_name = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}
 
         for base in self._aaf_sources:
-            # Video auto-match (never override a manual assignment)
+            # Video auto-match (never override a manual assignment).
+            # The picked path goes through _aaf_vid_label so the StringVar
+            # value matches the collision-disambiguated dropdown options;
+            # writing bare basename(vp) would NOT match options on a
+            # multicam basename collision and the rebuild guard would
+            # silently wipe the assignment.
             sv = self._aaf_source_file_vars.get(base)
             if sv and sv.get() == "— no video —" and self._aaf_video_paths:
                 vp = match_source_to_video(base, self._aaf_video_paths)
                 if vp:
-                    fn = basename(vp)
+                    fn = self._aaf_vid_label(vp)
                     if fn in vid_options:
                         sv.set(fn)
 
-            # Audio auto-match (never override a manual assignment)
+            # Audio auto-match (never override a manual assignment).
+            # Same disambiguation as video: the display var carries the
+            # collision-safe label so the on-change trace can map it back
+            # to the right physical path.
             aud_disp = self._aaf_source_audio_disp_vars.get(base)
             full_var = self._aaf_source_syncaudio_vars.get(base)
             if (aud_disp and full_var
@@ -1654,7 +1687,7 @@ class AafWorkflowMixin:
                     and self._aaf_audio_paths):
                 ap = match_source_to_video(base, self._aaf_audio_paths)
                 if ap:
-                    fn = basename(ap)
+                    fn = self._aaf_aud_label(ap)
                     if fn in aud_by_name:
                         # Set display var; the trace will update the full-path var
                         aud_disp.set(fn)
@@ -2285,7 +2318,7 @@ class AafWorkflowMixin:
             if ap:
                 audio_var.set(ap)
                 if aud_disp:
-                    aud_disp.set(basename(ap))
+                    aud_disp.set(self._aaf_aud_label(ap))
 
         if not audio_var or not audio_var.get():
             messagebox.showwarning("No Reference Audio",
@@ -2403,7 +2436,12 @@ class AafWorkflowMixin:
             def _apply():
                 # For multi-file sources, promote the winning file to slot-1 so
                 # the build step always uses the sync-verified file for all clips.
-                best_fn = basename(best_vp)
+                # Use _aaf_vid_label (not bare basename) so the stored value
+                # matches the dropdown options on a multicam basename collision —
+                # writing the bare basename would fall outside `options` and the
+                # row's rebuild guard at line 968 would silently wipe the
+                # assignment on the next rebuild.
+                best_fn = self._aaf_vid_label(best_vp)
                 sv = self._aaf_source_file_vars.get(base)
                 if sv and sv.get() != best_fn:
                     sv.set(best_fn)
@@ -3896,19 +3934,26 @@ class AafWorkflowMixin:
                 if _i < len(_evs) and _fn in options:
                     _evs[_i].set(_fn)
 
-        aud_by_name = {basename(p): p for p in self._aaf_audio_paths}
+        aud_by_name = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}
         for base, sd in data.get("sync", {}).items():
             if base in self._aaf_source_sync_vars:
                 self._aaf_source_sync_vars[base].set(sd.get("enabled", False))
             if base in self._aaf_source_syncaudio_vars:
                 full = sd.get("audio_path", "")
                 self._aaf_source_syncaudio_vars[base].set(full)
-                # Populate display var so the dropdown shows the filename
-                bn = basename(full) if full else ""
+                # Populate display var so the dropdown shows the filename.
+                # Resolve through _aaf_aud_label so a multicam basename
+                # collision restores to the EXACT same physical file the
+                # setup was saved against — bare basename would route to
+                # whichever same-named file is now last in the pool.
                 if base not in self._aaf_source_audio_disp_vars:
                     self._aaf_source_audio_disp_vars[base] = tk.StringVar()
-                self._aaf_source_audio_disp_vars[base].set(
-                    bn if bn in aud_by_name else ("— no audio —" if not bn else bn))
+                if full and full in self._aaf_audio_paths:
+                    lbl = self._aaf_aud_label(full)
+                    self._aaf_source_audio_disp_vars[base].set(
+                        lbl if lbl in aud_by_name else "— no audio —")
+                else:
+                    self._aaf_source_audio_disp_vars[base].set("— no audio —")
             if base in self._aaf_source_offset_vars:
                 self._aaf_source_offset_vars[base].set(sd.get("offset", "0.000"))
             if base in self._aaf_source_sync_label_vars:
