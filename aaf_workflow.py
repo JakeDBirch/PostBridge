@@ -369,6 +369,7 @@ class AafWorkflowMixin:
 
         # Body starts collapsed
         self._aaf_audio_paths     = []
+        self._aaf_audio_rows      = {}   # full path → row Frame (sister of _aaf_video_rows)
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
 
@@ -2114,21 +2115,43 @@ class AafWorkflowMixin:
             self._aaf_hidden_sources = set()
         self._aaf_hidden_sources.update(dead_sources)
 
+        # For each removed pool file, mirror _aaf_remove_video/_aaf_remove_audio:
+        # drop from the path list AND destroy its row Frame in the pool
+        # list view AND drop from the path→row registry.  Without this,
+        # the count label said "3 files" while the list still showed all
+        # the original rows (reported).
+        vid_rows = getattr(self, "_aaf_video_rows", {})
         for p in dead_vids:
             if p in self._aaf_video_paths:
                 self._aaf_video_paths.remove(p)
+            _row = vid_rows.pop(p, None)
+            if _row is not None:
+                try: _row.destroy()
+                except tk.TclError: pass
         nv = len(self._aaf_video_paths)
         if hasattr(self, "_aaf_count_lbl"):
             self._aaf_count_lbl.config(
                 text="{} file{}".format(nv, "s" if nv != 1 else ""))
 
+        aud_rows = getattr(self, "_aaf_audio_rows", {})
         for p in dead_auds:
             if p in self._aaf_audio_paths:
                 self._aaf_audio_paths.remove(p)
+            _row = aud_rows.pop(p, None)
+            if _row is not None:
+                try: _row.destroy()
+                except tk.TclError: pass
         na = len(self._aaf_audio_paths)
         if hasattr(self, "_aaf_audio_count_lbl"):
             self._aaf_audio_count_lbl.config(
                 text="{} file{}".format(na, "s" if na != 1 else ""))
+
+        # Sequence-preset dropdown still offers W×H@fps entries detected
+        # from videos that just got removed — same refresh _aaf_remove_video
+        # does on the single-file path.
+        if dead_vids:
+            try: self._aaf_update_seq_presets()
+            except Exception: pass
 
         self._rebuild_aaf_source_rows()
 
@@ -3119,6 +3142,13 @@ class AafWorkflowMixin:
                       cursor="hand2", padx=4)
         rm.pack(side="right")
         rm.bind("<Button-1>", lambda e, p=path, r=row: self._aaf_remove_audio(p, r))
+        # Path \u2192 row Frame registry \u2014 mirror of _aaf_video_rows, so bulk
+        # operations (CLEAN UP via _aaf_remove_unassigned) can find and
+        # destroy the row by its stable identity instead of leaving an
+        # orphaned Frame packed in _aaf_audio_file_list.
+        if not hasattr(self, "_aaf_audio_rows"):
+            self._aaf_audio_rows = {}
+        self._aaf_audio_rows[path] = row
         if not _batch:
             n = len(self._aaf_audio_paths)
             self._aaf_audio_count_lbl.config(
@@ -3127,6 +3157,7 @@ class AafWorkflowMixin:
     def _aaf_remove_audio(self, path, row):
         if path in self._aaf_audio_paths:
             self._aaf_audio_paths.remove(path)
+        getattr(self, "_aaf_audio_rows", {}).pop(path, None)
         row.destroy()
         n = len(self._aaf_audio_paths)
         self._aaf_audio_count_lbl.config(
