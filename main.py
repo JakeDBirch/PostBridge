@@ -2831,27 +2831,64 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     @staticmethod
     def _build_remap_index(folder):
-        """Walk folder recursively and return {lowercase_filename: absolute_path}.
-        Skips hidden directories (.pb_cache, .git, etc)."""
+        """Walk folder recursively and return {lowercase_filename: [absolute_path, …]}.
+        Skips hidden directories (.pb_cache, .git, etc).
+
+        Returns a LIST per basename instead of a single path so that
+        multicam folders (where CARD_A/CLIP.MP4 and CARD_B/CLIP.MP4
+        coexist) don't get silently collapsed by 'first match wins'.
+        _remap_path then picks the best candidate by parent-folder
+        suffix similarity to the saved old path."""
         index = {}
         for root, dirs, files in os.walk(folder):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fn in files:
                 key = fn.lower()
-                if key not in index:   # first match wins (shallowest path)
-                    index[key] = os.path.join(root, fn)
+                index.setdefault(key, []).append(os.path.join(root, fn))
         return index
 
     @staticmethod
-    def _remap_path(old_path, video_index, audio_index):
-        """Return the remapped path for old_path, routing to the correct index
-        by file type. Falls back to the other index if not found in the primary."""
+    def _pick_best_remap(old_path, candidates):
+        """Choose the candidate whose parent-folder tail best matches
+        old_path's parent-folder tail.  Saved old paths carry enough
+        identity (parent dirs) to disambiguate twin basenames; without
+        this scoring, basename-only lookup silently mapped two saved
+        references to the same physical file (reported when a foreign
+        session was opened against a multicam root)."""
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        old_dirs = [d.lower() for d in os.path.normpath(old_path).split(os.sep) if d]
+        best_path, best_score = None, -1
+        for c in candidates:
+            cdirs = [d.lower() for d in os.path.normpath(c).split(os.sep) if d]
+            # Longest matching suffix among the *parent* directories
+            # (drop the basename — every candidate shares it).
+            old_parents = old_dirs[:-1]
+            new_parents = cdirs[:-1]
+            score = 0
+            for a, b in zip(reversed(old_parents), reversed(new_parents)):
+                if a == b:
+                    score += 1
+                else:
+                    break
+            if score > best_score:
+                best_path, best_score = c, score
+        return best_path
+
+    @classmethod
+    def _remap_path(cls, old_path, video_index, audio_index):
+        """Return the remapped path for old_path, routing to the correct
+        index by file type, with parent-folder disambiguation when
+        multiple candidates share a basename."""
         fn  = os.path.basename(old_path).lower()
         ext = os.path.splitext(fn)[1]
-        if ext in VIDEO_EXTS:
-            return video_index.get(fn) or audio_index.get(fn) or old_path
-        else:
-            return audio_index.get(fn) or video_index.get(fn) or old_path
+        primary, secondary = (video_index, audio_index) \
+            if ext in VIDEO_EXTS else (audio_index, video_index)
+        return (cls._pick_best_remap(old_path, primary.get(fn) or [])
+                or cls._pick_best_remap(old_path, secondary.get(fn) or [])
+                or old_path)
 
     @classmethod
     def _remap_session_data(cls, data, video_index, audio_index):
@@ -11819,14 +11856,20 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             duration_s = max(0.5, out_s - in_s)
 
-        # Extract → temp WAV → play
+        # Extract → temp WAV → play.  Create the temp file BEFORE the
+        # try, so the cleanup branch always knows the path to unlink —
+        # the previous code created tf inside the try and the failure
+        # branch returned without removing it, leaking a zero-byte WAV
+        # into the OS temp dir on every failed playback.
+        tf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tf.close()
         try:
-            tf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tf.close()
             engines.extract_audio_segment(
                 src, in_s, duration_s, tf.name,
                 sample_rate=22050)
         except Exception as e:
+            try: os.unlink(tf.name)
+            except Exception: pass
             messagebox.showerror("Playback failed", str(e))
             return
 

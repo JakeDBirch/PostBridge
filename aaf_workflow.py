@@ -1310,8 +1310,19 @@ class AafWorkflowMixin:
                 self._aaf_confirm_btns[base] = cfm_btn
 
                 # ▶ PREVIEW
-                prev_btn = tk.Label(row1, text="\u25b6 PREVIEW", font=FB, bg=SURF3,
-                                    fg=TEXT, cursor="hand2", padx=6, pady=2, bd=0,
+                # Initial state must consult _aaf_qa_playing so a row
+                # rebuild during QA playback (page toggle, ALIGN accept,
+                # drag-select apply, etc.) doesn't show "play" on a
+                # button whose audio is actively playing.  The previous
+                # always-default construction left the button reading
+                # PREVIEW while audio kept rolling; the eventual
+                # _qa_poll-driven _aaf_qa_stop then tried to reset an
+                # already-default-styled (new) widget \u2014 silent no-op.
+                _is_playing = getattr(self, "_aaf_qa_playing", None) == base
+                _qa_text    = "\u25a0 STOP" if _is_playing else "\u25b6 PREVIEW"
+                _qa_fg      = WARN          if _is_playing else TEXT
+                prev_btn = tk.Label(row1, text=_qa_text, font=FB, bg=SURF3,
+                                    fg=_qa_fg, cursor="hand2", padx=6, pady=2, bd=0,
                                     highlightbackground=BORDER, highlightthickness=1)
                 prev_btn.pack(side="left", padx=(2, 0))
                 prev_btn.bind("<Enter>",  lambda e, w=prev_btn: w.config(bg=ACCENT))
@@ -3305,7 +3316,13 @@ class AafWorkflowMixin:
             cancel_btn.config(state="disabled")
 
             def _worker():
-                ok, msg = engines.mix_reference_audio(sel, out_path)
+                # Wrap mix_reference_audio — bare call would leave
+                # _busy["running"]=True on exception, making the modal
+                # uncloseable (same class as join-split's preflight).
+                try:
+                    ok, msg = engines.mix_reference_audio(sel, out_path)
+                except Exception as e:
+                    ok, msg = False, "exception: {}".format(e)
                 def _finish():
                     _busy["running"] = False
                     try:
@@ -3561,11 +3578,31 @@ class AafWorkflowMixin:
                 text="Checking {} files…".format(len(sel)), fg=SUB)
 
             def _preflight():
-                ok, reason = engines.probe_concat_compat(sel)
-                cstatus, cmsg, csummary = engines.probe_join_continuity(sel)
-                out_default = out_box["path"] or _default_out(sel)
+                # Wrap engine probes — if either raises (missing ffprobe,
+                # malformed media), the bare call would leave
+                # _busy["running"]=True and the modal would be
+                # uncloseable (CANCEL/Escape gate on _busy["running"])
+                # until app restart.  Surface the error and clear busy.
+                try:
+                    ok, reason = engines.probe_concat_compat(sel)
+                    cstatus, cmsg, csummary = engines.probe_join_continuity(sel)
+                    out_default = out_box["path"] or _default_out(sel)
+                except Exception as e:
+                    self._ui(lambda err=e: _abort_preflight(err))
+                    return
                 self._ui(lambda: _confirm(ok, reason, cstatus, cmsg,
                                           csummary, out_default))
+
+            def _abort_preflight(err):
+                _busy["running"] = False
+                try:
+                    join_btn.config(state="normal")
+                    cancel_btn.config(state="normal")
+                    status_lbl.config(text="", fg=SUB)
+                except tk.TclError:
+                    return
+                messagebox.showerror("Preflight failed",
+                                     "Could not probe the selected files:\n\n{}".format(err))
 
             def _confirm(ok, reason, cstatus, cmsg, csummary, out_path):
                 # Back on the Tk thread: release the busy lock so a "No"
@@ -3619,7 +3656,13 @@ class AafWorkflowMixin:
                 cancel_btn.config(state="disabled")
 
                 def _worker():
-                    ok2, msg, actual = engines.concat_video_files(sel, out_path)
+                    # Wrap engines.concat_video_files — bare call would
+                    # leave _busy["running"]=True on an exception, with
+                    # the same uncloseable-modal symptom as the preflight.
+                    try:
+                        ok2, msg, actual = engines.concat_video_files(sel, out_path)
+                    except Exception as e:
+                        ok2, msg, actual = False, "exception: {}".format(e), out_path
                     def _finish():
                         _busy["running"] = False
                         try:
@@ -4100,6 +4143,17 @@ class AafWorkflowMixin:
             self._pending_mark_saved = False
             self._mark_saved()
 
+    def _aaf_build_progress_hide(self):
+        """Pack-forget the build progress frame, on any exit path that
+        doesn't transition to a follow-up screen.  Without this, an
+        _aaf_build early-return (no matches, user cancelled Save-As)
+        leaves the progress bar stuck at its last percentage/text until
+        the user navigates away from Step 2."""
+        frame = getattr(self, "_aaf_prog_frame", None)
+        if frame is not None:
+            try: frame.pack_forget()
+            except tk.TclError: pass
+
     def _aaf_build_progress(self, pct, text):
         """Show/update the build progress bar.  pct is 0–100.  Thread-safe."""
         def _upd():
@@ -4218,9 +4272,17 @@ class AafWorkflowMixin:
                 unmatched += 1
                 clip_results.append((clip["clip_name"], "— no video assigned —", WARN))
 
-            # Determine XML track name based on grouping mode
+            # Determine XML track name based on grouping mode.  In
+            # by_source mode the track name is a GROUPING KEY (engines.
+            # build_xml_from_pt collapses every clip with the same `tn`
+            # into one v_tracks/a_tracks/cam_tracks bucket), so bare
+            # basename(vp) would merge clips from two physically
+            # different pool files that happen to share a basename
+            # (CARD_A/C0001.MP4 + CARD_B/C0001.MP4) into ONE output
+            # track — defeating the user's explicit "one track per
+            # source" choice.  Use the collision-safe pool label.
             if group_mode == "by_source":
-                tn = basename(vp) if vp else "No Video"
+                tn = self._aaf_vid_label(vp) if vp else "No Video"
             elif group_mode == "by_track":
                 tn = clip.get("track_name") or "Unknown Track"
             else:
@@ -4258,6 +4320,7 @@ class AafWorkflowMixin:
                     track_names_ordered.append(tn)
 
         if matched == 0:
+            self._aaf_build_progress_hide()
             messagebox.showerror("No Matches",
                 "No clips were matched to video files.\n"
                 "Add video files and assign at least one source to a video.")
@@ -4271,6 +4334,7 @@ class AafWorkflowMixin:
             initialfile="{}_aaf.xml".format(
                 self._aaf_data.get("session_name","postbridge").replace(" ","_")))
         if not out:
+            self._aaf_build_progress_hide()
             return
 
         # Snapshot Tkinter vars before handing off to the worker thread.
