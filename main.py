@@ -1171,17 +1171,37 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             pass
 
     def _load_script(self, path):
-        if not path or not os.path.isfile(path): return
+        def _clear_pending_restore():
+            # _open_session arms these for THIS load.  Every early-return
+            # path below MUST clear them, or they survive into the next
+            # script the user opens — restoring AAF#1's saved setup onto
+            # AAF#2, or marking the next freshly-opened file falsely
+            # clean (mirrors the _aaf_load failure-path fix).
+            self._pending_setup       = None
+            self._pending_results     = None
+            self._pending_s4_state    = None
+            self._pending_mark_saved  = False
+            # _confirmed_carryover / _rereconcile_src_override are
+            # mutating session state — leaving them populated would
+            # corrupt the next session's reconcile.
+            self._confirmed_carryover     = {}
+            self._rereconcile_src_override = {}
+
+        if not path or not os.path.isfile(path):
+            _clear_pending_restore()
+            return
         self._script_path = os.path.abspath(path)
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 text = f.read()
         except Exception as e:
+            _clear_pending_restore()
             messagebox.showerror("Error", str(e)); return
 
         tokens, parts, pulls, vo_blocks, doc_title, warnings = parse_script(text)
 
         if not pulls:
+            _clear_pending_restore()
             messagebox.showerror("Nothing Found",
                 "No @PULL markers found.\n"
                 "Make sure the script is in PostBridge format.")
@@ -4557,6 +4577,11 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 self._log_line("Model load failed: {}".format(e), ERR)
                 self._elapsed_running = False
+                # Clear the busy flags the caller set before launching
+                # this worker thread — otherwise the spinner dots keep
+                # animating and the model picker stays gated behind a
+                # warning dialog until app restart.
+                self._ui(self._stop_reconcile_runners)
                 return
 
         vo_takes_by_part = {}
@@ -5319,6 +5344,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 except Exception:
                     pass
                 self._run_log_fh = None
+            # Same flag-cleanup as the happy path — the user cancelled
+            # mid-reconcile, but the spinner dots / resource poller /
+            # busy flag must still be released.
+            self._ui(self._stop_reconcile_runners)
             self._ui(self._step2)
             return
 
@@ -5460,15 +5489,22 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._ui(self._finish_reconcile)
 
+    def _stop_reconcile_runners(self):
+        """Clear the three flags that gate the spinner / resource poller /
+        Settings-model-picker.  _finish_reconcile clears them on the happy
+        path, but the cancel branch and the model-load-failure branch of
+        _run_reconcile used to exit without clearing — leaving the dots
+        animating forever and the model picker silently blocked behind a
+        warning dialog until the app restarted."""
+        self._dot_running         = False
+        self._res_monitor_running = False
+        self._reconcile_busy      = False
+
     def _finish_reconcile(self):
         """Called on the main thread after _run_reconcile completes.
         Appends the pre-computed summary lines to the log widget then
         transitions to Step 4.  All Tk operations happen here, safely."""
-        self._dot_running = False   # stop the animated dots
-        self._res_monitor_running = False   # stop the resource poller
-        # Clear the reconcile-busy flag so the Settings model picker
-        # stops gating itself behind the warning dialog.
-        self._reconcile_busy = False
+        self._stop_reconcile_runners()
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
