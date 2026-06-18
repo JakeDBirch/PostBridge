@@ -11285,12 +11285,27 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 # Three-way merge against user edits
                                 # AND any configured-pass words that
                                 # may have already streamed in.
-                                session["transcript"] = App._pq_merge_streams(
-                                    list(tw),
-                                    list(streaming_main_words),
-                                    session.get("transcript") or [])
-                                self._ui(lambda s=session:
-                                          self._pq_preview_ready(s))
+                                #
+                                # Snapshot inputs on this thread, but
+                                # marshal the actual session-state write
+                                # onto the main thread.  The main thread
+                                # ALSO writes session["transcript"] from
+                                # _do_stream_render (line 11136-ish via
+                                # _pq_merge_streams); writing this dict
+                                # slot from two threads racelessly is
+                                # what self._ui is for.  Narrow window
+                                # (microseconds between the read and the
+                                # assign) but the fix is cheap and
+                                # brings the site into parity with the
+                                # _ui-marshalled preview-ready call
+                                # immediately below.
+                                _tw_snap   = list(tw)
+                                _smain_snap = list(streaming_main_words)
+                                def _commit(s=session, tws=_tw_snap, sms=_smain_snap):
+                                    s["transcript"] = App._pq_merge_streams(
+                                        tws, sms, s.get("transcript") or [])
+                                    self._pq_preview_ready(s)
+                                self._ui(_commit)
                         except engines.TranscriptionCancelled:
                             pass
                         except Exception as _e:
