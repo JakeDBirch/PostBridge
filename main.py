@@ -4608,7 +4608,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # a gate slot — freezing progress for 60+ seconds with nothing visible.
         if HAS_WHISPER:
             try:
-                self._log_line("Loading model ({})…".format(WHISPER_MODEL), INFO)
+                # Read the ACTIVE model size (picker override or config
+                # default) rather than the raw WHISPER_MODEL config
+                # constant.  engines.get_model() below picks the same
+                # value; without this the log printed "small" even when
+                # the user had set the picker to medium (reported), even
+                # though the actually-loaded model was medium.
+                self._log_line(
+                    "Loading model ({})…".format(
+                        engines.get_active_model_size()), INFO)
                 engines.get_model()
                 self._log_line("Model ready.", SUCCESS)
             except Exception as e:
