@@ -1038,6 +1038,29 @@ class MediaPool(tk.Frame):
                     continue
 
                 cand_stripped = _strip_media_type(cand_fn)
+                # Rule 4 — word-similarity mirror.  The old check fired at
+                # 0.6 with no speaker anchor: for a pool named e.g.
+                # "Turks_and_Caicos_<SPEAKER>_take1.wav" the shared
+                # prefix {turks, and, caicos, take1} alone exceeded 60 %
+                # of BRYAN1 vs RYAN1, so assigning a token to ONE file
+                # cascaded onto every same-prefix file regardless of
+                # speaker (reported).  Anchor the mirror on the assigned
+                # token appearing in BOTH filenames as a word — either
+                # the exact form or the form without trailing digits, so
+                # BRYAN1 matches "…BRYAN1…" and "…BRYAN…" alike but a
+                # RYAN1 file has neither anchor and is skipped.  VO
+                # tokens ("VO: Part 1") have no filename anchor; keep
+                # the old behaviour there.
+                if not new_token.startswith("VO:"):
+                    _anchors = {new_token.lower().strip()}
+                    _stripped_digits = re.sub(r"\d+$", "",
+                                              new_token.lower().strip())
+                    if _stripped_digits:
+                        _anchors.add(_stripped_digits)
+                    _sw = set(re.sub(r"[^a-z0-9]", " ", src_stripped).split())
+                    _cw = set(re.sub(r"[^a-z0-9]", " ", cand_stripped).split())
+                    if not (_anchors & _sw) or not (_anchors & _cw):
+                        continue
                 if _name_similarity(src_stripped, cand_stripped) >= 0.6:
                     r["var"].set(new_token)
         finally:
