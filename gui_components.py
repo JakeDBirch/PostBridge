@@ -2,7 +2,8 @@ import os
 import tkinter as tk
 import re
 import threading
-from tkinter import filedialog
+import json
+from tkinter import filedialog, messagebox
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -820,6 +821,19 @@ class MediaPool(tk.Frame):
         tint_refs.append(link_lbl)
         # (not packed here — _update_link_visuals inserts it before rm when needed)
 
+        # 🗑 — wipe cache for this file only (transcript + assigned-token pull
+        # results).  Lets the user re-transcribe / re-reconcile one outlier
+        # after fixing a bad pool assignment WITHOUT invalidating the
+        # cache for every other file they've already brought over the line.
+        # Hidden in AAF mode (which uses a completely different cache
+        # subsystem — sync results, not transcripts).
+        wipe = None
+        if not self._aaf_mode:
+            wipe = tk.Label(row, text="🗑", font=FB, bg=initial_bg, fg=SUB,
+                            cursor="hand2", padx=4)
+            wipe.pack(side="left")
+            tint_refs.append(wipe)
+
         rm = tk.Label(row, text="✕", font=FB, bg=initial_bg, fg=SUB,
                       cursor="hand2", padx=6)
         rm.pack(side="left")
@@ -831,6 +845,9 @@ class MediaPool(tk.Frame):
                "link_lbl": link_lbl, "rm_lbl": rm}
         self._rows.append(rec)
         rm.bind("<Button-1>", lambda e, r=rec: self._remove(r))
+        if wipe is not None:
+            wipe.bind("<Button-1>",
+                       lambda e, r=rec: self._wipe_cache(r))
 
         self._dz_lbl.config(text="")
         self._refresh_count()
@@ -1165,6 +1182,99 @@ class MediaPool(tk.Frame):
         rec["row"].destroy()
         self._refresh_count()
         self._update_link_visuals()
+
+    def _wipe_cache(self, rec):
+        """Wipe the transcript + assigned-token pull-result caches for
+        this one pool file, so the next reconcile re-transcribes/redoes
+        just those pulls.  Everything else keeps its cache and stays
+        fast on re-run.
+
+        Deletes, if present:
+          • the {media_stem}.pb_transcript.json sidecar next to the
+            audio file
+          • the internal .pb_cache/{md5(abs_path)}.json transcript
+            cache used by reconcile
+          • every .pb_cache/pull_*.json whose stored result.token
+            matches the row's current token — targets the pulls that
+            were reconciled AS this token, whether or not they landed
+            on the right file.
+        """
+        path = rec.get("path")
+        if not path:
+            return
+        tok = (rec["var"].get() if rec.get("var") else "") or ""
+        if tok == "— unassigned —":
+            tok = ""
+        # engines is imported lazily so gui_components stays leaf-ish.
+        import engines
+        fn = os.path.basename(path)
+        # Confirm — this is destructive and the user has invested work.
+        if not messagebox.askyesno(
+                "Clear cache for this file?",
+                "Delete the cached transcript AND every reconciled "
+                "pull result whose token is {!r} for this file?\n\n"
+                "  {}\n\n"
+                "Everything OTHER than this file keeps its cache; the "
+                "next reconcile will re-do just these pulls.".format(
+                    tok or "(none)", fn),
+                default="no"):
+            return
+
+        n_deleted = 0
+
+        # 1) sidecar next to the audio
+        try:
+            sc = engines.pb_transcript_path(path)
+            if sc and os.path.isfile(sc):
+                os.remove(sc); n_deleted += 1
+        except Exception:
+            pass
+
+        # 2) internal transcript cache (.pb_cache/{md5}.json)
+        try:
+            cp = engines._cache_path(path) if engines._cache_dir else None
+            if cp and os.path.isfile(cp):
+                os.remove(cp); n_deleted += 1
+        except Exception:
+            pass
+
+        # 3) matching pull_*.json files — filter by result.token
+        cache_dir = getattr(engines, "_cache_dir", None)
+        n_pulls = 0
+        if cache_dir and os.path.isdir(cache_dir) and tok:
+            for _fn in os.listdir(cache_dir):
+                if not _fn.startswith("pull_") or not _fn.endswith(".json"):
+                    continue
+                p = os.path.join(cache_dir, _fn)
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        d = json.load(f)
+                    result = d.get("result") if isinstance(d, dict) else None
+                    if isinstance(result, dict) and result.get("token") == tok:
+                        os.remove(p); n_pulls += 1
+                except Exception:
+                    continue
+        n_deleted += n_pulls
+
+        # Rebrand the row's cache button briefly so the user sees it worked.
+        try:
+            btn = None
+            for _child in rec["row"].winfo_children():
+                if isinstance(_child, tk.Label) and _child.cget("text") == "🗑":
+                    btn = _child; break
+            if btn is not None:
+                btn.config(text="✓")
+                btn.after(1400, lambda w=btn: w.config(text="🗑"))
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "Cache cleared",
+            "Deleted {} file{} ({} pull result{}) for:\n  {}\n\n"
+            "Run reconcile again to re-do just these pulls; the rest "
+            "stay cached.".format(
+                n_deleted, "s" if n_deleted != 1 else "",
+                n_pulls, "s" if n_pulls != 1 else "", fn))
 
     def _refresh_count(self):
         n = len(self._rows)
