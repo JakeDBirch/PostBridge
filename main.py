@@ -10433,17 +10433,71 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                         "*.wav *.aif *.aiff *.bwf *.mp3 *.m4a *.flac "
                         "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v"),
                        ("All", "*.*")])
-        added = 0
+        added_paths = []
         media = list(session.get("media", []))
         for f in files:
             f = os.path.abspath(f)
             if f not in media and is_media(f):
                 media.append(f)
-                added += 1
-        if not added:
+                added_paths.append(f)
+        if not added_paths:
             return
         session["media"] = media
-        # Adding new media invalidates the existing transcript
+
+        # ── Sidecar-adoption path ──────────────────────────────────────
+        # Before wiping session["transcript"], probe each newly-added
+        # file for a .pb_transcript.json sidecar.  Previously we always
+        # cleared the transcript and required the user to click ⟳
+        # TRANSCRIBE just to reach the USE EXISTING prompt — an obvious
+        # dead-end when they just wanted to search a transcript that
+        # already exists.  Now: if any added file has a valid sidecar,
+        # route through the same _pq_confirm_retranscribe dialog that
+        # the TRANSCRIBE-button flow uses, so USE EXISTING / RE-TRANSCRIBE
+        # is offered inline.
+        sidecar_paths = []
+        for p in added_paths:
+            try:
+                if engines.pb_transcript_load(p)[0] is not None:
+                    sidecar_paths.append(p)
+            except Exception:
+                pass
+
+        has_session_transcript = bool(session.get("transcript"))
+        if sidecar_paths or has_session_transcript:
+            choice, preserve_edits = self._pq_confirm_retranscribe(
+                session, has_session_transcript, sidecar_paths)
+            if choice == "cancel":
+                # Roll back the media add so the session stays as it was.
+                session["media"] = [p for p in media if p not in added_paths]
+                return
+            if choice == "use_cached" and sidecar_paths:
+                # Load the first sidecar's words directly into the session
+                # — mirrors _pq_run_transcription's USE EXISTING handler.
+                words, _ = engines.pb_transcript_load(sidecar_paths[0])
+                if words:
+                    session["transcript"] = list(words)
+                    self._pq_save_session_file(session)
+                    self._pq_render_media_list(session)
+                    self._pq_render_transcript_text(session)
+                    if getattr(self, "_pq_retx_btn", None):
+                        self._pq_retx_btn.config(text="⟳ RE-TRANSCRIBE")
+                    return
+            # Fall through: user chose RE-TRANSCRIBE (or use_cached had
+            # no words) — proceed with the existing wipe + re-render
+            # flow AND kick off the transcription immediately so they
+            # don't have to click TRANSCRIBE separately.
+            session["transcript"] = []
+            self._pq_save_session_file(session)
+            self._pq_render_media_list(session)
+            self._pq_render_transcript_text(session)
+            if getattr(self, "_pq_retx_btn", None):
+                self._pq_retx_btn.config(text="⟳ TRANSCRIBE")
+            self.after(80,
+                       lambda s=session: self._pq_run_transcription(s))
+            return
+
+        # No sidecar and no existing transcript — original behaviour:
+        # wipe + re-render, wait for the user to click TRANSCRIBE.
         session["transcript"] = []
         self._pq_save_session_file(session)
         self._pq_render_media_list(session)
