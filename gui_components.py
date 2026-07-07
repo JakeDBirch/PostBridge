@@ -821,18 +821,18 @@ class MediaPool(tk.Frame):
         tint_refs.append(link_lbl)
         # (not packed here — _update_link_visuals inserts it before rm when needed)
 
-        # 🗑 — wipe cache for this file only (transcript + assigned-token pull
-        # results).  Lets the user re-transcribe / re-reconcile one outlier
-        # after fixing a bad pool assignment WITHOUT invalidating the
-        # cache for every other file they've already brought over the line.
-        # Hidden in AAF mode (which uses a completely different cache
-        # subsystem — sync results, not transcripts).
-        wipe = None
-        if not self._aaf_mode:
-            wipe = tk.Label(row, text="🗑", font=FB, bg=initial_bg, fg=SUB,
-                            cursor="hand2", padx=4)
-            wipe.pack(side="left")
-            tint_refs.append(wipe)
+        # 🗑 — wipe cache for this file only (transcript + assigned-token
+        # pull results).  Lets the user re-transcribe / re-reconcile one
+        # outlier after fixing a bad pool assignment WITHOUT invalidating
+        # the cache for every other file they've already brought over
+        # the line.  Shown on every MediaPool row — MediaPool is only
+        # ever instantiated for the Script→Session flow (the AAF→XML
+        # workflow has its own pool in aaf_workflow.py), so there's no
+        # workflow to hide from.
+        wipe = tk.Label(row, text="🗑", font=FB, bg=initial_bg, fg=SUB,
+                        cursor="hand2", padx=4)
+        wipe.pack(side="left")
+        tint_refs.append(wipe)
 
         rm = tk.Label(row, text="✕", font=FB, bg=initial_bg, fg=SUB,
                       cursor="hand2", padx=6)
@@ -845,9 +845,8 @@ class MediaPool(tk.Frame):
                "link_lbl": link_lbl, "rm_lbl": rm}
         self._rows.append(rec)
         rm.bind("<Button-1>", lambda e, r=rec: self._remove(r))
-        if wipe is not None:
-            wipe.bind("<Button-1>",
-                       lambda e, r=rec: self._wipe_cache(r))
+        wipe.bind("<Button-1>",
+                   lambda e, r=rec: self._wipe_cache(r))
 
         self._dz_lbl.config(text="")
         self._refresh_count()
