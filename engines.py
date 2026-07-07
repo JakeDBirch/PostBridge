@@ -1412,9 +1412,35 @@ def _mix_dynaudnorm(path):
     os.replace(tmp, path)
 
 
+def _stable_mix_cache_path(paths):
+    """Content-addressed path in the transcript cache for the mixed
+    result of `paths`.  Key: md5(sorted (abspath, mtime, size)).
+    Returns None when no cache directory is set (falls back to temp)."""
+    if not _cache_dir or not paths:
+        return None
+    try:
+        parts = []
+        for p in paths:
+            ap = os.path.abspath(p)
+            try:
+                st = os.stat(ap)
+                mt = round(st.st_mtime, 2)
+                sz = st.st_size
+            except OSError:
+                mt, sz = 0, 0
+            parts.append((ap.lower(), mt, sz))
+        parts.sort()
+        digest = hashlib.md5(
+            json.dumps(parts, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        return os.path.join(_cache_dir, "mix_{}.wav".format(digest))
+    except Exception:
+        return None
+
+
 def mix_for_transcript(paths):
     """
-    Mix a list of audio file paths into a single temp 16 kHz mono WAV
+    Mix a list of audio file paths into a single 16 kHz mono WAV
     suitable for Whisper transcription.
 
     Each track receives:
@@ -1422,10 +1448,29 @@ def mix_for_transcript(paths):
       2. Speech-weighted level matching so all participants are roughly equal.
       3. A dynaudnorm pass on the final mix to even out dynamic speakers.
 
-    Returns the path of the temp file.  The caller must delete it after use.
-    Single-element lists are supported (still gated + normed for consistency).
+    CACHE: writes to a CONTENT-ADDRESSED path in .pb_cache/ keyed by the
+    sorted (abspath, mtime, size) of the inputs.  Second and subsequent
+    reconciles of the same token with the same source files find the
+    cached mix and return early — no re-mix, and the .pb_transcript.json
+    sidecar next to it means Whisper is skipped too.  If any input's
+    mtime or size changes, or a new file is added, the mix key changes
+    and a fresh mix is generated.
+
+    Returns the mix WAV path.  Callers should NOT delete the file when
+    the return path lives under `engines._cache_dir` (it's persistent);
+    the temp-file fallback (when the cache dir is unset) is still the
+    caller's responsibility.
     """
     import numpy as np
+
+    # ── Fast path: mix already cached and inputs unchanged ────────────────
+    cached_path = _stable_mix_cache_path(paths)
+    if cached_path and os.path.isfile(cached_path):
+        try:
+            if os.path.getsize(cached_path) > 44:   # >= a WAV header
+                return cached_path
+        except OSError:
+            pass
 
     track_data = []
     for path in paths:
@@ -1456,20 +1501,25 @@ def mix_for_transcript(paths):
     if peak > 1e-9:
         mixed *= _MIX_PEAK_TARGET / peak
 
-    # Write to a temp file
-    fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="_pb_mix_")
-    os.close(fd)
+    # Prefer the content-addressed cache path when a cache dir is set;
+    # fall back to a random temp file otherwise (old behaviour).
+    if cached_path:
+        out_path = cached_path
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    else:
+        fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="_pb_mix_")
+        os.close(fd)
     pcm16 = (np.clip(mixed, -1.0, 1.0) * 32767).astype(np.int16)
-    with wave.open(tmp_path, "wb") as wf:
+    with wave.open(out_path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(_MIX_SR)
         wf.writeframes(pcm16.tobytes())
 
     # Dynamic normalization pass
-    _mix_dynaudnorm(tmp_path)
+    _mix_dynaudnorm(out_path)
 
-    return tmp_path
+    return out_path
 
 
 def mix_reference_audio(paths, out_path, sample_rate=48000):

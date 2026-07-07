@@ -1229,20 +1229,54 @@ class MediaPool(tk.Frame):
         # equals this row's token.  That's the exact set of pulls that
         # will be recomputed on the next reconcile.
         cache_dir = getattr(engines, "_cache_dir", None)
-        n_pulls = 0
+        n_pulls, n_mixes = 0, 0
         if cache_dir and os.path.isdir(cache_dir):
             for _fn in os.listdir(cache_dir):
-                if not _fn.startswith("pull_") or not _fn.endswith(".json"):
-                    continue
                 p = os.path.join(cache_dir, _fn)
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        d = json.load(f)
-                    result = d.get("result") if isinstance(d, dict) else None
-                    if isinstance(result, dict) and result.get("token") == tok:
-                        os.remove(p); n_pulls += 1
-                except Exception:
-                    continue
+                if _fn.startswith("pull_") and _fn.endswith(".json"):
+                    try:
+                        with open(p, encoding="utf-8") as f:
+                            d = json.load(f)
+                        result = d.get("result") if isinstance(d, dict) else None
+                        if isinstance(result, dict) and result.get("token") == tok:
+                            os.remove(p); n_pulls += 1
+                    except Exception:
+                        continue
+
+        # For MULTI-FILE tokens (interview session pairs, VO L+R tracks),
+        # reconcile mixes the sources to a content-addressed WAV under
+        # .pb_cache/mix_{md5}.wav and transcribes THAT.  If the pool
+        # assignment for this token now points at a different set of
+        # source files, the OLD mix (and its sidecar transcript) are
+        # stale from this token's perspective.  Delete any mix whose
+        # deterministic path is what THIS row's audio would combine
+        # into with any other file already in the pool — but only when
+        # the token has multiple assignments (a genuine mix scenario).
+        try:
+            all_paths_for_tok = []
+            for _r in self._rows:
+                if _r.get("var") and _r["var"].get() == tok:
+                    _p = _r.get("path")
+                    if _p:
+                        all_paths_for_tok.append(_p)
+            if len(all_paths_for_tok) >= 2 and cache_dir:
+                mix_p = engines._stable_mix_cache_path(all_paths_for_tok)
+                if mix_p and os.path.isfile(mix_p):
+                    os.remove(mix_p); n_mixes += 1
+                # Sidecar next to the mix — same stem.
+                if mix_p:
+                    _stem, _ = os.path.splitext(mix_p)
+                    sc = _stem + ".pb_transcript.json"
+                    if os.path.isfile(sc):
+                        os.remove(sc)
+                # Also drop the internal .pb_cache/{md5-of-mix-path}.json
+                # transcript entry keyed off the mix path.
+                if mix_p:
+                    _tc = engines._cache_path(mix_p)
+                    if _tc and os.path.isfile(_tc):
+                        os.remove(_tc)
+        except Exception:
+            pass
 
         # Flash ✓ on the button briefly.
         try:
@@ -1254,14 +1288,17 @@ class MediaPool(tk.Frame):
         except Exception:
             pass
 
+        _mix_note = ("\n\nAlso dropped the cached mix + its transcript "
+                     "for this multi-file token, since the pool now "
+                     "points at a different combination." if n_mixes
+                     else "")
         messagebox.showinfo(
             "Ready to redo [{}]".format(tok),
-            "Cleared {} cached pull result{} for token [{}].\n\n"
-            "Run reconcile — just these pulls will redo; the {} others "
-            "(and every other token) keep their cache and land "
+            "Cleared {} cached pull result{} for token [{}].{}\n\n"
+            "Run reconcile — just these pulls will redo; the rest (and "
+            "every other token) keep their cache and land "
             "instantly.".format(
-                n_pulls, "s" if n_pulls != 1 else "", tok,
-                "rest"))
+                n_pulls, "s" if n_pulls != 1 else "", tok, _mix_note))
 
     def _refresh_count(self):
         n = len(self._rows)

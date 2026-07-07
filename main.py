@@ -4478,13 +4478,25 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # torn-down panel).
         self._ui(self._xc_reset)
 
-        # ── Build transcript_sources: mix multi-file tokens to a temp WAV ────
-        # Single-file tokens pass through unchanged.  Mix files from the previous
-        # run are cleaned up here (not in _finish_reconcile) so they stay alive
-        # through the whole Step 4 editing session — the waveform editor uses them
-        # as source_audio so the user hears the full mixed audio while reviewing.
+        # ── Build transcript_sources: mix multi-file tokens ─────────────────
+        # Single-file tokens pass through unchanged.  Multi-file tokens are
+        # mixed by engines.mix_for_transcript() to a CONTENT-ADDRESSED path
+        # under .pb_cache/mix_{md5}.wav — same source files → same path →
+        # second reconcile finds the cached mix + its sidecar transcript and
+        # skips both the mix pass and Whisper.  See mix_for_transcript().
+        #
+        # Older versions used tempfile.mkstemp so mixes had random names and
+        # never survived across runs; those old temps are cleaned up here.
+        # Cached mixes under _cache_dir are LEFT ALONE so they persist and
+        # get cache hits next time.
+        _cache_root = getattr(engines, "_cache_dir", None)
         for _old in getattr(self, "_temp_mix_files", []):
             try:
+                # Preserve any path that's inside the persistent cache dir;
+                # only clear old-style random temp files.
+                if (_cache_root and
+                        os.path.abspath(_old).startswith(os.path.abspath(_cache_root))):
+                    continue
                 os.remove(_old)
             except Exception:
                 pass
