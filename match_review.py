@@ -146,7 +146,8 @@ class MatchReviewDialog:
                  quote_text="", matched_text="", words=None,
                  context_before="", context_after="",
                  scripted_tc="",
-                 on_accept=None, fps=24.0):
+                 on_accept=None, fps=24.0,
+                 pool_by_token=None):
         self._parent          = parent
         self._audio_path      = source_audio
         self._on_accept       = on_accept
@@ -157,6 +158,16 @@ class MatchReviewDialog:
         self._context_before  = context_before or ""
         self._context_after   = context_after  or ""
         self._scripted_tc     = scripted_tc or ""
+        # Retained for the "copy corrected @PULL header" action in the
+        # cross-token search: the current pull's token label and the
+        # scripted quote text.
+        self._current_token   = title or ""
+        self._quote_text      = quote_text or ""
+        # Optional {token: [audio_paths]} map so the search bar can
+        # cross-check phrases against every OTHER pool file's
+        # .pb_transcript.json sidecar — used when the assigned token is
+        # itself wrong.  Falls back to the just-this-file default.
+        self._pool_by_token   = pool_by_token or {title: [source_audio]}
         self._words           = [w for w in (words or [])
                                   if isinstance(w, dict) and "start" in w]
 
@@ -525,6 +536,28 @@ class MatchReviewDialog:
         self._search_count_lbl = tk.Label(srow, text="", font=FB,
                                           bg=BG, fg=SUB)
         self._search_count_lbl.pack(side="left", padx=(6, 0))
+
+        # 🌐 All pulls — search across every other token's transcript
+        # sidecars.  When the phrase is nowhere in THIS file (or the
+        # user suspects the assigned token was wrong to begin with),
+        # the cross-token panel below surfaces hits with their file /
+        # token / timecode + a one-click "copy corrected @PULL header"
+        # so the user can paste the fix into the script and re-reconcile.
+        self._search_all_var = tk.BooleanVar(value=False)
+        _all_cb = tk.Checkbutton(srow, text="🌐 all pulls",
+                                  variable=self._search_all_var,
+                                  font=FB, bg=BG, fg=TEXT,
+                                  selectcolor=BG, activebackground=BG,
+                                  activeforeground=TEXT, cursor="hand2",
+                                  bd=0, padx=4, pady=0,
+                                  highlightthickness=0,
+                                  command=lambda: self._search_update())
+        _all_cb.pack(side="right", padx=(0, 4))
+
+        # Cross-token results panel — packed but empty by default.  Fills
+        # in when "all pulls" is on and there are hits in OTHER files.
+        self._search_xtok_frame = tk.Frame(win, bg=BG)
+        self._search_xtok_frame.pack(fill="x", padx=12, pady=(0, 0))
 
         # ── Playback row ──────────────────────────────────────────────────
         prow = tk.Frame(win, bg=BG)
@@ -1685,10 +1718,13 @@ class MatchReviewDialog:
 
     def _search_update(self):
         """Trace callback: recompute matches for the current query, jump
-        to the first, refresh the count label + redraw word timeline."""
+        to the first, refresh the count label + redraw word timeline.
+        Also refreshes the cross-token results panel when "all pulls"
+        is on."""
         q = self._search_norm(self._search_var.get())
         self._search_query = q
         self._search_hits  = []
+        self._search_xtok_refresh()   # always clear/refresh the panel
         if not q or not self._words:
             self._search_idx = 0
             if hasattr(self, "_search_count_lbl"):
@@ -1765,6 +1801,127 @@ class MatchReviewDialog:
     def _search_clear(self):
         try:
             self._search_var.set("")
+        except tk.TclError:
+            pass
+
+    def _find_phrase_in_words(self, q_words, words):
+        """Return [(word_idx, in_s, out_s), …] for every match of the
+        phrase (list of already-normalised query words) in a word list.
+        Same normalisation as the in-file search so cross-file hits use
+        the same matching semantics."""
+        if not q_words or not words:
+            return []
+        n_q = len(q_words)
+        w_first = []
+        for w in words:
+            t = self._search_norm(w.get("word", ""))
+            w_first.append(t.split()[0] if t else "")
+        hits = []
+        for i in range(len(w_first) - n_q + 1):
+            if w_first[i:i + n_q] == q_words:
+                in_s  = float(words[i].get("start", 0))
+                out_s = float(words[i + n_q - 1].get("end", in_s))
+                hits.append((i, in_s, out_s, words))
+        return hits
+
+    def _search_xtok_refresh(self):
+        """Rebuild the cross-token results panel from the current query.
+        Reads sidecars for every pool file that is NOT this pull's own
+        audio, finds all phrase matches, and packs a row per hit with
+        [token] file @ HH:MM:SS-HH:MM:SS + context + a Copy button that
+        puts a corrected @PULL header on the clipboard."""
+        panel = getattr(self, "_search_xtok_frame", None)
+        if panel is None:
+            return
+        for w in panel.winfo_children():
+            try: w.destroy()
+            except tk.TclError: pass
+        if not getattr(self, "_search_all_var", None) or not self._search_all_var.get():
+            return
+        q = self._search_query
+        if not q:
+            return
+        q_words = q.split()
+        try:
+            from engines import pb_transcript_load
+        except Exception:
+            return
+        # Walk every pool token / audio path that isn't this pull's own.
+        _own = os.path.abspath(self._audio_path or "")
+        rows = []   # (tok, audio_path, in_s, out_s, ctx_text)
+        for tok, paths in (self._pool_by_token or {}).items():
+            for ap in paths:
+                if not ap or os.path.abspath(ap) == _own:
+                    continue
+                try:
+                    words, _ = pb_transcript_load(ap)
+                except Exception:
+                    words = None
+                if not words:
+                    continue
+                for i, in_s, out_s, _ws in self._find_phrase_in_words(q_words, words):
+                    j0 = max(0, i - 3)
+                    j1 = min(len(words), i + len(q_words) + 3)
+                    ctx = " ".join(w.get("word", "") for w in words[j0:j1])
+                    rows.append((tok, ap, in_s, out_s, ctx))
+        if not rows:
+            tk.Label(panel, text="  no cross-token matches",
+                     font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(2, 0))
+            return
+        _lead = tk.Label(panel,
+                          text="  cross-token matches "
+                               "(◼ copy a corrected @PULL header):",
+                          font=FB, bg=BG, fg=SUB)
+        _lead.pack(anchor="w", pady=(2, 0))
+        for (tok, ap, in_s, out_s, ctx) in rows[:20]:
+            row = tk.Frame(panel, bg=SURF2,
+                            highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", padx=6, pady=1)
+            tk.Label(row, text="[{}]".format(tok), font=FBT,
+                      bg=SURF2, fg=ACCENT, padx=6, pady=2
+                      ).pack(side="left")
+            tk.Label(row, text=os.path.basename(ap), font=FB,
+                      bg=SURF2, fg=SUB, padx=4).pack(side="left")
+            tc = "{} — {}".format(self._fmt_tc(in_s), self._fmt_tc(out_s))
+            tk.Label(row, text=tc, font=FB, bg=SURF2, fg=TEXT, padx=6
+                      ).pack(side="left")
+            copy_lbl = tk.Label(row, text=" 📋 Copy ", font=FB,
+                                 bg=SURF3, fg=TEXT, cursor="hand2",
+                                 padx=6, pady=1, bd=0,
+                                 highlightbackground=BORDER, highlightthickness=1)
+            copy_lbl.pack(side="right", padx=(6, 6))
+            copy_lbl.bind("<Enter>", lambda e, w=copy_lbl: w.config(bg=ACCENT, fg=BG))
+            copy_lbl.bind("<Leave>", lambda e, w=copy_lbl: w.config(bg=SURF3, fg=TEXT))
+            copy_lbl.bind(
+                "<ButtonRelease-1>",
+                lambda e, t=tok, i=in_s, o=out_s: self._copy_fixed_pull_header(t, i, o))
+            tk.Label(row, text="  “{}”".format(ctx[:100]), font=FB,
+                      bg=SURF2, fg=SUB, anchor="w"
+                      ).pack(side="left", fill="x", expand=True)
+
+    def _fmt_tc(self, secs):
+        h, r = divmod(max(0.0, float(secs)), 3600)
+        m, s = divmod(r, 60)
+        return "{:02d}:{:02d}:{:02d}".format(int(h), int(m), int(s))
+
+    def _copy_fixed_pull_header(self, new_token, in_s, out_s):
+        """Put a bracketed @PULL header for the CORRECT token on the
+        clipboard, plus the original scripted quote text.  User pastes
+        into the script, saves, re-reconciles."""
+        header = "[{} {}-{}]".format(new_token, self._fmt_tc(in_s), self._fmt_tc(out_s))
+        body   = self._quote_text.strip()
+        block  = header + ("\n" + body if body else "")
+        try:
+            self._win.clipboard_clear()
+            self._win.clipboard_append(block)
+            self._win.update()
+        except tk.TclError:
+            return
+        # Brief on-screen confirmation next to the search count label.
+        try:
+            self._search_count_lbl.config(
+                text=" ✓ copied header for [{}]".format(new_token),
+                fg=SUCCESS)
         except tk.TclError:
             pass
 

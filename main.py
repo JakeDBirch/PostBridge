@@ -6183,6 +6183,21 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if _stc_in and _stc_out else ""
                 )
 
+                # Build {token: [audio_paths]} from the media pool so the
+                # dialog's "🌐 all pulls" search can cross-check the
+                # phrase against every OTHER token's transcript sidecar.
+                # Used when the assigned token is itself wrong and the
+                # quote lives in a completely different audio file.
+                _pool_by_token = {}
+                try:
+                    for _prow in getattr(self._pool, "_rows", []) or []:
+                        _tok = _prow["var"].get()
+                        _pth = _prow.get("path")
+                        if _tok and _pth and _tok != "— unassigned —":
+                            _pool_by_token.setdefault(_tok, []).append(_pth)
+                except Exception:
+                    _pool_by_token = {}
+
                 MatchReviewDialog(self, sa, segs_r,
                                   title=r.get("token", ""),
                                   quote_text=r.get("quote_text", ""),
@@ -6191,7 +6206,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                   context_after=_ctx_after,
                                   scripted_tc=_scripted_tc,
                                   words=_words,
-                                  on_accept=_accept, fps=fps)
+                                  on_accept=_accept, fps=fps,
+                                  pool_by_token=_pool_by_token)
 
             # ── Bind labels ────────────────────────────────────────────────────
             ignore_lbl.bind("<Button-1>",
