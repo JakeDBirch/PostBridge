@@ -4484,6 +4484,21 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # under .pb_cache/mix_{md5}.wav — same source files → same path →
         # second reconcile finds the cached mix + its sidecar transcript and
         # skips both the mix pass and Whisper.  See mix_for_transcript().
+
+        # Diagnostic — surface the cache dir and any existing mixes so a
+        # cache-miss cascade is visible in the log instead of silent.
+        _cd = getattr(engines, "_cache_dir", None) or ""
+        _mix_count = 0
+        if _cd and os.path.isdir(_cd):
+            try:
+                _mix_count = sum(1 for f in os.listdir(_cd)
+                                 if f.startswith("mix_") and f.endswith(".wav"))
+            except OSError:
+                pass
+        self._log_line(
+            "Cache dir: {}  |  cached mixes on disk: {}".format(
+                _cd or "(unset)", _mix_count),
+            SUB)
         #
         # Older versions used tempfile.mkstemp so mixes had random names and
         # never survived across runs; those old temps are cleaned up here.
