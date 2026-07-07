@@ -1213,32 +1213,19 @@ class MediaPool(tk.Frame):
         import engines   # lazy so gui_components stays leaf-ish
         fn = os.path.basename(path)
 
-        if not messagebox.askyesno(
-                "Redo pulls for [{}]?".format(tok),
-                "Delete every cached reconciliation result filed under "
-                "token [{}] so the next reconcile REDOES those pulls "
-                "against the file this row now points at:\n\n"
-                "  {}\n\n"
-                "The audio transcript is preserved.  Every other "
-                "token's pulls keep their cache and stay instant on "
-                "the next run.".format(tok, fn),
-                default="no"):
-            return
+        # Ask which layer(s) to invalidate.  Three named scopes cascade
+        # correctly because of content-addressing: dropping the mix
+        # forces a new transcript AND new pulls (mix path is the
+        # transcript's key); dropping the transcript forces new pulls
+        # (transcript path is the pull key).
+        scope = self._ask_wipe_scope(tok, fn)
+        if scope is None:
+            return   # user cancelled
 
-        # Delete .pb_cache/pull_*.json where the stored result.token
-        # equals this row's token.  That's the ONLY thing this button
-        # needs to do.  Mixes and mix-transcripts are content-addressed
-        # by the sorted (abspath, mtime, size) of their INPUT files
-        # (engines._stable_mix_cache_path); they are TOKEN-AGNOSTIC.
-        # If the pool now points this token at the same files another
-        # token previously used, the mix + transcript are still valid —
-        # deleting them here would force a redundant re-mix and re-
-        # Whisper of identical audio content (that was the 989b0ec bug
-        # the multi-agent audit surfaced).  Same files → same mix hash
-        # → cache hit.  Different files → different hash → fresh mix
-        # naturally.  Either way, no explicit invalidation needed.
         cache_dir = getattr(engines, "_cache_dir", None)
-        n_pulls = 0
+        n_pulls, n_transcripts, n_mixes = 0, 0, 0
+
+        # 1. Pull results — always deleted (this is the smallest scope).
         if cache_dir and os.path.isdir(cache_dir):
             for _fn in os.listdir(cache_dir):
                 if not (_fn.startswith("pull_") and _fn.endswith(".json")):
@@ -1253,7 +1240,48 @@ class MediaPool(tk.Frame):
                 except Exception:
                     continue
 
-        # Flash ✓ on the button briefly.
+        # Resolve THIS token's transcript path (mix path for multi-file,
+        # source path for single-file) so we can target its transcript /
+        # mix without touching other tokens'.
+        paths_for_tok = []
+        for _r in self._rows:
+            if _r.get("var") and _r["var"].get() == tok:
+                _p = _r.get("path")
+                if _p: paths_for_tok.append(_p)
+        if len(paths_for_tok) >= 2:
+            try:
+                transcript_key_path = engines._stable_mix_cache_path(paths_for_tok)
+            except Exception:
+                transcript_key_path = None
+        elif len(paths_for_tok) == 1:
+            transcript_key_path = paths_for_tok[0]
+        else:
+            transcript_key_path = None
+
+        # 2. Transcript — deleted for "re-transcribe" and "re-mix" scopes.
+        if scope in ("transcribe", "mix") and transcript_key_path:
+            try:
+                # .pb_transcript.json sidecar next to the media/mix
+                sc = engines.pb_transcript_path(transcript_key_path)
+                if sc and os.path.isfile(sc):
+                    os.remove(sc); n_transcripts += 1
+                # Internal .pb_cache/{md5}.json transcript entry
+                tc = engines._cache_path(transcript_key_path)
+                if tc and os.path.isfile(tc):
+                    os.remove(tc); n_transcripts += 1
+            except Exception:
+                pass
+
+        # 3. Mix WAV — deleted only for "re-mix" scope, and only if
+        # this token is genuinely multi-file (a mix exists).
+        if scope == "mix" and len(paths_for_tok) >= 2 and transcript_key_path:
+            try:
+                if os.path.isfile(transcript_key_path):
+                    os.remove(transcript_key_path); n_mixes += 1
+            except Exception:
+                pass
+
+        # Flash ✓ on the button briefly so the click is confirmed.
         try:
             for _child in rec["row"].winfo_children():
                 if isinstance(_child, tk.Label) and _child.cget("text") == "🗑":
@@ -1263,15 +1291,106 @@ class MediaPool(tk.Frame):
         except Exception:
             pass
 
+        _summary = ["{} cached pull result{}".format(n_pulls, "s" if n_pulls != 1 else "")]
+        if n_transcripts:
+            _summary.append("{} transcript entr{}".format(
+                n_transcripts, "ies" if n_transcripts != 1 else "y"))
+        if n_mixes:
+            _summary.append("{} mixed audio file".format(n_mixes))
         messagebox.showinfo(
-            "Ready to redo [{}]".format(tok),
-            "Cleared {} cached pull result{} for token [{}].\n\n"
-            "Run reconcile — just these pulls will redo.  Any mixed "
-            "transcript this token shares with other pool assignments "
-            "stays in cache (mix is content-addressed by input files, "
-            "not by token), so the next reconcile hits cache for the "
-            "audio side and re-runs only the pull matching.".format(
-                n_pulls, "s" if n_pulls != 1 else "", tok))
+            "Cleared [{}]".format(tok),
+            "Removed for token [{}]:\n  • {}\n\n"
+            "Run reconcile — the redo happens against whichever file(s) "
+            "the pool now points this token at.  Every other token's "
+            "cache is untouched.".format(tok, "\n  • ".join(_summary)))
+
+    def _ask_wipe_scope(self, tok, fn):
+        """Modal chooser with 3 named scopes.  Returns 'pulls',
+        'transcribe', 'mix', or None (cancel).  The scopes cascade
+        naturally through content-addressing — see _wipe_cache."""
+        win = tk.Toplevel(self)
+        win.title("Redo [{}]".format(tok))
+        win.configure(bg=BG)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        result = {"scope": None}
+
+        tk.Label(win, text="Redo work for token  [{}]".format(tok),
+                 font=FBT, bg=BG, fg=TEXT
+                 ).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, text="This row: {}".format(fn),
+                 font=FB, bg=BG, fg=SUB
+                 ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        scope_var = tk.StringVar(value="pulls")
+        _OPTS = [
+            ("pulls",
+             "Redo pull matching only  (fast)",
+             "Deletes cached reconciliation results for this token.  "
+             "Keeps the transcript and the mixed audio.  Use when the "
+             "pool assignment was wrong but the audio is the same "
+             "content."),
+            ("transcribe",
+             "Re-transcribe  (medium)",
+             "Also deletes the cached transcript, so Whisper runs "
+             "again for this token.  Keeps the mixed audio (it's "
+             "reused).  Use if the transcript has errors or you "
+             "switched Whisper models."),
+            ("mix",
+             "Re-mix + re-transcribe  (slow)",
+             "Also deletes the mixed audio file, so multi-file tokens "
+             "get remixed from source.  Use if you fixed the mix "
+             "quality or changed which files feed a multi-file token."),
+        ]
+        for key, title, desc in _OPTS:
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", padx=16, pady=(2, 0))
+            rb = tk.Radiobutton(row, text=title, variable=scope_var,
+                                value=key, font=FBT, bg=BG, fg=TEXT,
+                                selectcolor=BG, activebackground=BG,
+                                activeforeground=TEXT,
+                                highlightthickness=0, bd=0)
+            rb.pack(anchor="w")
+            tk.Label(row, text="   " + desc, font=FB, bg=BG, fg=SUB,
+                     wraplength=460, justify="left"
+                     ).pack(anchor="w", padx=(24, 0), pady=(0, 4))
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=16, pady=(10, 14))
+        cancel = tk.Label(nav, text="  Cancel  ", font=FB, bg=SURF3, fg=TEXT,
+                          cursor="hand2", padx=8, pady=4, bd=0,
+                          highlightbackground=BORDER, highlightthickness=1)
+        cancel.pack(side="left")
+        cancel.bind("<Enter>", lambda e: cancel.config(bg="#5a2020"))
+        cancel.bind("<Leave>", lambda e: cancel.config(bg=SURF3))
+        cancel.bind("<ButtonRelease-1>", lambda e: win.destroy())
+
+        go = tk.Label(nav, text="  Redo  ", font=FBT, bg=SUCCESS, fg=TEXT,
+                      cursor="hand2", padx=12, pady=4, bd=0,
+                      highlightbackground=BORDER, highlightthickness=1)
+        go.pack(side="right")
+        go.bind("<Enter>", lambda e: go.config(bg="#4a9a51"))
+        go.bind("<Leave>", lambda e: go.config(bg=SUCCESS))
+        def _apply():
+            result["scope"] = scope_var.get()
+            win.destroy()
+        go.bind("<ButtonRelease-1>", lambda e: _apply())
+        win.bind("<Return>", lambda e: _apply())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        pw = self.winfo_toplevel().winfo_width()
+        ph = self.winfo_toplevel().winfo_height()
+        px = self.winfo_toplevel().winfo_rootx()
+        py = self.winfo_toplevel().winfo_rooty()
+        w = max(520, win.winfo_reqwidth())
+        h = max(320, win.winfo_reqheight())
+        win.geometry("{}x{}+{}+{}".format(
+            w, h, px + max(0, (pw - w) // 2), py + max(0, (ph - h) // 2)))
+        win.wait_window()
+        return result["scope"]
 
     def _refresh_count(self):
         n = len(self._rows)
