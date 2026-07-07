@@ -59,17 +59,57 @@ def search_transcript(words, phrase, fuzzy=False, ratio=0.7):
         out.append((in_s, out_s, ctx))
     return out
 
+def _pause_if_interactive(msg="Press Enter to exit…"):
+    """Wait for the user before exiting when we're likely running via a
+    double-click (Windows explorer / no argv beyond the script), so the
+    console doesn't slam shut before results are visible."""
+    try:
+        input("\n" + msg)
+    except EOFError:
+        pass
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phrase", help="the quote text to hunt for")
+    ap.add_argument("phrase", nargs="?", default=None,
+                    help="the quote text to hunt for (prompted if omitted)")
     ap.add_argument("--root", default=r"F:\Blood Trails",
                     help="folder to scan recursively for .pb_transcript.json (default: F:\\Blood Trails)")
     ap.add_argument("--fuzzy", action="store_true",
                     help="approximate match (word overlap ratio >= 0.7)")
     args = ap.parse_args()
 
+    # Interactive mode: when double-clicked from Explorer there is no
+    # phrase argument and the console would just close on argparse's
+    # usage error.  Prompt inline instead.
+    interactive = args.phrase is None
+    if interactive:
+        print("PostBridge — search for a phrase across every .pb_transcript.json")
+        print("=" * 88)
+        try:
+            phrase = input("Phrase to find: ").strip()
+        except EOFError:
+            phrase = ""
+        if not phrase:
+            print("(no phrase entered — nothing to search)")
+            _pause_if_interactive()
+            return
+        try:
+            root = input("Root folder to search [{}]: ".format(args.root)).strip()
+        except EOFError:
+            root = ""
+        if root:
+            args.root = root
+        try:
+            fyn = input("Fuzzy match? (y/N): ").strip().lower()
+        except EOFError:
+            fyn = ""
+        args.phrase = phrase
+        args.fuzzy  = fyn.startswith("y")
+
     if not os.path.isdir(args.root):
-        print("root does not exist:", args.root); sys.exit(2)
+        print("root does not exist:", args.root)
+        if interactive: _pause_if_interactive()
+        sys.exit(2)
 
     t0 = time.time()
     scanned, matched, total_hits = 0, 0, 0
@@ -111,5 +151,15 @@ def main():
         print("no matches — try --fuzzy for approximate matching, "
               "or shorten the phrase")
 
+    if interactive:
+        _pause_if_interactive()
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Never let the console slam shut on a double-click without
+        # showing WHY it died.
+        import traceback
+        traceback.print_exc()
+        _pause_if_interactive("An error occurred. Press Enter to close…")
