@@ -4551,14 +4551,37 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 transcript_sources[tok] = None
             elif len(paths) == 1:
                 transcript_sources[tok] = paths[0]
+                self._log_line(
+                    "  [{}] source: {}".format(
+                        tok, os.path.basename(paths[0])), SUB)
             else:
                 try:
+                    # Peek at the content-addressed mix path BEFORE
+                    # calling — if it already exists, mix_for_transcript
+                    # will silently return it and we want the log to
+                    # reflect a cache hit rather than pretending we
+                    # just re-mixed.  Falls back to False when the
+                    # cache dir isn't set, in which case the temp-file
+                    # branch always runs the mix.
+                    _mix_cache_p = None
+                    try:
+                        _mix_cache_p = engines._stable_mix_cache_path(paths)
+                    except Exception:
+                        _mix_cache_p = None
+                    _was_cached = bool(
+                        _mix_cache_p and os.path.isfile(_mix_cache_p))
                     tmp = engines.mix_for_transcript(paths)
                     transcript_sources[tok] = tmp
                     self._temp_mix_files.append(tmp)
-                    self._log_line(
-                        "  [{}] mixed {} tracks → {}".format(
-                            tok, len(paths), os.path.basename(tmp)), SUB)
+                    if _was_cached:
+                        self._log_line(
+                            "  [{}] mix cached ({} tracks) → {}".format(
+                                tok, len(paths), os.path.basename(tmp)),
+                            SUCCESS)
+                    else:
+                        self._log_line(
+                            "  [{}] mixed {} tracks → {}".format(
+                                tok, len(paths), os.path.basename(tmp)), SUB)
                 except Exception as exc:
                     self._log_line(
                         "  [{}] mix failed ({}); falling back to first track".format(
