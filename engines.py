@@ -215,12 +215,27 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     Extract a short audio segment to a WAV file for playback preview.
 
     Returns True on success, raises RuntimeError on failure.
+
+    Uses ffmpeg's "double-seek" pattern (fast -ss BEFORE -i, accurate
+    -ss AFTER -i) so the extract is sample-accurate at the target time
+    without the decoder-warmup transient that pure fast-seek produces —
+    which was audible in the match-review playback as a fade-in at the
+    start of every clip.  The pre-seek keeps the operation fast even
+    on long source files by getting the demuxer close before the
+    accurate seek does the last leg.
     """
-    cmd = _ffmpeg_cmd() + [
-        "-y",
-        "-ss", "{:.3f}".format(max(0.0, start_s)),
+    start_s = max(0.0, start_s)
+    _PRE_BUFFER_S = 2.0    # fast-seek land this far before the target
+    if start_s > _PRE_BUFFER_S:
+        pre_seek  = start_s - _PRE_BUFFER_S
+        post_seek = _PRE_BUFFER_S
+        seek_args = (["-ss", "{:.3f}".format(pre_seek), "-i", media_path,
+                      "-ss", "{:.3f}".format(post_seek)])
+    else:
+        # Near the start of the file — just accurate-seek from 0.
+        seek_args = (["-i", media_path, "-ss", "{:.3f}".format(start_s)])
+    cmd = _ffmpeg_cmd() + ["-y"] + seek_args + [
         "-t", "{:.3f}".format(duration_s),
-        "-i", media_path,
         "-ar", str(sample_rate), "-ac", "1",
         "-acodec", "pcm_s16le",
         "-vn", out_wav_path,

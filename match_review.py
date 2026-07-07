@@ -201,6 +201,13 @@ class MatchReviewDialog:
         self._words_draw_key  = None      # cache key for _draw_words dedup
         self._playback_end_file = None    # file-time at which playback should auto-stop
 
+        # Word-search state — for hunting a phrase in a transcript that
+        # diverges wildly from what the script said.  self._search_hits
+        # holds [(word_idx, in_s, out_s), …] for the current query.
+        self._search_query  = ""
+        self._search_hits   = []
+        self._search_idx    = 0   # which hit is currently focussed
+
         # Silence snap
         self._silence_boundaries = []   # sorted list of all silence-edge timestamps (s)
         self._sil_starts         = []   # subset: silence onset times (speech ends here)
@@ -473,6 +480,41 @@ class MatchReviewDialog:
         win.bind("<Control-Z>", lambda e: (self._redo_wf(), "break")[1])
         win.bind("<Control-Shift-z>", lambda e: (self._redo_wf(), "break")[1])
         win.bind("<Control-Shift-Z>", lambda e: (self._redo_wf(), "break")[1])
+
+        # ── Transcript search row ─────────────────────────────────────────
+        # Type a phrase, prev/next steps through matches on the word
+        # timeline and centres the view + playhead on each hit.  Handy
+        # when the transcript diverges wildly from the scripted quote
+        # and you need to hunt for the phrase's real location.
+        srow = tk.Frame(win, bg=BG)
+        srow.pack(fill="x", padx=12, pady=(4, 0))
+        tk.Label(srow, text="🔎 Search transcript:",
+                 font=FB, bg=BG, fg=SUB).pack(side="left")
+        self._search_var = tk.StringVar()
+        _sent = tk.Entry(srow, textvariable=self._search_var, font=FB,
+                         bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                         relief="flat", bd=4, width=32)
+        _sent.pack(side="left", padx=(6, 4))
+        _sent.bind("<Return>",   lambda e: self._search_next())
+        _sent.bind("<KP_Enter>", lambda e: self._search_next())
+        _sent.bind("<Escape>",   lambda e: self._search_clear())
+        self._search_var.trace_add("write",
+                                    lambda *_: self._search_update())
+
+        def _sb(text, cmd):
+            b = tk.Label(srow, text=text, font=FB, bg=SURF3, fg=TEXT,
+                         cursor="hand2", padx=8, pady=2, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            b.pack(side="left", padx=(0, 4))
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT, fg=BG))
+            b.bind("<Leave>", lambda e, w=b: w.config(bg=SURF3, fg=TEXT))
+            b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
+            return b
+        _sb("◀ Prev", self._search_prev)
+        _sb("Next ▶", self._search_next)
+        self._search_count_lbl = tk.Label(srow, text="", font=FB,
+                                          bg=BG, fg=SUB)
+        self._search_count_lbl.pack(side="left", padx=(6, 0))
 
         # ── Playback row ──────────────────────────────────────────────────
         prow = tk.Frame(win, bg=BG)
@@ -1130,6 +1172,21 @@ class MatchReviewDialog:
 
         # Fill with same cut/keep colouring as the waveform
         cv.create_rectangle(0, 0, w, 36, fill=_CUT_FILL, outline="")
+
+        # Search-hit backgrounds — one WARN band per hit, ACCENT for the
+        # currently-focussed one.  Drawn BEFORE the segment kept/cut
+        # rectangles so those still tint over unmatched areas, and
+        # BEFORE the word text so the text sits on top.
+        for _hi, (_widx, _hin, _hout) in enumerate(
+                getattr(self, "_search_hits", [])):
+            _hp = self._t_to_px(_hin)
+            _hq = self._t_to_px(_hout)
+            if _hq >= 0 and _hp <= w:
+                _col = ACCENT if _hi == self._search_idx else WARN
+                cv.create_rectangle(max(-2, _hp - 2), 0,
+                                     min(w + 2, _hq + 2), 36,
+                                     fill=_col, outline="", stipple="gray50")
+
         _nw = len(self._segments)
         for _wi, (_win, _wout) in enumerate(self._segments):
             _ei  = self._in_s  if _wi == 0          else _win
@@ -1604,6 +1661,102 @@ class MatchReviewDialog:
         n  = len(self._samples)
         self._view_start = max(0, min(n - w * self._spp, vs))
         self._draw()
+
+    # ── Transcript search ────────────────────────────────────────────────
+
+    _SEARCH_NORM_RE = None
+    @staticmethod
+    def _search_norm(s):
+        """Lowercase, strip punctuation, normalise smart quotes — matches
+        how the reconcile normalises words for text-fallback searches."""
+        import re as _re
+        s = (s or "").replace("’", "'").replace("‘", "'")
+        return _re.sub(r"[^a-z0-9']+", " ", s.lower()).strip()
+
+    def _search_update(self):
+        """Trace callback: recompute matches for the current query, jump
+        to the first, refresh the count label + redraw word timeline."""
+        q = self._search_norm(self._search_var.get())
+        self._search_query = q
+        self._search_hits  = []
+        if not q or not self._words:
+            self._search_idx = 0
+            if hasattr(self, "_search_count_lbl"):
+                try: self._search_count_lbl.config(text="", fg=SUB)
+                except tk.TclError: pass
+            self._words_draw_key = None  # force _draw_words to redraw
+            self._draw_words()
+            return
+        # Multi-word phrase support: split query into words, then look
+        # for a run of consecutive transcript words that match.
+        q_words = q.split()
+        n_q = len(q_words)
+        w_texts = [self._search_norm(w.get("word", "")) for w in self._words]
+        # Some entries may split into multiple tokens after normalisation;
+        # collapse them to their first token for the sequence compare.
+        w_first = [t.split()[0] if t else "" for t in w_texts]
+        for i in range(len(w_first) - n_q + 1):
+            if w_first[i:i + n_q] == q_words:
+                in_s  = float(self._words[i].get("start", 0))
+                out_s = float(self._words[i + n_q - 1].get("end", in_s))
+                self._search_hits.append((i, in_s, out_s))
+        self._search_idx = 0
+        self._search_update_count_lbl()
+        if self._search_hits:
+            self._search_focus_current()
+        else:
+            self._words_draw_key = None
+            self._draw_words()
+
+    def _search_update_count_lbl(self):
+        if not hasattr(self, "_search_count_lbl"):
+            return
+        try:
+            if not self._search_hits:
+                self._search_count_lbl.config(text="no matches", fg=WARN)
+            else:
+                self._search_count_lbl.config(
+                    text="{}/{}".format(self._search_idx + 1, len(self._search_hits)),
+                    fg=SUCCESS)
+        except tk.TclError:
+            pass
+
+    def _search_next(self):
+        if not self._search_hits:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_hits)
+        self._search_update_count_lbl()
+        self._search_focus_current()
+
+    def _search_prev(self):
+        if not self._search_hits:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_hits)
+        self._search_update_count_lbl()
+        self._search_focus_current()
+
+    def _search_focus_current(self):
+        """Centre the waveform view on the current search hit and park
+        the playhead on it so PLAY IN picks it up."""
+        if not self._search_hits:
+            return
+        _, in_s, out_s = self._search_hits[self._search_idx]
+        t_centre = (in_s + out_s) / 2.0
+        w = self._canvas_w
+        window_s = w * self._spp / self._sr
+        vs = int((t_centre - window_s * 0.5 - self._ctx_start) * self._sr)
+        n  = len(getattr(self, "_samples", []))
+        max_vs = max(0, n - w * self._spp) if n else 0
+        self._view_start  = max(0, min(max_vs, vs))
+        self._playhead_s  = in_s
+        self._words_draw_key = None
+        self._draw()
+
+    def _search_clear(self):
+        try:
+            self._search_var.set("")
+        except tk.TclError:
+            pass
 
     def _play_in(self):
         """Zoom to IN; stitched if PLAY EDIT on, else raw from IN."""
