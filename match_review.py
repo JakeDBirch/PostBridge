@@ -421,18 +421,16 @@ class MatchReviewDialog:
         tk.Label(nrow, text="(1 frame = {:.2f}ms)".format(self._frame_s * 1000),
                  font=FB, bg=BG, fg=SUB).pack(side="left", padx=(0, 12))
 
+        # ZOOM — only FIT stays as a button; wheel-scroll + keyboard
+        # shortcuts (+/-, r/t) still zoom, per the keybindings below.
         tk.Label(nrow, text="ZOOM", font=FB, bg=BG, fg=SUB).pack(side="left", padx=(0, 4))
-        for zlbl, zfactor in [("−", 1.5), ("+", 1.0 / 1.5), ("FIT", None)]:
-            zb = tk.Label(nrow, text=zlbl, font=FB, bg=SURF3, fg=TEXT,
+        _zfit = tk.Label(nrow, text="FIT", font=FB, bg=SURF3, fg=TEXT,
                           cursor="hand2", padx=8, pady=2, bd=0,
                           highlightbackground=BORDER, highlightthickness=1)
-            zb.pack(side="left", padx=1)
-            zb.bind("<Enter>", lambda e, w=zb: w.config(bg=ACCENT))
-            zb.bind("<Leave>", lambda e, w=zb: w.config(bg=SURF3))
-            if zfactor is None:
-                zb.bind("<ButtonRelease-1>", lambda e: self._zoom_fit())
-            else:
-                zb.bind("<ButtonRelease-1>", lambda e, f=zfactor: self._zoom_by(f))
+        _zfit.pack(side="left", padx=1)
+        _zfit.bind("<Enter>", lambda e, w=_zfit: w.config(bg=ACCENT))
+        _zfit.bind("<Leave>", lambda e, w=_zfit: w.config(bg=SURF3))
+        _zfit.bind("<ButtonRelease-1>", lambda e: self._zoom_fit())
 
         tk.Frame(nrow, bg=BG, width=20).pack(side="left")
         for slbl, side in [("SET IN", "in"), ("SET OUT", "out")]:
@@ -576,8 +574,6 @@ class MatchReviewDialog:
         self._play_edit_mode = tk.BooleanVar(value=True)
 
         _pb("\u25b6 PLAY", self._play_or_edit)
-        _pb("\u25b6 IN",   self._play_in)
-        _pb("\u25b6 OUT",  self._play_out)
         _pb("\u25a0 STOP", self._stop)
 
         # SKIP CUTS checkbox — stitches segments, skipping excised gaps (ON by default)
@@ -1824,12 +1820,20 @@ class MatchReviewDialog:
                 hits.append((i, in_s, out_s, words))
         return hits
 
+    _CTX_WORDS_BEFORE = 15
+    _CTX_WORDS_AFTER  = 15
+
     def _search_xtok_refresh(self):
         """Rebuild the cross-token results panel from the current query.
-        Reads sidecars for every pool file that is NOT this pull's own
-        audio, finds all phrase matches, and packs a row per hit with
-        [token] file @ HH:MM:SS-HH:MM:SS + context + a Copy button that
-        puts a corrected @PULL header on the clipboard."""
+        For every pool file that isn't this pull's audio, load the
+        sidecar and pack one row per phrase match with:
+          • [TOKEN] and file name
+          • the surrounding transcript sentence (match highlighted)
+          • ▶ AUDITION — plays the match's audio without disturbing
+            this dialog's own playhead / waveform
+          • ADOPT — reassigns this pull to that token + timecode and
+            closes the dialog (caller handles the pull-dict update).
+        """
         panel = getattr(self, "_search_xtok_frame", None)
         if panel is None:
             return
@@ -1846,9 +1850,8 @@ class MatchReviewDialog:
             from engines import pb_transcript_load
         except Exception:
             return
-        # Walk every pool token / audio path that isn't this pull's own.
         _own = os.path.abspath(self._audio_path or "")
-        rows = []   # (tok, audio_path, in_s, out_s, ctx_text)
+        rows = []   # (tok, audio_path, in_s, out_s, ctx_before, matched, ctx_after)
         for tok, paths in (self._pool_by_token or {}).items():
             for ap in paths:
                 if not ap or os.path.abspath(ap) == _own:
@@ -1860,70 +1863,163 @@ class MatchReviewDialog:
                 if not words:
                     continue
                 for i, in_s, out_s, _ws in self._find_phrase_in_words(q_words, words):
-                    j0 = max(0, i - 3)
-                    j1 = min(len(words), i + len(q_words) + 3)
-                    ctx = " ".join(w.get("word", "") for w in words[j0:j1])
-                    rows.append((tok, ap, in_s, out_s, ctx))
+                    n_q  = len(q_words)
+                    b0   = max(0, i - self._CTX_WORDS_BEFORE)
+                    a1   = min(len(words), i + n_q + self._CTX_WORDS_AFTER)
+                    before  = " ".join(w.get("word", "") for w in words[b0:i]).strip()
+                    matched = " ".join(w.get("word", "") for w in words[i:i + n_q]).strip()
+                    after   = " ".join(w.get("word", "") for w in words[i + n_q:a1]).strip()
+                    rows.append((tok, ap, in_s, out_s, before, matched, after))
         if not rows:
-            tk.Label(panel, text="  no cross-token matches",
-                     font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(2, 0))
+            tk.Label(panel, text="  no matches in other tokens",
+                     font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(4, 0))
             return
-        _lead = tk.Label(panel,
-                          text="  cross-token matches "
-                               "(◼ copy a corrected @PULL header):",
-                          font=FB, bg=BG, fg=SUB)
-        _lead.pack(anchor="w", pady=(2, 0))
-        for (tok, ap, in_s, out_s, ctx) in rows[:20]:
+        tk.Label(panel,
+                  text="  matches in other tokens — ▶ audition, then ADOPT "
+                       "to reassign this pull:",
+                  font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(4, 2))
+        for (tok, ap, in_s, out_s, before, matched, after) in rows[:15]:
             row = tk.Frame(panel, bg=SURF2,
                             highlightbackground=BORDER, highlightthickness=1)
             row.pack(fill="x", padx=6, pady=1)
-            tk.Label(row, text="[{}]".format(tok), font=FBT,
-                      bg=SURF2, fg=ACCENT, padx=6, pady=2
-                      ).pack(side="left")
-            tk.Label(row, text=os.path.basename(ap), font=FB,
-                      bg=SURF2, fg=SUB, padx=4).pack(side="left")
+
+            # Left header line: token / file / TC / action buttons.
+            head = tk.Frame(row, bg=SURF2)
+            head.pack(fill="x", padx=6, pady=(3, 0))
+            tk.Label(head, text="[{}]".format(tok), font=FBT,
+                      bg=SURF2, fg=ACCENT).pack(side="left")
+            tk.Label(head, text=os.path.basename(ap), font=FB,
+                      bg=SURF2, fg=SUB, padx=(8, 0)).pack(side="left")
             tc = "{} — {}".format(self._fmt_tc(in_s), self._fmt_tc(out_s))
-            tk.Label(row, text=tc, font=FB, bg=SURF2, fg=TEXT, padx=6
-                      ).pack(side="left")
-            copy_lbl = tk.Label(row, text=" 📋 Copy ", font=FB,
-                                 bg=SURF3, fg=TEXT, cursor="hand2",
-                                 padx=6, pady=1, bd=0,
-                                 highlightbackground=BORDER, highlightthickness=1)
-            copy_lbl.pack(side="right", padx=(6, 6))
-            copy_lbl.bind("<Enter>", lambda e, w=copy_lbl: w.config(bg=ACCENT, fg=BG))
-            copy_lbl.bind("<Leave>", lambda e, w=copy_lbl: w.config(bg=SURF3, fg=TEXT))
-            copy_lbl.bind(
+            tk.Label(head, text=tc, font=FB, bg=SURF2, fg=TEXT,
+                      padx=(10, 0)).pack(side="left")
+
+            # ADOPT button — closes with reassignment.  Placed first (on
+            # the right) so it's the visually dominant action.
+            adopt = tk.Label(head, text="  ADOPT  ", font=FBT,
+                              bg=SUCCESS, fg=TEXT, cursor="hand2",
+                              padx=6, pady=1, bd=0,
+                              highlightbackground=BORDER, highlightthickness=1)
+            adopt.pack(side="right", padx=(6, 0))
+            adopt.bind("<Enter>", lambda e, w=adopt: w.config(bg="#4a9a51"))
+            adopt.bind("<Leave>", lambda e, w=adopt: w.config(bg=SUCCESS))
+            adopt.bind(
                 "<ButtonRelease-1>",
-                lambda e, t=tok, i=in_s, o=out_s: self._copy_fixed_pull_header(t, i, o))
-            tk.Label(row, text="  “{}”".format(ctx[:100]), font=FB,
-                      bg=SURF2, fg=SUB, anchor="w"
-                      ).pack(side="left", fill="x", expand=True)
+                lambda e, t=tok, p=ap, i=in_s, o=out_s: self._xtok_adopt(t, p, i, o))
+
+            # ▶ AUDITION button — plays that segment from the OTHER
+            # file without disturbing this dialog's own playhead.
+            aud = tk.Label(head, text=" ▶ Audition ", font=FB,
+                            bg=SURF3, fg=TEXT, cursor="hand2",
+                            padx=6, pady=1, bd=0,
+                            highlightbackground=BORDER, highlightthickness=1)
+            aud.pack(side="right", padx=(6, 0))
+            aud.bind("<Enter>", lambda e, w=aud: w.config(bg=ACCENT, fg=BG))
+            aud.bind("<Leave>", lambda e, w=aud: w.config(bg=SURF3, fg=TEXT))
+            aud.bind(
+                "<ButtonRelease-1>",
+                lambda e, p=ap, i=in_s, o=out_s: self._audition_cross(p, i, o))
+
+            # Context body: sentence-ish window with the match tagged in
+            # ACCENT so the user can see it in situ.
+            ctx = tk.Text(row, height=2, wrap="word", bg=SURF2, fg=TEXT,
+                          font=FB, relief="flat", bd=0,
+                          padx=6, pady=(0, 4), highlightthickness=0)
+            ctx.pack(fill="x", padx=6, pady=(2, 4))
+            if before:  ctx.insert("end", "… " + before + " ")
+            match_start = ctx.index("insert")
+            ctx.insert("end", matched)
+            match_end   = ctx.index("insert")
+            if after:   ctx.insert("end", " " + after + " …")
+            ctx.tag_add("match", match_start, match_end)
+            ctx.tag_configure("match", foreground=ACCENT, font=FBT)
+            ctx.configure(state="disabled")
 
     def _fmt_tc(self, secs):
         h, r = divmod(max(0.0, float(secs)), 3600)
         m, s = divmod(r, 60)
         return "{:02d}:{:02d}:{:02d}".format(int(h), int(m), int(s))
 
-    def _copy_fixed_pull_header(self, new_token, in_s, out_s):
-        """Put a bracketed @PULL header for the CORRECT token on the
-        clipboard, plus the original scripted quote text.  User pastes
-        into the script, saves, re-reconciles."""
-        header = "[{} {}-{}]".format(new_token, self._fmt_tc(in_s), self._fmt_tc(out_s))
-        body   = self._quote_text.strip()
-        block  = header + ("\n" + body if body else "")
-        try:
-            self._win.clipboard_clear()
-            self._win.clipboard_append(block)
-            self._win.update()
-        except tk.TclError:
+    def _audition_cross(self, other_path, start_s, duration_or_end_s):
+        """Play a short clip from a DIFFERENT file than this pull's audio
+        — used by the ▶ Audition buttons on cross-token search hits.
+        Deliberately doesn't touch this dialog's own playhead / view /
+        segments so switching between auditions doesn't disturb the
+        review state you might want to keep if you decide NOT to adopt."""
+        # Signature accepts either (start, duration) or (start, end); if the
+        # second arg is bigger than start_s it's an END time.
+        if duration_or_end_s > start_s:
+            duration_s = max(0.4, duration_or_end_s - start_s)
+        else:
+            duration_s = max(0.4, duration_or_end_s)
+        # Give the played clip a bit of tail so short matches (2-3
+        # words) are actually audible in context.
+        duration_s += 2.0
+        import numpy as _np
+        import wave as _wave
+        out_wav = os.path.join(self._tmp_dir,
+                                "_aud_{}.wav".format(int(start_s * 1000)))
+
+        def _do():
+            extract_audio_segment(other_path, max(0.0, start_s), duration_s,
+                                   out_wav, sample_rate=_PLAYBACK_SR)
+            with _wave.open(out_wav, "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            arr  = _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
+            peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
+            if peak > 1e-6:
+                arr = arr / peak * 0.85
+            lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
+            if lead_samps:
+                arr = _np.concatenate(
+                    [_np.zeros(lead_samps, dtype=_np.float32), arr])
+            pcm = (arr * 32767).astype(_np.int16)
+            with _wave.open(out_wav, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2)
+                wf.setframerate(_PLAYBACK_SR)
+                wf.writeframes(pcm.tobytes())
+            return out_wav
+
+        def _done(fut):
+            try:
+                path = fut.result()
+            except Exception:
+                _log.exception("audition extract failed"); return
+            def _do_play():
+                try:
+                    import winsound
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    winsound.PlaySound(path,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC)
+                except Exception:
+                    _log.exception("audition play failed")
+            try: self._win.after(0, _do_play)
+            except Exception: pass
+
+        ex = ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_do)
+        fut.add_done_callback(_done)
+        ex.shutdown(wait=False)
+
+    def _xtok_adopt(self, new_token, new_audio_path, in_s, out_s):
+        """User clicked ADOPT on a cross-token match.  Signals the
+        caller by invoking on_accept with the reassignment payload
+        (segments = single match window; new_token + new_audio_path
+        piggyback in the kwargs) and closes the dialog.  Callers that
+        don't care about reassignment (older signature) still get the
+        segments arg and simply ignore the rest."""
+        self._cleanup()
+        if not self._on_accept:
             return
-        # Brief on-screen confirmation next to the search count label.
+        segs = [(float(in_s), float(out_s))]
         try:
-            self._search_count_lbl.config(
-                text=" ✓ copied header for [{}]".format(new_token),
-                fg=SUCCESS)
-        except tk.TclError:
-            pass
+            self._on_accept(segs,
+                            new_token=new_token,
+                            new_audio_path=new_audio_path)
+        except TypeError:
+            # Caller uses the old single-arg signature — fall back
+            # gracefully; the token change is dropped in that case.
+            self._on_accept(segs)
 
     def _play_in(self):
         """Zoom to IN; stitched if PLAY EDIT on, else raw from IN."""

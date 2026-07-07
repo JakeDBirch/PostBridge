@@ -6119,9 +6119,24 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 segs_r = r.get("segments") or [(0.0, 30.0)]
                 fps    = getattr(self, "_seq_fps", 24.0)
 
-                def _accept(new_segs, r=r, af=af, ss=ss, sl=sl, rcl=rcl):
+                def _accept(new_segs, new_token=None, new_audio_path=None,
+                            r=r, af=af, ss=ss, sl=sl, rcl=rcl):
                     self._s4_push_undo()
                     old_status = r.get("status", "")
+                    # Cross-token ADOPT from the match-review search: also
+                    # reassign this pull to the new token + audio file and
+                    # refresh the scripted timecode fields.  segments arg
+                    # is a single-hit window (in_s, out_s) from the sidecar.
+                    if new_token and new_token != r.get("token"):
+                        r["token"] = new_token
+                    if new_audio_path:
+                        r["source_audio"] = new_audio_path
+                        # source_video was a fallback for restored sessions;
+                        # once we've reassigned, clear it so future opens
+                        # use the new audio path.
+                        r.pop("source_video", None)
+                        if is_video(new_audio_path):
+                            r["source_video"] = new_audio_path
                     r["segments"]   = new_segs
                     r["rec_in_s"]   = new_segs[0][0]
                     r["rec_out_s"]  = new_segs[-1][1]
