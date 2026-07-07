@@ -4811,6 +4811,18 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 pi, take_i + 1), ERR)
                         continue
                     engines.cache_save(ap, audio_words, blobs=blobs)
+                    # ALSO write the .pb_transcript.json sidecar next to
+                    # the source audio.  The internal cache above is keyed
+                    # by md5 in .pb_cache/ so only reconcile can see it;
+                    # the sidecar makes the same transcript reachable from
+                    # Pull Quotes (USE EXISTING on drop), which is how the
+                    # user searches transcript text after reconcile.  The
+                    # interview-source path already writes both; this
+                    # brings VO takes into parity.
+                    try:
+                        engines.pb_transcript_save(ap, audio_words, blobs=blobs)
+                    except Exception:
+                        pass
                     self._log_line(
                         "  Part {} Take {}: {} words  [saved to cache]".format(
                             pi, take_i + 1, len(audio_words)), INFO)
