@@ -1183,64 +1183,54 @@ class MediaPool(tk.Frame):
         self._update_link_visuals()
 
     def _wipe_cache(self, rec):
-        """Wipe the transcript + assigned-token pull-result caches for
-        this one pool file, so the next reconcile re-transcribes/redoes
-        just those pulls.  Everything else keeps its cache and stays
-        fast on re-run.
+        """Delete the cached pull-reconciliation results for the token
+        assigned to this row.  On the next reconcile, those pulls redo;
+        every other token's pulls hit cache and finish instantly.
 
-        Deletes, if present:
-          • the {media_stem}.pb_transcript.json sidecar next to the
-            audio file
-          • the internal .pb_cache/{md5(abs_path)}.json transcript
-            cache used by reconcile
-          • every .pb_cache/pull_*.json whose stored result.token
-            matches the row's current token — targets the pulls that
-            were reconciled AS this token, whether or not they landed
-            on the right file.
+        Deliberately does NOT touch the file's transcript (either the
+        sidecar or the .pb_cache/{md5}.json entry).  Multiple tokens
+        commonly share the same audio file (e.g. one Part-N.wav used
+        by every speaker who appears in that part), and deleting the
+        file's transcript would cascade into re-transcription plus
+        re-reconciliation for EVERY token touching it — the exact
+        "reconcile started from the beginning" symptom the user just
+        reported.  Wiping only pull_*.json for the token targets just
+        the pulls that were misassigned, and their re-reconcile hits
+        the still-cached transcript for whatever file the pool now
+        points them at.
         """
         path = rec.get("path")
         if not path:
             return
         tok = (rec["var"].get() if rec.get("var") else "") or ""
-        if tok == "— unassigned —":
-            tok = ""
-        # engines is imported lazily so gui_components stays leaf-ish.
-        import engines
+        if not tok or tok == "— unassigned —":
+            messagebox.showinfo(
+                "No token to wipe",
+                "This file isn't assigned to a token yet — nothing to "
+                "wipe.  Assign it to a token first, then click 🗑.")
+            return
+
+        import engines   # lazy so gui_components stays leaf-ish
         fn = os.path.basename(path)
-        # Confirm — this is destructive and the user has invested work.
+
         if not messagebox.askyesno(
-                "Clear cache for this file?",
-                "Delete the cached transcript AND every reconciled "
-                "pull result whose token is {!r} for this file?\n\n"
+                "Redo pulls for [{}]?".format(tok),
+                "Delete every cached reconciliation result filed under "
+                "token [{}] so the next reconcile REDOES those pulls "
+                "against the file this row now points at:\n\n"
                 "  {}\n\n"
-                "Everything OTHER than this file keeps its cache; the "
-                "next reconcile will re-do just these pulls.".format(
-                    tok or "(none)", fn),
+                "The audio transcript is preserved.  Every other "
+                "token's pulls keep their cache and stay instant on "
+                "the next run.".format(tok, fn),
                 default="no"):
             return
 
-        n_deleted = 0
-
-        # 1) sidecar next to the audio
-        try:
-            sc = engines.pb_transcript_path(path)
-            if sc and os.path.isfile(sc):
-                os.remove(sc); n_deleted += 1
-        except Exception:
-            pass
-
-        # 2) internal transcript cache (.pb_cache/{md5}.json)
-        try:
-            cp = engines._cache_path(path) if engines._cache_dir else None
-            if cp and os.path.isfile(cp):
-                os.remove(cp); n_deleted += 1
-        except Exception:
-            pass
-
-        # 3) matching pull_*.json files — filter by result.token
+        # Delete .pb_cache/pull_*.json where the stored result.token
+        # equals this row's token.  That's the exact set of pulls that
+        # will be recomputed on the next reconcile.
         cache_dir = getattr(engines, "_cache_dir", None)
         n_pulls = 0
-        if cache_dir and os.path.isdir(cache_dir) and tok:
+        if cache_dir and os.path.isdir(cache_dir):
             for _fn in os.listdir(cache_dir):
                 if not _fn.startswith("pull_") or not _fn.endswith(".json"):
                     continue
@@ -1253,27 +1243,25 @@ class MediaPool(tk.Frame):
                         os.remove(p); n_pulls += 1
                 except Exception:
                     continue
-        n_deleted += n_pulls
 
-        # Rebrand the row's cache button briefly so the user sees it worked.
+        # Flash ✓ on the button briefly.
         try:
-            btn = None
             for _child in rec["row"].winfo_children():
                 if isinstance(_child, tk.Label) and _child.cget("text") == "🗑":
-                    btn = _child; break
-            if btn is not None:
-                btn.config(text="✓")
-                btn.after(1400, lambda w=btn: w.config(text="🗑"))
+                    _child.config(text="✓")
+                    _child.after(1400, lambda w=_child: w.config(text="🗑"))
+                    break
         except Exception:
             pass
 
         messagebox.showinfo(
-            "Cache cleared",
-            "Deleted {} file{} ({} pull result{}) for:\n  {}\n\n"
-            "Run reconcile again to re-do just these pulls; the rest "
-            "stay cached.".format(
-                n_deleted, "s" if n_deleted != 1 else "",
-                n_pulls, "s" if n_pulls != 1 else "", fn))
+            "Ready to redo [{}]".format(tok),
+            "Cleared {} cached pull result{} for token [{}].\n\n"
+            "Run reconcile — just these pulls will redo; the {} others "
+            "(and every other token) keep their cache and land "
+            "instantly.".format(
+                n_pulls, "s" if n_pulls != 1 else "", tok,
+                "rest"))
 
     def _refresh_count(self):
         n = len(self._rows)
