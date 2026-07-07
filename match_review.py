@@ -80,6 +80,16 @@ def _wave_cache_save(audio_path, samples, peak):
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SR          = 8000     # waveform display sample rate
 _PLAYBACK_SR = 44100    # playback sample rate
+
+# Silent lead-in prepended to every extracted playback WAV.  Windows'
+# audio-session startup applies a smoothing gain-ramp (~50-150 ms) at
+# the head of every winsound.PlaySound() to prevent click/pop artefacts;
+# on speech that ramp is audible as a fade-in on the very first
+# syllable.  Prepending a short silent lead-in gives Windows something
+# to ramp over, so the real audio starts at full level.  The playhead
+# animation is offset by the same amount so the visual cursor stays
+# aligned with what the user hears.
+_LEAD_IN_MS = 120
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
 _SLIP_DRAG_PX = 4       # pixels mouse must move before a body-press becomes a slip
@@ -1898,6 +1908,14 @@ class MatchReviewDialog:
             peak = float(_np.max(_np.abs(combined))) if len(combined) else 0.0
             if peak > 1e-6:
                 combined = combined / peak * 0.85
+            # Prepend silent lead-in — see _play() for rationale.  For
+            # stitched playback the lead-in goes at the head of the
+            # combined stream only (NOT between segments — that would
+            # introduce gaps at every cut).
+            lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
+            if lead_samps:
+                combined = _np.concatenate(
+                    [_np.zeros(lead_samps, dtype=_np.float32), combined])
             pcm = (combined * 32767).astype(_np.int16)
             out_wav = os.path.join(self._tmp_dir, "_play_edit.wav")
             with _wave.open(out_wav, "wb") as wf:
@@ -1921,7 +1939,11 @@ class MatchReviewDialog:
                     _log.exception("winsound failed")
                     return
                 self._playhead_s          = seg_list[0][0]
-                self._playback_start_wall = _time.perf_counter()
+                # See _play() — offset the wall-clock start into the
+                # future by _LEAD_IN_MS so the cursor doesn't move
+                # during the silent lead-in.
+                self._playback_start_wall = (
+                    _time.perf_counter() + _LEAD_IN_MS / 1000.0)
                 self._playback_start_file = seg_list[0][0]
                 self._play_edit_segs      = list(seg_list)
                 self._animate_playhead()
@@ -2071,6 +2093,12 @@ class MatchReviewDialog:
             peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
             if peak > 1e-6:
                 arr = arr / peak * 0.85
+            # Prepend silent lead-in so Windows' PlaySound startup ramp
+            # happens over silence and the real audio starts at full level.
+            lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
+            if lead_samps:
+                arr = _np.concatenate(
+                    [_np.zeros(lead_samps, dtype=_np.float32), arr])
             pcm = (arr * 32767).astype(_np.int16)
             with _wave.open(out_wav, "wb") as wf:
                 wf.setnchannels(1); wf.setsampwidth(2)
@@ -2092,9 +2120,14 @@ class MatchReviewDialog:
                 except Exception:
                     _log.exception("winsound failed")
                     return
-                # Start playhead animation
+                # Start playhead animation.  Anchor the wall-clock start
+                # _LEAD_IN_MS in the FUTURE so the visual cursor doesn't
+                # advance while the silent lead-in is playing — the
+                # cursor then reaches start_s exactly when the real
+                # audio does.
                 self._playhead_s             = start_s
-                self._playback_start_wall    = _time.perf_counter()
+                self._playback_start_wall    = (
+                    _time.perf_counter() + _LEAD_IN_MS / 1000.0)
                 self._playback_start_file    = start_s
                 self._animate_playhead()
             try:
@@ -2111,7 +2144,12 @@ class MatchReviewDialog:
         import time as _time
         if self._playback_start_wall is None:
             return
-        elapsed = _time.perf_counter() - self._playback_start_wall
+        # Clamp elapsed at 0 — the play routines anchor start_wall a bit
+        # in the future (by _LEAD_IN_MS) so the visual cursor doesn't
+        # slide during the silent lead-in that absorbs Windows' audio
+        # startup ramp.
+        elapsed = max(0.0,
+                      _time.perf_counter() - self._playback_start_wall)
         if self._play_edit_segs:
             self._playhead_s = self._stitched_t_to_file_t(elapsed)
         else:
