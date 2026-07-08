@@ -1253,15 +1253,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                       "Adjust any incorrect assignments via the dropdown on each row.",
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
-        # ── Confirmed-carryover banner (shown when coming back via ← REDO) ────
+        # ── Confirmed-carryover banner (shown when coming back via ← BACK) ────
         _carryover = getattr(self, "_confirmed_carryover", None) or {}
         if _carryover:
             _n = len(_carryover)
             _co_frm = tk.Frame(self.body, bg=SURF, pady=6, padx=10)
             _co_frm.pack(fill="x", pady=(0, 10))
             tk.Label(_co_frm,
-                     text="ℹ  {} confirmed edit{} from the previous run will be "
-                          "preserved — only unconfirmed rows will be re-reconciled.".format(
+                     text="ℹ  {} approved edit{} from the previous run will be "
+                          "preserved — only untouched rows will be re-reconciled.".format(
                               _n, "s" if _n != 1 else ""),
                      font=FB, bg=SURF, fg=INFO,
                      wraplength=760, justify="left").pack(side="left",
@@ -1346,10 +1346,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             del self._pending_setup
 
         # Snapshot the freshly-applied assignments into _redo_setup so that a
-        # future ← REDO from Step 4 can restore them — without this, opening
+        # future ← BACK from Step 4 can restore them — without this, opening
         # a session that has cached results would jump straight to Step 4,
         # bypass the usual reconcile-time snapshot at line 2622, and lose
-        # every token/asset assignment on REDO.
+        # every token/asset assignment on BACK.
         if (self._pool and self._pool._rows
                 and not getattr(self, "_redo_setup", None)):
             self._redo_setup = {
@@ -2093,322 +2093,6 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 e.get("set_normal_fn", lambda: None)()
                 dec(r.get("status", ""))
 
-    def _s4_fix_export_src(self):
-        """Update which source file the export uses for a token — without
-        re-running reconcile or touching any Step 4 edits.
-
-        Use this when the reconcile results in Step 4 are already correct but
-        the wrong file was used (so the exported AAF/XML would reference it).
-        All confirmed states, adjusted timecodes, and accepted flags are
-        completely untouched.
-        """
-        pulls_all = getattr(self, "pulls", [])
-        token_set = sorted({p["token"] for p in pulls_all if p.get("token")})
-        if not token_set:
-            messagebox.showinfo("Fix Export Source",
-                                "No interview pulls found in this session.", parent=self)
-            return
-
-        class _Dlg(tk.Toplevel):
-            def __init__(self_, parent, tokens):
-                super().__init__(parent)
-                self_.result = None
-                self_.title("Fix Export Source")
-                self_.configure(bg=BG)
-                self_.resizable(False, False)
-                self_.grab_set()
-
-                tk.Label(self_,
-                         text="This updates which file the AAF/XML export uses\n"
-                              "for a token without changing any Step 4 edits.",
-                         font=FB, bg=BG, fg=SUB, justify="left").pack(
-                             padx=20, pady=(18, 10), anchor="w")
-
-                tk.Label(self_, text="Token:", font=FB, bg=BG, fg=TEXT).pack(
-                    padx=20, pady=(0, 4), anchor="w")
-                tok_var = tk.StringVar(value=tokens[0])
-                ttk.Combobox(self_, textvariable=tok_var, values=tokens,
-                             state="readonly", font=FB).pack(padx=20, fill="x")
-
-                tk.Label(self_, text="Correct source file:", font=FB, bg=BG, fg=TEXT
-                         ).pack(padx=20, pady=(14, 4), anchor="w")
-
-                file_var = tk.StringVar()
-                frm = tk.Frame(self_, bg=BG); frm.pack(padx=20, fill="x")
-                tk.Label(frm, textvariable=file_var, font=FB, bg=SURF, fg=TEXT,
-                         anchor="w", padx=6, pady=4, width=42,
-                         wraplength=320).pack(side="left", fill="x", expand=True)
-
-                def _pick():
-                    from tkinter.filedialog import askopenfilename
-                    p = askopenfilename(
-                        parent=self_, title="Source file for " + tok_var.get(),
-                        filetypes=[("Audio / Video",
-                                    "*.wav *.aif *.aiff *.mp3 *.m4a "
-                                    "*.mp4 *.mov *.mxf *.bwf"),
-                                   ("All files", "*.*")])
-                    if p:
-                        file_var.set(p)
-
-                tk.Button(frm, text="Browse…", command=_pick,
-                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
-                          padx=8, pady=4, cursor="hand2").pack(
-                              side="right", padx=(6, 0))
-
-                bf = tk.Frame(self_, bg=BG); bf.pack(padx=20, pady=18, fill="x")
-                tk.Button(bf, text="Cancel", command=self_.destroy,
-                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
-                          padx=12, pady=6, cursor="hand2").pack(side="left")
-                tk.Button(bf, text="Apply", command=lambda: self_._ok(tok_var, file_var),
-                          bg=ACCENT, fg=TEXT, font=FB, relief="flat",
-                          padx=12, pady=6, cursor="hand2").pack(side="right")
-
-                def _ok(tv, fv):
-                    if not fv.get():
-                        messagebox.showwarning("No file", "Please select a file.",
-                                               parent=self_)
-                        return
-                    self_.result = (tv.get(), fv.get())
-                    self_.destroy()
-                self_._ok = _ok
-
-                self_.update_idletasks()
-                pw = parent.winfo_width();  ph = parent.winfo_height()
-                px = parent.winfo_rootx(); py = parent.winfo_rooty()
-                dw = self_.winfo_width();   dh = self_.winfo_height()
-                self_.geometry("+{}+{}".format(
-                    px + (pw - dw) // 2, py + (ph - dh) // 2))
-
-        dlg = _Dlg(self, token_set)
-        self.wait_window(dlg)
-        if not dlg.result:
-            return
-        token, file_path = dlg.result
-
-        if not hasattr(self, "_rereconcile_src_override"):
-            self._rereconcile_src_override = {}
-        self._rereconcile_src_override[token] = file_path
-
-        # Persist immediately so a quick-save captures it
-        self._s4_save()
-
-        messagebox.showinfo(
-            "Export source updated",
-            "Export for '{}' will now use:\n{}".format(
-                token, os.path.basename(file_path)),
-            parent=self)
-
-    def _s4_rereconcile_token(self):
-        """Re-reconcile all pulls for one token against a user-chosen source file,
-        while preserving every other token's confirmed Step 4 state."""
-        import threading as _thr
-
-        pulls_all = getattr(self, "pulls", [])
-        token_set = sorted({p["token"] for p in pulls_all if p.get("token")})
-        if not token_set:
-            messagebox.showinfo("Re-reconcile Token",
-                                "No interview pulls found in this session.", parent=self)
-            return
-
-        # ── Inline dialog: pick token + source file ───────────────────────────
-        class _Dlg(tk.Toplevel):
-            def __init__(self_, parent, tokens):
-                super().__init__(parent)
-                self_.result = None
-                self_.title("Re-reconcile Token")
-                self_.configure(bg=BG)
-                self_.resizable(False, False)
-                self_.grab_set()
-
-                tk.Label(self_, text="Token to re-reconcile:",
-                         font=FB, bg=BG, fg=TEXT).pack(padx=20, pady=(18, 4), anchor="w")
-
-                tok_var = tk.StringVar(value=tokens[0])
-                tok_dd  = ttk.Combobox(self_, textvariable=tok_var, values=tokens,
-                                       state="readonly", font=FB)
-                tok_dd.pack(padx=20, fill="x")
-
-                tk.Label(self_, text="Correct source audio file:",
-                         font=FB, bg=BG, fg=TEXT).pack(padx=20, pady=(14, 4), anchor="w")
-
-                file_var  = tk.StringVar()
-                file_frm  = tk.Frame(self_, bg=BG)
-                file_frm.pack(padx=20, fill="x")
-                file_lbl  = tk.Label(file_frm, textvariable=file_var, font=FB,
-                                     bg=SURF, fg=TEXT, anchor="w", padx=6, pady=4,
-                                     width=42, wraplength=320)
-                file_lbl.pack(side="left", fill="x", expand=True)
-
-                def _pick():
-                    from tkinter.filedialog import askopenfilename
-                    p = askopenfilename(
-                        parent=self_,
-                        title="Source audio for " + tok_var.get(),
-                        filetypes=[("Audio / Video", "*.wav *.aif *.aiff *.mp3 *.m4a "
-                                    "*.mp4 *.mov *.mxf *.bwf"), ("All files", "*.*")]
-                    )
-                    if p:
-                        file_var.set(p)
-
-                tk.Button(file_frm, text="Browse…", command=_pick,
-                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
-                          padx=8, pady=4, cursor="hand2").pack(side="right", padx=(6, 0))
-
-                btn_frm = tk.Frame(self_, bg=BG)
-                btn_frm.pack(padx=20, pady=18, fill="x")
-
-                def _ok():
-                    if not file_var.get():
-                        messagebox.showwarning("No file selected",
-                                               "Please select a source audio file.", parent=self_)
-                        return
-                    self_.result = (tok_var.get(), file_var.get())
-                    self_.destroy()
-
-                tk.Button(btn_frm, text="Cancel", command=self_.destroy,
-                          bg=SURF3, fg=TEXT, font=FB, relief="flat",
-                          padx=12, pady=6, cursor="hand2").pack(side="left")
-                tk.Button(btn_frm, text="Re-reconcile", command=_ok,
-                          bg=ACCENT, fg=TEXT, font=FB, relief="flat",
-                          padx=12, pady=6, cursor="hand2").pack(side="right")
-
-                self_.update_idletasks()
-                pw = parent.winfo_width();  ph = parent.winfo_height()
-                px = parent.winfo_rootx(); py = parent.winfo_rooty()
-                dw = self_.winfo_width();   dh = self_.winfo_height()
-                self_.geometry("+{}+{}".format(px + (pw - dw) // 2, py + (ph - dh) // 2))
-
-        dlg = _Dlg(self, token_set)
-        self.wait_window(dlg)
-        if not dlg.result:
-            return
-        token, file_path = dlg.result
-
-        # ── Identify pulls for this token ─────────────────────────────────────
-        token_pulls = sorted(
-            [p for p in pulls_all if p.get("token") == token],
-            key=lambda p: p["order"]
-        )
-        if not token_pulls:
-            messagebox.showinfo("Re-reconcile Token",
-                                "No pulls found for token '{}'.".format(token), parent=self)
-            return
-
-        # ── Snapshot Step 4 state; strip entries for the chosen token ─────────
-        snap = self._s4_snapshot()
-        for p in token_pulls:
-            snap.pop(str(p["order"]), None)
-
-        # ── Clear pull-result cache for this pull (both old & new src) ──────
-        pad    = PAD_SECS
-        old_src = next(
-            (r.get("src_path") or r.get("transcript_path")
-             for r in getattr(self, "results", []) if r.get("token") == token),
-            None
-        )
-        for pull in token_pulls:
-            engines.pull_result_cache_clear(pull, file_path, pad)
-            if old_src and old_src != file_path:
-                engines.pull_result_cache_clear(pull, old_src, pad)
-
-        # ── Store partial snapshot; _step4() will apply it after rebuild ──────
-        self._s4_rereconcile_restore = snap
-
-        # ── Remember the new file so Step 5 export uses it instead of pool ───
-        if not hasattr(self, "_rereconcile_src_override"):
-            self._rereconcile_src_override = {}
-        self._rereconcile_src_override[token] = file_path
-
-        # ── Progress label with live pull counter ────────────────────────────
-        _prog_var = tk.StringVar(
-            value="·  Re-reconciling  0 / {}  for {}".format(len(token_pulls), token))
-        prog = tk.Label(self.body, textvariable=_prog_var,
-                        font=FB, bg=BG, fg=WARN)
-        prog.pack(pady=6)
-        self.update_idletasks()
-
-        # ── Run reconcile in a background thread ──────────────────────────────
-        _holder  = {"done": False, "result": None, "error": None, "progress": 0}
-        _frames  = ["·  ", "·· ", "···", " ··", "  ·", "   "]
-        _fi      = [0]
-
-        def _run():
-            try:
-                out    = []
-                cursor = 0.0
-                for idx, pull in enumerate(token_pulls):
-                    r = engines.reconcile_interview_pull(
-                        pull, file_path, pad=pad, min_start_s=cursor
-                    )
-                    if r.get("rec_out_s"):
-                        cursor = max(cursor, r["rec_out_s"])
-                    out.append((pull["order"], r))
-                    _holder["progress"] = idx + 1
-                _holder["result"] = out
-            except Exception as exc:
-                _holder["error"] = exc
-            finally:
-                _holder["done"] = True
-
-        _thr.Thread(target=_run, daemon=True).start()
-
-        def _check():
-            try:
-                # Animate label every tick
-                _fi[0] = (_fi[0] + 1) % len(_frames)
-                done = _holder["done"]
-                n    = _holder["progress"]
-                _prog_var.set("{}Re-reconciling  {} / {}  for {}{}".format(
-                    _frames[_fi[0]], n, len(token_pulls), token,
-                    "  ✓" if done and not _holder["error"] else ""))
-
-                if not done:
-                    self.after(200, _check)
-                    return
-
-                # Done — small pause so user sees the ✓ tick
-                self.after(600, _finish)
-            except Exception:
-                self.after(200, _check)   # keep polling even if label update fails
-
-        def _finish():
-            try:
-                prog.destroy()
-            except Exception:
-                pass
-            if _holder["error"]:
-                self._s4_rereconcile_restore = None
-                import traceback as _tb
-                messagebox.showerror(
-                    "Re-reconcile Error",
-                    "{}\n\n{}".format(_holder["error"],
-                                      _tb.format_exc() if hasattr(_holder["error"], "__traceback__") else ""),
-                    parent=self)
-                return
-            # Merge new results back into self.results
-            try:
-                by_order = {r["order"]: i for i, r in enumerate(self.results)
-                            if "order" in r}
-                for order, new_r in _holder["result"]:
-                    if order in by_order:
-                        old = self.results[by_order[order]]
-                        old.update(new_r)
-                        old.pop("_s4_accepted",    None)
-                        old.pop("_s4_ignored",     None)
-                        old.pop("_original_status", None)
-                    else:
-                        self.results.append(new_r)
-                # Rebuild Step 4 — _s4_rereconcile_restore applied automatically
-                self._step4()
-            except Exception as exc:
-                self._s4_rereconcile_restore = None
-                import traceback as _tb
-                messagebox.showerror("Re-reconcile Error",
-                                     "Error applying results:\n" + _tb.format_exc(),
-                                     parent=self)
-
-        self.after(200, _check)
-
     def _s4_push_undo(self):
         """Save current state onto the undo stack before a mutation."""
         stack = getattr(self, "_s4_undo_stack", None)
@@ -2455,20 +2139,22 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             fn()
 
     def _s4_redo_to_step2(self):
-        """Go back to Step 2 while preserving confirmed Step 4 edits.
+        """Go BACK to Step 2 while preserving user-approved Step 4 edits.
 
-        Confirmed rows are stashed in _confirmed_carryover so that
-        _run_reconcile can pass them through untouched.  Only pulls
-        without a confirmed result will be re-reconciled, letting the
-        user fix file assignments for problem tokens without losing
-        any confirmed work.
+        Rows the user confirmed OR ignored are stashed in
+        _confirmed_carryover so that _run_reconcile can pass them
+        through untouched — both interview pulls (via
+        process_token_pulls) and VO blocks (via process_vo_part).
+        Only untouched rows will be re-reconciled, letting the user
+        fix file assignments for problem tokens without losing any
+        approved work.
         """
-        confirmed = {
+        carryover = {
             r["order"]: r
             for r in getattr(self, "results", [])
-            if r.get("_s4_accepted")
+            if r.get("_s4_accepted") or r.get("_s4_ignored")
         }
-        self._confirmed_carryover = confirmed
+        self._confirmed_carryover = carryover
         self._step2()
 
     def _build_setup_data(self):
@@ -4925,8 +4611,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             tsrc    = transcript_sources.get(token)
             pad     = pad_secs
             # Pulls confirmed in the previous run are passed through as-is so
-            # the user can fix problem tokens via REDO without re-running work
-            # they've already approved.
+            # the user can fix problem tokens via ← BACK without re-running
+            # work they've already approved.
             _carryover = getattr(self, "_confirmed_carryover", None) or {}
 
             self._log_line(
@@ -5143,7 +4829,16 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 return [dict(engines._vo_base_result(b), status="cancelled")
                         for b in blocks]
             takes = vo_takes_by_part.get(part_index, [])
-            return engines.reconcile_vo_part(blocks, takes)
+            fresh = engines.reconcile_vo_part(blocks, takes)
+            # Same order-keyed passthrough as process_token_pulls above:
+            # a VO block the user already confirmed/ignored in a prior
+            # Step 4 pass is returned as-is instead of overwriting the
+            # user's approved result with fresh algo output.  Without
+            # this every confirmed VO row silently reverts on ← BACK.
+            _carryover = getattr(self, "_confirmed_carryover", None) or {}
+            if not _carryover:
+                return fresh
+            return [_carryover.get(r.get("order"), r) for r in fresh]
 
         from collections import defaultdict as _dd
         _vo_by_part = _dd(list)
@@ -5690,14 +5385,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                       "These are flagged by name in the exported XML.",
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,6))
 
-        _CLEAN = ("ok", "direct", "no_quote", "cancelled")
-        _ATTN  = ("no_match", "error", "low_confidence", "no_file", "not_run")
-
         ok     = sum(1 for r in self.results if r["status"] in ("ok", "direct"))
         review = sum(1 for r in self.results if r["status"] in
                      ("no_match", "error", "low_confidence", "not_run"))
         skips  = sum(1 for r in self.results if r["status"] in ("no_file", "cancelled"))
-        flags  = review + skips   # total items needing attention (used by filter tabs)
 
         # Live counters — each category decrements as items are confirmed
         _ok_count        = [ok]
@@ -5732,11 +5423,6 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _review_count[0] = max(0, _review_count[0] - 1)
                 _review_var.set(str(_review_count[0]))
                 _review_num_lbl.config(fg=WARN if _review_count[0] > 0 else SUB)
-                try:
-                    _fbtns["attention"].config(
-                        text="NEEDS ATTENTION  {}".format(_review_count[0]))
-                except Exception:
-                    pass
             _unconfirmed_count[0] = max(0, _unconfirmed_count[0] - 1)
             _sync_unconfirmed_btn()
 
@@ -5753,11 +5439,6 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 _review_count[0] += 1
                 _review_var.set(str(_review_count[0]))
                 _review_num_lbl.config(fg=WARN)
-                try:
-                    _fbtns["attention"].config(
-                        text="NEEDS ATTENTION  {}".format(_review_count[0]))
-                except Exception:
-                    pass
             _unconfirmed_count[0] += 1
             _sync_unconfirmed_btn()
 
@@ -5824,9 +5505,18 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(_ign_cell, text="ignored", font=FB, bg=SURF, fg=SUB).pack()
 
         # ── Filter tabs ───────────────────────────────────────────────────────
-        _fstate = {"mode": "all", "sort": "script"}
+        # sort_dir: {sort_key: 1 (ascending) or -1 (descending)}.  Clicking
+        # the active sort flips its direction; clicking a different sort
+        # switches to it in its remembered direction.
+        _fstate = {"mode": "all", "sort": "script",
+                   "sort_dir": {"script": 1, "alphabetical": 1,
+                                "confidence": 1, "subclips": -1}}
         _fbtns  = {}
         _sbtns  = {}
+        _sort_labels = {"script":       "Script",
+                        "alphabetical": "Alphabetical",
+                        "confidence":   "Confidence",
+                        "subclips":     "Sub-clips"}
 
         _part_dividers = {}   # part_index → divider Frame (filled during card loop)
 
@@ -5834,9 +5524,14 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             if mode is not None:
                 _fstate["mode"] = mode
             if sort is not None:
+                # Same sort clicked again → invert direction.  New sort →
+                # switch, keeping that sort's remembered direction.
+                if sort == _fstate["sort"]:
+                    _fstate["sort_dir"][sort] *= -1
                 _fstate["sort"] = sort
             cur_mode = _fstate["mode"]
             cur_sort = _fstate["sort"]
+            cur_dir  = _fstate["sort_dir"].get(cur_sort, 1)
 
             for m, b in _fbtns.items():
                 active = (m == cur_mode)
@@ -5844,7 +5539,9 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                          fg=BG    if active else TEXT)
             for s, b in _sbtns.items():
                 active = (s == cur_sort)
-                b.config(bg=ACCENT if active else SURF2,
+                arrow  = ("  ↑" if cur_dir > 0 else "  ↓") if active else ""
+                b.config(text=_sort_labels[s] + arrow,
+                         bg=ACCENT if active else SURF2,
                          fg=BG    if active else TEXT)
 
             # Freeze scrollregion recalculation during repack
@@ -5861,30 +5558,41 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # Determine visible entries
             visible = []
             for e in self._rv:
-                st = e["res"].get("status", "")
                 show = (cur_mode == "all" or
-                        (cur_mode == "attention"   and st in _ATTN) or
-                        (cur_mode == "matched"     and st in ("ok", "direct")) or
+                        (cur_mode == "confirmed"   and e["accepted_flag"][0]) or
                         (cur_mode == "unconfirmed" and
                          not e["accepted_flag"][0] and not e["skip_var"].get()))
                 if show:
                     visible.append(e)
 
-            # Apply sort
-            if cur_sort == "confidence":
+            # Apply sort.  cur_dir = 1 (asc) or -1 (desc); each branch
+            # inverts its own key so ascending is the "natural" direction
+            # for that sort (script = top-of-script first, alphabetical =
+            # A first, confidence = low first, sub-clips = few first).
+            reverse = (cur_dir < 0)
+            if cur_sort == "script":
+                visible.sort(key=lambda e: e["res"].get("order", 0),
+                             reverse=reverse)
+            elif cur_sort == "alphabetical":
+                def _alpha_key(e):
+                    txt = (e["res"].get("matched_text")
+                           or e["res"].get("quote")
+                           or e["res"].get("token") or "")
+                    return txt.strip().lower()
+                visible.sort(key=_alpha_key, reverse=reverse)
+            elif cur_sort == "confidence":
                 def _conf_key(e):
                     c = e["res"].get("confidence", 0) or 0
                     # Items with no confidence (adjusted/manual) sink to the bottom
                     return (1, 0) if c == 0 else (0, c)
-                visible.sort(key=_conf_key)
+                visible.sort(key=_conf_key, reverse=reverse)
             elif cur_sort == "subclips":
                 visible.sort(
                     key=lambda e: len(e["res"].get("segments") or []),
-                    reverse=True)
-            # "script" order → no sort (already in script order)
+                    reverse=reverse)
 
-            # Repack — only show part dividers in script order
-            use_dividers = (cur_sort == "script")
+            # Repack — only show part dividers in ascending script order
+            use_dividers = (cur_sort == "script" and cur_dir > 0)
             cur_pi = object()  # sentinel
             for e in visible:
                 if use_dividers:
@@ -5907,11 +5615,11 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             1 for r in self.results
             if not r.get("_s4_accepted") and not r.get("_s4_ignored")
         )
+        _conf_initial = sum(1 for r in self.results if r.get("_s4_accepted"))
         for _fm, _fl, _fc in [
-            ("all",          "ALL",              len(self.results)),
-            ("matched",      "MATCHED",          ok),
-            ("attention",    "NEEDS ATTENTION",  flags),
-            ("unconfirmed",  "UNCONFIRMED",      _unc_initial),
+            ("all",         "ALL",         len(self.results)),
+            ("confirmed",   "CONFIRMED",   _conf_initial),
+            ("unconfirmed", "UNCONFIRMED", _unc_initial),
         ]:
             b = tk.Label(frow, text="{}  {}".format(_fl, _fc), font=FB,
                          bg=SURF2, fg=TEXT, cursor="hand2",
@@ -5925,12 +5633,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         srow = tk.Frame(self.body, bg=BG)
         srow.pack(fill="x", pady=(0, 8))
         tk.Label(srow, text="SORT:", font=FB, bg=BG, fg=SUB).pack(side="left")
-        for _sk, _sl in [
-            ("script",     "Script Order"),
-            ("confidence", "Confidence"),
-            ("subclips",   "Sub-clips"),
-        ]:
-            b = tk.Label(srow, text=_sl, font=FB,
+        for _sk in ("script", "alphabetical", "confidence", "subclips"):
+            b = tk.Label(srow, text=_sort_labels[_sk], font=FB,
                          bg=SURF2, fg=TEXT, cursor="hand2",
                          padx=10, pady=4, bd=0,
                          highlightbackground=BORDER, highlightthickness=1)
@@ -6346,7 +6050,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._s4_rereconcile_restore = None
 
         # Flush the current (fully-restored) state to the sidecar so that if
-        # the user clicks ← REDO and re-runs reconciliation, the next Step 4
+        # the user clicks ← BACK and re-runs reconciliation, the next Step 4
         # entry can reload the correct positions from the sidecar rather than
         # showing stale cache-reconciliation results.
         self._s4_save()
@@ -6360,17 +6064,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._mark_saved()
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
-        self._btn(nav, "← REDO", self._s4_redo_to_step2).pack(side="left")
+        self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
         if DEV_DIAGNOSTIC:
             self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
                       small=True).pack(side="left", padx=(4,0))
-
-        self._btn(nav, "FIX EXPORT SRC…", self._s4_fix_export_src,
-                  small=True).pack(side="left", padx=(12, 0))
-        self._btn(nav, "RE-RECONCILE TOKEN…", self._s4_rereconcile_token,
-                  small=True).pack(side="left", padx=(12, 0))
 
         # Undo / Redo buttons
         _undo_btn = self._btn(nav, "↩ UNDO", self._s4_undo, small=True)
