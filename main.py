@@ -3273,6 +3273,40 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.wait_window(dlg)
         return result["proceed"]
 
+    def _build_provisional_results(self, int_assets):
+        """Seed Step-4 result rows from the script's authored timecodes
+        so the user can start reviewing before Whisper runs.
+
+        For each interview pull, produce a `_base_result` with the
+        pull's `[in..out]` copied verbatim from the script bracket
+        and `source_audio` pointing at the first non-video pool file
+        for that token — enough for single-side playback in the
+        waveform editor.  When reconcile eventually finishes, these
+        provisional rows are replaced by the reconciled results,
+        UNLESS the user already marked the row confirmed/ignored
+        (see the merge in _run_reconcile).
+
+        VO blocks are NOT seeded — they have no authored TC in the
+        script and can't be provisionally placed.  They appear in
+        Step 4 with status "not_run" until reconcile hands them
+        real matches.
+        """
+        results = []
+        for pull in getattr(self, "pulls", []):
+            r = engines._base_result(pull)
+            r["status"] = "provisional"
+            r["confidence"] = 0.0
+            r["matched_text"] = pull.get("quote_text", "")
+            tok = pull.get("token", "")
+            files = [p for p in int_assets.get(tok, []) if not is_video(p)]
+            if files:
+                r["source_audio"] = files[0]
+            results.append(r)
+        for vo in getattr(self, "vo_blocks", []) or []:
+            results.append(engines._vo_base_result(vo))
+        results.sort(key=lambda r: r.get("order", 0))
+        return results
+
     def _start_reconcile(self):
         # A fresh reconcile always produces new results — discard any loaded results.
         self._pending_results = None
@@ -3419,6 +3453,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # MemoryError.  Surface this BEFORE the long-running run starts.
         if not self._preflight_memory_check():
             return
+
+        # ── Provisional-first review: seed self.results with the script's
+        # authored timecodes so a → REVIEW NOW jump into Step 4 has
+        # something to render before Whisper starts producing real
+        # reconciled TCs.  _run_reconcile's final merge preserves any
+        # row the user confirmed/ignored while transcription was
+        # still running in the background.
+        self.results = self._build_provisional_results(int_assets)
+        self._bg_reconcile_active = True
 
         self._clear()
         self._section("STEP 3 — RECONCILING")
@@ -3663,6 +3706,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._cancel.clear()
         nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
         self._btn(nav, "CANCEL", self._cancel_reconcile).pack(side="left")
+
+        # Provisional-first jump: user can enter Step 4 review while the
+        # background transcribe keeps running.  Rows appear with script-
+        # authored TCs and single-side playback; confirms made here are
+        # preserved when reconcile finishes and merges its real results.
+        self._btn(nav, "REVIEW NOW  →", self._step4,
+                  color=ACCENT).pack(side="left", padx=(8, 0))
 
         # Background-mode toggle — works on the fly via shared live-workers ref
         _cpu    = os.cpu_count() or 2
@@ -4133,13 +4183,25 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 consumed = False
             if consumed:
                 return
-            self._log.configure(state="normal")
+            # The log widget lives in Step 3.  When the user navigated to
+            # Step 4 (provisional-first flow) it no longer exists — file
+            # writes above are the authoritative record; skip the widget
+            # write silently.
+            _log = getattr(self, "_log", None)
+            if _log is None:
+                return
+            try:
+                if not _log.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            _log.configure(state="normal")
             tag = "c{}".format(abs(hash(color or "")))
             if color:
-                self._log.tag_configure(tag, foreground=color)
-            self._log.insert("end", msg + "\n", tag if color else "")
-            self._log.see("end")
-            self._log.configure(state="disabled")
+                _log.tag_configure(tag, foreground=color)
+            _log.insert("end", msg + "\n", tag if color else "")
+            _log.see("end")
+            _log.configure(state="disabled")
         self._ui(_do)
 
     def _set_tx_progress(self, n, total, label=""):
@@ -5285,6 +5347,17 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._run_log_fh = None
 
         # ── Store results; schedule ONE after() call to finish on main thread ──
+        # Merge with any user-approved edits made in Step 4 while this
+        # reconcile was running in the background (provisional-first flow).
+        # Rows the user already marked _s4_accepted or _s4_ignored win —
+        # their TCs and any manual segments are preserved verbatim.  Every
+        # other row is replaced by the fresh reconciled result.
+        _prev = getattr(self, "results", None) or []
+        _kept = {r["order"]: r for r in _prev
+                 if r.get("_s4_accepted") or r.get("_s4_ignored")}
+        if _kept:
+            sorted_results = [_kept.get(r["order"], r) for r in sorted_results]
+
         self.results          = sorted_results
         self._vo_takes_by_part = vo_takes_by_part
         self._pending_summary = sum_lines   # consumed by _finish_reconcile
@@ -5292,15 +5365,16 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._ui(self._finish_reconcile)
 
     def _stop_reconcile_runners(self):
-        """Clear the three flags that gate the spinner / resource poller /
-        Settings-model-picker.  _finish_reconcile clears them on the happy
-        path, but the cancel branch and the model-load-failure branch of
-        _run_reconcile used to exit without clearing — leaving the dots
-        animating forever and the model picker silently blocked behind a
-        warning dialog until the app restarted."""
+        """Clear the four flags that gate the spinner / resource poller /
+        Settings-model-picker / provisional-first strip.  _finish_reconcile
+        clears them on the happy path, but the cancel branch and the
+        model-load-failure branch of _run_reconcile used to exit without
+        clearing — leaving the dots animating forever and the model picker
+        silently blocked behind a warning dialog until the app restarted."""
         self._dot_running         = False
         self._res_monitor_running = False
         self._reconcile_busy      = False
+        self._bg_reconcile_active = False
 
     def _finish_reconcile(self):
         """Called on the main thread after _run_reconcile completes.
@@ -5311,6 +5385,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._log_line(txt, color)
         self._pending_summary = []
         self._confirmed_carryover = {}   # consumed; clear for next run
+        self._bg_reconcile_active = False   # provisional-first strip auto-hides
         # Mix files (_temp_mix_files) are intentionally kept alive here so the
         # waveform editor can use them during Step 4.  They are cleaned up at the
         # start of the next reconcile run, or when the window closes.
@@ -5322,6 +5397,11 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._write_conform_baseline()
         except Exception:
             pass
+        # Rebuild Step 4 to show fully-reconciled rows.  This covers both
+        # cases: (a) user is still on Step 3, so this is the normal
+        # transition; (b) user jumped to Step 4 via → REVIEW NOW, so the
+        # rebuild swaps their provisional rows for the merged real ones
+        # (confirmed/ignored preserved — see the merge in _run_reconcile).
         self.after(800, self._step4)
 
     def _cancel_reconcile(self):
@@ -5379,6 +5459,48 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._clear()
         self._section("STEP 4 — REVIEW")
+
+        # ── Background-reconcile progress strip ─────────────────────────
+        # When the user jumped into Step 4 via → REVIEW NOW while
+        # transcribe is still running (provisional-first flow), show
+        # a small always-visible strip up top counting provisional
+        # rows still awaiting a real Whisper match.  Auto-hides when
+        # _finish_reconcile fires and clears _bg_reconcile_active.
+        if getattr(self, "_bg_reconcile_active", False):
+            _bg_strip = tk.Frame(self.body, bg=SURF,
+                                 highlightbackground=INFO,
+                                 highlightthickness=1)
+            _bg_strip.pack(fill="x", pady=(0, 8))
+            _spin_lbl = tk.Label(_bg_strip, text="…", font=FL, bg=SURF, fg=INFO,
+                                 padx=10, pady=6)
+            _spin_lbl.pack(side="left")
+            _msg_lbl = tk.Label(_bg_strip,
+                                text="Transcribing in background — provisional "
+                                     "rows will upgrade as tokens finish.",
+                                font=FB, bg=SURF, fg=TEXT, anchor="w")
+            _msg_lbl.pack(side="left", padx=(0, 8), fill="x", expand=True)
+            _prov_n = sum(1 for r in self.results
+                          if r.get("status") == "provisional")
+            _count_lbl = tk.Label(
+                _bg_strip,
+                text="{} provisional".format(_prov_n),
+                font=FB, bg=SURF, fg=SUB, padx=10)
+            _count_lbl.pack(side="right")
+            self._bg_strip_frame = _bg_strip
+            self._bg_strip_count_lbl = _count_lbl
+            self._bg_strip_msg_lbl   = _msg_lbl
+            # Simple dot-cycle spinner tied to the strip's lifetime.
+            def _tick_spin(step=0, lbl=_spin_lbl, frm=_bg_strip):
+                try:
+                    if not frm.winfo_exists():
+                        return
+                    lbl.config(text=("·  ", "·· ", "···", " ··",
+                                     "  ·", "   ")[step % 6])
+                except tk.TclError:
+                    return
+                self.after(300, _tick_spin, step + 1)
+            self.after(300, _tick_spin)
+
         tk.Label(self.body,
                  text="Reconcile log.  "
                       "[~] low confidence    [?] unmatched fallback    "
@@ -5660,6 +5782,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "no_file":        ERR,
             "not_run":        SUB,
             "cancelled":      SUB,
+            "provisional":    INFO,
         }
         STATUS_LABEL = {
             "ok":             "\u2713  matched",
@@ -5672,6 +5795,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "no_file":        "\u2717  no file assigned",
             "not_run":        "\u2013  not run",
             "cancelled":      "\u2013  cancelled",
+            "provisional":    "\u2026  provisional",
         }
 
         # Accordion: only one card body open at a time.
