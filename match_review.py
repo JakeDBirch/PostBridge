@@ -1889,10 +1889,10 @@ class MatchReviewDialog:
             tk.Label(head, text="[{}]".format(tok), font=FBT,
                       bg=SURF2, fg=ACCENT).pack(side="left")
             tk.Label(head, text=os.path.basename(ap), font=FB,
-                      bg=SURF2, fg=SUB, padx=(8, 0)).pack(side="left")
+                      bg=SURF2, fg=SUB).pack(side="left", padx=(8, 0))
             tc = "{} — {}".format(self._fmt_tc(in_s), self._fmt_tc(out_s))
-            tk.Label(head, text=tc, font=FB, bg=SURF2, fg=TEXT,
-                      padx=(10, 0)).pack(side="left")
+            tk.Label(head, text=tc, font=FB, bg=SURF2, fg=TEXT
+                     ).pack(side="left", padx=(10, 0))
 
             # ADOPT button — closes with reassignment.  Placed first (on
             # the right) so it's the visually dominant action.
@@ -1924,7 +1924,7 @@ class MatchReviewDialog:
             # ACCENT so the user can see it in situ.
             ctx = tk.Text(row, height=2, wrap="word", bg=SURF2, fg=TEXT,
                           font=FB, relief="flat", bd=0,
-                          padx=6, pady=(0, 4), highlightthickness=0)
+                          padx=6, pady=0, highlightthickness=0)
             ctx.pack(fill="x", padx=6, pady=(2, 4))
             if before:  ctx.insert("end", "… " + before + " ")
             match_start = ctx.index("insert")
