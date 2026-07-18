@@ -2138,6 +2138,201 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         if fn is not None:
             fn()
 
+    def _s4_reassign_dialog(self, res):
+        """Open a picker letting the user swap this pull's source file
+        and/or its token from Step 4.  Covers the case the cross-token
+        phrase search can't reach — the quote isn't findable in any
+        other sidecar (typo, contraction drift, or the correct file
+        was never transcribed).
+
+        Scope:
+          - "This pull only" — mutates res alone.
+          - "Every pull in this token" — mutates every result whose
+            current token matches res's original token.
+
+        On apply, affected rows are reset to a fresh provisional state:
+        source_audio / token swapped as requested; rec_in/out and
+        segments reset to the script's authored TCs; _s4_accepted and
+        _s4_ignored cleared; status → "provisional".  The user
+        re-verifies against the new file.
+        """
+        cur_tok  = res.get("token", "")
+        cur_file = res.get("source_audio", "") or res.get("source_video", "") or ""
+
+        # ── Collect available tokens and per-token pool files ──────────
+        tokens = list(getattr(self, "tokens", []) or [])
+        if cur_tok and cur_tok not in tokens:
+            tokens = [cur_tok] + tokens
+        pool_files_by_token = {}
+        for row in getattr(self._pool, "_rows", []) or []:
+            _t = row.get("var").get() if row.get("var") else ""
+            _p = row.get("path")
+            if _t and _p and _t != "— unassigned —":
+                pool_files_by_token.setdefault(_t, []).append(_p)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Reassign source")
+        dlg.configure(bg=BG)
+        dlg.transient(self); dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="Reassign this pull's source file and/or token.",
+                 font=FB, bg=BG, fg=SUB, justify="left").pack(
+                     anchor="w", padx=20, pady=(18, 4))
+        _quote = (res.get("quote_text", "") or "").strip()
+        if _quote:
+            tk.Label(dlg, text="Quote: “{}”".format(
+                        _quote if len(_quote) < 80 else _quote[:77] + "…"),
+                     font=FB, bg=BG, fg=TEXT, justify="left",
+                     wraplength=520).pack(anchor="w", padx=20, pady=(0, 12))
+
+        # Token dropdown
+        tk.Label(dlg, text="Token:", font=FB, bg=BG, fg=TEXT).pack(
+            anchor="w", padx=20)
+        tok_var = tk.StringVar(value=cur_tok)
+        tok_cb  = ttk.Combobox(dlg, textvariable=tok_var, values=tokens,
+                               state="readonly", font=FB, width=48)
+        tok_cb.pack(padx=20, pady=(2, 12), fill="x")
+
+        # File dropdown — refreshed on token change, plus a Browse entry
+        _BROWSE = "📁  Browse for a file not in the pool…"
+        tk.Label(dlg, text="Source file:", font=FB, bg=BG, fg=TEXT).pack(
+            anchor="w", padx=20)
+        file_var = tk.StringVar(value=cur_file or "")
+        file_cb  = ttk.Combobox(dlg, textvariable=file_var, values=[],
+                                state="readonly", font=FB, width=48)
+        file_cb.pack(padx=20, pady=(2, 12), fill="x")
+
+        def _refresh_files(*_a):
+            files = list(pool_files_by_token.get(tok_var.get(), []))
+            files.append(_BROWSE)
+            file_cb.config(values=files)
+            if cur_file and cur_file in files and tok_var.get() == cur_tok:
+                file_var.set(cur_file)
+            elif files:
+                file_var.set(files[0])
+        tok_var.trace_add("write", lambda *a: _refresh_files())
+        _refresh_files()
+
+        def _on_file_pick(*_a):
+            if file_var.get() == _BROWSE:
+                from tkinter.filedialog import askopenfilename
+                p = askopenfilename(
+                    parent=dlg, title="Source file",
+                    filetypes=[("Audio", "*.wav *.mp3 *.aif *.aiff *.flac *.m4a"),
+                               ("Video", "*.mov *.mp4 *.mkv"),
+                               ("All", "*.*")])
+                if p:
+                    vals = list(file_cb.cget("values"))
+                    if p not in vals:
+                        vals = [p] + vals
+                        file_cb.config(values=vals)
+                    file_var.set(p)
+                else:
+                    file_var.set(cur_file or "")
+        file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
+
+        # Scope
+        scope_var = tk.StringVar(value="pull")
+        sf = tk.Frame(dlg, bg=BG); sf.pack(anchor="w", padx=20, pady=(0, 4))
+        tk.Label(sf, text="Scope:", font=FB, bg=BG, fg=TEXT).pack(side="left")
+        for _v, _lbl in (("pull",  "This pull only"),
+                         ("token", "Every pull in token “{}”".format(cur_tok))):
+            tk.Radiobutton(sf, text=_lbl, variable=scope_var, value=_v,
+                           font=FB, bg=BG, fg=TEXT, selectcolor=SURF2,
+                           activebackground=BG, activeforeground=TEXT
+                           ).pack(side="left", padx=(10, 0))
+        # Honest note about export vs. review-only reach.  Token-scope
+        # reassign registers _rereconcile_src_override so build_aaf uses
+        # the new file; pull-scope stops at playback / the waveform
+        # editor.  If you need per-pull export overrides, use token
+        # scope after moving the pull to its own single-pull token.
+        tk.Label(dlg,
+                 text="Pull scope affects review/playback only.  "
+                      "Token scope also updates the AAF/XML export source.",
+                 font=FB, bg=BG, fg=SUB, justify="left",
+                 wraplength=520).pack(anchor="w", padx=20, pady=(0, 12))
+
+        result = {"ok": False}
+        def _apply():
+            if not file_var.get() or file_var.get() == _BROWSE:
+                messagebox.showwarning("Pick a file",
+                                       "Choose a source file first.",
+                                       parent=dlg)
+                return
+            result["ok"] = True
+            dlg.destroy()
+        def _cancel():
+            dlg.destroy()
+
+        br = tk.Frame(dlg, bg=BG); br.pack(fill="x", padx=20, pady=(0, 16))
+        self._btn(br, "Cancel", _cancel, small=True).pack(side="right")
+        self._btn(br, "Apply", _apply, color=ACCENT,
+                  small=True).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        _px, _py = self.winfo_rootx(), self.winfo_rooty()
+        _pw, _ph = self.winfo_width(), self.winfo_height()
+        _dw, _dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        dlg.geometry("+{}+{}".format(_px + (_pw - _dw) // 2,
+                                      _py + (_ph - _dh) // 2))
+        self.wait_window(dlg)
+        if not result["ok"]:
+            return
+
+        new_tok  = tok_var.get()
+        new_file = file_var.get()
+        scope    = scope_var.get()
+
+        # Identify affected rows
+        if scope == "token":
+            targets = [r for r in self.results if r.get("token") == cur_tok]
+        else:
+            targets = [res]
+
+        # No undo push: _s4_snapshot captures TCs/accept-flags but not
+        # token/source_audio/matched_text/words, so undoing a reassign
+        # would leave the row half-restored and worse than the current
+        # state.  Reassigns are terminal for now — a follow-up can
+        # widen the snapshot if we want them undoable.
+
+        # Token-scope reassigns propagate to the AAF/XML export via
+        # _rereconcile_src_override: the export code pushes that file
+        # to the front of int_assets[tok] at build time (main.py:6713)
+        # so it becomes the token's primary track.  Pull-scope reassigns
+        # only affect playback / the waveform editor — see the note in
+        # the dialog when adding per-pull export overrides.
+        if scope == "token" and new_tok == cur_tok:
+            if not hasattr(self, "_rereconcile_src_override"):
+                self._rereconcile_src_override = {}
+            self._rereconcile_src_override[cur_tok] = new_file
+
+        for r in targets:
+            r["token"]         = new_tok
+            r["source_audio"]  = new_file
+            r.pop("source_video", None)
+            if is_video(new_file):
+                r["source_video"] = new_file
+            # Reset to script-authored TCs — the previous reconciled
+            # window was against a different file and can't be trusted.
+            _oi = r.get("orig_in_s",  r.get("rec_in_s",  0.0))
+            _oo = r.get("orig_out_s", r.get("rec_out_s", 0.0))
+            r["rec_in_s"]  = _oi
+            r["rec_out_s"] = _oo
+            r["rec_in_tc"]  = r.get("in_tc",  "")
+            r["rec_out_tc"] = r.get("out_tc", "")
+            r["segments"]  = [(_oi, _oo)]
+            r["words"]     = []
+            r["matched_text"]  = r.get("quote_text", "")
+            r["confidence"]    = 0.0
+            r["status"]        = "provisional"
+            r.pop("_s4_accepted",   None)
+            r.pop("_s4_ignored",    None)
+            r.pop("_original_status", None)
+
+        self._s4_save()
+        self._step4()
+
     def _s4_redo_to_step2(self):
         """Go BACK to Step 2 while preserving user-approved Step 4 edits.
 
@@ -5922,6 +6117,22 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             ignore_lbl.pack(side="right", padx=(4, 0))
             ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
             ignore_lbl.bind("<Leave>", lambda e, w=ignore_lbl: w.config(fg=SUB))
+
+            # REASSIGN — opens a picker to swap this pull's source file
+            # (or every pull in this token's) without going through the
+            # cross-token phrase search, which only helps when the quote
+            # is findable in another already-transcribed sidecar.
+            # VO rows use takes_data + best_take_index; the source-file
+            # swap model doesn't fit, so skip the button there.
+            if not res.get("is_vo"):
+                reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
+                                        bg=SURF, fg=SUB, cursor="hand2")
+                reassign_lbl.pack(side="right", padx=(4, 0))
+                reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
+                reassign_lbl.bind("<Leave>", lambda e, w=reassign_lbl: w.config(fg=SUB))
+                reassign_lbl.bind(
+                    "<Button-1>",
+                    lambda e, r=res: self._s4_reassign_dialog(r))
 
             # ── State management helpers ────────────────────────────────────────
             def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
