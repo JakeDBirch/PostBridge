@@ -4255,49 +4255,81 @@ class AafWorkflowMixin:
                 continue   # skip fades and unresolvable clips entirely
 
             _paths = source_video.get(base)
+            # Multi-angle stacking: when a source has sync enabled AND
+            # holds >1 video, treat every video as a parallel camera
+            # angle of the same take rather than picking one.  Sync is
+            # what tells us "these files are aligned to the same audio,"
+            # which is precisely the semantic that makes stacking
+            # correct.  Each angle emits its own clips_with_media
+            # entry on its own track_name so build_xml_from_pt renders
+            # them as stacked <track>s; the sync audio path is attached
+            # only to angle 1 to avoid triplicating the audio.
+            _stack = (_paths and base in source_sync_done and len(_paths) > 1)
+
             if _paths:
-                # When sync has been run on a multi-file source, slot-1 holds the
-                # sync-verified file (promoted by _aaf_do_sync).  Use it for every
-                # clip from this source rather than guessing by position.
-                if base in source_sync_done and len(_paths) > 1:
+                if _stack:
                     vp = _paths[0]
+                elif base in source_sync_done and len(_paths) > 1:
+                    vp = _paths[0]   # unreachable — _stack covers this
                 else:
                     _idx = _occ_count.get(base, 0)
                     vp   = _paths[min(_idx, len(_paths) - 1)]
                     _occ_count[base] = _idx + 1
                 matched += 1
-                clip_results.append((clip["clip_name"], basename(vp), SUCCESS))
+                if _stack:
+                    _lbl = "{}  ({} angles stacked)".format(
+                        basename(vp), len(_paths))
+                    clip_results.append((clip["clip_name"], _lbl, SUCCESS))
+                else:
+                    clip_results.append((clip["clip_name"], basename(vp), SUCCESS))
             else:
                 vp = None
                 unmatched += 1
                 clip_results.append((clip["clip_name"], "— no video assigned —", WARN))
 
-            # Determine XML track name based on grouping mode.  In
-            # by_source mode the track name is a GROUPING KEY (engines.
-            # build_xml_from_pt collapses every clip with the same `tn`
-            # into one v_tracks/a_tracks/cam_tracks bucket), so bare
-            # basename(vp) would merge clips from two physically
-            # different pool files that happen to share a basename
-            # (CARD_A/C0001.MP4 + CARD_B/C0001.MP4) into ONE output
-            # track — defeating the user's explicit "one track per
-            # source" choice.  Use the collision-safe pool label.
-            if group_mode == "by_source":
-                tn = self._aaf_vid_label(vp) if vp else "No Video"
-            elif group_mode == "by_track":
-                tn = clip.get("track_name") or "Unknown Track"
+            # Build the per-angle track name list.  Single-video sources
+            # get one track (the historical behaviour); stacked sources
+            # get one per angle — the first keeps the source's normal
+            # label so its audio track lines up with the visual, then
+            # ANGLE 2/3/... land on their own tracks above it.
+            def _tn_for(_vp, _angle_i):
+                if group_mode == "by_source":
+                    _base_tn = self._aaf_vid_label(_vp) if _vp else "No Video"
+                elif group_mode == "by_track":
+                    _base_tn = clip.get("track_name") or "Unknown Track"
+                else:
+                    # Consolidate mode: keep the placeholder verbatim
+                    # so the interval scheduler below distributes each
+                    # angle to the first free track by overlap.  Stacked
+                    # angles share start_secs so they naturally land on
+                    # distinct tracks.
+                    return "_consolidate_"
+                if _angle_i == 0:
+                    return _base_tn
+                return "{}  ·  ANGLE {}".format(_base_tn, _angle_i + 1)
+
+            if _stack:
+                _angle_paths = list(_paths)
             else:
-                tn = "_consolidate_"   # placeholder; resolved below
+                _angle_paths = [vp]   # historical single-angle case
 
-            if tn not in track_names_ordered and tn != "_consolidate_":
-                track_names_ordered.append(tn)
-
-            clips_with_media.append({
-                **clip,
-                "track_name":        tn,
-                "video_path":        vp,
-                "audio_path":        source_syncaudio.get(base),
-                "video_offset_secs": source_offset.get(base, 0.0),
-            })
+            for _angle_i, _avp in enumerate(_angle_paths):
+                tn = _tn_for(_avp, _angle_i)
+                if tn not in track_names_ordered and tn != "_consolidate_":
+                    track_names_ordered.append(tn)
+                clips_with_media.append({
+                    **clip,
+                    "track_name":        tn,
+                    "video_path":        _avp,
+                    # Attach the sync audio only to angle 0 so it doesn't
+                    # appear on every stacked track.  Camera audio (from
+                    # the video file itself, when include_camera_audio is
+                    # on) stays per-angle since each angle has its own
+                    # embedded audio channel.
+                    "audio_path":        (source_syncaudio.get(base)
+                                          if _angle_i == 0 else None),
+                    "video_offset_secs": source_offset.get(base, 0.0),
+                })
 
         # Interval scheduling for "consolidate" mode — assign minimum tracks
         if group_mode == "single":
