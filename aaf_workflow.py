@@ -473,6 +473,27 @@ class AafWorkflowMixin:
             self._aaf_source_slot_counts = {}   # base → int (default 1)
         if not hasattr(self, "_aaf_source_extra_vars"):
             self._aaf_source_extra_vars = {}    # base → list of StringVars (slots 2..N)
+        # ── Per-slot state parallel to _aaf_source_extra_vars ──────────
+        # Each list holds one entry per SLOT (index 0 = slot 1 = the
+        # same value as the shared scalar _aaf_source_{sync,syncaudio,
+        # offset}_vars[base]; indices 1..N-1 hold slot 2..N).  Kept in
+        # lock-step with _aaf_source_extra_vars length by
+        # _aaf_update_slot_count.  The scalar readers at ~997, 1276,
+        # 1426, 2607, 3051 keep working (they see slot-1's value) until
+        # Slice B rewires the UI and Slice C rewires the exporter.
+        if not hasattr(self, "_aaf_source_sync_extra_vars"):
+            self._aaf_source_sync_extra_vars      = {}  # base → [BooleanVar, ...]
+        if not hasattr(self, "_aaf_source_syncaudio_extra_vars"):
+            self._aaf_source_syncaudio_extra_vars = {}  # base → [StringVar,  ...]
+        if not hasattr(self, "_aaf_source_offset_extra_vars"):
+            self._aaf_source_offset_extra_vars    = {}  # base → [StringVar,  ...]
+        if not hasattr(self, "_aaf_source_multi_mode_vars"):
+            # StringVar per source; "simultaneous" | "sequential".
+            # Only meaningful when slot_count > 1.  Default
+            # "simultaneous" preserves post-a94bac2 stacking semantics
+            # so anyone with a saved-since-a94bac2 session gets the
+            # same export they had before.
+            self._aaf_source_multi_mode_vars      = {}
         self._aaf_sync_btns = {}   # always reset — widget refs are stale after _clear()
         # Close any sync preview dialogs left open from a previous visit
         for _dlg in getattr(self, "_aaf_sync_previews", {}).values():
@@ -953,6 +974,18 @@ class AafWorkflowMixin:
                 self._aaf_source_syncaudio_vars[base]  = tk.StringVar(value="")
             if base not in self._aaf_source_offset_vars:
                 self._aaf_source_offset_vars[base]     = tk.StringVar(value="0.000")
+            # Per-extra-slot parallels + multi-mode.  Empty lists / default
+            # "simultaneous" are correct for the N=1 case; grown by
+            # _aaf_update_slot_count when the user adds slots.
+            if base not in getattr(self, "_aaf_source_sync_extra_vars", {}):
+                self._aaf_source_sync_extra_vars[base]      = []
+            if base not in getattr(self, "_aaf_source_syncaudio_extra_vars", {}):
+                self._aaf_source_syncaudio_extra_vars[base] = []
+            if base not in getattr(self, "_aaf_source_offset_extra_vars", {}):
+                self._aaf_source_offset_extra_vars[base]    = []
+            if base not in getattr(self, "_aaf_source_multi_mode_vars", {}):
+                self._aaf_source_multi_mode_vars[base]      = tk.StringVar(
+                    value="simultaneous")
             if base not in self._aaf_source_sync_label_vars:
                 self._aaf_source_sync_label_vars[base] = tk.StringVar(value="")
             if base not in self._aaf_sync_state_vars:
@@ -1836,6 +1869,62 @@ class AafWorkflowMixin:
         for base in sources_to_sync:
             self._aaf_do_sync(base, _sem=_sem)
 
+    # ── Per-slot accessors (Slice A foundation) ────────────────────────
+    # Each returns a list of length N (N = slot_counts[base]).  Index 0
+    # is slot 1's value (from the scalar var); indices 1..N-1 come from
+    # the _extra_vars lists.  Missing/short extras get sensible defaults
+    # so callers can iterate without bounds-checking.
+
+    def _aaf_slot_syncs(self, base):
+        n = self._aaf_source_slot_counts.get(base, 1)
+        out = [bool(self._aaf_source_sync_vars.get(
+            base, tk.BooleanVar()).get())]
+        for bv in getattr(self, "_aaf_source_sync_extra_vars",
+                          {}).get(base, [])[:n - 1]:
+            try:    out.append(bool(bv.get()))
+            except Exception: out.append(False)
+        while len(out) < n:
+            out.append(False)
+        return out
+
+    def _aaf_slot_syncaudios(self, base):
+        n = self._aaf_source_slot_counts.get(base, 1)
+        out = [str(self._aaf_source_syncaudio_vars.get(
+            base, tk.StringVar()).get() or "")]
+        for sv in getattr(self, "_aaf_source_syncaudio_extra_vars",
+                          {}).get(base, [])[:n - 1]:
+            try:    out.append(str(sv.get() or ""))
+            except Exception: out.append("")
+        while len(out) < n:
+            out.append("")
+        return out
+
+    def _aaf_slot_offsets(self, base):
+        n = self._aaf_source_slot_counts.get(base, 1)
+        def _to_f(v):
+            try:    return float(v)
+            except (TypeError, ValueError): return 0.0
+        out = [_to_f(self._aaf_source_offset_vars.get(
+            base, tk.StringVar(value="0.000")).get())]
+        for sv in getattr(self, "_aaf_source_offset_extra_vars",
+                          {}).get(base, [])[:n - 1]:
+            try:    out.append(_to_f(sv.get()))
+            except Exception: out.append(0.0)
+        while len(out) < n:
+            out.append(0.0)
+        return out
+
+    def _aaf_multi_mode(self, base):
+        """Return "simultaneous" | "sequential" | "single".
+        Sources with N==1 always report "single" regardless of stored
+        mode — the toggle only matters when multiple slots exist."""
+        n = self._aaf_source_slot_counts.get(base, 1)
+        if n <= 1:
+            return "single"
+        mv = getattr(self, "_aaf_source_multi_mode_vars", {}).get(base)
+        val = mv.get() if mv is not None else "simultaneous"
+        return val if val in ("simultaneous", "sequential") else "simultaneous"
+
     def _aaf_update_slot_count(self, base, delta):
         """Increment or decrement the slot counter in-place — no row rebuild."""
         old_n = self._aaf_source_slot_counts.get(base, 1)
@@ -1850,6 +1939,26 @@ class AafWorkflowMixin:
         while len(evs) < new_n - 1:
             evs.append(tk.StringVar(value="— no video —"))
         self._aaf_source_extra_vars[base] = evs
+
+        # Keep per-slot sync/syncaudio/offset extras in lock-step with
+        # the file-slot count.  Each list holds one entry per EXTRA slot
+        # (index 0 = slot 2, index 1 = slot 3, ...); slot 1's value
+        # stays in the scalar _aaf_source_{sync,syncaudio,offset}_vars.
+        # New slots get sensible defaults — Slice B's UI will let the
+        # user override them per-slot.
+        for _attr, _seed in (
+            ("_aaf_source_sync_extra_vars",      lambda: tk.BooleanVar(value=False)),
+            ("_aaf_source_syncaudio_extra_vars", lambda: tk.StringVar(value="")),
+            ("_aaf_source_offset_extra_vars",    lambda: tk.StringVar(value="0.000")),
+        ):
+            _d = getattr(self, _attr, None)
+            if _d is None:
+                continue
+            _lst = _d.get(base, [])
+            del _lst[new_n - 1:]
+            while len(_lst) < new_n - 1:
+                _lst.append(_seed())
+            _d[base] = _lst
 
         sv = self._aaf_source_file_vars.get(base)
         n_filled = 0
@@ -2774,7 +2883,26 @@ class AafWorkflowMixin:
                 "state":      self._aaf_sync_state_vars.get(b, tk.StringVar()).get(),
                 "needs_sync": self._aaf_needs_sync_vars.get(b, tk.BooleanVar()).get(),
                 "locked":     self._aaf_sync_locked_vars.get(b, tk.BooleanVar()).get(),
+                # Per-extra-slot values (Slice A) so undo restores per-slot
+                # edits, not just slot 1.
+                "extra_enabled":    [bv.get() for bv in
+                    getattr(self, "_aaf_source_sync_extra_vars",      {}).get(b, [])],
+                "extra_audio_path": [sv.get() for sv in
+                    getattr(self, "_aaf_source_syncaudio_extra_vars", {}).get(b, [])],
+                "extra_offset":     [sv.get() for sv in
+                    getattr(self, "_aaf_source_offset_extra_vars",    {}).get(b, [])],
             }
+        snap["multi_mode"] = {
+            b: self._aaf_source_multi_mode_vars[b].get()
+            for b in self._aaf_sources
+            if b in getattr(self, "_aaf_source_multi_mode_vars", {})
+        }
+        snap["slot_counts"] = dict(getattr(self, "_aaf_source_slot_counts", {}))
+        snap["extra_assignments"] = {
+            b: [ev.get() for ev in
+                getattr(self, "_aaf_source_extra_vars", {}).get(b, [])]
+            for b in self._aaf_sources
+        }
         return snap
 
     def _aaf_push_full_undo(self):
@@ -2805,6 +2933,17 @@ class AafWorkflowMixin:
         for b in saved_sources:
             if b not in self._aaf_source_file_vars:
                 self._aaf_source_file_vars[b]       = tk.StringVar(value="— no video —")
+            # Per-slot extras + multi-mode default seeds (values applied
+            # further down alongside the scalar restore).
+            if b not in getattr(self, "_aaf_source_sync_extra_vars", {}):
+                self._aaf_source_sync_extra_vars[b]      = []
+            if b not in getattr(self, "_aaf_source_syncaudio_extra_vars", {}):
+                self._aaf_source_syncaudio_extra_vars[b] = []
+            if b not in getattr(self, "_aaf_source_offset_extra_vars", {}):
+                self._aaf_source_offset_extra_vars[b]    = []
+            if b not in getattr(self, "_aaf_source_multi_mode_vars", {}):
+                self._aaf_source_multi_mode_vars[b]      = tk.StringVar(
+                    value="simultaneous")
             if b not in self._aaf_source_sync_vars:
                 self._aaf_source_sync_vars[b]       = tk.BooleanVar(value=False)
             if b not in self._aaf_source_syncaudio_vars:
@@ -2823,6 +2962,9 @@ class AafWorkflowMixin:
                 self._aaf_sync_locked_vars[b]       = tk.BooleanVar(value=False)
 
         # Apply saved values
+        _slot_counts_snap        = snap.get("slot_counts", {}) or {}
+        _extra_assignments_snap  = snap.get("extra_assignments", {}) or {}
+        _multi_mode_snap         = snap.get("multi_mode", {}) or {}
         for b in saved_sources:
             fn = assignments.get(b, "— no video —")
             if fn in options:
@@ -2836,6 +2978,41 @@ class AafWorkflowMixin:
             self._aaf_sync_state_vars[b].set(sd.get("state", ""))
             self._aaf_needs_sync_vars[b].set(sd.get("needs_sync", False))
             self._aaf_sync_locked_vars[b].set(sd.get("locked", False))
+
+            # Restore slot count, extra file assignments, per-slot
+            # sync/syncaudio/offset extras, and multi_mode.  Extras are
+            # sized to match the restored slot count; legacy snapshots
+            # missing these keys just get empty lists (safe defaults).
+            _n = _slot_counts_snap.get(b, 1)
+            self._aaf_source_slot_counts[b] = _n
+            _n_extra = max(0, _n - 1)
+            _evs = self._aaf_source_extra_vars.get(b, [])
+            del _evs[_n_extra:]
+            while len(_evs) < _n_extra:
+                _evs.append(tk.StringVar(value="— no video —"))
+            for _i, _fn in enumerate(_extra_assignments_snap.get(b, [])):
+                if _i < _n_extra:
+                    _evs[_i].set(_fn if _fn in options else "— no video —")
+            self._aaf_source_extra_vars[b] = _evs
+            for _attr, _key, _seed in (
+                ("_aaf_source_sync_extra_vars",      "extra_enabled",    lambda: tk.BooleanVar(value=False)),
+                ("_aaf_source_syncaudio_extra_vars", "extra_audio_path", lambda: tk.StringVar(value="")),
+                ("_aaf_source_offset_extra_vars",    "extra_offset",     lambda: tk.StringVar(value="0.000")),
+            ):
+                _d = getattr(self, _attr, None)
+                if _d is None:
+                    continue
+                _lst = _d.get(b, [])
+                del _lst[_n_extra:]
+                while len(_lst) < _n_extra:
+                    _lst.append(_seed())
+                for _i, _v in enumerate(sd.get(_key, []) or []):
+                    if _i < _n_extra:
+                        try: _lst[_i].set(_v)
+                        except Exception: pass
+                _d[b] = _lst
+            if b in _multi_mode_snap and b in getattr(self, "_aaf_source_multi_mode_vars", {}):
+                self._aaf_source_multi_mode_vars[b].set(_multi_mode_snap[b])
 
         self._rebuild_aaf_source_rows()
 
@@ -3924,9 +4101,26 @@ class AafWorkflowMixin:
                                       base, tk.BooleanVar()).get(),
                     "locked":     self._aaf_sync_locked_vars.get(
                                       base, tk.BooleanVar()).get(),
+                    # Per-extra-slot values (index 0 = slot 2, ...).  Only
+                    # written when N > 1 so single-slot sources don't
+                    # bloat the save file.  Slot 1's values live in the
+                    # scalar fields above.
+                    "extra_enabled":    [bv.get() for bv in
+                        getattr(self, "_aaf_source_sync_extra_vars",      {}).get(base, [])],
+                    "extra_audio_path": [sv.get() for sv in
+                        getattr(self, "_aaf_source_syncaudio_extra_vars", {}).get(base, [])],
+                    "extra_offset":     [sv.get() for sv in
+                        getattr(self, "_aaf_source_offset_extra_vars",    {}).get(base, [])],
                 }
                 for base in self._aaf_sources
                 if base in self._aaf_source_sync_vars
+            },
+            # simultaneous | sequential — only meaningful when slot_count>1.
+            # Persisted per-source so users don't have to re-pick on reload.
+            "multi_mode": {
+                base: self._aaf_source_multi_mode_vars[base].get()
+                for base in self._aaf_sources
+                if base in getattr(self, "_aaf_source_multi_mode_vars", {})
             },
             "hidden_sources": sorted(getattr(self, "_aaf_hidden_sources", set())),
             "grouping":      self._aaf_group_var.get(),
@@ -4088,6 +4282,45 @@ class AafWorkflowMixin:
                 self._aaf_needs_sync_vars[base].set(sd.get("needs_sync", False))
             if base in self._aaf_sync_locked_vars:
                 self._aaf_sync_locked_vars[base].set(sd.get("locked", False))
+
+            # Per-extra-slot restore.  Legacy saves have no "extra_*"
+            # keys — they get empty lists (default) which _aaf_update_
+            # slot_count will then reseed when it grows the slot count
+            # from persisted slot_counts below.  Post-Slice-A saves
+            # carry the per-slot values verbatim.
+            _n_extra = max(0, data.get("slot_counts", {}).get(base, 1) - 1)
+            for _attr, _key, _seed in (
+                ("_aaf_source_sync_extra_vars",      "extra_enabled",    lambda: tk.BooleanVar(value=False)),
+                ("_aaf_source_syncaudio_extra_vars", "extra_audio_path", lambda: tk.StringVar(value="")),
+                ("_aaf_source_offset_extra_vars",    "extra_offset",     lambda: tk.StringVar(value="0.000")),
+            ):
+                _d = getattr(self, _attr, None)
+                if _d is None:
+                    continue
+                _saved = sd.get(_key, []) or []
+                _lst = _d.get(base, [])
+                del _lst[_n_extra:]
+                while len(_lst) < _n_extra:
+                    _lst.append(_seed())
+                for _i in range(min(_n_extra, len(_saved))):
+                    try:
+                        _lst[_i].set(_saved[_i])
+                    except Exception:
+                        pass
+                _d[base] = _lst
+
+        # multi_mode: default "simultaneous" for multi-slot sources
+        # (matches post-a94bac2 stacking); legacy pre-Slice-A saves get
+        # this default automatically since the key won't be present.
+        _mm_data = data.get("multi_mode", {})
+        _mm_dict = getattr(self, "_aaf_source_multi_mode_vars", None)
+        if _mm_dict is not None:
+            for base in self._aaf_sources:
+                if base not in _mm_dict:
+                    _mm_dict[base] = tk.StringVar(
+                        value=_mm_data.get(base, "simultaneous"))
+                elif base in _mm_data:
+                    _mm_dict[base].set(_mm_data[base])
 
         # Restore hidden sources
         self._aaf_hidden_sources = set(data.get("hidden_sources", []))
