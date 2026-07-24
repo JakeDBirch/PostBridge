@@ -8338,6 +8338,34 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                         padx=12, pady=6)
         self._pq_status_lbl.pack(side="right")
 
+        # ── Cursor timecode readout ──────────────────────────────────
+        # Shows the source TC of the word under the transcript cursor
+        # so the user can quickly adjust a pull's timecode in the
+        # script without having to copy-paste to extract the time.
+        # Click the readout to copy the TC to the clipboard.
+        self._pq_cursor_tc_var = tk.StringVar(value="—")
+        self._pq_cursor_tc_lbl = tk.Label(
+            tx_hdr, textvariable=self._pq_cursor_tc_var, font=FBT,
+            bg=SURF3, fg=ACCENT, cursor="hand2", padx=12, pady=6)
+        self._pq_cursor_tc_lbl.pack(side="right")
+        tk.Label(tx_hdr, text="AT", font=FB, bg=SURF3, fg=SUB,
+                 padx=(0, 0), pady=6).pack(side="right")
+
+        def _copy_cursor_tc(_e=None):
+            v = self._pq_cursor_tc_var.get()
+            if not v or v == "—":
+                return
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(v)
+                # Brief visual acknowledgement
+                _orig = self._pq_cursor_tc_lbl.cget("fg")
+                self._pq_cursor_tc_lbl.config(fg=SUCCESS)
+                self.after(500, lambda: self._pq_cursor_tc_lbl.config(fg=_orig))
+            except tk.TclError:
+                pass
+        self._pq_cursor_tc_lbl.bind("<Button-1>", _copy_cursor_tc)
+
         # Search row — Entry + match counter + ◀ ▶ navigation
         sr = tk.Frame(tx_outer, bg=SURF, padx=12, pady=6)
         if self._pq_search_visible:
@@ -8502,6 +8530,42 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         tx_text.configure(yscrollcommand=tx_sb.set)
         tx_text.pack(side="left", fill="both", expand=True)
         self._pq_tx_text = tx_text
+
+        # ── Cursor timecode: keep _pq_cursor_tc_var in sync with the
+        # text-widget insertion point.  Fires on click and any key that
+        # moves the insertion cursor (arrows, Home/End, etc.).  Uses
+        # binary search across _pq_word_index (ordered by abs char
+        # position) so lookup stays O(log N) on long transcripts.
+        import bisect as _bisect
+        def _update_cursor_tc(_e=None, t=tx_text):
+            idx = getattr(self, "_pq_word_index", None)
+            var = getattr(self, "_pq_cursor_tc_var", None)
+            if var is None:
+                return
+            if not idx:
+                var.set("—"); return
+            try:
+                pos = t.count("1.0", "insert")
+                pos_i = int(pos[0]) if pos else 0
+            except (tk.TclError, TypeError, ValueError):
+                var.set("—"); return
+            # bisect on the start-char field; then verify the cursor sits
+            # inside that word's range OR pick the nearest neighbour.
+            starts = [s for (s, _e, _w) in idx]
+            i = _bisect.bisect_right(starts, pos_i) - 1
+            if i < 0:
+                i = 0
+            elif i < len(idx) - 1 and idx[i][1] < pos_i:
+                # Cursor is past this word's end; if the NEXT word starts
+                # close, snap to it (feels natural when clicking whitespace).
+                if idx[i + 1][0] - pos_i < pos_i - idx[i][1]:
+                    i += 1
+            w = idx[i][2]
+            t_s = float(w.get("start", 0.0) or 0.0)
+            var.set(secs_tc(t_s).split(".")[0])
+
+        tx_text.bind("<ButtonRelease-1>", _update_cursor_tc, add="+")
+        tx_text.bind("<KeyRelease>",       _update_cursor_tc, add="+")
 
         # Search match highlight tag
         tx_text.tag_configure("pq_match", background="#5a3a10",
