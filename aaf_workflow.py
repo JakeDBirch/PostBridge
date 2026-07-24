@@ -192,7 +192,15 @@ class AafWorkflowMixin:
                 "_aaf_source_sync_cand_idx", "_aaf_source_sync_candidates",
                 "_aaf_source_has_slate_vars",
                 "_aaf_sync_state_vars", "_aaf_needs_sync_vars",
-                "_aaf_sync_locked_vars"):
+                "_aaf_sync_locked_vars",
+                # Slice A extras — same prune rules as their scalar
+                # counterparts, otherwise stale entries would leak into
+                # the setup save and mis-restore onto a source the new
+                # AAF lacks.
+                "_aaf_source_sync_extra_vars",
+                "_aaf_source_syncaudio_extra_vars",
+                "_aaf_source_offset_extra_vars",
+                "_aaf_source_multi_mode_vars"):
             _d = getattr(self, _dname, None)
             if isinstance(_d, dict):
                 for _stale in [k for k in _d if k not in _live]:
@@ -222,6 +230,83 @@ class AafWorkflowMixin:
         else:
             self._ui(self._aaf_step2)
 
+    def _aaf_reimport(self, new_path=None):
+        """Swap in a re-exported AAF while preserving every non-AAF piece
+        of the setup — pool files, assignments, per-slot sync/offsets,
+        multi-mode, hide selections, grouping, seq params, mix path.
+
+        Use case: the Pro Tools session got a notes-driven re-cut but
+        the underlying media, pool assignments, and syncs didn't change.
+        Only the clip timing/boundaries differ.  Round-trips the setup
+        through _aaf_build_setup_data / _aaf_restore_setup so any base
+        common to old + new keeps its state; new bases seed defaults,
+        removed bases silently drop out.
+        """
+        if not new_path:
+            new_path = filedialog.askopenfilename(
+                title="Reimport AAF (preserve setup)",
+                filetypes=[("AAF", "*.aaf"), ("All", "*.*")])
+        if not new_path or not os.path.isfile(new_path):
+            return
+        if not getattr(self, "_aaf_data", None):
+            # No current setup to preserve — behave like a normal load.
+            self._aaf_load(new_path)
+            return
+
+        old_sources = set(getattr(self, "_aaf_sources", []) or [])
+        try:
+            saved = self._aaf_build_setup_data()
+        except Exception as e:
+            messagebox.showerror("Reimport error",
+                                 "Could not capture current setup:\n{}".format(e))
+            return
+
+        # Override the AAF path in the snapshot so _aaf_restore_setup's
+        # "aaf" key (if consulted) points at the new file, not the old.
+        saved["aaf"] = os.path.abspath(new_path)
+
+        self._aaf_load(new_path)
+        if not getattr(self, "_aaf_data", None):
+            # _aaf_load already surfaced an error dialog; nothing more to do.
+            return
+
+        try:
+            self._aaf_restore_setup(saved)
+        except Exception as e:
+            messagebox.showerror("Reimport error",
+                                 "Loaded new AAF but couldn't restore setup:\n{}\n\n"
+                                 "Your saved setup file is untouched — reopen it "
+                                 "to recover.".format(e))
+            return
+
+        new_sources = set(getattr(self, "_aaf_sources", []) or [])
+        common  = old_sources & new_sources
+        added   = new_sources - old_sources
+        removed = old_sources - new_sources
+
+        _lines = [
+            "AAF reimported.  Setup preserved for shared sources.",
+            "",
+            "  Kept:    {} source{}".format(len(common), "s" if len(common) != 1 else ""),
+            "  Added:   {} source{}".format(len(added),  "s" if len(added)  != 1 else ""),
+            "  Removed: {} source{}".format(len(removed), "s" if len(removed) != 1 else ""),
+        ]
+        if added:
+            _lines.append("")
+            _lines.append("  New (needs assignment):")
+            for _b in sorted(added)[:8]:
+                _lines.append("    • " + _b)
+            if len(added) > 8:
+                _lines.append("    … and {} more".format(len(added) - 8))
+        if removed:
+            _lines.append("")
+            _lines.append("  Removed (state dropped):")
+            for _b in sorted(removed)[:8]:
+                _lines.append("    • " + _b)
+            if len(removed) > 8:
+                _lines.append("    … and {} more".format(len(removed) - 8))
+        messagebox.showinfo("Reimport complete", "\n".join(_lines))
+
     def _aaf_step2(self):
         # Preserve pool state so Back → Next doesn't lose work
         _saved_vpaths = list(getattr(self, "_aaf_video_paths", []))
@@ -239,6 +324,12 @@ class AafWorkflowMixin:
                   self._aaf_sync_redo, small=True).pack(side="right", padx=(0, 4))
         self._btn(_hdr, "\u21b6 UNDO",
                   self._aaf_sync_undo, small=True).pack(side="right", padx=(0, 4))
+        # Swap in a re-exported AAF while keeping every non-AAF piece
+        # of the setup \u2014 pool, assignments, per-slot sync/offsets, hide
+        # selections, seq params.  For the Pro-Tools-recut case where
+        # only clip timing changed.
+        self._btn(_hdr, "REIMPORT AAF\u2026",
+                  self._aaf_reimport, small=True).pack(side="right", padx=(0, 12))
         # Keyboard bindings (idempotent — safe to re-bind each visit)
         self.bind_all("<Control-z>", lambda e: self._aaf_sync_undo())
         self.bind_all("<Control-y>", lambda e: self._aaf_sync_redo())
