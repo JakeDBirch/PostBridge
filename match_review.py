@@ -175,6 +175,17 @@ class MatchReviewDialog:
         # Interior segment boundaries stay fixed; on accept we shift
         # the first-in and last-out by the same deltas the user applied.
         self._segments   = [list(s) for s in segments]  # mutable copy
+        # Sweep zero-duration segments from any prior session's saved
+        # state before we compute _in_s / _out_s — otherwise the span
+        # inherits an artefactual boundary at the empty segment's
+        # position and the visible edit area expands to include it.
+        # (Method may not exist yet during first-run tests; be defensive.)
+        _fps_for_prune = float(fps) if fps else 24.0
+        _eps = 1.0 / max(1.0, _fps_for_prune)
+        _clean = [list(s) for s in self._segments
+                   if (float(s[1]) - float(s[0])) >= _eps]
+        if _clean:
+            self._segments = _clean
         self._in_s       = self._segments[0][0]  if self._segments else 0.0
         self._out_s      = self._segments[-1][1] if self._segments else 0.0
 
@@ -1140,13 +1151,25 @@ class MatchReviewDialog:
                 _ex = _t_to_px(_eff_out)
                 _seg_w = _ex - _sx
                 _cx    = (_sx + _ex) / 2
-                # Only draw if the segment is wide enough to fit the label
-                if _seg_w > 80 and 0 <= _cx < w:
+                # Adapt label to available width so short segments still
+                # get a clickable button.  A zero-duration segment can
+                # never appear here \u2014 _prune_empty_segments sweeps them
+                # on every mutation \u2014 but user-created 200-ms segments
+                # (e.g. two cuts placed close together) still need a
+                # way out.  Threshold matches the smallest label that
+                # renders as a real button (~14px for a single "\u00d7").
+                if _seg_w > 14 and 0 <= _cx < w:
+                    if _seg_w > 100:
+                        _label = "\u00d7 remove segment"
+                    elif _seg_w > 44:
+                        _label = "\u00d7 remove"
+                    else:
+                        _label = "\u00d7"
                     _tag = "rm_seg_{}".format(_si)
                     _cy  = mid + 28
                     _rm  = cv.create_text(
                         int(_cx), _cy,
-                        text="\u00d7 remove segment",
+                        text=_label,
                         fill=ERR,
                         font=("Segoe UI", 8, "bold"),
                         anchor="center",
@@ -1655,6 +1678,15 @@ class MatchReviewDialog:
                     remain = max(0.5, self._ctx_dur - new_t)
                     self._play(new_t, min(remain, 30.0))
                 self._pre_play_pos = new_t
+        # A drag on a CUT boundary can crush a segment down to zero
+        # duration.  Auto-prune so the invisible-sliver-that-won't-
+        # remove state (screenshot from Jordan) can't happen.
+        _pre = len(self._segments)
+        if hasattr(self, "_prune_empty_segments"):
+            self._prune_empty_segments()
+            if len(self._segments) != _pre:
+                self._refresh_displays()
+                self._draw()
         self._drag = None
 
     def _on_hover(self, event):
@@ -2263,6 +2295,51 @@ class MatchReviewDialog:
         fut.add_done_callback(_done)
         ex.shutdown(wait=False)
 
+    def _prune_empty_segments(self):
+        """Drop any segments whose effective duration is below one frame
+        (~40 ms at 24 fps), and merge adjacent segments whose boundaries
+        touch (out == in).  Called after every mutation so the editor's
+        segment list never falls into the "invisible sliver that can't
+        be clicked" state Jordan hit — a zero-duration segment renders
+        as no waveform region and doesn't fit a remove-segment button,
+        yet still expands the edit area because its endpoints do count
+        in the min/max span.
+
+        Preserves the FIRST and LAST segments as sacred (they anchor
+        _in_s / _out_s); only interior segments can be pruned by this
+        pass.  The global IN/OUT get realigned to whichever kept
+        segments now sit at the head/tail.
+        """
+        _EPS = 1.0 / max(1.0, float(getattr(self, "_fps", 24.0)))
+        if len(self._segments) <= 1:
+            return
+        keep = []
+        for s in self._segments:
+            try:
+                _in, _out = float(s[0]), float(s[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if _out - _in >= _EPS:
+                keep.append([_in, _out])
+        # Coalesce touching segments (out == next.in) so the "merge"
+        # button doesn't have to be clicked for redundant boundaries.
+        merged = []
+        for s in keep:
+            if merged and abs(merged[-1][1] - s[0]) < _EPS:
+                merged[-1][1] = s[1]
+            else:
+                merged.append(list(s))
+        # Guard: don't reduce to zero segments — leave at least one
+        # even if everything was pruned (indicates a degenerate input).
+        if not merged and self._segments:
+            merged = [list(self._segments[0])]
+        if merged != self._segments:
+            self._segments = merged
+            # Realign global handles to the new head/tail so the
+            # displayed IN/OUT don't drift off into pruned space.
+            self._in_s  = self._segments[0][0]
+            self._out_s = self._segments[-1][1]
+
     def _remove_cut(self, seg_idx):
         """Merge segment (seg_idx-1) and (seg_idx), removing the cut between them."""
         n = len(self._segments)
@@ -2272,6 +2349,7 @@ class MatchReviewDialog:
         # Extend the previous segment's out to the next segment's out, then delete next
         self._segments[seg_idx - 1][1] = self._segments[seg_idx][1]
         del self._segments[seg_idx]
+        self._prune_empty_segments()
         self._draw()
 
     def _remove_segment(self, seg_idx):
@@ -2291,6 +2369,7 @@ class MatchReviewDialog:
             # New last segment inherits the global OUT
             self._out_s = self._segments[n - 2][1]
         del self._segments[seg_idx]
+        self._prune_empty_segments()
         self._refresh_displays()
         self._draw()
 
@@ -2353,6 +2432,7 @@ class MatchReviewDialog:
                 self._push_undo()
                 self._segments[i] = [eff_in, cut_out]
                 self._segments.insert(i + 1, [cut_in, eff_out])
+                self._prune_empty_segments()
                 self._draw()
                 return
 
