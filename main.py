@@ -6053,10 +6053,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                              reverse=reverse)
             elif cur_sort == "alphabetical":
                 def _alpha_key(e):
-                    txt = (e["res"].get("matched_text")
-                           or e["res"].get("quote")
-                           or e["res"].get("token") or "")
-                    return txt.strip().lower()
+                    # Sort by token/label so all pulls for a token
+                    # group together; secondary key is script order
+                    # so within-token rows stay in the order they
+                    # appear in the script.
+                    return ((e["res"].get("token") or "").strip().lower(),
+                            e["res"].get("order", 0))
                 visible.sort(key=_alpha_key, reverse=reverse)
             elif cur_sort == "confidence":
                 def _conf_key(e):
@@ -6350,20 +6352,73 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             def _open_review(event=None, r=res, af=_accepted_flag,
                              ss=_set_accepted, sl=stat_lbl,
                              rcl=_refresh_clips_lbl):
-                # Compute sa dynamically so session-restored results without
-                # source_video still get a second chance via the pool.
-                sa = r.get("source_audio") or r.get("source_video") or ""
+                # Resolve source audio with a fallback ladder so cards
+                # from restored sessions / provisional-first / post-
+                # reassign flows all open cleanly.  A silent return here
+                # was the reason many cards appeared "dead to clicks".
+                tried = []
+                def _try(path, label):
+                    tried.append((label, path or "(unset)"))
+                    return path and os.path.isfile(path)
+
+                sa = r.get("source_audio", "") or ""
+                if not _try(sa, "source_audio"):
+                    sa = r.get("source_video", "") or ""
+                    if not _try(sa, "source_video"):
+                        sa = ""
+
+                # For VO rows the winning take's apath is the canonical
+                # source — try it before any pool guessing.
+                if not sa and r.get("is_vo"):
+                    _td = r.get("takes_data") or []
+                    _bi = r.get("best_take_index", 0) or 0
+                    if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
+                        _apath = _td[_bi].get("apath", "") or ""
+                        if _try(_apath, "takes_data[{}].apath".format(_bi)):
+                            sa = _apath
+                            r["source_audio"] = _apath   # cache
+
+                # Pool fallbacks — prefer audio, then video (existing
+                # behavior extended: audio was never tried before).
+                if not sa:
+                    tok = r.get("token", "")
+                    _pool = getattr(self, "_pool", None)
+                    if _pool is not None:
+                        if r.get("is_vo"):
+                            _pi = r.get("part_index", -1)
+                            try:
+                                _bin = _pool.get_vo_assets().get(_pi, {}) or {}
+                            except Exception:
+                                _bin = {}
+                            _audios = _bin.get("audios", []) or []
+                            _videos = _bin.get("videos", []) or []
+                        else:
+                            _assigned = _pool.get_interview_assets().get(tok, []) or []
+                            _audios = [p for p in _assigned if not is_video(p)]
+                            _videos = [p for p in _assigned if is_video(p)]
+
+                        _aud = next((p for p in _audios if os.path.isfile(p)), None)
+                        if _try(_aud, "pool audio"):
+                            sa = _aud
+                            r["source_audio"] = _aud   # cache
+                        else:
+                            _vid = next((p for p in _videos if os.path.isfile(p)), None)
+                            if _try(_vid, "pool video"):
+                                sa = _vid
+                                r["source_video"] = _vid   # cache
+
                 if not sa or not os.path.isfile(sa):
-                    # Fallback: look for a video file in current pool assets
-                    tok    = r.get("token", "")
-                    assets = (getattr(self, "_pool", None) and
-                              self._pool.get_interview_assets().get(tok, []))
-                    vid = next((p for p in (assets or [])
-                                if is_video(p) and os.path.isfile(p)), None)
-                    if vid:
-                        sa = vid
-                        r["source_video"] = vid   # cache for future opens
-                if not sa or not os.path.isfile(sa):
+                    # Explain WHY the editor can't open — not silent.
+                    _msg  = ("Can't open the waveform editor for #{:03d}  {}\n\n"
+                             "No usable source audio/video found.  Sources "
+                             "checked:\n\n".format(
+                                 r.get("order", 0), r.get("token", "?")))
+                    for _lbl, _path in tried:
+                        _msg += "  • {:20}  {}\n".format(_lbl, _path)
+                    _msg += ("\nUse the REASSIGN button on this card to point "
+                             "it at a valid file, or add the missing file to "
+                             "the pool via Step 2.")
+                    messagebox.showwarning("No source available", _msg, parent=self)
                     return
                 segs_r = r.get("segments") or [(0.0, 30.0)]
                 fps    = getattr(self, "_seq_fps", 24.0)
