@@ -2284,10 +2284,23 @@ class MatchReviewDialog:
     # ── Playback ──────────────────────────────────────────────────────────
 
     def _toggle_play(self):
-        """Spacebar handler — stop if playing, play/edit if stopped."""
+        """Spacebar handler — stop if playing, play/edit if stopped.
+
+        First-spacebar guard: if the user hasn't played anything yet
+        this dialog session (no _pre_play_pos, no active playback),
+        snap the playhead to IN before playing.  Otherwise a stray
+        canvas click / callback that shifted _playhead_s during load
+        would leave the user hearing playback start "part-way
+        through the edit" on their first press.  Subsequent
+        spacebars respect the current playhead position so scrubbing
+        + play-from-cursor still works.
+        """
         if self._playback_start_wall is not None:
             self._stop()
         else:
+            if self._pre_play_pos is None:
+                self._playhead_s = self._in_s
+                self._draw()
             self._play_or_edit()
 
     def _play_or_edit(self):

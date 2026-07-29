@@ -93,6 +93,42 @@ def _tx_count_displaylines(tx, a, b):
 
 
 class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
+
+    # ── Status display maps (single source of truth) ────────────────
+    # Class-level so any code path that renders a status label uses
+    # THE SAME copy — no risk of surgical-patch helpers drifting out
+    # of sync with _step4's build-time copy.  Colour aliases (SUCCESS,
+    # WARN, etc.) live at module scope, imported when this class is
+    # defined, so the maps here can reference them safely.
+    STATUS_COLOR = {
+        "ok":             SUCCESS,
+        "direct":         SUCCESS,
+        "manual":         SUCCESS,
+        "low_confidence": WARN,
+        "no_match":       ERR,
+        "no_quote":       SUB,
+        "error":          ERR,
+        "no_file":        ERR,
+        "not_run":        SUB,
+        "cancelled":      SUB,
+        "provisional":    INFO,
+        "transcribing":   INFO,
+    }
+    STATUS_LABEL = {
+        "ok":             "✓  matched",
+        "direct":         "✓  matched",
+        "manual":         "✓  adjusted",
+        "low_confidence": "⚠  low confidence",
+        "no_match":       "✗  no match",
+        "no_quote":       "–  no quote text",
+        "error":          "✗  error",
+        "no_file":        "✗  no file assigned",
+        "not_run":        "–  not run",
+        "cancelled":      "–  cancelled",
+        "provisional":    "…  provisional",
+        "transcribing":   "⧗  transcribing…",
+    }
+
     def __init__(self):
         super().__init__()
         self.title("PostBridge")
@@ -2737,39 +2773,22 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _s4_patch_card_status(self, res):
         """Surgical single-card status refresh — avoids a full _step4
         rebuild when only ONE row's status changed.  Looks up the
-        res in self._rv, updates that entry's stat_lbl text + color
-        using the same STATUS_LABEL / STATUS_COLOR maps _step4 uses
-        at build time.  No-op if the entry can't be found (e.g. Step
-        4 isn't rendered right now)."""
+        res in self._rv and updates that entry's stat_lbl text +
+        color using the class-level STATUS_LABEL / STATUS_COLOR
+        maps (App.STATUS_*) — single source of truth so this can't
+        drift out of sync with _step4's build-time rendering."""
         _rv = getattr(self, "_rv", None)
         if not _rv:
             return
-        # STATUS_LABEL / STATUS_COLOR live as _step4-scope locals; the
-        # values used here must stay in sync.  Reproduced narrowly.
-        _COL = {"ok": SUCCESS, "direct": SUCCESS, "manual": SUCCESS,
-                "low_confidence": WARN, "no_match": ERR, "no_quote": SUB,
-                "error": ERR, "no_file": ERR, "not_run": SUB,
-                "cancelled": SUB, "provisional": INFO,
-                "transcribing": INFO}
-        _LBL = {"ok": "✓  matched", "direct": "✓  matched",
-                "manual": "✓  adjusted",
-                "low_confidence": "⚠  low confidence",
-                "no_match": "✗  no match",
-                "no_quote": "–  no quote text",
-                "error": "✗  error",
-                "no_file": "✗  no file assigned",
-                "not_run": "–  not run",
-                "cancelled": "–  cancelled",
-                "provisional": "…  provisional",
-                "transcribing": "⧗  transcribing…"}
         _new_st = res.get("status", "")
         for e in _rv:
             if e.get("res") is res:
                 _lbl = e.get("stat_lbl")
                 if _lbl:
                     try:
-                        _lbl.config(text=_LBL.get(_new_st, _new_st),
-                                    fg=_COL.get(_new_st, SUB))
+                        _lbl.config(
+                            text=self.STATUS_LABEL.get(_new_st, _new_st),
+                            fg=self.STATUS_COLOR.get(_new_st, SUB))
                     except tk.TclError:
                         pass
                 break
@@ -6596,34 +6615,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._rv   = []
         self._skip = []
 
-        STATUS_COLOR = {
-            "ok":             SUCCESS,
-            "direct":         SUCCESS,
-            "manual":         SUCCESS,
-            "low_confidence": WARN,
-            "no_match":       ERR,
-            "no_quote":       SUB,
-            "error":          ERR,
-            "no_file":        ERR,
-            "not_run":        SUB,
-            "cancelled":      SUB,
-            "provisional":    INFO,
-            "transcribing":   INFO,
-        }
-        STATUS_LABEL = {
-            "ok":             "\u2713  matched",
-            "direct":         "\u2713  matched",
-            "manual":         "\u2713  adjusted",
-            "low_confidence": "\u26a0  low confidence",
-            "no_match":       "\u2717  no match",
-            "no_quote":       "\u2013  no quote text",
-            "error":          "\u2717  error",
-            "no_file":        "\u2717  no file assigned",
-            "not_run":        "\u2013  not run",
-            "cancelled":      "\u2013  cancelled",
-            "provisional":    "\u2026  provisional",
-            "transcribing":   "\u29d7  transcribing\u2026",
-        }
+        # Alias the class-level maps so the existing per-card build code
+        # that references bare STATUS_COLOR / STATUS_LABEL keeps working
+        # verbatim.  Single source of truth lives at App.STATUS_COLOR /
+        # App.STATUS_LABEL now, so surgical patchers (like
+        # _s4_patch_card_status) can't drift out of sync.
+        STATUS_COLOR = self.STATUS_COLOR
+        STATUS_LABEL = self.STATUS_LABEL
 
         # Accordion: only one card body open at a time.
         _open_card   = [None]
