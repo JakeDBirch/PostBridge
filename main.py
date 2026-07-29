@@ -2705,24 +2705,74 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             _blobs = None
 
         if _cached_words:
+            # Cache hit — reconcile completes synchronously, and
+            # results change enough (TCs, segments, status) that a
+            # full rebuild is the honest way to reflect them.
             self._s4_reconcile_vo_row(res, new_file, _cached_words, _blobs)
             res.setdefault("status", "provisional")
+            self._s4_save()
+            try:
+                _cv = getattr(self, "_s4_scroll_canvas", None)
+                if _cv is not None:
+                    self._s4_pending_scroll_frac = float(_cv.yview()[0])
+            except Exception:
+                pass
+            self._step4()
         else:
+            # Bg transcribe path — SKIP the full rebuild here.  A full
+            # _step4() at this point produced the "screen blanks and
+            # cycles through each row before returning" jitter Jordan
+            # reported, because packing 200+ cards is not free.
+            # Instead patch this ONE card's status label surgically
+            # to "transcribing…"; the eventual completion callback in
+            # _s4_transcribe_and_reconcile_vo will do the full rebuild
+            # ONCE, when the results actually change.
             res["status"] = "transcribing"
+            self._s4_patch_card_status(res)
+            self._s4_save()
             threading.Thread(
                 target=self._s4_transcribe_and_reconcile_vo,
                 args=(res, new_file), daemon=True).start()
 
-        self._s4_save()
-        # Preserve scroll position across the Step 4 rebuild so the user
-        # stays anchored on the row they just reassigned.
-        try:
-            _cv = getattr(self, "_s4_scroll_canvas", None)
-            if _cv is not None:
-                self._s4_pending_scroll_frac = float(_cv.yview()[0])
-        except Exception:
-            pass
-        self._step4()
+    def _s4_patch_card_status(self, res):
+        """Surgical single-card status refresh — avoids a full _step4
+        rebuild when only ONE row's status changed.  Looks up the
+        res in self._rv, updates that entry's stat_lbl text + color
+        using the same STATUS_LABEL / STATUS_COLOR maps _step4 uses
+        at build time.  No-op if the entry can't be found (e.g. Step
+        4 isn't rendered right now)."""
+        _rv = getattr(self, "_rv", None)
+        if not _rv:
+            return
+        # STATUS_LABEL / STATUS_COLOR live as _step4-scope locals; the
+        # values used here must stay in sync.  Reproduced narrowly.
+        _COL = {"ok": SUCCESS, "direct": SUCCESS, "manual": SUCCESS,
+                "low_confidence": WARN, "no_match": ERR, "no_quote": SUB,
+                "error": ERR, "no_file": ERR, "not_run": SUB,
+                "cancelled": SUB, "provisional": INFO,
+                "transcribing": INFO}
+        _LBL = {"ok": "✓  matched", "direct": "✓  matched",
+                "manual": "✓  adjusted",
+                "low_confidence": "⚠  low confidence",
+                "no_match": "✗  no match",
+                "no_quote": "–  no quote text",
+                "error": "✗  error",
+                "no_file": "✗  no file assigned",
+                "not_run": "–  not run",
+                "cancelled": "–  cancelled",
+                "provisional": "…  provisional",
+                "transcribing": "⧗  transcribing…"}
+        _new_st = res.get("status", "")
+        for e in _rv:
+            if e.get("res") is res:
+                _lbl = e.get("stat_lbl")
+                if _lbl:
+                    try:
+                        _lbl.config(text=_LBL.get(_new_st, _new_st),
+                                    fg=_COL.get(_new_st, SUB))
+                    except tk.TclError:
+                        pass
+                break
 
     def _s4_reconcile_vo_row(self, res, audio_file, words, blobs=None):
         """Reconcile a single VO block against a cached transcript.
@@ -2773,15 +2823,18 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             def _fail():
                 res["status"] = "error"
                 res["matched_text"] = "transcription failed"
-                # Refresh so the failure shows up
-                self._step4()
+                # Surgical status patch — no full rebuild for an
+                # error state change on a single row.
+                self._s4_patch_card_status(res)
+                self._s4_save()
             self._ui(_fail)
             return
         if not words:
             def _empty():
                 res["status"] = "no_match"
                 res["matched_text"] = "transcription empty"
-                self._step4()
+                self._s4_patch_card_status(res)
+                self._s4_save()
             self._ui(_empty)
             return
         # Persist so subsequent opens hit the sidecar cache.
@@ -7080,6 +7133,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 "toggle_ignore_fn": _toggle_ignore,
                 "set_accepted_fn": _set_accepted,
                 "set_normal_fn":   _set_normal,
+                # Stashed for surgical single-card updates (see
+                # _s4_patch_card_status) so state changes on ONE row
+                # don't have to full-rebuild all ~200 cards.
+                "stat_lbl":       stat_lbl,
             })
 
             # ── Restore saved state ────────────────────────────────────────────
