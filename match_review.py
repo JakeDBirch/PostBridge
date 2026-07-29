@@ -1065,7 +1065,41 @@ class MatchReviewDialog:
                 cv.create_text(lbl_x, 14, text=label, fill=color,
                                font=("Segoe UI", 8, "bold"), anchor=anchor)
 
+        # ── Small helper: turn a text label into a clickable "floating
+        # button" by drawing a bordered rectangle behind it, tagged the
+        # same so hover + click hit the whole rectangle, not just the
+        # text glyphs.  Padding is intentionally generous so the click
+        # target comfortably exceeds the text ink.
+        def _canvas_button(text_id, tag,
+                            fill_bg=SURF2, fill_bg_hover=ERR,
+                            ink=SUB, ink_hover=BG,
+                            pad=(8, 3)):
+            _bb = cv.bbox(text_id)
+            if not _bb:
+                return
+            x1, y1, x2, y2 = _bb
+            _rect = cv.create_rectangle(
+                x1 - pad[0], y1 - pad[1],
+                x2 + pad[0], y2 + pad[1],
+                fill=fill_bg, outline=BORDER, width=1,
+                tags=(tag,))
+            cv.tag_lower(_rect, text_id)   # keep text on top of rect
+            cv.itemconfig(text_id, fill=ink)
+            cv.tag_bind(tag, "<Enter>",
+                        lambda e, r=_rect, t=text_id: (
+                            cv.itemconfig(r, fill=fill_bg_hover),
+                            cv.itemconfig(t, fill=ink_hover),
+                            cv.config(cursor="hand2")))
+            cv.tag_bind(tag, "<Leave>",
+                        lambda e, r=_rect, t=text_id: (
+                            cv.itemconfig(r, fill=fill_bg),
+                            cv.itemconfig(t, fill=ink),
+                            cv.config(cursor="")))
+
         # ── Multi-segment interior boundaries — draggable, removable ──────
+        # _remove_hit_areas kept as an empty list so _on_press's stale
+        # position scan bails cleanly; the button fires via tag_bind
+        # on release now.
         self._remove_hit_areas = []
         if len(self._segments) > 1:
             for i, (seg_in, seg_out) in enumerate(self._segments):
@@ -1076,16 +1110,15 @@ class MatchReviewDialog:
                         cv.create_text(px + 4, 22, text="\u25b6 CUT IN",
                                        fill=WARN,
                                        font=("Segoe UI", 8, "bold"), anchor="w")
-                        # "× merge" remove button
-                        _rm = cv.create_text(px + 4, 36, text="\u00d7 merge",
-                                             fill=SUB,
-                                             font=("Segoe UI", 7), anchor="w",
-                                             tags=("rm_in_{}".format(i),))
-                        cv.tag_bind("rm_in_{}".format(i), "<Enter>",
-                                    lambda e, t=_rm: cv.itemconfig(t, fill=ERR))
-                        cv.tag_bind("rm_in_{}".format(i), "<Leave>",
-                                    lambda e, t=_rm: cv.itemconfig(t, fill=SUB))
-                        self._remove_hit_areas.append((px + 4, 36, i))
+                        _tag = "rm_in_{}".format(i)
+                        _rm  = cv.create_text(
+                            px + 8, 40, text="\u00d7 merge",
+                            fill=SUB,
+                            font=("Segoe UI", 8, "bold"), anchor="w",
+                            tags=(_tag,))
+                        _canvas_button(_rm, _tag)
+                        cv.tag_bind(_tag, "<ButtonRelease-1>",
+                                    lambda e, ii=i: self._remove_cut(ii))
                 if i < len(self._segments) - 1:
                     px = _t_to_px(seg_out)
                     if -_MARKER_HIT <= px <= w + _MARKER_HIT:
@@ -1097,6 +1130,7 @@ class MatchReviewDialog:
         # ── Segment delete buttons — one per kept segment ─────────────────
         # Only shown when there is more than one segment (so deleting one
         # still leaves at least one behind).
+        # _remove_seg_areas empty for the same reason as _remove_hit_areas.
         self._remove_seg_areas = []
         if len(self._segments) > 1:
             for _si, (_seg_in, _seg_out) in enumerate(self._segments):
@@ -1117,13 +1151,11 @@ class MatchReviewDialog:
                         font=("Segoe UI", 8, "bold"),
                         anchor="center",
                         tags=(_tag,))
-                    cv.tag_bind(_tag, "<Enter>",
-                                lambda e, t=_rm: cv.itemconfig(t, fill="#ff5555"))
-                    cv.tag_bind(_tag, "<Leave>",
-                                lambda e, t=_rm: cv.itemconfig(t, fill=ERR))
+                    _canvas_button(_rm, _tag,
+                                   ink=ERR, ink_hover=BG,
+                                   fill_bg_hover=ERR)
                     cv.tag_bind(_tag, "<ButtonRelease-1>",
                                 lambda e, i=_si: self._remove_segment(i))
-                    self._remove_seg_areas.append((int(_cx), _cy, _si))
 
         # ── Playhead cursor ────────────────────────────────────────────────
         ph_px = _t_to_px(self._playhead_s)
@@ -1330,6 +1362,27 @@ class MatchReviewDialog:
         if self._samples is None:
             return
         self._drag_undo_pushed = False
+        # If the press landed on one of our clickable canvas buttons
+        # (merge / remove-segment), let its tag-bound <ButtonRelease-1>
+        # handle the action — don't start a drag underneath it.
+        try:
+            _cv    = self._word_cv.master  # the waveform canvas — actually resolve properly
+        except Exception:
+            _cv = None
+        try:
+            _wf_cv = getattr(self, "_wf_cv", None) or getattr(self, "_wfcv", None)
+        except Exception:
+            _wf_cv = None
+        # The canvas the event originates from IS event.widget; use it.
+        _ew = getattr(event, "widget", None)
+        if _ew is not None:
+            _cur = _ew.find_withtag("current")
+            if _cur:
+                _tags = _ew.gettags(_cur[0])
+                if any(t.startswith("rm_in_") or t.startswith("rm_seg_")
+                        for t in _tags):
+                    self._drag = None
+                    return
         # Check "× merge" buttons first (merge adjacent segments)
         for cx, cy, seg_idx in self._remove_hit_areas:
             if abs(event.x - cx) <= 28 and abs(event.y - cy) <= 8:
