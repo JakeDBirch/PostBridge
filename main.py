@@ -4362,7 +4362,14 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         sb.pack(side="right", fill="y")
 
         self._cancel.clear()
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
+        # Pin the nav to the BOTTOM of the parent so the log_frame
+        # (packed above with fill=both+expand=True) can't push it off
+        # the visible window.  Without side="bottom" the nav lands
+        # below the expanding log — invisible on any window smaller
+        # than the log's minimum height + all its siblings.  Which is
+        # every window Jordan's seeing.
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8, 0))
         self._btn(nav, "CANCEL", self._cancel_reconcile).pack(side="left")
 
         # Provisional-first jump: user can enter Step 4 review while the
