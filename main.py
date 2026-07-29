@@ -2645,13 +2645,110 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         res["rec_out_tc"]      = "00:00:00"
         res["matched_text"]    = ""
         res["confidence"]      = 0.0
-        res["status"]          = "provisional"
         res.pop("_s4_accepted",   None)
         res.pop("_s4_ignored",    None)
         res.pop("_original_status", None)
 
+        # Try to reconcile immediately against the new file's cached
+        # transcript.  If none exists, kick off a background transcribe
+        # + reconcile and mark the row "transcribing" so the user has
+        # a visible indicator that work is happening.
+        _cached_words, _blobs = engines.pb_transcript_load(new_file)
+        if _cached_words is None:
+            _cached_words = engines.cache_load(new_file)
+            _blobs = None
+
+        if _cached_words:
+            self._s4_reconcile_vo_row(res, new_file, _cached_words, _blobs)
+            res.setdefault("status", "provisional")
+        else:
+            res["status"] = "transcribing"
+            threading.Thread(
+                target=self._s4_transcribe_and_reconcile_vo,
+                args=(res, new_file), daemon=True).start()
+
         self._s4_save()
+        # Preserve scroll position across the Step 4 rebuild so the user
+        # stays anchored on the row they just reassigned.
+        try:
+            _cv = getattr(self, "_s4_scroll_canvas", None)
+            if _cv is not None:
+                self._s4_pending_scroll_frac = float(_cv.yview()[0])
+        except Exception:
+            pass
         self._step4()
+
+    def _s4_reconcile_vo_row(self, res, audio_file, words, blobs=None):
+        """Reconcile a single VO block against a cached transcript.
+
+        Rebuilds a minimal `takes` list with one entry, calls
+        engines.reconcile_vo_part on this block alone, then merges the
+        winning take's segments / TCs / matched_text back onto `res`.
+        Silent on error — the row just stays in whatever pre-call
+        state it was in.
+        """
+        # Find the original VO block dict from self.vo_blocks so the
+        # reconciler has the script text + gap flag to match against.
+        vo_block = None
+        _order = res.get("order")
+        for vb in getattr(self, "vo_blocks", []) or []:
+            if vb.get("order") == _order:
+                vo_block = vb
+                break
+        if vo_block is None:
+            return
+        # Take tuple shape mirrors engines.reconcile_vo_part's unpack
+        # at engines.py:3044 — (audio_words, v_offset, vpath, apath[, blobs]).
+        take = (words, 0.0, None, audio_file,
+                blobs if blobs is not None else [])
+        try:
+            new_results = engines.reconcile_vo_part([vo_block], [take])
+        except Exception:
+            return
+        if not new_results:
+            return
+        nr = new_results[0]
+        # Merge non-underscore keys onto res so _s4_accepted /
+        # _s4_ignored / _original_status stay owned by Step 4 state.
+        for k, v in nr.items():
+            if not k.startswith("_"):
+                res[k] = v
+        # Guarantee status reflects success; reconcile_vo_part will
+        # have already set it to ok / low_confidence / no_match.
+
+    def _s4_transcribe_and_reconcile_vo(self, res, audio_file):
+        """Background: transcribe `audio_file` (writing the sidecar so
+        future runs are cache-hits), then reconcile this VO row against
+        it.  Runs off the main thread; all UI updates route through
+        self._ui() so Tk stays single-threaded."""
+        try:
+            words, blobs = engines.transcribe_file(audio_file)
+        except Exception:
+            def _fail():
+                res["status"] = "error"
+                res["matched_text"] = "transcription failed"
+                # Refresh so the failure shows up
+                self._step4()
+            self._ui(_fail)
+            return
+        if not words:
+            def _empty():
+                res["status"] = "no_match"
+                res["matched_text"] = "transcription empty"
+                self._step4()
+            self._ui(_empty)
+            return
+        # Persist so subsequent opens hit the sidecar cache.
+        try:
+            engines.pb_transcript_save(audio_file, words, blobs=blobs)
+        except Exception:
+            pass
+
+        def _finish():
+            self._s4_reconcile_vo_row(res, audio_file, words, blobs)
+            self._s4_save()
+            self._step4()
+        self._ui(_finish)
 
     def _s4_redo_to_step2(self):
         """Go BACK to Step 2 while preserving user-approved Step 4 edits.
@@ -6145,9 +6242,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # sort_dir: {sort_key: 1 (ascending) or -1 (descending)}.  Clicking
         # the active sort flips its direction; clicking a different sort
         # switches to it in its remembered direction.
-        _fstate = {"mode": "all", "sort": "script",
-                   "sort_dir": {"script": 1, "alphabetical": 1,
-                                "confidence": 1, "subclips": -1}}
+        # Persist filter/sort state on self so a mid-review rebuild
+        # (e.g. reassign apply, reconcile-merge, status change) doesn't
+        # bounce the user back to the default ALL / Script view.
+        if not hasattr(self, "_s4_fstate") or not isinstance(
+                getattr(self, "_s4_fstate", None), dict):
+            self._s4_fstate = {"mode": "all", "sort": "script",
+                               "sort_dir": {"script": 1, "alphabetical": 1,
+                                            "confidence": 1, "subclips": -1}}
+        _fstate = self._s4_fstate
         _fbtns  = {}
         _sbtns  = {}
         _sort_labels = {"script":       "Script",
@@ -6300,6 +6403,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "not_run":        SUB,
             "cancelled":      SUB,
             "provisional":    INFO,
+            "transcribing":   INFO,
         }
         STATUS_LABEL = {
             "ok":             "\u2713  matched",
@@ -6313,6 +6417,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "not_run":        "\u2013  not run",
             "cancelled":      "\u2013  cancelled",
             "provisional":    "\u2026  provisional",
+            "transcribing":   "\u29d7  transcribing\u2026",
         }
 
         # Accordion: only one card body open at a time.
@@ -6815,8 +6920,24 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         sf.update_idletasks()
         _cv.configure(scrollregion=_cv.bbox("all"))
 
-        # Apply default filter and highlight its tab
-        _apply_filter(mode="all")
+        # Re-apply persisted filter mode (persisted via self._s4_fstate);
+        # falls back to "all" on first entry.  This is what stops a
+        # mid-review rebuild (reassign apply, status change, etc.) from
+        # bouncing the user back to the ALL/Script default.
+        _apply_filter(mode=self._s4_fstate.get("mode", "all"))
+
+        # Restore scroll fraction requested by the caller (e.g. reassign
+        # apply captures yview()[0] pre-rebuild; consumed once here so
+        # normal Step 4 entry still opens at the top).
+        _pend_scroll = getattr(self, "_s4_pending_scroll_frac", None)
+        if _pend_scroll is not None:
+            self._s4_pending_scroll_frac = None
+            try:
+                # Small delay so layout settles before we scroll.
+                self.after(30, lambda f=_pend_scroll:
+                    self._s4_scroll_canvas.yview_moveto(f))
+            except Exception:
+                pass
 
         # If this Step 4 was triggered by a selective re-reconcile, restore the
         # confirmed states for all tokens that were NOT re-reconciled.
