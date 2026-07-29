@@ -4951,11 +4951,51 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     if (_data.get("workflow") == "interview_session"
                             and _data.get("transcript")):
                         _data["_file_path"] = _sp
+                        # ── Path relocation ────────────────────────────
+                        # audio_cache + media were written as absolute
+                        # paths on the machine that made the session
+                        # (usually a different user's Downloads folder).
+                        # If they don't resolve here, try the session
+                        # file's own directory (basename lookup) and
+                        # then fall back to the pool's assigned audio
+                        # for this token.  Otherwise source_audio ends
+                        # up empty and the waveform editor's resolver
+                        # picks whichever pool file happens to be first
+                        # — often the wrong side of the conversation.
+                        _sess_dir  = os.path.dirname(_sp)
+                        _pool_here = [p for p in token_audio_paths.get(_tok, [])
+                                      if p and os.path.isfile(p) and not is_video(p)]
+                        _relocs = 0
+                        _cur_ac = _data.get("audio_cache", "") or ""
+                        if _cur_ac and not os.path.isfile(_cur_ac):
+                            _local = os.path.join(_sess_dir, os.path.basename(_cur_ac))
+                            if os.path.isfile(_local):
+                                _data["audio_cache"] = _local; _relocs += 1
+                            elif _pool_here:
+                                _data["audio_cache"] = _pool_here[0]; _relocs += 1
+                        _fixed_media = []
+                        for _mp in (_data.get("media") or []):
+                            if _mp and os.path.isfile(_mp):
+                                _fixed_media.append(_mp); continue
+                            _local = os.path.join(_sess_dir, os.path.basename(_mp or ""))
+                            if _mp and os.path.isfile(_local):
+                                _fixed_media.append(_local); _relocs += 1; continue
+                            # Try to fuzzy-match a pool file by basename stem
+                            _stem = os.path.splitext(os.path.basename(_mp or ""))[0].lower()
+                            _hit = next((p for p in _pool_here
+                                         if _stem in os.path.basename(p).lower()),
+                                        None) if _stem else None
+                            if _hit:
+                                _fixed_media.append(_hit); _relocs += 1
+                        if _fixed_media:
+                            _data["media"] = _fixed_media
                         pq_session_data[_tok] = _data
+                        _reloc_note = ("  [{} paths relocated]".format(_relocs)
+                                       if _relocs else "")
                         self._log_line(
-                            "  [{}] using Pull Quotes transcript ({} words) — "
-                            "skipping mix/transcribe".format(
-                                _tok, len(_data["transcript"])), SUCCESS)
+                            "  [{}] using Pull Quotes transcript ({} words){}".format(
+                                _tok, len(_data["transcript"]), _reloc_note),
+                            SUCCESS)
                 except Exception as _exc:
                     self._log_line(
                         "  [{}] failed to load session JSON: {}".format(
@@ -4964,10 +5004,33 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         transcript_sources   = {}
         for tok, paths in token_audio_paths.items():
-            # Tokens with a pre-transcribed session don't need a mix.
-            if tok in pq_session_data:
+            # Pool-mix-wins rule: when the pool has >=2 audio files for
+            # this token, the pool is the source of truth — remix + re-
+            # transcribe fresh (using the fixed mix algorithm), ignoring
+            # any pq_session's stale .pb_audio.wav / transcript that
+            # may have been baked from a bad mix.  Single-file tokens
+            # (0 or 1 pool files) fall back to the pq_session when one
+            # exists, because there's nothing new to mix.
+            _pool_audios = [p for p in (paths or []) if not is_video(p)]
+            if tok in pq_session_data and len(_pool_audios) < 2:
                 transcript_sources[tok] = None
+                self._log_line(
+                    "  [{}] pq_session wins (pool has {} audio file{})".format(
+                        tok, len(_pool_audios),
+                        "s" if len(_pool_audios) != 1 else ""),
+                    SUB)
                 continue
+            if tok in pq_session_data and len(_pool_audios) >= 2:
+                # Drop the pq_session for this token so the mix path
+                # below fires cleanly — otherwise process_token_pulls
+                # would still see pq_session_data[tok] and use its
+                # transcript.
+                pq_session_data.pop(tok, None)
+                self._log_line(
+                    "  [{}] pool-mix wins ({} audio files); "
+                    "pq_session ignored (would be stale)".format(
+                        tok, len(_pool_audios)),
+                    SUB)
             if not paths:
                 transcript_sources[tok] = None
             elif len(paths) == 1:

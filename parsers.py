@@ -269,31 +269,72 @@ def discover_pq_sessions(script_path, max_walk_up=6):
     scan_root = project_root or os.path.dirname(os.path.abspath(script_path))
     result   = {}
     warnings = []
+    episode_files = []   # .pb_episode.json paths discovered during walk
+
+    def _register(full, source):
+        """Load a candidate session file, register by token if valid.
+        `source` is a short label for warning messages (walk / episode)."""
+        try:
+            with open(full, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if data.get("workflow") != "interview_session":
+            return
+        tok = data.get("token")
+        if not tok:
+            return
+        if tok in result and result[tok] != full:
+            warnings.append(
+                "Duplicate session for token '{}' [{}]: {} vs {}".format(
+                    tok, source, result[tok], full))
+            return
+        result[tok] = full
+
     for dirpath, dirnames, filenames in os.walk(scan_root):
         dirnames[:] = [d for d in dirnames
                        if not d.startswith(".")
                        and d.lower() not in
                        ("__pycache__", "node_modules", "build", "dist")]
         for fn in filenames:
-            if not fn.endswith(".pb_session.json"):
-                continue
             full = os.path.join(dirpath, fn)
-            try:
-                with open(full, encoding="utf-8") as f:
-                    data = json.load(f)
-                if data.get("workflow") != "interview_session":
-                    continue
-                tok = data.get("token")
-                if not tok:
-                    continue
-                if tok in result and result[tok] != full:
-                    warnings.append(
-                        "Duplicate session for token '{}': {} vs {}".format(
-                            tok, result[tok], full))
-                    continue
-                result[tok] = full
-            except Exception:
+            if fn.endswith(".pb_session.json"):
+                _register(full, "walk")
+            elif fn.endswith(".pb_episode.json"):
+                episode_files.append(full)
+
+    # ── .pb_episode.json awareness ────────────────────────────────────
+    # An Episode Project is an authoritative list of session paths, but
+    # those paths are absolute (written by the machine that made the
+    # project — usually not the current user's).  So for each entry
+    # that fails to resolve, try relocating it to the episode file's
+    # own directory (Jordan's convention: drop the session next to
+    # the raw audio, next to the episode file).  This is the
+    # "belt-and-braces" mechanism next to the walker so users with a
+    # curated episode project don't depend on directory layout to be
+    # discoverable.
+    for ep_path in episode_files:
+        try:
+            with open(ep_path, encoding="utf-8") as f:
+                ep = json.load(f)
+        except Exception:
+            continue
+        ep_dir = os.path.dirname(ep_path)
+        for sp in ep.get("sessions", []) or []:
+            if not sp:
                 continue
+            _cand = sp if os.path.isfile(sp) else None
+            if _cand is None:
+                # Relocate: try the episode file's directory first.
+                _local = os.path.join(ep_dir, os.path.basename(sp))
+                if os.path.isfile(_local):
+                    _cand = _local
+            if _cand is None:
+                warnings.append(
+                    "Episode session not found (nor relocatable): {}".format(sp))
+                continue
+            _register(_cand, "episode")
+
     if warnings:
         result["__warnings__"] = warnings
     return result
