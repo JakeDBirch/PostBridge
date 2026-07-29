@@ -2165,16 +2165,39 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         cur_tok  = res.get("token", "")
         cur_file = res.get("source_audio", "") or res.get("source_video", "") or ""
 
-        # ── Collect available tokens and per-token pool files ──────────
+        # ── Collect available tokens and the WHOLE pool of files ───────
+        # The file picker shows every audio file in the pool prefixed
+        # with its currently-assigned token so the user can pick any of
+        # them regardless of what's in the token dropdown — the two
+        # controls are independent.  Was previously filtered to the
+        # selected token's files only, which hid most of the pool.
         tokens = list(getattr(self, "tokens", []) or [])
         if cur_tok and cur_tok not in tokens:
             tokens = [cur_tok] + tokens
-        pool_files_by_token = {}
+        _pool_entries = []          # (display_str, path) — assigned files first
+        _path_by_display = {}       # display_str → path
         for row in getattr(self._pool, "_rows", []) or []:
             _t = row.get("var").get() if row.get("var") else ""
-            _p = row.get("path")
-            if _t and _p and _t != "— unassigned —":
-                pool_files_by_token.setdefault(_t, []).append(_p)
+            _p = row.get("path") or ""
+            if not _p or is_video(_p):
+                continue            # audio-only for interview reassign
+            _tok_lbl = _t if (_t and _t != "— unassigned —") else "unassigned"
+            _display = "[{}]  {}".format(_tok_lbl, os.path.basename(_p))
+            # Disambiguate collisions on basename by tacking on a
+            # short parent-dir hint (rare but real for card_A/C0001.wav
+            # + card_B/C0001.wav multicam pools).
+            if _display in _path_by_display and _path_by_display[_display] != _p:
+                _display = "[{}]  {}  ({})".format(
+                    _tok_lbl, os.path.basename(_p),
+                    os.path.basename(os.path.dirname(_p)))
+            _pool_entries.append((_display, _p))
+            _path_by_display[_display] = _p
+        # Sort: assigned tokens A→Z first, then unassigned; within
+        # each group, by filename.
+        _pool_entries.sort(key=lambda e: (
+            e[0].startswith("[unassigned]"),
+            e[0].lower(),
+        ))
 
         dlg = tk.Toplevel(self)
         dlg.title("Reassign source")
@@ -2200,25 +2223,35 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                state="readonly", font=FB, width=48)
         tok_cb.pack(padx=20, pady=(2, 12), fill="x")
 
-        # File dropdown — refreshed on token change, plus a Browse entry
+        # File dropdown — shows the WHOLE pool of audio files with
+        # each entry labelled by its currently-assigned token.  Token
+        # selection above is independent of file selection.
         _BROWSE = "📁  Browse for a file not in the pool…"
-        tk.Label(dlg, text="Source file:", font=FB, bg=BG, fg=TEXT).pack(
-            anchor="w", padx=20)
-        file_var = tk.StringVar(value=cur_file or "")
-        file_cb  = ttk.Combobox(dlg, textvariable=file_var, values=[],
-                                state="readonly", font=FB, width=48)
-        file_cb.pack(padx=20, pady=(2, 12), fill="x")
+        tk.Label(dlg, text="Source file  (all audio in the pool):",
+                 font=FB, bg=BG, fg=TEXT).pack(anchor="w", padx=20)
 
-        def _refresh_files(*_a):
-            files = list(pool_files_by_token.get(tok_var.get(), []))
-            files.append(_BROWSE)
-            file_cb.config(values=files)
-            if cur_file and cur_file in files and tok_var.get() == cur_tok:
-                file_var.set(cur_file)
-            elif files:
-                file_var.set(files[0])
-        tok_var.trace_add("write", lambda *a: _refresh_files())
-        _refresh_files()
+        # Compute the display value for the current file so the
+        # dropdown opens showing what the pull is already pointing at.
+        _cur_display = ""
+        for _disp, _pth in _pool_entries:
+            if _pth == cur_file:
+                _cur_display = _disp
+                break
+        # If the current file is outside the pool (e.g. a Browse pick
+        # from a prior reassign), add it as a leading option so the
+        # dropdown still reflects the current state.
+        if cur_file and not _cur_display:
+            _cur_display = "[external]  " + os.path.basename(cur_file)
+            _pool_entries.insert(0, (_cur_display, cur_file))
+            _path_by_display[_cur_display] = cur_file
+
+        _display_values = [d for (d, _p) in _pool_entries] + [_BROWSE]
+        file_var = tk.StringVar(value=_cur_display or (
+            _display_values[0] if _display_values and _display_values[0] != _BROWSE else ""))
+        file_cb  = ttk.Combobox(dlg, textvariable=file_var,
+                                values=_display_values,
+                                state="readonly", font=FB, width=56)
+        file_cb.pack(padx=20, pady=(2, 12), fill="x")
 
         def _on_file_pick(*_a):
             if file_var.get() == _BROWSE:
@@ -2229,13 +2262,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                ("Video", "*.mov *.mp4 *.mkv"),
                                ("All", "*.*")])
                 if p:
+                    _disp = "[browsed]  " + os.path.basename(p)
+                    _path_by_display[_disp] = p
                     vals = list(file_cb.cget("values"))
-                    if p not in vals:
-                        vals = [p] + vals
+                    if _disp not in vals:
+                        vals = [_disp] + vals
                         file_cb.config(values=vals)
-                    file_var.set(p)
+                    file_var.set(_disp)
                 else:
-                    file_var.set(cur_file or "")
+                    file_var.set(_cur_display or "")
         file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
 
         # Scope
@@ -2261,7 +2296,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         result = {"ok": False}
         def _apply():
-            if not file_var.get() or file_var.get() == _BROWSE:
+            _sel = file_var.get()
+            if not _sel or _sel == _BROWSE:
                 messagebox.showwarning("Pick a file",
                                        "Choose a source file first.",
                                        parent=dlg)
@@ -2287,7 +2323,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
 
         new_tok  = tok_var.get()
-        new_file = file_var.get()
+        # Display strings map back to real paths via _path_by_display.
+        new_file = _path_by_display.get(file_var.get(), file_var.get())
         scope    = scope_var.get()
 
         # Identify affected rows
@@ -2368,15 +2405,29 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             pass
         part_label = part_name or ("Part {}".format(pi))
 
-        # Gather VO audio files for this part_index from the pool.
-        # get_vo_assets returns {part_index: {"audios": [...], "videos": [...]}}
-        vo_files = []
-        try:
-            _vo_assets = self._pool.get_vo_assets() if self._pool else {}
-            _bin = _vo_assets.get(pi, {}) or {}
-            vo_files = list(_bin.get("audios", []) or [])
-        except Exception:
-            pass
+        # Gather EVERY audio file in the pool, labelled by its current
+        # assignment.  Files already assigned to this VO part are
+        # bubbled to the top, but the user can pick any file — VO
+        # blocks that were mis-assigned in the pool need access to the
+        # full list.
+        _pool_entries = []
+        _path_by_display = {}
+        _this_vo_key = "VO: " + (part_name or "")
+        for row in getattr(self._pool, "_rows", []) or []:
+            _t = row.get("var").get() if row.get("var") else ""
+            _p = row.get("path") or ""
+            if not _p or is_video(_p):
+                continue
+            _tok_lbl = _t if (_t and _t != "— unassigned —") else "unassigned"
+            _display = "[{}]  {}".format(_tok_lbl, os.path.basename(_p))
+            if _display in _path_by_display and _path_by_display[_display] != _p:
+                _display = "[{}]  {}  ({})".format(
+                    _tok_lbl, os.path.basename(_p),
+                    os.path.basename(os.path.dirname(_p)))
+            _pool_entries.append((_display, _p, _t == _this_vo_key))
+            _path_by_display[_display] = _p
+        # Files assigned to THIS VO part first, then the rest alpha.
+        _pool_entries.sort(key=lambda e: (not e[2], e[0].lower()))
 
         # Current audio for this VO — takes_data[best_i]["apath"] wins
         # if present; fall back to source_audio; then to nothing.
@@ -2406,13 +2457,25 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                      wraplength=520).pack(anchor="w", padx=20, pady=(0, 12))
 
         _BROWSE = "📁  Browse for a file not in the pool…"
-        tk.Label(dlg, text="Source file:", font=FB, bg=BG, fg=TEXT).pack(
-            anchor="w", padx=20)
-        file_var = tk.StringVar(value=cur_file or "")
-        _file_options = list(vo_files) + [_BROWSE]
+        tk.Label(dlg, text="Source file  (all audio in the pool):",
+                 font=FB, bg=BG, fg=TEXT).pack(anchor="w", padx=20)
+
+        _cur_display = ""
+        for _disp, _pth, _mine in _pool_entries:
+            if _pth == cur_file:
+                _cur_display = _disp
+                break
+        if cur_file and not _cur_display:
+            _cur_display = "[external]  " + os.path.basename(cur_file)
+            _pool_entries.insert(0, (_cur_display, cur_file, False))
+            _path_by_display[_cur_display] = cur_file
+
+        _display_values = [d for (d, _p, _m) in _pool_entries] + [_BROWSE]
+        file_var = tk.StringVar(value=_cur_display or (
+            _display_values[0] if _display_values and _display_values[0] != _BROWSE else ""))
         file_cb  = ttk.Combobox(dlg, textvariable=file_var,
-                                values=_file_options,
-                                state="readonly", font=FB, width=48)
+                                values=_display_values,
+                                state="readonly", font=FB, width=56)
         file_cb.pack(padx=20, pady=(2, 12), fill="x")
 
         def _on_file_pick(*_a):
@@ -2423,13 +2486,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     filetypes=[("Audio", "*.wav *.mp3 *.aif *.aiff *.flac *.m4a"),
                                ("All", "*.*")])
                 if p:
+                    _disp = "[browsed]  " + os.path.basename(p)
+                    _path_by_display[_disp] = p
                     vals = list(file_cb.cget("values"))
-                    if p not in vals:
-                        vals = [p] + vals
+                    if _disp not in vals:
+                        vals = [_disp] + vals
                         file_cb.config(values=vals)
-                    file_var.set(p)
+                    file_var.set(_disp)
                 else:
-                    file_var.set(cur_file or "")
+                    file_var.set(_cur_display or "")
         file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
 
         tk.Label(dlg,
@@ -2465,7 +2530,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         if not result["ok"]:
             return
 
-        new_file = file_var.get()
+        new_file = _path_by_display.get(file_var.get(), file_var.get())
 
         # Rebuild takes_data with the new single-entry take.  Segments
         # cleared so build_aaf's takes_data[best_i]["segments"] read at
