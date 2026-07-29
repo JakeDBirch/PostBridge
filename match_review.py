@@ -1460,28 +1460,53 @@ class MatchReviewDialog:
             if interior_hit:
                 self._drag = interior_hit
             elif in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
-                # Inside the selected region body.  We don't know yet whether
-                # this is a click (→ playhead) or a drag (→ slip), so park in
-                # "slip_pending" and decide in _on_drag_motion / _on_release.
-                # Identify WHICH segment the press landed inside so a slip
-                # only moves that segment's boundaries — not every segment
-                # in a multi-clip pull (was a footgun: dragging one sub-
-                # clip yanked all the others along with it).
+                # Inside the overall selected region.  Two possibilities:
+                #   (a) blue kept segment  → slip that segment
+                #   (b) red interior gap   → slip the gap (both boundaries
+                #                            together, keeping gap length)
+                # Determine which by checking whether the click's time
+                # falls into any segment's [in..out], or into a gap
+                # between two segments.
                 _click_t = self._px_to_t(event.x)
-                _slip_i  = 0
+                _seg_i   = None
+                _gap_i   = None   # gap sits BETWEEN seg _gap_i and _gap_i+1
                 for _i, (_sin, _sout) in enumerate(self._segments):
                     _eff_in  = self._in_s  if _i == 0                      else _sin
                     _eff_out = self._out_s if _i == len(self._segments) - 1 else _sout
                     if _eff_in <= _click_t <= _eff_out:
-                        _slip_i = _i
+                        _seg_i = _i
                         break
-                self._drag              = "slip_pending"
-                self._slip_anchor_x    = event.x
-                self._slip_seg_idx     = _slip_i
-                self._slip_anchor_seg  = list(self._segments[_slip_i])
-                self._slip_anchor_in   = self._in_s
-                self._slip_anchor_out  = self._out_s
-                self._slip_anchor_segs = [list(s) for s in self._segments]
+                if _seg_i is None and len(self._segments) >= 2:
+                    for _i in range(len(self._segments) - 1):
+                        if (self._segments[_i][1] <= _click_t
+                                <= self._segments[_i + 1][0]):
+                            _gap_i = _i
+                            break
+
+                if _gap_i is not None:
+                    # RED-gap slip: shift seg[i].out and seg[i+1].in
+                    # together, keeping the gap duration constant.
+                    self._drag             = "gap_slip_pending"
+                    self._slip_anchor_x   = event.x
+                    self._gap_slip_idx    = _gap_i
+                    self._gap_anchor_left  = self._segments[_gap_i][1]
+                    self._gap_anchor_right = self._segments[_gap_i + 1][0]
+                    self._slip_anchor_segs = [list(s) for s in self._segments]
+                else:
+                    # BLUE-segment slip — the existing per-segment
+                    # behavior, only moves the one segment under the
+                    # cursor.  Falls back to seg 0 if the click's
+                    # time somehow landed outside every segment (edge
+                    # case: click on the boundary marker itself).
+                    if _seg_i is None:
+                        _seg_i = 0
+                    self._drag              = "slip_pending"
+                    self._slip_anchor_x    = event.x
+                    self._slip_seg_idx     = _seg_i
+                    self._slip_anchor_seg  = list(self._segments[_seg_i])
+                    self._slip_anchor_in   = self._in_s
+                    self._slip_anchor_out  = self._out_s
+                    self._slip_anchor_segs = [list(s) for s in self._segments]
             elif abs(event.x - ph_px) <= _MARKER_HIT or event.y <= 14:
                 self._drag = "playhead"
             else:
@@ -1638,13 +1663,18 @@ class MatchReviewDialog:
     def _on_drag_motion(self, event):
         if not self._drag or self._samples is None:
             return
-        # Promote slip_pending → slip only once the mouse has moved enough.
-        # Until then, suppress all motion handling so a simple click doesn't
-        # accidentally shift the region.
+        # Promote (blue-segment) slip_pending → slip only once the mouse
+        # has moved enough.  Until then, suppress all motion handling so
+        # a simple click doesn't accidentally shift the region.
         if self._drag == "slip_pending":
             if abs(event.x - self._slip_anchor_x) <= _SLIP_DRAG_PX:
                 return
-            self._drag = "slip"   # commit: this is a real drag
+            self._drag = "slip"
+        # Same promotion for red-gap slip.
+        elif self._drag == "gap_slip_pending":
+            if abs(event.x - self._slip_anchor_x) <= _SLIP_DRAG_PX:
+                return
+            self._drag = "gap_slip"
         # Push undo once per drag gesture (not for playhead moves)
         if not self._drag_undo_pushed and self._drag != "playhead":
             self._push_undo()
@@ -1710,16 +1740,38 @@ class MatchReviewDialog:
             if i == n - 1:
                 self._out_s = new_out
             self._refresh_displays()
+        elif self._drag == "gap_slip":
+            # Shift a RED interior gap left/right while keeping its
+            # DURATION constant — seg[i].out and seg[i+1].in move
+            # together by the same delta.  Effect: the gap "walks"
+            # across the timeline; kept audio at the tail of seg i
+            # gets cut (or restored) and the head of seg i+1 does the
+            # opposite.
+            raw_delta = self._px_to_t(event.x) - self._px_to_t(self._slip_anchor_x)
+            i         = self._gap_slip_idx
+            gap_dur   = self._gap_anchor_right - self._gap_anchor_left
+            # Clamp: neither boundary can cross into its segment's
+            # anchor.  seg[i].out can't go below seg[i].in + 1 frame,
+            # seg[i+1].in can't exceed seg[i+1].out - 1 frame.
+            _left_min  = self._slip_anchor_segs[i][0]     + self._frame_s
+            _right_max = self._slip_anchor_segs[i + 1][1] - self._frame_s
+            new_left  = max(_left_min, self._gap_anchor_left + raw_delta)
+            new_left  = min(new_left, _right_max - gap_dur)
+            new_right = new_left + gap_dur
+            self._segments = [list(s) for s in self._slip_anchor_segs]
+            self._segments[i][1]     = new_left
+            self._segments[i + 1][0] = new_right
+            self._refresh_displays()
         else:  # playhead
             self._playhead_s = min(t, self._ctx_dur)
         self._draw()
 
     def _on_release(self, event):
-        if self._drag == "slip_pending":
-            # Mouse was pressed in the region body but never dragged far enough
-            # to become a slip — treat it as a plain playhead click, matching
-            # the behaviour of clicking outside the region (including jump-to
-            # position during playback).
+        if self._drag in ("slip_pending", "gap_slip_pending"):
+            # Mouse was pressed in the region body / a red gap but never
+            # dragged far enough to become a slip — treat it as a plain
+            # playhead click, matching the behaviour of clicking outside
+            # the region (including jump-to position during playback).
             new_t = max(0.0, min(self._px_to_t(event.x), self._ctx_dur))
             self._playhead_s = new_t
             was_playing = self._playback_start_wall is not None
