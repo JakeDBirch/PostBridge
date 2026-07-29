@@ -92,6 +92,11 @@ _PLAYBACK_SR = 44100    # playback sample rate
 _LEAD_IN_MS = 120
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
+_CUT_HIT     = 18       # wider radius for interior CUT IN / CUT OUT lines —
+                        # they're the boundaries between kept segments and
+                        # get grabbed constantly during multi-clip cleanup,
+                        # so they need to win against the fleur-slip zone
+                        # even on a slightly-off click
 _SLIP_DRAG_PX = 4       # pixels mouse must move before a body-press becomes a slip
 _CHUNK_S          = 120.0   # seconds per lazy-load chunk (for scrolling beyond preview)
 _TRIGGER_S        = 15.0    # trigger next chunk when viewport is this close to a loaded edge
@@ -1426,20 +1431,32 @@ class MatchReviewDialog:
         elif abs(event.x - out_px) <= _MARKER_HIT:
             self._drag = "out"
         else:
-            # Check interior segment boundaries before falling through to playhead
+            # Check interior segment boundaries before falling through to
+            # playhead / slip.  Uses _CUT_HIT (wider than _MARKER_HIT) so
+            # a slightly-off click on a cut still grabs the cut instead
+            # of triggering slip on the neighbouring segment.  If two
+            # cuts are within _CUT_HIT of each other AND both within
+            # _CUT_HIT of the click, we prefer the one CLOSER to the
+            # cursor (not just "first found") — otherwise the CUT OUT
+            # of segment N and CUT IN of segment N+1 sitting a few
+            # pixels apart would always resolve to seg_out N even when
+            # the user was closer to seg_in N+1.
             n = len(self._segments)
             interior_hit = None
+            best_dist    = _CUT_HIT + 1
             for i in range(n):
                 if i > 0:
                     px = self._t_to_px(self._segments[i][0])
-                    if abs(event.x - px) <= _MARKER_HIT:
+                    d  = abs(event.x - px)
+                    if d <= _CUT_HIT and d < best_dist:
                         interior_hit = ("seg_in", i)
-                        break
+                        best_dist    = d
                 if i < n - 1:
                     px = self._t_to_px(self._segments[i][1])
-                    if abs(event.x - px) <= _MARKER_HIT:
+                    d  = abs(event.x - px)
+                    if d <= _CUT_HIT and d < best_dist:
                         interior_hit = ("seg_out", i)
-                        break
+                        best_dist    = d
             if interior_hit:
                 self._drag = interior_hit
             elif in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
@@ -1736,17 +1753,21 @@ class MatchReviewDialog:
                 abs(event.x - out_px) <= _MARKER_HIT):
             self._cv.config(cursor="sb_h_double_arrow")
             return
-        # Interior segment cut boundaries (CUT IN / CUT OUT lines)
+        # Interior segment cut boundaries (CUT IN / CUT OUT lines).
+        # Uses _CUT_HIT (wider than _MARKER_HIT for outer IN / OUT) —
+        # must match _on_press so cursor feedback and hit behavior
+        # agree, otherwise the user sees the fleur cursor over an
+        # area that ACTUALLY grabs a cut.
         n = len(self._segments)
         for i in range(n):
             if i > 0:
                 px = self._t_to_px(self._segments[i][0])
-                if abs(event.x - px) <= _MARKER_HIT:
+                if abs(event.x - px) <= _CUT_HIT:
                     self._cv.config(cursor="sb_h_double_arrow")
                     return
             if i < n - 1:
                 px = self._t_to_px(self._segments[i][1])
-                if abs(event.x - px) <= _MARKER_HIT:
+                if abs(event.x - px) <= _CUT_HIT:
                     self._cv.config(cursor="sb_h_double_arrow")
                     return
         if in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
