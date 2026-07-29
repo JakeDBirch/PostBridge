@@ -1283,8 +1283,31 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8,0))
-        self._btn(nav, "RECONCILE  →",   self._start_reconcile,
+
+        # Consistent prev/next everywhere.  BACK to Step 1 on the left.
+        # NEXT → REVIEW on the right; jumps into Step 4 IF results
+        # already exist from a prior reconcile — otherwise nudges the
+        # user to click RECONCILE first instead of silently doing
+        # nothing.  RECONCILE stays as its own separate action so
+        # peeking at Step 2 between reviews doesn't require re-running
+        # a 20-minute pipeline.
+        self._btn(nav, "← BACK", self._step1).pack(side="left")
+
+        def _step2_next():
+            if getattr(self, "results", None):
+                self._step4()
+            else:
+                messagebox.showinfo(
+                    "No results yet",
+                    "There are no reconciled results to review.  "
+                    "Click RECONCILE first to run the pipeline, then "
+                    "come back and click NEXT.",
+                    parent=self)
+        self._btn(nav, "NEXT  →  REVIEW", _step2_next,
                   color=ACCENT).pack(side="right")
+
+        self._btn(nav, "RECONCILE", self._start_reconcile
+                  ).pack(side="right", padx=(0, 8))
 
         # Inline model picker just left of RECONCILE so the user can
         # change the Whisper size before kicking off the reconcile.
@@ -7039,8 +7062,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         _redo_btn = self._btn(nav, "↪ REDO", self._s4_redo, small=True)
         _redo_btn.pack(side="left", padx=(2,0))
 
-        self._btn(nav, "EXPORT  →", self._step5,
+        # Standard Prev/Next/Reconcile trio on the right, matching
+        # Step 2's layout.  EXPORT is the "next" step from review.
+        # RECONCILE stays available so you can re-run the pipeline
+        # without leaving Step 4 — carryover preserves confirmed rows,
+        # so a re-run only touches the ones you haven't approved yet.
+        self._btn(nav, "NEXT  →  EXPORT", self._step5,
                   color=ACCENT).pack(side="right")
+        self._btn(nav, "RECONCILE", self._start_reconcile
+                  ).pack(side="right", padx=(0, 8))
 
         # Keyboard shortcuts for undo/redo
         self.bind_all("<Control-z>",       self._s4_undo)
