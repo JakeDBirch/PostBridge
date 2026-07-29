@@ -2204,7 +2204,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         dlg.configure(bg=BG)
         dlg.transient(self); dlg.grab_set()
         dlg.resizable(True, True)
-        dlg.minsize(640, 420)
+        dlg.minsize(1280, 480)
 
         tk.Label(dlg, text="Reassign this pull's source file and/or token.",
                  font=FB, bg=BG, fg=SUB, justify="left").pack(
@@ -2259,7 +2259,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             _display_rows.append((_disp, _p))
             _path_by_display[_disp] = _p
 
-        # Current file: hoist to the top and add "[current]" tag if present.
+        # Alphabetize by basename so the list is scannable — display
+        # strings already start with the basename, so a lower-case
+        # sort of the display string sorts by filename directly.
+        _display_rows.sort(key=lambda e: e[0].lower())
+
+        # Current file: hoist to the top so Apply just works if the
+        # user opened the dialog by accident.
         _cur_display = ""
         for i, (_disp, _p) in enumerate(_display_rows):
             if _p == cur_file:
@@ -2287,6 +2293,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         for _disp, _p in _display_rows:
             _lb.insert("end", _disp)
         _lb.insert("end", _BROWSE)
+        # Consume the mousewheel over the Listbox so it doesn't bubble
+        # up to the Step 4 scroll canvas behind the dialog — otherwise
+        # scrolling here scrolls the Step 4 review under the modal.
+        def _lb_wheel(event, lb=_lb):
+            lb.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        _lb.bind("<MouseWheel>", _lb_wheel)
         # Preselect the current file's row so Apply just works.
         if _cur_display:
             _lb.selection_set(0)
@@ -2493,7 +2506,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         dlg.configure(bg=BG)
         dlg.transient(self); dlg.grab_set()
         dlg.resizable(True, True)
-        dlg.minsize(640, 420)
+        dlg.minsize(1280, 480)
 
         tk.Label(dlg, text="Reassign this VO block's source audio file.",
                  font=FB, bg=BG, fg=SUB, justify="left").pack(
@@ -2534,6 +2547,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             _display_rows.append((_disp, _p))
             _path_by_display[_disp] = _p
 
+        # Alphabetize by basename.  Display strings start with basename,
+        # so a lower-case sort of the display sorts by filename.
+        _display_rows.sort(key=lambda e: e[0].lower())
+
         _cur_display = ""
         for i, (_disp, _p) in enumerate(_display_rows):
             if _p == cur_file:
@@ -2560,6 +2577,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         for _disp, _p in _display_rows:
             _lb.insert("end", _disp)
         _lb.insert("end", _BROWSE)
+        # Consume mousewheel so the Step-4 canvas behind the modal
+        # doesn't scroll along with the Listbox.
+        def _vo_lb_wheel(event, lb=_lb):
+            lb.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        _lb.bind("<MouseWheel>", _vo_lb_wheel)
         if _cur_display:
             _lb.selection_set(0)
             _lb.activate(0); _lb.see(0)
@@ -6494,6 +6517,16 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # each _make_status_popup call, so each stat_lbl gets its
             # own truly captured closures.
             def _make_status_popup(r, sl_w):
+                # A "success"-family status means the row belongs in
+                # the CONFIRMED bucket if _s4_accepted is True.  Any
+                # right-click change AWAY from that family (to a
+                # review-y status like low_confidence / no_match /
+                # provisional / not_run) implies the user is walking
+                # the row BACK to unconfirmed, so drop the accepted
+                # flag to keep the state consistent.  Otherwise the
+                # row keeps showing in the CONFIRMED tab despite the
+                # label saying otherwise.
+                _SUCCESS_STATUSES = {"ok", "direct", "manual"}
                 def _change(new_status):
                     self._s4_push_undo()
                     if "_original_status" not in r:
@@ -6502,6 +6535,23 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     sl_w.config(
                         text=STATUS_LABEL.get(new_status, new_status),
                         fg=STATUS_COLOR.get(new_status, SUB))
+                    # If moving off a success status, un-accept so the
+                    # CONFIRMED counter drops this row and the card
+                    # visual state (stripe + right-side ACCEPTED lbl)
+                    # reverts to the default look.  A full rebuild
+                    # picks up the new state cleanly.
+                    if (new_status not in _SUCCESS_STATUSES
+                            and r.get("_s4_accepted")):
+                        r.pop("_s4_accepted", None)
+                        try:
+                            _cv = getattr(self, "_s4_scroll_canvas", None)
+                            if _cv is not None:
+                                self._s4_pending_scroll_frac = float(_cv.yview()[0])
+                        except Exception:
+                            pass
+                        self._s4_save()
+                        self._step4()
+                        return
                     self._s4_save()
 
                 def _restore():
@@ -6513,6 +6563,21 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     r.pop("_original_status", None)
                     sl_w.config(text=STATUS_LABEL.get(orig, orig),
                                 fg=STATUS_COLOR.get(orig, SUB))
+                    # Same un-accept rule for Restore — if the ORIGINAL
+                    # status was a review-y one, don't leave the row
+                    # confirmed with a mismatched label.
+                    if (orig not in _SUCCESS_STATUSES
+                            and r.get("_s4_accepted")):
+                        r.pop("_s4_accepted", None)
+                        try:
+                            _cv = getattr(self, "_s4_scroll_canvas", None)
+                            if _cv is not None:
+                                self._s4_pending_scroll_frac = float(_cv.yview()[0])
+                        except Exception:
+                            pass
+                        self._s4_save()
+                        self._step4()
+                        return
                     self._s4_save()
 
                 def _popup(event):

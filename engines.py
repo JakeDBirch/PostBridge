@@ -1412,10 +1412,17 @@ def _mix_dynaudnorm(path):
     os.replace(tmp, path)
 
 
+_MIX_ALG_VER = 2   # bump when mix_for_transcript's algorithm changes
+
 def _stable_mix_cache_path(paths):
     """Content-addressed path in the transcript cache for the mixed
-    result of `paths`.  Key: md5(sorted (abspath, mtime, size)).
-    Returns None when no cache directory is set (falls back to temp)."""
+    result of `paths`.  Key: md5(sorted (abspath, mtime, size) + alg_ver).
+    Returns None when no cache directory is set (falls back to temp).
+
+    _MIX_ALG_VER is included in the hash so a bug fix to the mix
+    algorithm gets a fresh cache path instead of silently reusing a
+    stale bad mix.  Old mix WAVs stay on disk (harmless; cleaned by
+    normal cache eviction) but stop being consulted."""
     if not _cache_dir or not paths:
         return None
     try:
@@ -1430,8 +1437,9 @@ def _stable_mix_cache_path(paths):
                 mt, sz = 0, 0
             parts.append((ap.lower(), mt, sz))
         parts.sort()
+        payload = {"paths": parts, "alg": _MIX_ALG_VER}
         digest = hashlib.md5(
-            json.dumps(parts, sort_keys=True, default=str).encode()
+            json.dumps(payload, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
         return os.path.join(_cache_dir, "mix_{}.wav".format(digest))
     except Exception:
@@ -1475,7 +1483,22 @@ def mix_for_transcript(paths):
     track_data = []
     for path in paths:
         pcm      = _mix_decode(path)
-        nf_rms   = float(np.percentile(_mix_frame_rms(pcm), _MIX_NOISE_PCT))
+        # Noise-floor estimate.  The fixed 10th-percentile assumption
+        # breaks for a continuously-talking speaker (typical interview
+        # guest at 80-95% duty cycle): the 10th percentile lands INSIDE
+        # the speech distribution, `thr = nf_rms * 3` closes the gate
+        # on their own voice, and the mixed track that reaches Whisper
+        # is missing that side of the conversation.  Cap nf_rms against
+        # the MEDIAN frame RMS so a chatty track can't be its own noise
+        # floor — a speech-dominated track's median IS speech, so
+        # `median / 8` (~-18 dB below speech) sits reliably below every
+        # real utterance.  Silent-heavy tracks (host between questions)
+        # stay unaffected because their 10th percentile is already the
+        # smaller value.
+        _rms   = _mix_frame_rms(pcm)
+        _p10   = float(np.percentile(_rms, _MIX_NOISE_PCT))
+        _p50   = float(np.percentile(_rms, 50))
+        nf_rms = min(_p10, _p50 / 8.0)
         thr      = float(np.clip(nf_rms * _MIX_THR_MULT, _MIX_THR_MIN, _MIX_THR_MAX))
         envelope = _mix_gate_envelope(pcm, thr)
         sp_rms   = _mix_speech_rms(pcm, envelope)
