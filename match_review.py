@@ -1446,8 +1446,22 @@ class MatchReviewDialog:
                 # Inside the selected region body.  We don't know yet whether
                 # this is a click (→ playhead) or a drag (→ slip), so park in
                 # "slip_pending" and decide in _on_drag_motion / _on_release.
+                # Identify WHICH segment the press landed inside so a slip
+                # only moves that segment's boundaries — not every segment
+                # in a multi-clip pull (was a footgun: dragging one sub-
+                # clip yanked all the others along with it).
+                _click_t = self._px_to_t(event.x)
+                _slip_i  = 0
+                for _i, (_sin, _sout) in enumerate(self._segments):
+                    _eff_in  = self._in_s  if _i == 0                      else _sin
+                    _eff_out = self._out_s if _i == len(self._segments) - 1 else _sout
+                    if _eff_in <= _click_t <= _eff_out:
+                        _slip_i = _i
+                        break
                 self._drag              = "slip_pending"
                 self._slip_anchor_x    = event.x
+                self._slip_seg_idx     = _slip_i
+                self._slip_anchor_seg  = list(self._segments[_slip_i])
                 self._slip_anchor_in   = self._in_s
                 self._slip_anchor_out  = self._out_s
                 self._slip_anchor_segs = [list(s) for s in self._segments]
@@ -1642,20 +1656,42 @@ class MatchReviewDialog:
                     this_in + self._frame_s,
                     min(t, next_in - self._frame_s))
         elif self._drag == "slip":
-            # Shift the entire region (IN + OUT + all segment boundaries) by the
-            # same delta, anchored from the initial press position so floating-
-            # point errors don't accumulate across many motion events.
+            # Slip ONLY the segment the press landed inside — was
+            # previously "slip the whole region" which yanked every
+            # sub-clip of a multi-segment pull whenever the user
+            # tried to nudge one of them.  Anchored from the initial
+            # press to avoid float drift across motion events.
             raw_delta = self._px_to_t(event.x) - self._px_to_t(self._slip_anchor_x)
-            dur       = self._slip_anchor_out - self._slip_anchor_in
-            new_in    = max(0.0, self._slip_anchor_in + raw_delta)
-            new_in    = min(new_in, self._ctx_dur - dur)   # don't run past end
-            new_out   = new_in + dur
-            shift     = new_in - self._slip_anchor_in
-            self._in_s  = new_in
-            self._out_s = new_out
-            if self._slip_anchor_segs:
-                self._segments = [[s[0] + shift, s[1] + shift]
-                                  for s in self._slip_anchor_segs]
+            i         = self._slip_seg_idx
+            n         = len(self._slip_anchor_segs)
+            anc_in    = self._slip_anchor_seg[0]
+            anc_out   = self._slip_anchor_seg[1]
+            dur       = anc_out - anc_in
+
+            # Clamp so this segment can't cross into its neighbors
+            # (preserves ordering + prevents overlaps).  First segment
+            # is bounded left by 0; last by the file end; interior
+            # segments by their neighbor boundaries.
+            _left_bound  = (0.0 if i == 0
+                            else self._slip_anchor_segs[i - 1][1])
+            _right_bound = (self._ctx_dur if i == n - 1
+                            else self._slip_anchor_segs[i + 1][0])
+            new_in  = max(_left_bound, anc_in + raw_delta)
+            new_in  = min(new_in, _right_bound - dur)
+            new_out = new_in + dur
+
+            # Update just this segment.  The rest keep their anchored
+            # positions so multi-clip pulls stay put around the one
+            # segment the user is nudging.
+            self._segments = [list(s) for s in self._slip_anchor_segs]
+            self._segments[i] = [new_in, new_out]
+            # First / last segment slip also drags the global IN / OUT
+            # so the visible region matches — interior slips leave
+            # IN / OUT untouched.
+            if i == 0:
+                self._in_s  = new_in
+            if i == n - 1:
+                self._out_s = new_out
             self._refresh_displays()
         else:  # playhead
             self._playhead_s = min(t, self._ctx_dur)
