@@ -2139,23 +2139,29 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             fn()
 
     def _s4_reassign_dialog(self, res):
-        """Open a picker letting the user swap this pull's source file
-        and/or its token from Step 4.  Covers the case the cross-token
-        phrase search can't reach — the quote isn't findable in any
-        other sidecar (typo, contraction drift, or the correct file
-        was never transcribed).
+        """Open a picker letting the user swap this row's source file
+        (and, for interview pulls, its token) from Step 4.  Covers the
+        case the cross-token phrase search can't reach — the quote
+        isn't findable in any other sidecar (typo, contraction drift,
+        or the correct file was never transcribed).
 
-        Scope:
-          - "This pull only" — mutates res alone.
-          - "Every pull in this token" — mutates every result whose
-            current token matches res's original token.
+        Interview pulls (default):
+          Scope choice — "This pull only" or "Every pull in token".
+          On apply: source_audio / token swapped; rec_in/out and segments
+          reset to the script's authored TCs; _s4_accepted / _s4_ignored
+          cleared; status → "provisional".
 
-        On apply, affected rows are reset to a fresh provisional state:
-        source_audio / token swapped as requested; rec_in/out and
-        segments reset to the script's authored TCs; _s4_accepted and
-        _s4_ignored cleared; status → "provisional".  The user
-        re-verifies against the new file.
+        VO blocks:
+          No token dropdown (VO is bound to a script part), no scope
+          (each VO block is independent).  On apply: takes_data is
+          rebuilt as a single-entry list pointing at the new file,
+          best_take_index reset to 0, segments cleared so the user
+          defines the new range in the waveform editor.
         """
+        if res.get("is_vo"):
+            self._s4_reassign_vo(res)
+            return
+
         cur_tok  = res.get("token", "")
         cur_file = res.get("source_audio", "") or res.get("source_video", "") or ""
 
@@ -2329,6 +2335,161 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             r.pop("_s4_accepted",   None)
             r.pop("_s4_ignored",    None)
             r.pop("_original_status", None)
+
+        self._s4_save()
+        self._step4()
+
+    def _s4_reassign_vo(self, res):
+        """Reassign a VO block's source audio file.
+
+        Unlike interview pulls, VO isn't a token-scoped concept — each
+        VO block is bound to a specific script part and identified by
+        its VO id.  The pool tracks VO audio under "VO: <part name>"
+        tokens (see gui_components.py:1419), so the file picker is
+        filtered to those rows for the block's part_index.
+
+        On apply the block's takes_data is rebuilt as a single-entry
+        list pointing at the new file, best_take_index reset to 0,
+        source_audio + segments cleared so the waveform editor opens
+        clean and the user defines the new range from scratch.  Flags
+        and status reset the same way interview reassigns do.
+        """
+        pi = res.get("part_index", -1)
+        # Look up the human-readable part name from the pool so the
+        # dialog can label WHICH VO we're editing.  Falls back to the
+        # numeric part_index if pool state isn't queryable.
+        part_name = None
+        try:
+            for _p in getattr(self._pool, "_parts", []) or []:
+                if _p.get("index") == pi:
+                    part_name = _p.get("name")
+                    break
+        except Exception:
+            pass
+        part_label = part_name or ("Part {}".format(pi))
+
+        # Gather VO audio files for this part_index from the pool.
+        # get_vo_assets returns {part_index: {"audios": [...], "videos": [...]}}
+        vo_files = []
+        try:
+            _vo_assets = self._pool.get_vo_assets() if self._pool else {}
+            _bin = _vo_assets.get(pi, {}) or {}
+            vo_files = list(_bin.get("audios", []) or [])
+        except Exception:
+            pass
+
+        # Current audio for this VO — takes_data[best_i]["apath"] wins
+        # if present; fall back to source_audio; then to nothing.
+        _td = res.get("takes_data") or []
+        _bi = res.get("best_take_index", 0) or 0
+        cur_file = ""
+        if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
+            cur_file = _td[_bi].get("apath", "") or ""
+        if not cur_file:
+            cur_file = res.get("source_audio", "") or ""
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Reassign VO source")
+        dlg.configure(bg=BG)
+        dlg.transient(self); dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="Reassign this VO block's source audio file.",
+                 font=FB, bg=BG, fg=SUB, justify="left").pack(
+                     anchor="w", padx=20, pady=(18, 4))
+        _quote = (res.get("quote_text", "") or "").strip()
+        if _quote:
+            tk.Label(dlg, text="VO ({}): “{}”".format(
+                        part_label,
+                        _quote if len(_quote) < 80 else _quote[:77] + "…"),
+                     font=FB, bg=BG, fg=TEXT, justify="left",
+                     wraplength=520).pack(anchor="w", padx=20, pady=(0, 12))
+
+        _BROWSE = "📁  Browse for a file not in the pool…"
+        tk.Label(dlg, text="Source file:", font=FB, bg=BG, fg=TEXT).pack(
+            anchor="w", padx=20)
+        file_var = tk.StringVar(value=cur_file or "")
+        _file_options = list(vo_files) + [_BROWSE]
+        file_cb  = ttk.Combobox(dlg, textvariable=file_var,
+                                values=_file_options,
+                                state="readonly", font=FB, width=48)
+        file_cb.pack(padx=20, pady=(2, 12), fill="x")
+
+        def _on_file_pick(*_a):
+            if file_var.get() == _BROWSE:
+                from tkinter.filedialog import askopenfilename
+                p = askopenfilename(
+                    parent=dlg, title="VO source file",
+                    filetypes=[("Audio", "*.wav *.mp3 *.aif *.aiff *.flac *.m4a"),
+                               ("All", "*.*")])
+                if p:
+                    vals = list(file_cb.cget("values"))
+                    if p not in vals:
+                        vals = [p] + vals
+                        file_cb.config(values=vals)
+                    file_var.set(p)
+                else:
+                    file_var.set(cur_file or "")
+        file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
+
+        tk.Label(dlg,
+                 text="VO segments will be cleared — set the new IN/OUT "
+                      "in the waveform editor after applying.",
+                 font=FB, bg=BG, fg=SUB, justify="left",
+                 wraplength=520).pack(anchor="w", padx=20, pady=(0, 12))
+
+        result = {"ok": False}
+        def _apply():
+            if not file_var.get() or file_var.get() == _BROWSE:
+                messagebox.showwarning("Pick a file",
+                                       "Choose a source file first.",
+                                       parent=dlg)
+                return
+            result["ok"] = True
+            dlg.destroy()
+        def _cancel():
+            dlg.destroy()
+
+        br = tk.Frame(dlg, bg=BG); br.pack(fill="x", padx=20, pady=(0, 16))
+        self._btn(br, "Cancel", _cancel, small=True).pack(side="right")
+        self._btn(br, "Apply", _apply, color=ACCENT,
+                  small=True).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        _px, _py = self.winfo_rootx(), self.winfo_rooty()
+        _pw, _ph = self.winfo_width(), self.winfo_height()
+        _dw, _dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        dlg.geometry("+{}+{}".format(_px + (_pw - _dw) // 2,
+                                      _py + (_ph - _dh) // 2))
+        self.wait_window(dlg)
+        if not result["ok"]:
+            return
+
+        new_file = file_var.get()
+
+        # Rebuild takes_data with the new single-entry take.  Segments
+        # cleared so build_aaf's takes_data[best_i]["segments"] read at
+        # engines.py:build_aaf-time skips this clip until the user
+        # opens the waveform editor and sets a range.  source_audio
+        # also updated because the Step-4 card + editor both read that
+        # field first before takes_data (main.py:5860).
+        res["takes_data"]      = [{"apath": new_file, "segments": []}]
+        res["best_take_index"] = 0
+        res["source_audio"]    = new_file
+        res.pop("source_video", None)
+        if is_video(new_file):
+            res["source_video"] = new_file
+        res["segments"]        = []
+        res["rec_in_s"]        = 0.0
+        res["rec_out_s"]       = 0.0
+        res["rec_in_tc"]       = "00:00:00"
+        res["rec_out_tc"]      = "00:00:00"
+        res["matched_text"]    = ""
+        res["confidence"]      = 0.0
+        res["status"]          = "provisional"
+        res.pop("_s4_accepted",   None)
+        res.pop("_s4_ignored",    None)
+        res.pop("_original_status", None)
 
         self._s4_save()
         self._step4()
@@ -6118,21 +6279,20 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
             ignore_lbl.bind("<Leave>", lambda e, w=ignore_lbl: w.config(fg=SUB))
 
-            # REASSIGN — opens a picker to swap this pull's source file
-            # (or every pull in this token's) without going through the
-            # cross-token phrase search, which only helps when the quote
-            # is findable in another already-transcribed sidecar.
-            # VO rows use takes_data + best_take_index; the source-file
-            # swap model doesn't fit, so skip the button there.
-            if not res.get("is_vo"):
-                reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
-                                        bg=SURF, fg=SUB, cursor="hand2")
-                reassign_lbl.pack(side="right", padx=(4, 0))
-                reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
-                reassign_lbl.bind("<Leave>", lambda e, w=reassign_lbl: w.config(fg=SUB))
-                reassign_lbl.bind(
-                    "<Button-1>",
-                    lambda e, r=res: self._s4_reassign_dialog(r))
+            # REASSIGN — opens a picker to swap this pull/VO's source
+            # file without going through the cross-token phrase search,
+            # which only helps when the quote is findable in another
+            # already-transcribed sidecar.  Interview and VO share the
+            # same entry point; the dialog adapts its layout + apply
+            # logic based on res["is_vo"].
+            reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
+                                    bg=SURF, fg=SUB, cursor="hand2")
+            reassign_lbl.pack(side="right", padx=(4, 0))
+            reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
+            reassign_lbl.bind("<Leave>", lambda e, w=reassign_lbl: w.config(fg=SUB))
+            reassign_lbl.bind(
+                "<Button-1>",
+                lambda e, r=res: self._s4_reassign_dialog(r))
 
             # ── State management helpers ────────────────────────────────────────
             def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
