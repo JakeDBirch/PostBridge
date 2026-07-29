@@ -6377,51 +6377,67 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # waveform editor: pick "matched" (or Restore original) and
             # the flag flips back.  Only user-facing statuses are
             # offered — internal/error states aren't picker-safe.
-            def _change_status(new_status, r=res, sl_w=stat_lbl):
-                self._s4_push_undo()
-                if "_original_status" not in r:
-                    r["_original_status"] = r.get("status", "")
-                r["status"] = new_status
-                sl_w.config(text=STATUS_LABEL.get(new_status, new_status),
-                            fg=STATUS_COLOR.get(new_status, SUB))
-                self._s4_save()
+            #
+            # A FACTORY, not free-standing defs: previously
+            # _change_status / _restore_original were loop-scoped names
+            # that got rebound every iteration.  The popup's menu
+            # lambdas closed over the ENCLOSING scope's names — which,
+            # by the time the user right-clicked, all pointed at the
+            # LAST card's version.  So clicking a menu on card N would
+            # mutate the last card in self.results.  Wrapping the
+            # per-row helpers in a factory rebinds them as locals to
+            # each _make_status_popup call, so each stat_lbl gets its
+            # own truly captured closures.
+            def _make_status_popup(r, sl_w):
+                def _change(new_status):
+                    self._s4_push_undo()
+                    if "_original_status" not in r:
+                        r["_original_status"] = r.get("status", "")
+                    r["status"] = new_status
+                    sl_w.config(
+                        text=STATUS_LABEL.get(new_status, new_status),
+                        fg=STATUS_COLOR.get(new_status, SUB))
+                    self._s4_save()
 
-            def _restore_original(r=res, sl_w=stat_lbl):
-                orig = r.get("_original_status") or ""
-                if not orig or orig == r.get("status"):
-                    return
-                self._s4_push_undo()
-                r["status"] = orig
-                r.pop("_original_status", None)
-                sl_w.config(text=STATUS_LABEL.get(orig, orig),
-                            fg=STATUS_COLOR.get(orig, SUB))
-                self._s4_save()
+                def _restore():
+                    orig = r.get("_original_status") or ""
+                    if not orig or orig == r.get("status"):
+                        return
+                    self._s4_push_undo()
+                    r["status"] = orig
+                    r.pop("_original_status", None)
+                    sl_w.config(text=STATUS_LABEL.get(orig, orig),
+                                fg=STATUS_COLOR.get(orig, SUB))
+                    self._s4_save()
 
-            def _popup_status(event, r=res):
-                m = tk.Menu(self, tearoff=0, bg=SURF, fg=TEXT,
-                            activebackground=ACCENT, activeforeground=BG,
-                            bd=0)
-                _orig = r.get("_original_status") or ""
-                _cur  = r.get("status", "")
-                if _orig and _orig != _cur:
-                    m.add_command(
-                        label="Restore original ({})".format(
-                            STATUS_LABEL.get(_orig, _orig).lstrip("✓✗⚠–… ").strip()),
-                        command=_restore_original)
-                    m.add_separator()
-                # Curated status options — user-facing labels only,
-                # skipping internal states (no_quote / error / no_file /
-                # cancelled) that shouldn't be user-settable.
-                for _key in ("ok", "manual", "low_confidence",
-                             "no_match", "provisional", "not_run"):
-                    m.add_command(
-                        label=STATUS_LABEL.get(_key, _key),
-                        command=lambda k=_key: _change_status(k))
-                try:
-                    m.tk_popup(event.x_root, event.y_root)
-                finally:
-                    m.grab_release()
-            stat_lbl.bind("<Button-3>", _popup_status)
+                def _popup(event):
+                    m = tk.Menu(self, tearoff=0, bg=SURF, fg=TEXT,
+                                activebackground=ACCENT,
+                                activeforeground=BG, bd=0)
+                    _orig = r.get("_original_status") or ""
+                    _cur  = r.get("status", "")
+                    if _orig and _orig != _cur:
+                        m.add_command(
+                            label="Restore original ({})".format(
+                                STATUS_LABEL.get(_orig, _orig)
+                                    .lstrip("✓✗⚠–… ").strip()),
+                            command=_restore)
+                        m.add_separator()
+                    # Curated status options — user-facing labels only,
+                    # skipping internal states (no_quote / error /
+                    # no_file / cancelled) that shouldn't be user-settable.
+                    for _key in ("ok", "manual", "low_confidence",
+                                 "no_match", "provisional", "not_run"):
+                        m.add_command(
+                            label=STATUS_LABEL.get(_key, _key),
+                            command=lambda k=_key: _change(k))
+                    try:
+                        m.tk_popup(event.x_root, event.y_root)
+                    finally:
+                        m.grab_release()
+                return _popup
+
+            stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
 
             conf_hdr = res.get("confidence", 0)
             if conf_hdr:
