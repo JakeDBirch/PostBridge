@@ -2203,7 +2203,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         dlg.title("Reassign source")
         dlg.configure(bg=BG)
         dlg.transient(self); dlg.grab_set()
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
+        dlg.minsize(640, 420)
 
         tk.Label(dlg, text="Reassign this pull's source file and/or token.",
                  font=FB, bg=BG, fg=SUB, justify="left").pack(
@@ -2223,55 +2224,103 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                state="readonly", font=FB, width=48)
         tok_cb.pack(padx=20, pady=(2, 12), fill="x")
 
-        # File dropdown — shows the WHOLE pool of audio files with
-        # each entry labelled by its currently-assigned token.  Token
-        # selection above is independent of file selection.
+        # File picker — a proper scrollable Listbox instead of a Combobox
+        # so long basenames don't get clipped by widget width, and so it
+        # visually resembles the pool's row-per-file layout Jordan sees
+        # in Step 2.  Two-column-ish rendering (basename left, token
+        # right) via space-padding on a fixed-width font.
         _BROWSE = "📁  Browse for a file not in the pool…"
         tk.Label(dlg, text="Source file  (all audio in the pool):",
                  font=FB, bg=BG, fg=TEXT).pack(anchor="w", padx=20)
 
-        # Compute the display value for the current file so the
-        # dropdown opens showing what the pull is already pointing at.
+        # Compute the pad width so basenames align in a "column".
+        _bn_max = max([len(os.path.basename(_p)) for _d, _p in _pool_entries]
+                       + [len(os.path.basename(cur_file)) if cur_file else 0,
+                          20])
+        _bn_pad = min(_bn_max, 60)   # cap so extreme names don't blow layout
+
+        def _fmt_row(path, tok_lbl):
+            bn  = os.path.basename(path)
+            pad = " " * max(2, _bn_pad + 2 - len(bn))
+            return "{}{}[{}]".format(bn, pad, tok_lbl)
+
+        # Rebuild display strings using the two-column format; keep the
+        # same _path_by_display mapping (regenerate to match new format).
+        _path_by_display = {}
+        _display_rows = []
+        for _old_disp, _p in _pool_entries:
+            # Recover the token label from the old "[TOK]  bn" prefix.
+            _tok_lbl = _old_disp.split("]", 1)[0].lstrip("[") if _old_disp.startswith("[") else "?"
+            _disp = _fmt_row(_p, _tok_lbl)
+            # Disambiguate rare basename collisions by tacking parent-dir
+            # onto the token-label side so the basename column stays clean.
+            while _disp in _path_by_display and _path_by_display[_disp] != _p:
+                _disp += "  · " + os.path.basename(os.path.dirname(_p))
+            _display_rows.append((_disp, _p))
+            _path_by_display[_disp] = _p
+
+        # Current file: hoist to the top and add "[current]" tag if present.
         _cur_display = ""
-        for _disp, _pth in _pool_entries:
-            if _pth == cur_file:
+        for i, (_disp, _p) in enumerate(_display_rows):
+            if _p == cur_file:
                 _cur_display = _disp
+                _display_rows.insert(0, _display_rows.pop(i))
                 break
-        # If the current file is outside the pool (e.g. a Browse pick
-        # from a prior reassign), add it as a leading option so the
-        # dropdown still reflects the current state.
         if cur_file and not _cur_display:
-            _cur_display = "[external]  " + os.path.basename(cur_file)
-            _pool_entries.insert(0, (_cur_display, cur_file))
+            _cur_display = _fmt_row(cur_file, "external")
+            _display_rows.insert(0, (_cur_display, cur_file))
             _path_by_display[_cur_display] = cur_file
 
-        _display_values = [d for (d, _p) in _pool_entries] + [_BROWSE]
-        file_var = tk.StringVar(value=_cur_display or (
-            _display_values[0] if _display_values and _display_values[0] != _BROWSE else ""))
-        file_cb  = ttk.Combobox(dlg, textvariable=file_var,
-                                values=_display_values,
-                                state="readonly", font=FB, width=56)
-        file_cb.pack(padx=20, pady=(2, 12), fill="x")
+        # Scrollable Listbox.  Fixed-width font so the [TOK] column aligns.
+        _lb_frame = tk.Frame(dlg, bg=BG)
+        _lb_frame.pack(fill="both", expand=True, padx=20, pady=(2, 6))
+        _lb = tk.Listbox(_lb_frame, font=("Consolas", 10),
+                         activestyle="dotbox", height=12,
+                         bg=SURF, fg=TEXT,
+                         selectbackground=ACCENT, selectforeground=BG,
+                         highlightthickness=1, highlightbackground=BORDER,
+                         exportselection=False)
+        _lb.pack(side="left", fill="both", expand=True)
+        _lb_sb = tk.Scrollbar(_lb_frame, orient="vertical", command=_lb.yview)
+        _lb_sb.pack(side="right", fill="y")
+        _lb.configure(yscrollcommand=_lb_sb.set)
+        for _disp, _p in _display_rows:
+            _lb.insert("end", _disp)
+        _lb.insert("end", _BROWSE)
+        # Preselect the current file's row so Apply just works.
+        if _cur_display:
+            _lb.selection_set(0)
+            _lb.activate(0); _lb.see(0)
 
-        def _on_file_pick(*_a):
-            if file_var.get() == _BROWSE:
+        # file_var holds the CURRENTLY-SELECTED display string so the
+        # existing apply logic (below) can look it up via _path_by_display.
+        file_var = tk.StringVar(value=_cur_display or "")
+
+        def _on_lb_select(_e=None):
+            sel = _lb.curselection()
+            if not sel:
+                return
+            v = _lb.get(sel[0])
+            if v == _BROWSE:
                 from tkinter.filedialog import askopenfilename
                 p = askopenfilename(
                     parent=dlg, title="Source file",
                     filetypes=[("Audio", "*.wav *.mp3 *.aif *.aiff *.flac *.m4a"),
                                ("Video", "*.mov *.mp4 *.mkv"),
                                ("All", "*.*")])
-                if p:
-                    _disp = "[browsed]  " + os.path.basename(p)
-                    _path_by_display[_disp] = p
-                    vals = list(file_cb.cget("values"))
-                    if _disp not in vals:
-                        vals = [_disp] + vals
-                        file_cb.config(values=vals)
-                    file_var.set(_disp)
-                else:
-                    file_var.set(_cur_display or "")
-        file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
+                if not p:
+                    return
+                _disp = _fmt_row(p, "browsed")
+                _path_by_display[_disp] = p
+                _lb.insert(0, _disp)
+                _lb.selection_clear(0, "end")
+                _lb.selection_set(0)
+                _lb.activate(0)
+                file_var.set(_disp)
+            else:
+                file_var.set(v)
+        _lb.bind("<<ListboxSelect>>", _on_lb_select)
+        _lb.bind("<Double-Button-1>", lambda e: (_on_lb_select(), _apply()))
 
         # Scope
         scope_var = tk.StringVar(value="pull")
@@ -2443,7 +2492,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         dlg.title("Reassign VO source")
         dlg.configure(bg=BG)
         dlg.transient(self); dlg.grab_set()
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
+        dlg.minsize(640, 420)
 
         tk.Label(dlg, text="Reassign this VO block's source audio file.",
                  font=FB, bg=BG, fg=SUB, justify="left").pack(
@@ -2460,42 +2510,86 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(dlg, text="Source file  (all audio in the pool):",
                  font=FB, bg=BG, fg=TEXT).pack(anchor="w", padx=20)
 
+        # Two-column row layout (basename left, [TOK] right) matching
+        # the interview dialog + the Step-2 pool visual.  See the same
+        # comment in _s4_reassign_dialog for why we use a Listbox
+        # instead of a Combobox.
+        _bn_max = max([len(os.path.basename(_p)) for _d, _p, _m in _pool_entries]
+                       + [len(os.path.basename(cur_file)) if cur_file else 0,
+                          20])
+        _bn_pad = min(_bn_max, 60)
+
+        def _fmt_row(path, tok_lbl):
+            bn  = os.path.basename(path)
+            pad = " " * max(2, _bn_pad + 2 - len(bn))
+            return "{}{}[{}]".format(bn, pad, tok_lbl)
+
+        _path_by_display = {}
+        _display_rows = []
+        for _old_disp, _p, _mine in _pool_entries:
+            _tok_lbl = _old_disp.split("]", 1)[0].lstrip("[") if _old_disp.startswith("[") else "?"
+            _disp = _fmt_row(_p, _tok_lbl)
+            while _disp in _path_by_display and _path_by_display[_disp] != _p:
+                _disp += "  · " + os.path.basename(os.path.dirname(_p))
+            _display_rows.append((_disp, _p))
+            _path_by_display[_disp] = _p
+
         _cur_display = ""
-        for _disp, _pth, _mine in _pool_entries:
-            if _pth == cur_file:
+        for i, (_disp, _p) in enumerate(_display_rows):
+            if _p == cur_file:
                 _cur_display = _disp
+                _display_rows.insert(0, _display_rows.pop(i))
                 break
         if cur_file and not _cur_display:
-            _cur_display = "[external]  " + os.path.basename(cur_file)
-            _pool_entries.insert(0, (_cur_display, cur_file, False))
+            _cur_display = _fmt_row(cur_file, "external")
+            _display_rows.insert(0, (_cur_display, cur_file))
             _path_by_display[_cur_display] = cur_file
 
-        _display_values = [d for (d, _p, _m) in _pool_entries] + [_BROWSE]
-        file_var = tk.StringVar(value=_cur_display or (
-            _display_values[0] if _display_values and _display_values[0] != _BROWSE else ""))
-        file_cb  = ttk.Combobox(dlg, textvariable=file_var,
-                                values=_display_values,
-                                state="readonly", font=FB, width=56)
-        file_cb.pack(padx=20, pady=(2, 12), fill="x")
+        _lb_frame = tk.Frame(dlg, bg=BG)
+        _lb_frame.pack(fill="both", expand=True, padx=20, pady=(2, 6))
+        _lb = tk.Listbox(_lb_frame, font=("Consolas", 10),
+                         activestyle="dotbox", height=12,
+                         bg=SURF, fg=TEXT,
+                         selectbackground=ACCENT, selectforeground=BG,
+                         highlightthickness=1, highlightbackground=BORDER,
+                         exportselection=False)
+        _lb.pack(side="left", fill="both", expand=True)
+        _lb_sb = tk.Scrollbar(_lb_frame, orient="vertical", command=_lb.yview)
+        _lb_sb.pack(side="right", fill="y")
+        _lb.configure(yscrollcommand=_lb_sb.set)
+        for _disp, _p in _display_rows:
+            _lb.insert("end", _disp)
+        _lb.insert("end", _BROWSE)
+        if _cur_display:
+            _lb.selection_set(0)
+            _lb.activate(0); _lb.see(0)
 
-        def _on_file_pick(*_a):
-            if file_var.get() == _BROWSE:
+        file_var = tk.StringVar(value=_cur_display or "")
+
+        def _on_lb_select(_e=None):
+            sel = _lb.curselection()
+            if not sel:
+                return
+            v = _lb.get(sel[0])
+            if v == _BROWSE:
                 from tkinter.filedialog import askopenfilename
                 p = askopenfilename(
                     parent=dlg, title="VO source file",
                     filetypes=[("Audio", "*.wav *.mp3 *.aif *.aiff *.flac *.m4a"),
                                ("All", "*.*")])
-                if p:
-                    _disp = "[browsed]  " + os.path.basename(p)
-                    _path_by_display[_disp] = p
-                    vals = list(file_cb.cget("values"))
-                    if _disp not in vals:
-                        vals = [_disp] + vals
-                        file_cb.config(values=vals)
-                    file_var.set(_disp)
-                else:
-                    file_var.set(_cur_display or "")
-        file_cb.bind("<<ComboboxSelected>>", _on_file_pick)
+                if not p:
+                    return
+                _disp = _fmt_row(p, "browsed")
+                _path_by_display[_disp] = p
+                _lb.insert(0, _disp)
+                _lb.selection_clear(0, "end")
+                _lb.selection_set(0)
+                _lb.activate(0)
+                file_var.set(_disp)
+            else:
+                file_var.set(v)
+        _lb.bind("<<ListboxSelect>>", _on_lb_select)
+        _lb.bind("<Double-Button-1>", lambda e: (_on_lb_select(), _apply()))
 
         tk.Label(dlg,
                  text="VO segments will be cleared — set the new IN/OUT "
