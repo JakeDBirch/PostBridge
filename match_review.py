@@ -492,6 +492,17 @@ class MatchReviewDialog:
         # Spacebar = toggle play/stop
         win.bind("<space>", lambda e: self._toggle_play())
 
+        # Shift+S = toggle SKIP CUTS (matches the checkbox in the
+        # transport row).  Both cases bound because Tk delivers
+        # <Shift-S> when caps/shift produces uppercase and <Shift-s>
+        # otherwise depending on keyboard layout.
+        def _toggle_skip_cuts(_e=None):
+            v = self._play_edit_mode
+            if v is not None:
+                v.set(not v.get())
+        win.bind("<Shift-S>", _toggle_skip_cuts)
+        win.bind("<Shift-s>", _toggle_skip_cuts)
+
         # + / - zoom in / out — viewport centre stays fixed
         win.bind("<plus>",       lambda e: self._zoom_by(1.0/1.5))
         win.bind("<minus>",      lambda e: self._zoom_by(1.5))
