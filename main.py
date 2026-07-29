@@ -4989,6 +4989,42 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                                 _fixed_media.append(_hit); _relocs += 1
                         if _fixed_media:
                             _data["media"] = _fixed_media
+                        # ── Audio-signature verification ────────────────
+                        # For each media file referenced by this session,
+                        # check its baked audio_signature against the
+                        # local file.  Mismatch → WARN and DROP the
+                        # session so the pool-mix path (or fresh
+                        # transcribe) takes over.  Legacy sessions
+                        # without audio_signatures pass silently.
+                        _sigs = _data.get("audio_signatures") or {}
+                        _sig_bad = False
+                        _sig_msgs = []
+                        for _mp in (_data.get("media") or []) + (
+                                [_data.get("audio_cache")] if _data.get("audio_cache") else []):
+                            if not _mp:
+                                continue
+                            _sig = _sigs.get(_mp)
+                            if not _sig:
+                                # Try basename fallback for relocated paths.
+                                _bn = os.path.basename(_mp)
+                                for _k, _v in _sigs.items():
+                                    if os.path.basename(_k) == _bn:
+                                        _sig = _v
+                                        break
+                            if not _sig:
+                                continue   # no signature to verify — legacy
+                            _ok, _reason = engines.audio_signature_matches(_sig, _mp)
+                            if not _ok:
+                                _sig_bad = True
+                                _sig_msgs.append(
+                                    "{}: {}".format(os.path.basename(_mp), _reason))
+                        if _sig_bad:
+                            self._log_line(
+                                "  [{}] pq_session REJECTED — audio signature "
+                                "mismatch; falling back to pool mix.  {}".format(
+                                    _tok, " | ".join(_sig_msgs)),
+                                WARN)
+                            continue   # don't populate pq_session_data
                         pq_session_data[_tok] = _data
                         _reloc_note = ("  [{} paths relocated]".format(_relocs)
                                        if _relocs else "")
@@ -8173,6 +8209,23 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         ac = session.get("audio_cache")
         if ac and os.path.isfile(ac):
             payload["audio_cache"] = ac
+        # Per-file audio_signatures (sha256 + duration + sr + channels
+        # + size) so cross-machine reconcile can validate the local
+        # audio matches what the transcript was made from.  Legacy
+        # sessions without this field still load (audio_signature_
+        # matches returns True for missing sigs), but new saves start
+        # populating it immediately.  Keyed by ABSOLUTE PATH — resolver
+        # code that relocates paths at load time strips down to
+        # basename lookup when validating, so the map is consulted by
+        # basename when abs-path doesn't match.
+        _sigs = {}
+        for _mp in payload["media"]:
+            if _mp and os.path.isfile(_mp):
+                _sigs[_mp] = engines.audio_signature(_mp)
+        if ac and os.path.isfile(ac) and ac not in _sigs:
+            _sigs[ac] = engines.audio_signature(ac)
+        if _sigs:
+            payload["audio_signatures"] = _sigs
         # Optional per-source speaker label overrides (map of
         # filename → display label).  Only saved when set.
         speakers = session.get("speakers")
@@ -8266,6 +8319,27 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             "sessions": [s["_file_path"] for s in project["sessions"]
                          if s.get("_file_path")],
         }
+        # Per-session sha256 so cross-machine consumption can validate
+        # the .pb_session.json file itself hasn't drifted from what
+        # this episode project was built against.  Cheap — session
+        # files are tiny (few KB); no ffprobe involved for this one.
+        try:
+            import hashlib as _hl
+            _session_sigs = {}
+            for _sp in payload["sessions"]:
+                if _sp and os.path.isfile(_sp):
+                    _h = _hl.sha256()
+                    with open(_sp, "rb") as _f:
+                        for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                            _h.update(_chunk)
+                    _session_sigs[_sp] = {
+                        "sha256": _h.hexdigest(),
+                        "size":   os.path.getsize(_sp),
+                    }
+            if _session_sigs:
+                payload["session_signatures"] = _session_sigs
+        except Exception:
+            pass
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)

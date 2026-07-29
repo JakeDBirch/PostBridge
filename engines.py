@@ -685,6 +685,16 @@ def pb_transcript_save(media_path, words, blobs=None):
     data = {"version": 1, "model": WHISPER_MODEL, "mtime": mtime, "words": words}
     if blobs is not None:
         data["blobs"] = blobs
+    # Bake audio_signature so cross-machine reconcile can verify the
+    # local audio is bit-identical to what the transcript was made
+    # from.  mtime alone is fragile — file copies change mtime while
+    # keeping content, and re-saves change mtime with no real edit.
+    try:
+        _sig = audio_signature(media_path)
+        if _sig:
+            data["audio_signature"] = _sig
+    except Exception:
+        pass
     try:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -3349,6 +3359,106 @@ def _extract_mono(src_path, duration, out_sr):
 
 
 _duration_cache = {}   # normpath.lower() → (mtime, duration_s)
+
+# ── Audio signature (cross-machine PQ consumption safety) ─────────────
+# Bake a per-file fingerprint into every PQ artifact (session, episode,
+# transcript sidecar) so reconciliation on a different machine can
+# confirm the local audio is the same one the transcript was made from.
+# Cheap checks first; sha256 is authoritative but only run when the
+# fast checks all pass.  ~1 s per 100 MB of audio.
+
+def audio_signature(path):
+    """Return a stable fingerprint dict for `path`, or {} on IO error.
+    Never raises.  Keys are optional — callers must tolerate any subset.
+
+    Keys:
+      size:        file size in bytes
+      duration_s:  audio duration, seconds (3-decimal rounded)
+      sample_rate: Hz (0 if probe failed)
+      channels:    channel count (0 if probe failed)
+      sha256:      hex SHA-256 of the entire file
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+    sig = {}
+    try:
+        sig["size"] = os.path.getsize(path)
+    except OSError:
+        return sig
+    try:
+        sig["duration_s"] = round(float(get_media_duration(path) or 0.0), 3)
+    except Exception:
+        sig["duration_s"] = 0.0
+    try:
+        _v, a = _concat_stream_sig(path)
+        if a and len(a) >= 3:
+            sig["sample_rate"] = int(a[1])
+            sig["channels"]    = int(a[2])
+    except Exception:
+        pass
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as _f:
+            for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                h.update(_chunk)
+        sig["sha256"] = h.hexdigest()
+    except OSError:
+        pass
+    return sig
+
+
+def audio_signature_matches(sig, path):
+    """Verify `sig` against `path`'s current content.
+    Returns (ok: bool, reason: str).  Cheap checks first — short-circuits
+    on any mismatch.  A missing / empty `sig` returns (True, "no
+    signature") so legacy PQ files without baked signatures still work.
+    """
+    if not sig:
+        return True, "no stored signature"
+    if not path or not os.path.isfile(path):
+        return False, "local file not found"
+    try:
+        actual_size = os.path.getsize(path)
+    except OSError:
+        return False, "local file unreadable"
+    if sig.get("size") and int(sig["size"]) != actual_size:
+        return False, "size mismatch ({} stored vs {} local)".format(
+            sig["size"], actual_size)
+    if sig.get("duration_s"):
+        try:
+            actual_dur = round(float(get_media_duration(path) or 0.0), 3)
+        except Exception:
+            actual_dur = 0.0
+        # 100 ms tolerance absorbs tiny transcode-driven drift.
+        if abs(float(sig["duration_s"]) - actual_dur) > 0.1:
+            return False, ("duration mismatch ({:.2f}s stored vs "
+                           "{:.2f}s local)".format(
+                               float(sig["duration_s"]), actual_dur))
+    if sig.get("sample_rate") or sig.get("channels"):
+        try:
+            _v, a = _concat_stream_sig(path)
+        except Exception:
+            a = None
+        if a and len(a) >= 3:
+            if sig.get("sample_rate") and int(a[1]) != int(sig["sample_rate"]):
+                return False, "sample-rate mismatch ({} stored vs {} local)".format(
+                    sig["sample_rate"], a[1])
+            if sig.get("channels") and int(a[2]) != int(sig["channels"]):
+                return False, "channel-count mismatch ({} stored vs {} local)".format(
+                    sig["channels"], a[2])
+    if sig.get("sha256"):
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as _f:
+                for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                    h.update(_chunk)
+            actual_hash = h.hexdigest()
+        except OSError:
+            return False, "local file unreadable during hash"
+        if actual_hash != sig["sha256"]:
+            return False, "sha256 mismatch (bytes differ)"
+    return True, "match"
+
 
 def _probe_duration(path):
     """Return file duration in seconds, or 0 on failure.  Result is cached in
