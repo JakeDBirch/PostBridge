@@ -1470,6 +1470,16 @@ class MatchReviewDialog:
                         best_dist    = d
             if interior_hit:
                 self._drag = interior_hit
+            elif abs(event.x - ph_px) <= _MARKER_HIT:
+                # Playhead line: grab from anywhere along its full
+                # vertical extent, not just the triangle handle at
+                # the top.  Ordered BEFORE the region-body slip
+                # check so a click directly on the cursor line wins
+                # against slip on whatever segment / gap sits under
+                # it.  The bare-ruler variant below (y <= 14) still
+                # fires for clicks at the top even off the line
+                # itself, so the triangle grabber stays generous.
+                self._drag = "playhead"
             elif in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
                 # Inside the overall selected region.  Two possibilities:
                 #   (a) blue kept segment  → slip that segment
@@ -1518,7 +1528,13 @@ class MatchReviewDialog:
                     self._slip_anchor_in   = self._in_s
                     self._slip_anchor_out  = self._out_s
                     self._slip_anchor_segs = [list(s) for s in self._segments]
-            elif abs(event.x - ph_px) <= _MARKER_HIT or event.y <= 14:
+            elif event.y <= 14:
+                # Ruler strip at the top — grabs the playhead even off
+                # the line itself, so the triangle handle stays a
+                # generous target for coarse-precision seeking.  The
+                # abs(event.x - ph_px) check that used to live here
+                # has been hoisted above the region-body slip branch
+                # so cursor clicks anywhere on the line win.
                 self._drag = "playhead"
             else:
                 # Click anywhere else: move playhead; if playing, jump to new position
@@ -1833,6 +1849,14 @@ class MatchReviewDialog:
                 if abs(event.x - px) <= _CUT_HIT:
                     self._cv.config(cursor="sb_h_double_arrow")
                     return
+        # Playhead line: any y within _MARKER_HIT horizontally shows
+        # the h-resize cursor so the user knows they can grab the
+        # cursor from anywhere along its length (matches the priority
+        # order in _on_press).
+        ph_px = self._t_to_px(self._playhead_s)
+        if abs(event.x - ph_px) <= _MARKER_HIT:
+            self._cv.config(cursor="sb_h_double_arrow")
+            return
         if in_px + _MARKER_HIT < event.x < out_px - _MARKER_HIT and event.y > 14:
             self._cv.config(cursor="fleur")               # slip / move region
         else:
@@ -2297,21 +2321,16 @@ class MatchReviewDialog:
     def _toggle_play(self):
         """Spacebar handler — stop if playing, play/edit if stopped.
 
-        First-spacebar guard: if the user hasn't played anything yet
-        this dialog session (no _pre_play_pos, no active playback),
-        snap the playhead to IN before playing.  Otherwise a stray
-        canvas click / callback that shifted _playhead_s during load
-        would leave the user hearing playback start "part-way
-        through the edit" on their first press.  Subsequent
-        spacebars respect the current playhead position so scrubbing
-        + play-from-cursor still works.
+        Always plays from the current playhead position — Jordan
+        specifically wants "if I've moved the cursor elsewhere,
+        playback starts from there".  Playhead defaults to _in_s at
+        dialog init (line 229), so a truly-untouched dialog still
+        plays from IN.  If a real bug ever shifts the playhead
+        during load, fix it at the source rather than snapping here.
         """
         if self._playback_start_wall is not None:
             self._stop()
         else:
-            if self._pre_play_pos is None:
-                self._playhead_s = self._in_s
-                self._draw()
             self._play_or_edit()
 
     def _play_or_edit(self):
