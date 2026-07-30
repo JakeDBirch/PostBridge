@@ -175,6 +175,12 @@ class MatchReviewDialog:
         self._pool_by_token   = pool_by_token or {title: [source_audio]}
         self._words           = [w for w in (words or [])
                                   if isinstance(w, dict) and "start" in w]
+        # Cached start-time array for O(log N) visible-word slicing in
+        # _draw_words.  Long-form interview transcripts run 10-20K
+        # words; walking the whole list on every _draw was 50-200 ms
+        # per redraw and _draw fires 3-5× during initial open.
+        self._word_starts     = [float(w.get("start", 0.0))
+                                  for w in self._words]
 
         # Working copy — we edit the overall span (first in / last out).
         # Interior segment boundaries stay fixed; on accept we shift
@@ -621,7 +627,13 @@ class MatchReviewDialog:
 
         # ── Accept / Cancel ───────────────────────────────────────────────
         bot = tk.Frame(win, bg=BG)
-        bot.pack(fill="x", padx=12, pady=(8, 12))
+        # side="bottom" so ACCEPT / CANCEL survive when the canvas
+        # frame (packed above with fill=both+expand=True) grows to
+        # fill the window.  Without this, resizing the editor shorter
+        # (or opening on a smaller display) pushes the accept row off
+        # the visible area — same failure mode as the Step 3 and
+        # Step 4 nav fixes (476483a + this session's).
+        bot.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
 
         cancel = tk.Label(bot, text="CANCEL", font=FBT, bg=SURF3, fg=TEXT,
                           cursor="hand2", padx=16, pady=6, bd=0,
@@ -1340,8 +1352,20 @@ class MatchReviewDialog:
 
         # ── Build candidate list (visible words only) ─────────────────────
         # Each entry: [global_index, px, text_w, text, colour, is_priority]
+        # Bisect the sorted start-time array for the visible time
+        # window instead of walking every word.  On a 20K-word
+        # transcript this trims per-draw cost from ~50-200 ms to
+        # a few ms.  Slight over-scan (± 1s worth of margin) so
+        # words whose start is off-screen but whose ink still spills
+        # into the viewport get considered.
+        import bisect as _bisect
+        _t_left  = self._px_to_t(-5)
+        _t_right = self._px_to_t(w + 5)
+        _lo = _bisect.bisect_left(self._word_starts,  _t_left  - 1.0)
+        _hi = _bisect.bisect_right(self._word_starts, _t_right + 1.0)
         cands = []
-        for gi, wd in enumerate(self._words):
+        for gi in range(_lo, _hi):
+            wd = self._words[gi]
             t  = wd.get("start", 0)
             px = self._t_to_px(t)
             if px < -5 or px > w + 5:

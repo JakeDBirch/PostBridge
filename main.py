@@ -7209,7 +7209,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._pending_mark_saved = False
             self._mark_saved()
 
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
+        nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
@@ -7485,7 +7485,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     tk.Label(_rrow, text="({} segs)".format(len(_segs)),
                              font=FS, bg=_bg, fg=WARN, anchor="w").pack(side="left", padx=(4,0))
 
-        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(8,0))
+        nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._step4).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
