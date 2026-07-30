@@ -832,25 +832,39 @@ class MatchReviewDialog:
             _cache_ex.submit(_wave_cache_save, self._audio_path, samples, src_peak)
             _cache_ex.shutdown(wait=False)
 
+        # ── Do the amplitude rescale HERE (on the bg thread) ─────────
+        # Was in _swap on the main thread — samples * (p2/p1) is an
+        # entire-array numpy multiply, ~432 MB of memory writes for a
+        # 3.75-hour file that stalled the UI for 500 ms - 2 s.  _src_peak
+        # is a scalar float set by Phase-1's _preview_done; safe to read
+        # from this callback (fut.add_done_callback runs on the worker
+        # thread that completed the future, which is fine for reading
+        # already-published main-thread scalars).  If Phase-1 hasn't
+        # published yet (unlikely — Phase-1 finishes in ~1 s), we skip
+        # the rescale entirely and _swap uses samples verbatim.
+        import numpy as _np
+        prev_peak = getattr(self, "_src_peak", None)
+        if (src_peak > 1e-6 and prev_peak and prev_peak > 1e-6
+                and abs(src_peak - prev_peak) / prev_peak > 0.05):
+            display_samples = samples * (src_peak / prev_peak)
+        else:
+            display_samples = samples
+
+        # ── Silence-boundary detection also on the bg thread ─────────
+        # ~295 ms on a 3.75-hour file (post-vectorisation).  _swap just
+        # assigns the pre-computed lists instead of running the reshape
+        # + np.diff on the main thread.
+        sil_starts, sil_ends, sil_all = self._compute_silence_boundaries_arrays(
+            display_samples, self._sr, 0.0)
+
         def _swap():
             try:
                 if not self._win.winfo_exists():
                     return
-                import numpy as _np
                 # Preserve the current viewport centre in absolute time
                 centre_t = (self._ctx_start +
                             (self._view_start +
                              self._canvas_w * self._spp / 2) / self._sr)
-
-                # Rescale so the visible region doesn't jump amplitude on swap.
-                # Phase 1 used gain = 0.85/p1.  Phase 2 used gain = 0.85/p2.
-                # samples = raw * (0.85/p2).  Multiply by (p2/p1) → raw * (0.85/p1).
-                prev_peak = self._src_peak
-                if (src_peak > 1e-6 and prev_peak and prev_peak > 1e-6
-                        and abs(src_peak - prev_peak) / prev_peak > 0.05):
-                    display_samples = samples * (src_peak / prev_peak)
-                else:
-                    display_samples = samples
 
                 self._samples   = display_samples
                 # Update to whole-file peak for accurate playback gain
@@ -867,7 +881,9 @@ class MatchReviewDialog:
                 new_vs = int(centre_t * self._sr) - self._canvas_w * self._spp // 2
                 max_vs = max(0, n - self._canvas_w * self._spp)
                 self._view_start = max(0, min(max_vs, new_vs))
-                self._compute_silence_boundaries()
+                self._sil_starts         = sil_starts
+                self._sil_ends           = sil_ends
+                self._silence_boundaries = sil_all
                 self._draw()
             except Exception:
                 _log.exception("_swap failed")
@@ -1610,62 +1626,54 @@ class MatchReviewDialog:
                     # Return point is the clicked position, not the original start
                     self._pre_play_pos = new_t
 
-    def _compute_silence_boundaries(self):
-        """Build sorted lists of silence-region edge timestamps for snap points.
+    @staticmethod
+    def _compute_silence_boundaries_arrays(samples, sr, ctx_start):
+        """Pure-function core of silence-boundary detection.
 
-        _sil_starts: times where a silence begins (= speech just ended → OUT snap target)
-        _sil_ends:   times where a silence ends   (= speech just began → IN snap target)
-        _silence_boundaries: combined list used for tick rendering
-
-        Vectorised — was a pure-Python for-loop over ~N/160 windows
-        that stalled the main thread for 1-4 s on hour-long sources
-        (workflow-verified as the biggest waveform-open lag cause).
-        Reshape → per-row RMS in one C-level call → boolean transitions
-        via np.diff → convert transition indices to seconds.  Runs
-        ~100× faster and drops the freeze to under 50 ms on typical
-        interview lengths.
+        Returns (sil_starts, sil_ends, all_boundaries) — no self access,
+        so this is safe to call from a bg thread when the full-file swap
+        is prepared off the main thread.  Vectorised (reshape → per-row
+        RMS → np.diff on boolean transitions); ~24× faster than the
+        pure-Python for-loop it replaced.
         """
         import numpy as _np
-        self._silence_boundaries = []
-        self._sil_starts         = []
-        self._sil_ends           = []
-        if self._samples is None or len(self._samples) == 0:
-            return
-        sr        = self._sr
+        if samples is None or len(samples) == 0:
+            return [], [], []
         win       = max(1, int(sr * 0.02))    # 20 ms windows
         threshold = 0.02                       # RMS threshold (audio peak-normalised ~0.85)
         min_dur_s = 0.1                        # only silences ≥ 100 ms
 
-        samples = self._samples
         n_full  = (len(samples) // win) * win  # trim ragged tail — we don't need sub-window precision
         if n_full == 0:
-            return
-        # Row = one 20 ms window; column = sample within window.
+            return [], [], []
         rms = _np.sqrt(_np.mean(
             samples[:n_full].reshape(-1, win).astype(_np.float32) ** 2, axis=1))
         is_sil = rms < threshold
 
-        # Locate silence-region edges: pad boolean array with False on
-        # both ends so a run starting at 0 or ending at last window is
-        # detected the same way as an interior one.  np.diff on an
-        # int8 view gives +1 at rising edges (speech→silence, i.e.
-        # silence STARTS) and -1 at falling edges (silence ENDS).
         pad = _np.concatenate(([False], is_sil, [False])).astype(_np.int8)
         d   = _np.diff(pad)
-        starts_i = _np.flatnonzero(d ==  1)   # window indices where silence starts
-        ends_i   = _np.flatnonzero(d == -1)   # window indices where silence ends
-        # Convert window indices → seconds via window * (win / sr).
+        starts_i = _np.flatnonzero(d ==  1)
+        ends_i   = _np.flatnonzero(d == -1)
         w_dur = win / sr
-        starts_s = self._ctx_start + starts_i * w_dur
-        ends_s   = self._ctx_start + ends_i   * w_dur
-        # Filter silences shorter than min_dur_s.
+        starts_s = ctx_start + starts_i * w_dur
+        ends_s   = ctx_start + ends_i   * w_dur
         keep = (ends_s - starts_s) >= min_dur_s
-        starts_s = starts_s[keep]
-        ends_s   = ends_s[keep]
+        starts_s = starts_s[keep].tolist()
+        ends_s   = ends_s[keep].tolist()
+        return starts_s, ends_s, sorted(starts_s + ends_s)
 
-        self._sil_starts         = starts_s.tolist()
-        self._sil_ends           = ends_s.tolist()
-        self._silence_boundaries = sorted(self._sil_starts + self._sil_ends)
+    def _compute_silence_boundaries(self):
+        """Instance wrapper — pulls state from self, stores back to self.
+
+        _sil_starts: times where a silence begins (= speech just ended → OUT snap target)
+        _sil_ends:   times where a silence ends   (= speech just began → IN snap target)
+        _silence_boundaries: combined list used for tick rendering
+        """
+        starts, ends, both = self._compute_silence_boundaries_arrays(
+            self._samples, self._sr, self._ctx_start)
+        self._sil_starts         = starts
+        self._sil_ends           = ends
+        self._silence_boundaries = both
 
     def _auto_snap_boundaries(self):
         """Snap IN/OUT to the nearest appropriate silence boundary automatically.
