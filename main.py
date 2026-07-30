@@ -6004,6 +6004,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                         st    = res["status"]
                         conf  = res.get("confidence", 0)
                         is_vo = res.get("is_vo", False)
+                        # Coarse 3-tier severity for the reconcile log —
+                        # intentionally NOT App.STATUS_COLOR, which uses SUB
+                        # (grey) for informational states like no_quote /
+                        # not_run / cancelled.  The log has no muted tier;
+                        # a no_quote row still warrants an orange log entry
+                        # because it tells the user "we processed this and
+                        # found no quote text to match".
                         color = (SUCCESS if st in ("ok","direct")
                                  else WARN if st in ("low_confidence","no_quote")
                                  else ERR)
@@ -6366,6 +6373,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         REVIEW_STATUSES = self.REVIEW_STATUSES
         ok     = sum(1 for r in self.results if r["status"] in OK_STATUSES)
         review = sum(1 for r in self.results if r["status"] in REVIEW_STATUSES)
+        # NEVER_RAN semantic: row didn't get to run at all.  Distinct
+        # from BUILD_UNUSABLE (also excludes rows with no transcript /
+        # failed extract) and from _TERMINAL_SKIP_STATUSES in engines.py
+        # (also excludes rows with unverified script timecodes).
         skips  = sum(1 for r in self.results if r["status"] in ("no_file", "cancelled"))
 
         # Live counters — each category decrements as items are confirmed
@@ -7544,6 +7555,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             if rv_e and rv_e["skip_var"].get():
                 continue
 
+            # BUILD_UNUSABLE semantic: no transcript, no data to place.
+            # More permissive than engines._TERMINAL_SKIP_STATUSES (which
+            # also drops no_match / error) because manually-accepted
+            # no_match / error rows have already been promoted to "manual"
+            # in _accept, so any remaining no_match / error row is one
+            # the user chose not to accept — engines will drop it at
+            # build time anyway.
             if st in ("no_file", "cancelled", "extract_failed", "no_transcript"):
                 continue
 
