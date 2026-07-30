@@ -555,8 +555,17 @@ class MatchReviewDialog:
         _sent.bind("<Return>",   lambda e: self._search_next())
         _sent.bind("<KP_Enter>", lambda e: self._search_next())
         _sent.bind("<Escape>",   lambda e: self._search_clear())
-        self._search_var.trace_add("write",
-                                    lambda *_: self._search_update())
+        # Debounce so the O(N-word) match scan doesn't fire on every
+        # single keystroke.  150 ms after the last edit is quick
+        # enough to feel live while collapsing "hello" from 5 firings
+        # down to 1.
+        def _schedule_search(*_):
+            _prev = getattr(self, "_search_after_id", None)
+            if _prev is not None:
+                try: self._win.after_cancel(_prev)
+                except Exception: pass
+            self._search_after_id = self._win.after(150, self._search_update)
+        self._search_var.trace_add("write", _schedule_search)
 
         def _sb(text, cmd):
             b = tk.Label(srow, text=text, font=FB, bg=SURF3, fg=TEXT,
@@ -2025,10 +2034,15 @@ class MatchReviewDialog:
         # for a run of consecutive transcript words that match.
         q_words = q.split()
         n_q = len(q_words)
-        w_texts = [self._search_norm(w.get("word", "")) for w in self._words]
-        # Some entries may split into multiple tokens after normalisation;
-        # collapse them to their first token for the sequence compare.
-        w_first = [t.split()[0] if t else "" for t in w_texts]
+        # Cache the normalised word arrays — self._words doesn't
+        # change over the dialog's lifetime, so rebuilding them per
+        # keystroke was 20k _search_norm calls + 20k splits for
+        # nothing.  Build once, reuse.
+        w_first = getattr(self, "_search_w_first", None)
+        if w_first is None:
+            w_texts = [self._search_norm(w.get("word", "")) for w in self._words]
+            w_first = [t.split()[0] if t else "" for t in w_texts]
+            self._search_w_first = w_first
         for i in range(len(w_first) - n_q + 1):
             if w_first[i:i + n_q] == q_words:
                 in_s  = float(self._words[i].get("start", 0))
@@ -2332,10 +2346,21 @@ class MatchReviewDialog:
         self._play(self._out_s - pre, pre)
 
     def _on_resize(self, event):
-        self._canvas_w = max(100, event.width)
-        self._canvas_h = max(50, event.height)
-        # On the first resize with real dimensions, zoom to the match region.
-        # This handles the cache-hit path where winfo_width() was 1 at load time.
+        # Short-circuit no-op configures: Tk fires <Configure> repeatedly
+        # as widgets settle their sizes on open, and each event was
+        # triggering a full waveform + word-timeline redraw.  On real
+        # sessions this stacked 5-10 identical redraws per open — most
+        # of the "reloading graphics" jitter came from here.
+        new_w = max(100, event.width)
+        new_h = max(50,  event.height)
+        _prev = getattr(self, "_last_resize_size", (0, 0))
+        if (new_w, new_h) == _prev and not self._need_initial_zoom:
+            return
+        self._last_resize_size = (new_w, new_h)
+        self._canvas_w = new_w
+        self._canvas_h = new_h
+        # Initial-zoom logic runs synchronously so the first paint uses
+        # the correct dimensions; guarded to fire only once.
         if self._need_initial_zoom and event.width > 100 and self._samples is not None:
             self._need_initial_zoom = False
             pad = 3.0
@@ -2344,7 +2369,14 @@ class MatchReviewDialog:
             view_dur_s   = max(0.1, view_end_s - view_start_s)
             self._spp        = max(1, int(view_dur_s * self._sr / self._canvas_w))
             self._view_start = int((view_start_s - self._ctx_start) * self._sr)
-        self._draw()
+        # Debounce the redraw: cancel any pending draw and schedule one
+        # ~30 ms out.  Rapid Configure bursts collapse into a single
+        # final redraw instead of 5-10 stacked.
+        _prev_id = getattr(self, "_resize_after_id", None)
+        if _prev_id is not None:
+            try: self._win.after_cancel(_prev_id)
+            except Exception: pass
+        self._resize_after_id = self._win.after(30, self._draw)
 
     def _nudge(self, side, frames):
         delta = frames * self._frame_s
