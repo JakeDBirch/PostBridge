@@ -129,6 +129,25 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         "transcribing":   "⧗  transcribing…",
     }
 
+    # ── Status-bucket sets (single source of truth) ─────────────────
+    # OK_STATUSES: auto-matched by the pipeline — count in the OK
+    #   bucket at the top of Step 4.  Excludes "manual" because the
+    #   user's edit changed it from an auto match to a hand-adjusted
+    #   one; the OK bucket tracks the pipeline's own hit rate.
+    # REVIEW_STATUSES: rows the user needs to look at (matched
+    #   nothing, low confidence, errored out, not yet run).
+    # SUCCESS_STATUSES: any status representing a resolved row —
+    #   used by _make_status_popup to decide whether a right-click
+    #   status change should also un-accept the row.  Includes
+    #   "manual" because a hand-adjusted row is still resolved.
+    # Semantically distinct — keep both.  Previously they were
+    # inline tuples that drifted:  _decrement_confirmed included
+    # "manual" in the OK bucket while _increment_confirmed didn't,
+    # so un-accepting a "manual" row was inflating _ok_count.
+    OK_STATUSES      = ("ok", "direct")
+    REVIEW_STATUSES  = ("no_match", "error", "low_confidence", "not_run")
+    SUCCESS_STATUSES = frozenset(("ok", "direct", "manual"))
+
     def __init__(self):
         super().__init__()
         self.title("PostBridge")
@@ -6343,9 +6362,10 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                       "These are flagged by name in the exported XML.",
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,6))
 
-        ok     = sum(1 for r in self.results if r["status"] in ("ok", "direct"))
-        review = sum(1 for r in self.results if r["status"] in
-                     ("no_match", "error", "low_confidence", "not_run"))
+        OK_STATUSES     = self.OK_STATUSES
+        REVIEW_STATUSES = self.REVIEW_STATUSES
+        ok     = sum(1 for r in self.results if r["status"] in OK_STATUSES)
+        review = sum(1 for r in self.results if r["status"] in REVIEW_STATUSES)
         skips  = sum(1 for r in self.results if r["status"] in ("no_file", "cancelled"))
 
         # Live counters — each category decrements as items are confirmed
@@ -6373,11 +6393,11 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             _confirmed_count[0] += 1
             _confirmed_var.set(str(_confirmed_count[0]))
             _confirmed_num_lbl.config(fg=SUCCESS)
-            if status in ("ok", "direct"):
+            if status in OK_STATUSES:
                 _ok_count[0] = max(0, _ok_count[0] - 1)
                 _ok_var.set(str(_ok_count[0]))
                 _ok_num_lbl.config(fg=SUCCESS if _ok_count[0] > 0 else SUB)
-            elif status in ("no_match", "error", "low_confidence", "not_run"):
+            elif status in REVIEW_STATUSES:
                 _review_count[0] = max(0, _review_count[0] - 1)
                 _review_var.set(str(_review_count[0]))
                 _review_num_lbl.config(fg=WARN if _review_count[0] > 0 else SUB)
@@ -6389,11 +6409,11 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             _confirmed_count[0] = max(0, _confirmed_count[0] - 1)
             _confirmed_var.set(str(_confirmed_count[0]))
             _confirmed_num_lbl.config(fg=SUCCESS if _confirmed_count[0] > 0 else SUB)
-            if status in ("ok", "direct", "manual"):
+            if status in OK_STATUSES:
                 _ok_count[0] += 1
                 _ok_var.set(str(_ok_count[0]))
                 _ok_num_lbl.config(fg=SUCCESS)
-            elif status in ("no_match", "error", "low_confidence", "not_run"):
+            elif status in REVIEW_STATUSES:
                 _review_count[0] += 1
                 _review_var.set(str(_review_count[0]))
                 _review_num_lbl.config(fg=WARN)
@@ -6706,7 +6726,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # flag to keep the state consistent.  Otherwise the
                 # row keeps showing in the CONFIRMED tab despite the
                 # label saying otherwise.
-                _SUCCESS_STATUSES = {"ok", "direct", "manual"}
+                _SUCCESS_STATUSES = self.SUCCESS_STATUSES
                 def _change(new_status):
                     self._s4_push_undo()
                     if "_original_status" not in r:

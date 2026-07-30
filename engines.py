@@ -1324,6 +1324,18 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
 # smooth out dynamic speakers.  The caller receives a temp file path and is
 # responsible for deleting it after reconciliation.
 
+# Statuses the render pipelines (AAF + WAV) treat as terminal: skip
+# the row at build time.  no_match / error rows carry unverified
+# script timecodes; the others were never fully processed.  If a user
+# manually accepts such a row in Step 4, _accept() promotes it to
+# "manual" and it drops off this list.  Kept as a module-level
+# constant so build_aaf and the WAV builder can't drift — adding a
+# new terminal status here updates both call sites at once.
+_TERMINAL_SKIP_STATUSES = frozenset((
+    "extract_failed", "no_transcript", "cancelled", "no_file",
+    "no_match", "error",
+))
+
 _MIX_SR              = 16_000
 _MIX_FRAME_SAMP      = _MIX_SR * 20 // 1000   # 20 ms frames = 320 samples
 _MIX_NOISE_PCT       = 10
@@ -3815,12 +3827,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         out_s = res.get("rec_out_s", 0.0)
         st    = res.get("status", "")
 
-        if st in ("extract_failed", "no_transcript", "cancelled", "no_file",
-                  "no_match", "error"):
-            # no_match / error clips have unverified raw-script timecodes —
-            # skip them so they don't land at wrong positions.  If the user
-            # manually accepts such a clip in Step 4, _accept() promotes its
-            # status to "manual" so it will no longer be caught here.
+        if st in _TERMINAL_SKIP_STATUSES:
             skipped.append(res); continue
         if not is_vo and in_s >= out_s:
             skipped.append(res); continue
@@ -4723,11 +4730,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         st       = res.get("status", "")
         segments = res.get("segments") or []
 
-        if st in ("extract_failed", "no_transcript", "cancelled", "no_file",
-                  "no_match", "error"):
-            # no_match / error clips carry unverified raw-script timecodes.
-            # Skip them unless the user explicitly accepted them in Step 4,
-            # in which case _accept() will have promoted status to "manual".
+        if st in _TERMINAL_SKIP_STATUSES:
             skipped.append(res); continue
         if not is_vo and not segments:
             skipped.append(res); continue
