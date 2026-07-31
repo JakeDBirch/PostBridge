@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import bisect
 import hashlib
 import threading
 import queue
@@ -10106,9 +10107,49 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 sorted_bps = sorted(break_positions)
                 # Convert run_start to absolute char count from "1.0"
                 run_start_abs = _tx_count_chars(tx, "1.0", run_start)
+
+                # ── Literal "line.column" index mapping ──────────────
+                # This loop used to tag each word with
+                #     "1.0 + {}c".format(abs_s)
+                # Tk resolves a "+Nc" index by WALKING FORWARD N chars
+                # from the base, so cost is O(N) per call and O(N^2)
+                # across the render.  Benchmarked on this box: 5.1 s at
+                # 20k words, 15.7 s at 34k — every 1.2 s throughout a
+                # streaming transcription.  That is the single biggest
+                # source of the "sluggish / re-loading graphics" feel.
+                #
+                # Emitting a literal "L.C" index instead costs Tk a
+                # direct B-tree seek: same 20k words drops to ~87 ms
+                # (~58x), and batching the spans into one tag_add call
+                # takes it to ~30 ms (~170x).
+                #
+                # NB batching ALONE does not help — the cost is index
+                # resolution, not Tcl round-trips (measured: 5430 ms
+                # batched vs 5018 ms looped).  The literal index is the
+                # part that matters; batching is a bonus on top.
+                _rl, _, _rc = run_start.partition(".")
+                _run_line, _run_col = int(_rl), int(_rc)
+                # Newline offsets within run_text, for offset -> (line, col).
+                _nl, _p = [], run_text.find("\n")
+                while _p != -1:
+                    _nl.append(_p)
+                    _p = run_text.find("\n", _p + 1)
+
+                def _local_index(off, _nl=_nl,
+                                 _run_line=_run_line, _run_col=_run_col):
+                    """Char offset within run_text -> literal Tk "L.C" index."""
+                    k = bisect.bisect_left(_nl, off)   # newlines strictly before off
+                    if k == 0:
+                        return "{}.{}".format(_run_line, _run_col + off)
+                    return "{}.{}".format(_run_line + k, off - _nl[k - 1] - 1)
+
+                _tiny_spans, _user_spans = [], []
                 for s, e, w in cont_idx:
-                    # Add 2 chars for each break before this word in run
-                    n_before = sum(1 for bp in sorted_bps if bp <= s)
+                    # Add 2 chars for each break before this word in run.
+                    # sorted_bps is sorted and cont_idx ascends by s, so
+                    # the old full rescan per word (O(words x breaks),
+                    # 294 ms at 20k words) is a bisect.
+                    n_before = bisect.bisect_right(sorted_bps, s)
                     shift = n_before * 2
                     abs_s = run_start_abs + s + shift
                     abs_e = run_start_abs + e + shift
@@ -10122,15 +10163,16 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                     # the user always knows what they touched.
                     src = w.get("_src")
                     if _fade_tiny and src == "tiny":
-                        tx.tag_add(
-                            "body_tiny",
-                            "1.0 + {}c".format(abs_s),
-                            "1.0 + {}c".format(abs_e))
+                        _tiny_spans.append(_local_index(s + shift))
+                        _tiny_spans.append(_local_index(e + shift))
                     elif src == "user":
-                        tx.tag_add(
-                            "body_user",
-                            "1.0 + {}c".format(abs_s),
-                            "1.0 + {}c".format(abs_e))
+                        _user_spans.append(_local_index(s + shift))
+                        _user_spans.append(_local_index(e + shift))
+                # tag_add takes any number of index PAIRS — one call each.
+                if _tiny_spans:
+                    tx.tag_add("body_tiny", *_tiny_spans)
+                if _user_spans:
+                    tx.tag_add("body_user", *_user_spans)
 
             # Reset undo history — programmatic render is not a user
             # edit, so Ctrl+Z shouldn't revert to "before render".
