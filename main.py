@@ -1031,11 +1031,36 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         canvas = tk.Canvas(outer, bg=BG, bd=0, highlightthickness=0)
         sb     = _SlimScrollbar(outer, command=canvas.yview)
         sf     = tk.Frame(canvas, bg=BG)
-        sf.bind("<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(win_id, width=e.width))
+
+        # Both Configure handlers below are edge-triggered: they only
+        # touch the canvas when the value actually CHANGED.  Tk fires
+        # <Configure> liberally (and each of these handlers can provoke
+        # the other — setting the item width resizes the frame, which
+        # re-fires the frame's Configure, which sets scrollregion), so
+        # unguarded they ping-pong through redundant relayouts.
+        _last_sr = [None]
+        def _sync_scrollregion(_e=None):
+            bb = canvas.bbox("all")
+            if bb != _last_sr[0]:
+                _last_sr[0] = bb
+                canvas.configure(scrollregion=bb)
+
+        _last_w = [None]
+        def _sync_item_width(e):
+            if e.width != _last_w[0]:
+                _last_w[0] = e.width
+                canvas.itemconfigure(win_id, width=e.width)
+
+        sf.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_item_width)
         win_id = canvas.create_window((0,0), window=sf, anchor="nw")
+        # Published on the frame so the freeze/unfreeze dance around bulk
+        # repacks (Step 4 filter/sort) can REBIND THIS handler instead of
+        # writing its own lambda.  It used to write
+        #     lambda e, c=cv: c.configure(scrollregion=c.bbox("all"))
+        # which silently replaced the guarded version above, so the
+        # de-duplication was lost after the first filter click.
+        sf._pb_sync_scrollregion = _sync_scrollregion
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -1057,7 +1082,17 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # macOS uses delta 1/-1 per notch; Windows uses 120/-120
             units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
             canvas.yview_scroll(units, "units")
-            canvas.update_idletasks()
+            # NO update_idletasks() here.  It used to force a synchronous
+            # layout+paint flush on every wheel notch, which:
+            #   * ran the <Configure> handler above, recomputing
+            #     bbox("all") across every card in the frame (200+ on a
+            #     real episode) — per notch;
+            #   * repainted MID-SCROLL, before the canvas had finished
+            #     moving its embedded window, so a partially-updated
+            #     frame reached the screen.  That is the "ghosts of
+            #     previous things overlaying the new things" artefact.
+            # Letting Tk return to its event loop coalesces the scroll
+            # and paints once, coherently.
 
         self.bind_all("<MouseWheel>", _on_wheel)
         return sf
@@ -6729,8 +6764,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             # Unfreeze scrollregion — one layout pass covers all repacked cards
             if _s4cv:
-                sf.bind("<Configure>",
-                        lambda e, c=_s4cv: c.configure(scrollregion=c.bbox("all")))
+                # Rebind the SAME guarded handler _scroll_frame installed,
+                # not a fresh lambda — a fresh one drops the
+                # only-when-changed guard for the rest of the session.
+                _sr = getattr(sf, "_pb_sync_scrollregion", None)
+                if _sr is not None:
+                    sf.bind("<Configure>", _sr)
                 sf.update_idletasks()
                 _s4cv.configure(scrollregion=_s4cv.bbox("all"))
 
@@ -7322,9 +7361,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # Restore scrollregion binding now that all cards are packed, then do
         # one layout pass so the canvas knows the full scroll extent.
+        # Rebind _scroll_frame's own guarded handler rather than a fresh
+        # lambda, so the only-when-changed check survives the rebuild.
         _cv = self._s4_scroll_canvas
-        sf.bind("<Configure>",
-                lambda e, c=_cv: c.configure(scrollregion=c.bbox("all")))
+        _sr = getattr(sf, "_pb_sync_scrollregion", None)
+        if _sr is not None:
+            sf.bind("<Configure>", _sr)
         sf.update_idletasks()
         _cv.configure(scrollregion=_cv.bbox("all"))
 

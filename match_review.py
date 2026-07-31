@@ -1794,6 +1794,20 @@ class MatchReviewDialog:
             self._segments[0]  = [new_in,  s0[1]]
             self._segments[-1] = [sl[0],   new_out]
 
+        # Re-anchor the playhead to the snapped IN.  __init__ parked it
+        # on the ORIGINAL in-point, but the IN candidate window reaches
+        # back _AUTO_SNAP_WINDOW seconds, so a snap that moves IN
+        # EARLIER left the cursor sitting a visible distance after the
+        # in marker on open.
+        #
+        # Only re-anchor when the playhead is still exactly where
+        # __init__ put it — if the user has already clicked elsewhere,
+        # leave it be.  (Playback always starts from the cursor; an
+        # earlier attempt to force it to IN on play was reverted for
+        # exactly that reason.)
+        if abs(self._playhead_s - orig_in) < 1e-6:
+            self._playhead_s = new_in
+
         self._auto_snapped = True
         try:
             if self._snap_lbl and self._snap_lbl.winfo_exists():
