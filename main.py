@@ -2225,9 +2225,30 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             return {}
 
     def _s4_apply_state(self, snap):
-        """Apply a snapshot dict to the live _rv card list."""
+        """Apply a snapshot dict to the live _rv card list.
+
+        Bulk operation: undo, redo, and the selective-re-reconcile
+        restore all land here and drive the same per-row tally callbacks
+        the card-build loop does.  Suppress the per-row UNCONFIRMED
+        re-filter for the duration and re-sync once at the end —
+        otherwise a single Ctrl+Z over a 212-row list runs a full
+        unpack/re-sort/repack/flush cycle per changed row.
+        """
         inc = getattr(self, "_s4_increment_confirmed", lambda s="": None)
         dec = getattr(self, "_s4_decrement_confirmed", lambda s="": None)
+        _was_building     = getattr(self, "_s4_building", False)
+        self._s4_building = True
+        try:
+            self._s4_apply_state_rows(snap, inc, dec)
+        finally:
+            self._s4_building = _was_building
+        if not _was_building:
+            _sync = getattr(self, "_s4_sync_unconfirmed", None)
+            if _sync is not None:
+                _sync()
+
+    def _s4_apply_state_rows(self, snap, inc, dec):
+        """Row-by-row body of _s4_apply_state (see the latch there)."""
         for e in getattr(self, "_rv", []):
             order = str(e["res"]["order"])
             if order not in snap:
@@ -6555,8 +6576,39 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         _confirmed_var   = tk.StringVar(value="0")
         _ignored_var     = tk.StringVar(value="0")
         _unconfirmed_count = [0]   # mutable; set accurately after card-restore loop
+        # True only while the per-card build/restore loop is running.
+        #
+        # Every restored row that was previously accepted or ignored calls
+        # _increment_confirmed / _increment_ignored, which call
+        # _sync_unconfirmed_btn.  With the UNCONFIRMED tab active that ran a
+        # FULL _apply_filter per row — unpack every card and divider,
+        # re-sort, re-pack, then sf.update_idletasks().  That is the
+        # "graphics populating in a piecemeal way" on session load: one
+        # synchronous repaint per restored row, over a list that is still
+        # growing.
+        #
+        # Every one of those calls is pure waste: the loop tail recomputes
+        # the count from live _rv state and rewrites the label, then does
+        # one terminal _apply_filter.
+        #
+        # Worse, _apply_filter REBINDS sf's <Configure> handler, which the
+        # build deliberately unbound to freeze scrollregion recalculation
+        # for the whole loop.  So the first in-loop call also silently
+        # cancelled that optimisation for every remaining card.pack().
+        #
+        # Lives on self, not in a closure, because _s4_apply_state (a
+        # method — undo, redo, and the selective-re-reconcile restore)
+        # drives the same per-row tally callbacks and needs to suppress
+        # them the same way.  A closure would have been unreachable from
+        # there, which is exactly the trap that produced the duplicated
+        # STATUS maps.
+        self._s4_building = False
 
         def _sync_unconfirmed_btn():
+            # Suppressed during bulk updates; the caller re-syncs both the
+            # label and the filter once when it finishes.
+            if getattr(self, "_s4_building", False):
+                return
             try:
                 _fbtns["unconfirmed"].config(
                     text="UNCONFIRMED  {}".format(_unconfirmed_count[0]))
@@ -6815,6 +6867,14 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         sf.unbind("<Configure>")
         self._rv   = []
         self._skip = []
+        # Latch the in-loop UNCONFIRMED re-filter off for the whole build
+        # (see _sync_unconfirmed_btn).  Cleared right after the loop.
+        #
+        # No try/finally: if the loop raises, _step4 has already aborted
+        # with a half-built screen, and the next _step4() resets the latch
+        # on the line above its own loop.  Not worth re-indenting 500 lines
+        # of loop body to guard a state that self-heals.
+        self._s4_building = True
 
         # Alias the class-level maps so the existing per-card build code
         # that references bare STATUS_COLOR / STATUS_LABEL keeps working
@@ -7350,9 +7410,16 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 eff = res.get("_original_status") or res.get("status", "")
                 _increment_confirmed(eff)
 
+        # Build finished — live edits from here on should update the
+        # UNCONFIRMED label and re-filter normally again.
+        self._s4_building = False
+
         # Store tally callbacks on self so _s4_apply_state can reach them
         self._s4_increment_confirmed = _increment_confirmed
         self._s4_decrement_confirmed = _decrement_confirmed
+        # ...and the refresh, so a bulk apply can suppress the per-row
+        # storm and re-sync exactly once when it is done.
+        self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
 
         # Recompute the UNCONFIRMED count from the live _rv state now that
         # card restoration has run (accepted_flag / skip_var are authoritative).
