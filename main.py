@@ -1809,7 +1809,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             e = by_tok[tok]
             e["total"]      += 1
             e[c["user_action"]] += 1
-            if c["algo_status"] in ("ok", "direct"):   e["algo_ok"]  += 1
+            if c["algo_status"] in self.OK_STATUSES:   e["algo_ok"]  += 1
             elif c["algo_status"] == "low_confidence": e["algo_low"] += 1
             elif c["algo_status"] in ("no_match", "error"): e["algo_miss"] += 1
         for ov in ordering_violations:
@@ -6087,7 +6087,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         int_results = [r for r in sorted_results if not r.get("is_vo")]
 
         def _counts(rlist):
-            ok_  = sum(1 for r in rlist if r.get("status") in ("ok", "direct"))
+            ok_  = sum(1 for r in rlist if r.get("status") in self.OK_STATUSES)
             lc   = sum(1 for r in rlist if r.get("status") == "low_confidence")
             nm   = sum(1 for r in rlist if r.get("status") == "no_match")
             err  = sum(1 for r in rlist if r.get("status") in
@@ -6107,9 +6107,9 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         clow = sum(1 for c in conf_vals if c < 0.50)
 
         seg_counts = [len(r.get("segments") or []) for r in sorted_results
-                      if r.get("status") in ("ok", "direct") and r.get("segments")]
+                      if r.get("status") in self.OK_STATUSES and r.get("segments")]
         seg_outliers = [r for r in sorted_results
-                        if r.get("status") in ("ok", "direct")
+                        if r.get("status") in self.OK_STATUSES
                         and len(r.get("segments") or []) > 5]
 
         from collections import defaultdict as _dd2
@@ -6118,7 +6118,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         for r in vo_results:
             pi = r.get("part_index", "?")
             _vo_part_tot[pi]  += 1
-            if r.get("status") not in ("ok", "direct"):
+            if r.get("status") not in self.OK_STATUSES:
                 _vo_part_fail[pi] += 1
 
         def _take_dur(t):
@@ -7068,7 +7068,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                             # from the audio file the waveform editor just used.
                             r["takes_data"]      = [{"apath": sa, "segments": list(new_segs)}]
                             r["best_take_index"] = 0
-                    if old_status not in ("ok", "direct", "manual"):
+                    if old_status not in self.SUCCESS_STATUSES:
                         # Remember the original status so restore/un-accept
                         # can decrement the correct tally bucket.
                         r["_original_status"] = old_status
@@ -7712,7 +7712,7 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                 _set_status("Probing media settings… ({} clips, {} with edits)".format(
                     len(edited),
-                    sum(1 for _r in edited if _r.get("status") in ("manual", "ok", "direct"))))
+                    sum(1 for _r in edited if _r.get("status") in self.SUCCESS_STATUSES)))
                 seq_w, seq_h, seq_fps, seq_sr = engines.probe_media_settings(
                     [p for p in all_paths if p])
 

@@ -181,6 +181,14 @@ class MatchReviewDialog:
         # per redraw and _draw fires 3-5× during initial open.
         self._word_starts     = [float(w.get("start", 0.0))
                                   for w in self._words]
+        # Cached lowercase-first-token array for the transcript search
+        # box.  Sibling of _word_starts — same lifecycle (self._words
+        # is immutable over the dialog's lifetime), same eager pattern.
+        # Was a lazy getattr(..., None) dance inside _search_update,
+        # inconsistent with _word_starts for no reason.
+        _w_texts              = [self._search_norm(w.get("word", ""))
+                                  for w in self._words]
+        self._search_w_first  = [t.split()[0] if t else "" for t in _w_texts]
 
         # Working copy — we edit the overall span (first in / last out).
         # Interior segment boundaries stay fixed; on accept we shift
@@ -217,7 +225,11 @@ class MatchReviewDialog:
 
         # Lazy-load chunk tracking — samples array is a contiguous window that grows
         # outward from the Phase-1 preview as the user scrolls.
-        self._file_dur_s     = _file_dur if (_file_dur and _file_dur > 0) else 0.0
+        # 0.0 starter — _preview_done refines this from the real ffprobe
+        # duration once the bg thread returns.  Was `_file_dur` (a local
+        # from a synchronous get_media_duration call) before the async-
+        # duration commit removed the call but left this line intact.
+        self._file_dur_s     = 0.0
         self._loaded_start_s = 0.0   # file-time of samples[0]
         self._loaded_end_s   = 0.0   # file-time of samples[-1]
         self._loading_left   = False  # background chunk fetch in progress (left)
@@ -552,8 +564,19 @@ class MatchReviewDialog:
                          bg=SURF2, fg=TEXT, insertbackground=TEXT,
                          relief="flat", bd=4, width=32)
         _sent.pack(side="left", padx=(6, 4))
-        _sent.bind("<Return>",   lambda e: self._search_next())
-        _sent.bind("<KP_Enter>", lambda e: self._search_next())
+        # Flush the debounce before jumping.  Enter within 150 ms of
+        # the last keystroke would otherwise fire _search_next against
+        # empty/stale _search_hits, so the jump silently did nothing.
+        def _search_enter():
+            _prev = getattr(self, "_search_after_id", None)
+            if _prev is not None:
+                try: self._win.after_cancel(_prev)
+                except Exception: pass
+                self._search_after_id = None
+                self._search_update()
+            self._search_next()
+        _sent.bind("<Return>",   lambda e: _search_enter())
+        _sent.bind("<KP_Enter>", lambda e: _search_enter())
         _sent.bind("<Escape>",   lambda e: self._search_clear())
         # Debounce so the O(N-word) match scan doesn't fire on every
         # single keystroke.  150 ms after the last edit is quick
@@ -720,11 +743,16 @@ class MatchReviewDialog:
             samples, preview_start, src_peak, real_dur = fut.result()
             self._src_peak     = src_peak if src_peak > 1e-6 else None
             self._display_gain = (0.85 / src_peak) if src_peak > 1e-6 else 1.0
-            # Refine _ctx_dur from the real probe now that ffprobe has
-            # run off-thread.  Falls back to whatever coarse estimate
-            # __init__ set if the probe returned 0.
+            # Refine _ctx_dur AND _file_dur_s from the real probe now
+            # that ffprobe has run off-thread.  Both fall back to
+            # whatever coarse estimate __init__ set if the probe
+            # returned 0.  _file_dur_s gates lazy right-side chunk
+            # expansion (see _check_and_expand); without this line,
+            # scrolling right past the preview window between Phase-1
+            # and Phase-2 silently hits a black waveform.
             if real_dur and real_dur > 0:
-                self._ctx_dur = real_dur
+                self._ctx_dur    = real_dur
+                self._file_dur_s = real_dur
         except Exception as exc:
             _log.exception("preview extraction failed")
             def _err():
@@ -842,7 +870,6 @@ class MatchReviewDialog:
         # already-published main-thread scalars).  If Phase-1 hasn't
         # published yet (unlikely — Phase-1 finishes in ~1 s), we skip
         # the rescale entirely and _swap uses samples verbatim.
-        import numpy as _np
         prev_peak = getattr(self, "_src_peak", None)
         if (src_peak > 1e-6 and prev_peak and prev_peak > 1e-6
                 and abs(src_peak - prev_peak) / prev_peak > 0.05):
@@ -857,6 +884,14 @@ class MatchReviewDialog:
         sil_starts, sil_ends, sil_all = self._compute_silence_boundaries_arrays(
             display_samples, self._sr, 0.0)
 
+        # Hoist the length OUT of the closure so `samples` isn't captured
+        # unnecessarily.  In the rescale branch above, `samples` and
+        # `display_samples` are DIFFERENT arrays (both ~432 MB on a
+        # 3.75-hour file) — closing over both doubles peak RSS from
+        # _full_done returning until _swap runs on the main thread.
+        _n_samples = len(display_samples)
+        del samples
+
         def _swap():
             try:
                 if not self._win.winfo_exists():
@@ -870,16 +905,15 @@ class MatchReviewDialog:
                 # Update to whole-file peak for accurate playback gain
                 self._src_peak  = src_peak if src_peak > 1e-6 else self._src_peak
                 self._ctx_start = 0.0
-                self._ctx_dur   = len(samples) / self._sr
+                self._ctx_dur   = _n_samples / self._sr
                 # Mark the full file as loaded so lazy expansion stops
                 self._loaded_start_s = 0.0
                 self._loaded_end_s   = self._ctx_dur
                 self._loading_left   = False
                 self._loading_right  = False
                 # Reposition view to the same absolute time centre
-                n      = len(samples)
                 new_vs = int(centre_t * self._sr) - self._canvas_w * self._spp // 2
-                max_vs = max(0, n - self._canvas_w * self._spp)
+                max_vs = max(0, _n_samples - self._canvas_w * self._spp)
                 self._view_start = max(0, min(max_vs, new_vs))
                 self._sil_starts         = sil_starts
                 self._sil_ends           = sil_ends
@@ -2042,15 +2076,11 @@ class MatchReviewDialog:
         # for a run of consecutive transcript words that match.
         q_words = q.split()
         n_q = len(q_words)
-        # Cache the normalised word arrays — self._words doesn't
-        # change over the dialog's lifetime, so rebuilding them per
-        # keystroke was 20k _search_norm calls + 20k splits for
-        # nothing.  Build once, reuse.
-        w_first = getattr(self, "_search_w_first", None)
-        if w_first is None:
-            w_texts = [self._search_norm(w.get("word", "")) for w in self._words]
-            w_first = [t.split()[0] if t else "" for t in w_texts]
-            self._search_w_first = w_first
+        # _search_w_first built eagerly in __init__ (sibling of
+        # _word_starts) — self._words is immutable over the dialog's
+        # lifetime, so building once at open is cheaper than a lazy
+        # getattr dance on every keystroke.
+        w_first = self._search_w_first
         for i in range(len(w_first) - n_q + 1):
             if w_first[i:i + n_q] == q_words:
                 in_s  = float(self._words[i].get("start", 0))
@@ -2849,6 +2879,18 @@ class MatchReviewDialog:
 
     def _cleanup(self):
         self._stop()
+        # Cancel any pending debounced callbacks — search, resize, tip
+        # — before destroying the window.  Without this, an in-flight
+        # after() fires against the destroyed Toplevel and _search_update
+        # / _draw / etc. raise TclError from inside the Tk mainloop.
+        for _attr in ("_search_after_id", "_resize_after_id",
+                      "_tip_job", "_pq_layout_resize_after"):
+            _id = getattr(self, _attr, None)
+            if _id is not None:
+                try: self._win.after_cancel(_id)
+                except Exception: pass
+                try: setattr(self, _attr, None)
+                except Exception: pass
         try:
             import shutil
             shutil.rmtree(self._tmp_dir, ignore_errors=True)
