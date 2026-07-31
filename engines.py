@@ -41,11 +41,24 @@ def _safe_exists(path, _timeout=2.0):
     return _safe_net_call(lambda: os.path.exists(path), False, _timeout)
 from xml.etree.ElementTree import Element, SubElement, ElementTree, indent
 
-try:
-    from faster_whisper import WhisperModel
-    HAS_WHISPER = True
-except ImportError:
-    HAS_WHISPER = False
+# faster_whisper pulls in ctranslate2 -> torch, measured at ~2.45 s of the
+# ~2.61 s it took to `import main` — 94% of all startup import time, paid
+# before Tk is even initialised, so the user stared at nothing for it.
+#
+# find_spec answers "is it installed?" by locating the module WITHOUT
+# executing it, so HAS_WHISPER is still available at import time for UI
+# gating.  The real import happens lazily in get_model(), the only place
+# WhisperModel is actually constructed.
+#
+# Caveat vs the old try/except: find_spec cannot detect a package that is
+# present but broken (the classic case being a ctranslate2 whose native
+# DLL fails to load).  Such an install now surfaces its error when the
+# user starts a transcription rather than by greying the button out at
+# launch — get_model raises with the original exception attached so the
+# message is still actionable.  Trading a clearer failure in a rare
+# broken-install case for 2.45 s off every single launch.
+import importlib.util as _importlib_util
+HAS_WHISPER = _importlib_util.find_spec("faster_whisper") is not None
 
 try:
     import aaf2
@@ -987,6 +1000,18 @@ def get_model(size=None):
             # config.WHISPER_NUM_WORKERS for the rationale.  Critical
             # for reconcile runs where one full-audio interview pass
             # is happening alongside several VO chunked transcribes.
+            # Lazy import — see the HAS_WHISPER note at the top of this
+            # module.  This is the only place a WhisperModel is built, so
+            # it is the natural place to pay the ctranslate2/torch cost.
+            try:
+                from faster_whisper import WhisperModel
+            except Exception as _exc:
+                raise RuntimeError(
+                    "faster-whisper is installed but failed to load "
+                    "({}: {}).  This usually means the ctranslate2 native "
+                    "library is missing or mismatched — reinstall "
+                    "faster-whisper and ctranslate2.".format(
+                        type(_exc).__name__, _exc)) from _exc
             _model_cache[size] = WhisperModel(
                 size, device=device, compute_type=compute,
                 download_root=_persistent_models_dir(),

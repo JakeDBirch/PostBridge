@@ -23,11 +23,14 @@ try:
 except ImportError:
     HAS_DND = False
 
-try:
-    from faster_whisper import WhisperModel
-    HAS_WHISPER = True
-except ImportError:
-    HAS_WHISPER = False
+# Availability only — main.py never references WhisperModel, it just gates
+# UI on the flag.  Importing the symbol here dragged in ctranslate2 -> torch
+# (~2.5 s) as the 27th line of the entry-point module, i.e. before config,
+# utils, parsers, gui_components or engines, and long before Tk existed.
+# find_spec locates the module without executing it.  engines.py owns the
+# real (lazy) import; see the note there.
+import importlib.util as _importlib_util
+HAS_WHISPER = _importlib_util.find_spec("faster_whisper") is not None
 
 try:
     import aaf2
