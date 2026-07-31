@@ -382,6 +382,14 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=36)
 
     def _clear(self):
+        # Flush any pending Step 4 state write before the screen goes
+        # away.  _s4_save coalesces rapid edits behind a short timer;
+        # every navigation lands here, so this is the universal
+        # commit point.
+        try:
+            self._s4_save_flush()
+        except Exception:
+            pass
         self.unbind_all("<MouseWheel>")
         # <x>/<X> are Step 4's "toggle IGNORE on the active card"
         # shortcut (bound via bind_all in _step4).  They were never
@@ -2099,8 +2107,49 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             snap[str(order)] = entry
         return snap
 
+    # Coalescing window for Step 4 state writes, in ms.  Short enough
+    # that a crash loses nothing a user would notice, long enough that
+    # holding X to burn through a run of cards writes once, not once
+    # per card.
+    _S4_SAVE_DEBOUNCE_MS = 400
+
     def _s4_save(self):
-        """Persist the current Step 4 state to a sidecar JSON file."""
+        """Schedule a Step 4 state write (coalescing rapid edits).
+
+        The actual work is _s4_save_flush.  It writes the state sidecar,
+        re-reads the conform baseline, takes a SECOND full snapshot and
+        writes the user-edits diff sidecar — ~25 ms of blocking
+        main-thread I/O measured on a real 212-pull project, and it used
+        to run synchronously on every accept, ignore-toggle, X keypress,
+        status change, undo and redo.
+
+        Every navigation away from Step 4 goes through _clear, and app
+        close goes through _on_app_close; both flush synchronously, so
+        nothing is ever lost by deferring.
+        """
+        if not self._step4_state_path():
+            return
+        self._s4_save_pending = True
+        _prev = getattr(self, "_s4_save_after_id", None)
+        if _prev is not None:
+            try: self.after_cancel(_prev)
+            except Exception: pass
+        self._s4_save_after_id = self.after(
+            self._S4_SAVE_DEBOUNCE_MS, self._s4_save_flush)
+
+    def _s4_save_flush(self):
+        """Persist the current Step 4 state to a sidecar JSON file.
+
+        Safe to call when nothing is pending — it just no-ops.
+        """
+        _prev = getattr(self, "_s4_save_after_id", None)
+        if _prev is not None:
+            try: self.after_cancel(_prev)
+            except Exception: pass
+            self._s4_save_after_id = None
+        if not getattr(self, "_s4_save_pending", False):
+            return
+        self._s4_save_pending = False
         path = self._step4_state_path()
         if not path:
             return
@@ -3027,6 +3076,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _on_app_close(self):
         """WM_DELETE_WINDOW handler — prompt to save unsaved work."""
+        # Commit any coalesced Step 4 state write before anything else,
+        # so the sidecar on disk reflects the user's last edit even if
+        # they close within the debounce window.
+        try:
+            self._s4_save_flush()
+        except Exception:
+            pass
         # In-flight work guard.  Transcription / reconcile run on worker
         # threads whose results aren't part of _state_signature until
         # they land, so the dirty-check below can't see them — closing
