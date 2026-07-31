@@ -9894,33 +9894,41 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # dict at the same audio time (refined pass overwriting
             # tiny words) — without it, the cursor jumps to the end of
             # the buffer mid-stream and feels twitchy.
+            # word_idx is built in ascending start-char order by
+            # _pq_render_transcript_text, so locate the containing word
+            # by bisect rather than walking all 20-34k entries.  This
+            # runs on every streaming tick alongside the re-render.
+            def _word_at(pos):
+                i = bisect.bisect_right(word_idx, pos,
+                                        key=lambda it: it[0]) - 1
+                if 0 <= i < len(word_idx):
+                    s, e, w = word_idx[i]
+                    if s <= pos <= e:
+                        return w
+                return None
+
             try:
                 c = _tx_count_chars(tx, "1.0", tx.index("insert"))
-                for s, e, w in word_idx:
-                    if s <= c <= e:
-                        state["insert_word_id"] = id(w)
-                        try:
-                            state["insert_word_t"] = (
-                                float(w.get("start", 0.0))
-                                + float(w.get("end", 0.0))) / 2.0
-                        except Exception:
-                            pass
-                        break
+                w = _word_at(c)
+                if w is not None:
+                    state["insert_word_id"] = id(w)
+                    try:
+                        state["insert_word_t"] = (
+                            float(w.get("start", 0.0))
+                            + float(w.get("end", 0.0))) / 2.0
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Selection range by word ids
             try:
                 f = _tx_count_chars(tx, "1.0", tx.index("sel.first"))
                 l = _tx_count_chars(tx, "1.0", tx.index("sel.last"))
-                first_id = last_id = None
-                for s, e, w in word_idx:
-                    if first_id is None and s <= f <= e:
-                        first_id = id(w)
-                    if s <= l <= e:
-                        last_id = id(w)
-                if first_id is not None and last_id is not None:
-                    state["sel_first_id"] = first_id
-                    state["sel_last_id"]  = last_id
+                wf = _word_at(f)
+                wl = _word_at(l)
+                if wf is not None and wl is not None:
+                    state["sel_first_id"] = id(wf)
+                    state["sel_last_id"]  = id(wl)
             except tk.TclError:
                 pass
             # Scroll position — store the absolute DISTANCE from the
@@ -9961,19 +9969,25 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # The fallback keeps the cursor stable during streaming
             # when the refined pass swaps in fresh dicts for the same
             # audio range.
+            # One pass to build id -> (start, end); the three lookups
+            # below (cursor, selection start, selection end) each used
+            # to walk all 20-34k entries independently, on every
+            # streaming tick.
+            _by_id = {}
+            for s, e, w in word_idx:
+                _by_id[id(w)] = (s, e)
+
             ins_id = state.get("insert_word_id")
             ins_t  = state.get("insert_word_t")
             placed = False
             if ins_id is not None:
-                for s, e, w in word_idx:
-                    if id(w) == ins_id:
-                        try:
-                            tx.mark_set("insert",
-                                         "1.0+{}c".format(s))
-                            placed = True
-                        except tk.TclError:
-                            pass
-                        break
+                _hit = _by_id.get(ins_id)
+                if _hit is not None:
+                    try:
+                        tx.mark_set("insert", "1.0+{}c".format(_hit[0]))
+                        placed = True
+                    except tk.TclError:
+                        pass
             if not placed and ins_t is not None:
                 best = None
                 best_dt = float("inf")
@@ -10002,11 +10016,12 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             sl = state.get("sel_last_id")
             if sf is not None and sl is not None:
                 new_first = new_last = None
-                for s, e, w in word_idx:
-                    if id(w) == sf and new_first is None:
-                        new_first = "1.0+{}c".format(s)
-                    if id(w) == sl:
-                        new_last = "1.0+{}c".format(e)
+                _hf = _by_id.get(sf)
+                _hl = _by_id.get(sl)
+                if _hf is not None:
+                    new_first = "1.0+{}c".format(_hf[0])
+                if _hl is not None:
+                    new_last = "1.0+{}c".format(_hl[1])
                 if new_first and new_last:
                     try:
                         tx.tag_remove("sel", "1.0", "end")
