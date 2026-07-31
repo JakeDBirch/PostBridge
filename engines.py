@@ -1534,14 +1534,39 @@ def mix_for_transcript(paths):
         sp = td["sp_rms"]
         td["scale"] = min(target / sp, max_sc) if sp > 1e-6 else 1.0
 
-    # Apply gate + scale, then mix
+    # ── Apply gate + scale, then mix ─────────────────────────────────────
+    # Accumulate into ONE preallocated buffer.  This used to build a
+    # `gated` list of N full-length np.pad copies and then call
+    # np.sum(gated, axis=0) — and np.sum over a LIST first stacks it
+    # into an (N, maxlen) array, so at that moment it held N padded
+    # copies PLUS an N x maxlen stack PLUS the decoded tracks and their
+    # envelopes, all live at once.
+    #
+    # For four 3.75-hour tracks (216M samples each = 864 MB per float32
+    # array) that measured ~14.6 GB peak against ~4.4 GB of headroom on
+    # this machine — guaranteed page-file thrash, in the step
+    # immediately before transcription.
+    #
+    # Folding each track in place drops peak to roughly the decoded
+    # tracks plus one output buffer, and removes the np.pad copies
+    # entirely (padding was pure waste — a shorter track just stops
+    # contributing past its own length).
     maxlen  = max(len(td["pcm"]) for td in track_data)
-    gated   = []
+    mixed   = np.zeros(maxlen, dtype=np.float32)
     for td in track_data:
-        g = (td["pcm"] * td["envelope"] * td["scale"]).astype(np.float32)
-        gated.append(np.pad(g, (0, maxlen - len(g))))
+        pcm = td["pcm"]
+        n   = len(pcm)
+        # Gate and level-match in place — no new full-length array.
+        # Both operands are float32 (see _mix_decode / _mix_gate_envelope)
+        # and scale is a Python float, so the result stays float32,
+        # matching the old explicit .astype(np.float32).
+        pcm *= td["envelope"]
+        pcm *= td["scale"]
+        mixed[:n] += pcm
+        # Release this track's buffers now so they are reclaimable while
+        # the remaining tracks are still being folded in.
+        td["pcm"] = td["envelope"] = None
 
-    mixed = np.sum(gated, axis=0).astype(np.float32)
     peak  = np.max(np.abs(mixed))
     if peak > 1e-9:
         mixed *= _MIX_PEAK_TARGET / peak
