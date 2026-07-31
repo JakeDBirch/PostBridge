@@ -190,6 +190,11 @@ class MatchReviewDialog:
         _w_texts              = [self._search_norm(w.get("word", ""))
                                   for w in self._words]
         self._search_w_first  = [t.split()[0] if t else "" for t in _w_texts]
+        # Same idea for the OTHER pool files, but populated lazily —
+        # {abspath: (words, w_first)}.  Only the cross-token search
+        # ("all pulls") touches these, so most dialogs never pay for
+        # them at all.  See _xtok_words.
+        self._xtok_cache      = {}
 
         # Working copy — we edit the overall span (first in / last out).
         # Interior segment boundaries stay fixed; on accept we shift
@@ -2198,18 +2203,56 @@ class MatchReviewDialog:
         except tk.TclError:
             pass
 
-    def _find_phrase_in_words(self, q_words, words):
-        """Return [(word_idx, in_s, out_s), …] for every match of the
-        phrase (list of already-normalised query words) in a word list.
-        Same normalisation as the in-file search so cross-file hits use
-        the same matching semantics."""
-        if not q_words or not words:
-            return []
-        n_q = len(q_words)
+    def _xtok_words(self, ap):
+        """Load and normalise one pool file's transcript, once per dialog.
+
+        Returns (words, w_first) or (None, None).
+
+        This used to be re-read from disk and re-normalised on EVERY
+        search keystroke — measured at 0.4-0.6 s of blocked Tk main
+        loop per fire on a real 4-file / 56,747-word pool.  The
+        sidecars cannot change while the dialog is open, so both the
+        word list and its normalised first-token array are cached.
+        Mirrors _search_w_first, which does the same for this pull's
+        own transcript.
+        """
+        key   = os.path.abspath(ap)
+        cache = self._xtok_cache
+        hit   = cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            from engines import pb_transcript_load
+            words, _ = pb_transcript_load(ap)
+        except Exception:
+            words = None
+        if not words:
+            cache[key] = (None, None)
+            return None, None
         w_first = []
         for w in words:
             t = self._search_norm(w.get("word", ""))
             w_first.append(t.split()[0] if t else "")
+        cache[key] = (words, w_first)
+        return words, w_first
+
+    def _find_phrase_in_words(self, q_words, words, w_first=None):
+        """Return [(word_idx, in_s, out_s), …] for every match of the
+        phrase (list of already-normalised query words) in a word list.
+        Same normalisation as the in-file search so cross-file hits use
+        the same matching semantics.
+
+        w_first (the per-word normalised first token) may be passed in
+        by a caller that has it cached; otherwise it is derived here.
+        """
+        if not q_words or not words:
+            return []
+        n_q = len(q_words)
+        if w_first is None:
+            w_first = []
+            for w in words:
+                t = self._search_norm(w.get("word", ""))
+                w_first.append(t.split()[0] if t else "")
         hits = []
         for i in range(len(w_first) - n_q + 1):
             if w_first[i:i + n_q] == q_words:
@@ -2244,23 +2287,18 @@ class MatchReviewDialog:
         if not q:
             return
         q_words = q.split()
-        try:
-            from engines import pb_transcript_load
-        except Exception:
-            return
         _own = os.path.abspath(self._audio_path or "")
         rows = []   # (tok, audio_path, in_s, out_s, ctx_before, matched, ctx_after)
         for tok, paths in (self._pool_by_token or {}).items():
             for ap in paths:
                 if not ap or os.path.abspath(ap) == _own:
                     continue
-                try:
-                    words, _ = pb_transcript_load(ap)
-                except Exception:
-                    words = None
+                # Cached per dialog — see _xtok_words.
+                words, w_first = self._xtok_words(ap)
                 if not words:
                     continue
-                for i, in_s, out_s, _ws in self._find_phrase_in_words(q_words, words):
+                for i, in_s, out_s, _ws in self._find_phrase_in_words(
+                        q_words, words, w_first):
                     n_q  = len(q_words)
                     b0   = max(0, i - self._CTX_WORDS_BEFORE)
                     a1   = min(len(words), i + n_q + self._CTX_WORDS_AFTER)
