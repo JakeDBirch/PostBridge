@@ -69,8 +69,8 @@ def _get_dur_key(path):
     """Return file duration rounded to nearest second as a string key, or None.
     Used to identify duration-matched files for auto-linking.  Called in a
     background thread so blocking subprocess calls are fine."""
-    import subprocess as _sp
     import json as _json
+    from utils import run_hidden as _run_hidden
     ext = os.path.splitext(path)[1].lower()
     # Fast path: native Python for WAV files
     if ext == '.wav':
@@ -88,7 +88,11 @@ def _get_dur_key(path):
             probe = _ffprobe_cmd()
         except Exception:
             probe = ['ffprobe']
-        res = _sp.run(
+        # run_hidden, not bare subprocess.run — in the bundled WINDOWED
+        # build there is no parent console, so a raw spawn flashes its
+        # own black window per file.  Pool probing runs one of these per
+        # media file, so dropping a pool in gave a burst of flashes.
+        res = _run_hidden(
             probe + ['-v', 'quiet', '-print_format', 'json',
                      '-show_entries', 'format=duration', path],
             capture_output=True, timeout=10)
