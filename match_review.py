@@ -6,6 +6,7 @@ the edit points found by the reconciler.  Shows a context window of the source
 audio waveform with the matched region highlighted and draggable IN/OUT markers.
 """
 
+import bisect
 import hashlib
 import logging
 import os
@@ -1165,8 +1166,19 @@ class MatchReviewDialog:
         # Hide when zoomed out past ~100 ms/pixel — boundaries cluster too closely.
         if self._silence_boundaries and self._spp / self._sr <= 0.1:
             _tick_h = max(6, h // 8)
-            for _sb in self._silence_boundaries:
-                _spx = _t_to_px(_sb)
+            # _silence_boundaries is sorted (built as sorted(starts+ends)),
+            # so bisect the visible time window instead of walking all of
+            # it.  A 2.78-hour source yields ~25,500 boundaries of which
+            # well under 1% are ever on screen; the full walk measured
+            # ~5.1 ms per frame — more than all the other drawing in the
+            # frame combined — on every <B1-Motion> event of a drag.
+            # Invert the local _t_to_px:  t = ctx_start + (px*spp + vs)/sr
+            _t_l = self._ctx_start + (vs) / self._sr
+            _t_r = self._ctx_start + (w * spp + vs) / self._sr
+            _slo = bisect.bisect_left(self._silence_boundaries,  _t_l)
+            _shi = bisect.bisect_right(self._silence_boundaries, _t_r)
+            for _si in range(_slo, _shi):
+                _spx = _t_to_px(self._silence_boundaries[_si])
                 if 0 <= _spx < w:
                     cv.create_line(_spx, 0, _spx, _tick_h,
                                    fill="#556070", width=1)
@@ -1404,9 +1416,24 @@ class MatchReviewDialog:
 
         # Measure real character widths using tkinter Font so the overlap
         # check is accurate regardless of DPI or font rendering.
-        import tkinter.font as _tkfont
+        #
+        # Both the Font object and the per-word measurements are cached.
+        # This used to build a fresh _tkfont.Font every frame and then
+        # make one Tcl round-trip per visible word — on every single
+        # <B1-Motion> event of a drag.  Measured: 12-90 ms at the
+        # default open zoom, 160-420 ms at a 2-5 min view, and 4.1-5.2 s
+        # fully zoomed out on a 20k-word transcript.  Transcript
+        # vocabulary repeats heavily, so a text->width dict collapses
+        # nearly all of it to dict hits.
         _FONT    = ("Segoe UI", 8)
-        _fnt_obj = _tkfont.Font(family="Segoe UI", size=8)
+        _fnt_obj = getattr(self, "_word_font", None)
+        if _fnt_obj is None:
+            import tkinter.font as _tkfont
+            _fnt_obj = self._word_font = _tkfont.Font(
+                family="Segoe UI", size=8)
+            self._word_w_cache = {}
+        _wcache  = self._word_w_cache
+        _measure = _fnt_obj.measure
         _min_gap = 4   # minimum pixel gap between drawn words
 
         # ── Build candidate list (visible words only) ─────────────────────
@@ -1432,7 +1459,10 @@ class MatchReviewDialog:
             text = wd.get("word", "")
             if not text:
                 continue
-            cands.append([gi, px, _fnt_obj.measure(text), text,
+            tw = _wcache.get(text)
+            if tw is None:
+                tw = _wcache[text] = _measure(text)
+            cands.append([gi, px, tw, text,
                           SUCCESS if self._in_s <= t <= self._out_s else SUB,
                           False])   # is_priority filled below
 
@@ -1766,12 +1796,36 @@ class MatchReviewDialog:
         except Exception:
             pass
 
+    def _nearest_boundary(self, t):
+        """Nearest silence boundary to t, or None if there are none.
+
+        _silence_boundaries is sorted, so the nearest value is one of
+        the two neighbours of t's insertion point.  Both callers used
+        to run `min(self._silence_boundaries, key=lambda b: abs(b - t))`
+        — a full linear scan with a Python lambda per element, measured
+        at 2.6 ms across 25,500 boundaries (a 2.78-hour source), on
+        EVERY <B1-Motion> event of a drag.
+
+        Ties resolve to the earlier boundary, matching min()'s
+        first-minimum behaviour on a sorted list.
+        """
+        sb = self._silence_boundaries
+        if not sb:
+            return None
+        i = bisect.bisect_left(sb, t)
+        if i == 0:
+            return sb[0]
+        if i >= len(sb):
+            return sb[-1]
+        before, after = sb[i - 1], sb[i]
+        return before if (t - before) <= (after - t) else after
+
     def _snap_to_silence(self, t):
         """Return t snapped to nearest silence boundary if within ~8 pixels."""
-        if not self._silence_boundaries:
+        best = self._nearest_boundary(t)
+        if best is None:
             return t
         radius = 8 * self._spp / self._sr   # 8 px at current zoom
-        best   = min(self._silence_boundaries, key=lambda b: abs(b - t))
         return best if abs(best - t) <= radius else t
 
     def _snap(self, t):
@@ -1787,9 +1841,9 @@ class MatchReviewDialog:
         best_dist = float("inf")
 
         # Silence boundaries
-        if self._silence_boundaries:
-            sb = min(self._silence_boundaries, key=lambda b: abs(b - t))
-            d  = abs(sb - t)
+        sb = self._nearest_boundary(t)
+        if sb is not None:
+            d = abs(sb - t)
             if d <= radius_sil and d < best_dist:
                 best_t, best_dist = sb, d
 
