@@ -383,12 +383,28 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _clear(self):
         self.unbind_all("<MouseWheel>")
+        # <x>/<X> are Step 4's "toggle IGNORE on the active card"
+        # shortcut (bound via bind_all in _step4).  They were never
+        # unbound here, so after visiting Step 4 once they stayed live
+        # on every later screen, firing a stale _s4_active_toggle
+        # against a card the user can no longer see.
         for key in ("<Control-z>", "<Control-Z>",
-                    "<Control-Shift-z>", "<Control-Shift-Z>"):
+                    "<Control-Shift-z>", "<Control-Shift-Z>",
+                    "<x>", "<X>"):
             try:
                 self.unbind_all(key)
             except Exception:
                 pass
+        self._s4_active_toggle = None
+        # Cancel debounced callbacks owned by the outgoing screen so a
+        # pending after() can't fire against widgets we're about to
+        # destroy.
+        for _attr in ("_pq_search_after_id", "_pq_layout_resize_after"):
+            _id = getattr(self, _attr, None)
+            if _id is not None:
+                try: self.after_cancel(_id)
+                except Exception: pass
+                setattr(self, _attr, None)
         for w in self.body.winfo_children(): w.destroy()
 
     # ── Model picker (inline dropdown widgets) ─────────────────────────────
@@ -4322,15 +4338,23 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # transcribe-start / transcribe-done events in the same file.
         self._res_monitor_t0 = time.perf_counter()
 
-        def _tick_resources():
-            if not self._res_monitor_running:
-                return
-            try:
-                if not self._res_lbl.winfo_exists():
-                    return
-            except tk.TclError:
-                return
+        # Single worker so samples can never overlap and thread churn is
+        # zero for the life of the screen.
+        self._res_monitor_ex      = ThreadPoolExecutor(max_workers=1)
+        self._res_sample_inflight = [False]
 
+        def _sample_resources():
+            """BG THREAD — probe GPU/RAM and append the debug-log line.
+
+            _get_gpu_stats shells out to nvidia-smi.  Measured on this
+            box: 52-70 ms idle, but 279-646 ms once the reconcile
+            saturates the CPU — which is exactly when this screen is
+            up.  On the main thread at a 2 s cadence that was a visible
+            hitch 30 times a minute for the whole multi-minute run.
+
+            Returns (text, fg) for the label; the caller marshals the
+            actual widget update back to the main thread.
+            """
             parts = []
             # Raw sample values for the file log (separate from the
             # styled UI text below).
@@ -4363,12 +4387,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             # Single label, multi-color via... actually we can't mix colors
             # in one Label.  Render as plain text with the first segment
             # color (GPU) since that's the most diagnostic.
-            try:
-                text = "".join(p[0] for p in parts)
-                fg   = parts[0][1] if parts else SUB
-                self._res_lbl.config(text=text, fg=fg)
-            except tk.TclError:
-                return
+            text = "".join(p[0] for p in parts)
+            fg   = parts[0][1] if parts else SUB
 
             # Mirror to _debug_run.log so a post-run audit can see the
             # whole utilisation timeline.  Direct file write — bypasses
@@ -4403,6 +4423,50 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                         _f.write(line + "\n")
             except Exception:
                 pass
+
+            return text, fg
+
+        def _tick_resources():
+            """MAIN THREAD — schedule a sample, apply the previous one.
+
+            Does no probing itself: submit, reschedule, done.  The only
+            main-thread work left is a single label.config().
+            """
+            if not self._res_monitor_running:
+                return
+            try:
+                if not self._res_lbl.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+
+            # Skip if the previous sample is still running (nvidia-smi
+            # can stall under heavy load).  Without this the executor
+            # queue would grow without bound at 2 s per tick.
+            if not self._res_sample_inflight[0]:
+                self._res_sample_inflight[0] = True
+
+                def _done(fut):
+                    self._res_sample_inflight[0] = False
+                    try:
+                        text, fg = fut.result()
+                    except Exception:
+                        return
+
+                    def _apply():
+                        if not self._res_monitor_running:
+                            return
+                        try:
+                            self._res_lbl.config(text=text, fg=fg)
+                        except tk.TclError:
+                            pass
+                    self._ui(_apply)
+
+                try:
+                    self._res_monitor_ex.submit(
+                        _sample_resources).add_done_callback(_done)
+                except Exception:
+                    self._res_sample_inflight[0] = False
 
             self.after(2000, _tick_resources)
 
@@ -6238,6 +6302,13 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._res_monitor_running = False
         self._reconcile_busy      = False
         self._bg_reconcile_active = False
+        # Tear down the resource-sampling worker (created in _step3).
+        # wait=False so a stalled nvidia-smi can't block the UI thread.
+        _res_ex = getattr(self, "_res_monitor_ex", None)
+        if _res_ex is not None:
+            try: _res_ex.shutdown(wait=False)
+            except Exception: pass
+            self._res_monitor_ex = None
 
     def _finish_reconcile(self):
         """Called on the main thread after _run_reconcile completes.
@@ -9283,11 +9354,32 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                   small=True).pack(side="right", padx=(2, 0))
         self._btn(sr, "◀", lambda: self._pq_search_step(-1),
                   small=True).pack(side="right")
-        self._pq_search_var.trace_add(
-            "write", lambda *_: self._pq_search_apply())
-        sr_entry.bind("<Return>", lambda e: self._pq_search_step(+1))
+        # Debounce the scan.  _pq_search_apply walks the whole Text
+        # widget and re-tags every hit; running it per keystroke froze
+        # the UI for over a second on a long transcript while the user
+        # was still typing.  150 ms matches the waveform editor's
+        # search debounce, which had the same problem.
+        def _schedule_pq_search(*_):
+            _prev = getattr(self, "_pq_search_after_id", None)
+            if _prev is not None:
+                try: self.after_cancel(_prev)
+                except Exception: pass
+            self._pq_search_after_id = self.after(150, self._pq_search_apply)
+
+        def _flush_pq_search():
+            """Run any pending scan NOW so Enter never steps stale hits."""
+            _prev = getattr(self, "_pq_search_after_id", None)
+            if _prev is not None:
+                try: self.after_cancel(_prev)
+                except Exception: pass
+                self._pq_search_after_id = None
+                self._pq_search_apply()
+
+        self._pq_search_var.trace_add("write", _schedule_pq_search)
+        sr_entry.bind("<Return>",
+                      lambda e: (_flush_pq_search(), self._pq_search_step(+1)))
         sr_entry.bind("<Shift-Return>",
-                      lambda e: self._pq_search_step(-1))
+                      lambda e: (_flush_pq_search(), self._pq_search_step(-1)))
         sr_entry.bind("<Escape>", lambda e: self._pq_search_clear())
 
         def _toggle_search(_e=None):
@@ -12895,10 +12987,26 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             if lbl: lbl.config(text="", fg=SUB)
             return
 
+        # A single character matches essentially every position in the
+        # transcript, so the loop below instantly saturates its 5000-hit
+        # cap — measured at 220 ms to 1.17 s of frozen UI on a 34k-word
+        # transcript, on the very first keystroke.  Nothing useful is
+        # shown at that point anyway, so wait for a second character.
+        if len(term) < 2:
+            if lbl: lbl.config(text="keep typing…", fg=SUB)
+            return
+
         try:
             idx       = "1.0"
             term_len  = len(term)
-            count_var = tk.IntVar(self)   # populated by Tk on each match
+            # One reusable Tk variable for the life of the App.  This
+            # used to be `tk.IntVar(self)` per call — every keystroke
+            # registered a fresh variable in the Tcl interpreter that
+            # was never explicitly freed.
+            count_var = getattr(self, "_pq_search_count_var", None)
+            if count_var is None:
+                count_var = self._pq_search_count_var = tk.IntVar(self)
+            _spans = []
             # Hard upper bound on iterations so we cannot pathologically
             # loop on a degenerate query — 5000 hits is far more than
             # any user would ever need to see.
@@ -12912,7 +13020,8 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 # `term_len` but reading the var is the safer path.
                 hit_len = count_var.get() or term_len
                 end = "{}+{}c".format(pos, hit_len)
-                tx.tag_add("pq_match", pos, end)
+                _spans.append(pos)
+                _spans.append(end)
                 self._pq_search_hits.append((pos, end))
                 # Always advance — if the search returns the same
                 # position twice (shouldn't, but be paranoid) we still
@@ -12921,6 +13030,9 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if new_idx == idx:
                     break
                 idx = new_idx
+            # One tag_add for every hit instead of one per hit.
+            if _spans:
+                tx.tag_add("pq_match", *_spans)
         except (tk.TclError, ValueError) as exc:
             if lbl:
                 lbl.config(text="search error: {}".format(str(exc)[:32]),
