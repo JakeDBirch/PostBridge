@@ -10343,7 +10343,72 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
                 tx.edit_reset()
             except tk.TclError:
                 pass
+        # Invalidate the derived playback caches (see _pq_playback_caches).
+        # Bumped rather than rebuilt because most renders are never
+        # followed by playback, and building them costs a full widget
+        # read + sort.
+        self._pq_index_seq = getattr(self, "_pq_index_seq", 0) + 1
         self._pq_update_status_lbl(session)
+
+    def _pq_playback_caches(self):
+        """Return (time_index, line_starts) for the playback highlight,
+        rebuilding them only when the transcript has been re-rendered.
+
+        time_index: (word_start_s, word_end_s, abs_s, abs_e) sorted by
+            word_start_s.  _pq_word_index itself is ordered by CHARACTER
+            offset, and when speaker labels are present the words are
+            grouped per speaker — so character order is not time order
+            and cannot be bisected on time directly.
+
+        line_starts: absolute char offset of the first character of each
+            line, so an absolute offset can be turned into a literal
+            "line.column" Tk index.  The tick used to address the
+            playing word as "1.0 + {}c", which Tk resolves by walking
+            forward from the buffer origin — three such walks per tick
+            at 16 ticks/second, each walking ~200k characters on a long
+            transcript.
+
+        Both are derived once per render, and only if playback actually
+        starts.
+        """
+        seq = getattr(self, "_pq_index_seq", 0)
+        if getattr(self, "_pq_cache_seq", None) == seq:
+            return self._pq_time_index, self._pq_line_starts
+
+        word_idx = getattr(self, "_pq_word_index", []) or []
+        ti = []
+        for s_abs, e_abs, w in word_idx:
+            try:
+                ws = float(w.get("start", 0.0))
+                we = float(w.get("end", ws))
+            except Exception:
+                continue
+            ti.append((ws, we, s_abs, e_abs))
+        ti.sort(key=lambda it: it[0])
+
+        ls = [0]
+        tx = getattr(self, "_pq_tx_text", None)
+        if tx is not None:
+            try:
+                _txt = tx.get("1.0", "end-1c")
+                _p = _txt.find("\n")
+                while _p != -1:
+                    ls.append(_p + 1)
+                    _p = _txt.find("\n", _p + 1)
+            except tk.TclError:
+                pass
+
+        self._pq_time_index  = ti
+        self._pq_line_starts = ls
+        self._pq_cache_seq   = seq
+        return ti, ls
+
+    def _pq_abs_index(self, n, line_starts):
+        """Absolute char offset -> literal Tk "line.column" index."""
+        i = bisect.bisect_right(line_starts, n) - 1
+        if i < 0:
+            i = 0
+        return "{}.{}".format(i + 1, n - line_starts[i])
 
     # ── Selection actions ─────────────────────────────────────────────────
 
@@ -13308,26 +13373,33 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
             try:
                 playhead = audio_in_s + (
                     time.perf_counter() - start_clock)
-                # Linear search is fine — _pq_word_index typically
-                # has a few hundred entries and we only run this 16x/s.
+                # Bisect a time-sorted index instead of walking every
+                # word.  The old comment here claimed _pq_word_index
+                # "typically has a few hundred entries" — a real 3.75-hour
+                # session has 20-34k, so this was 5-9 ms of linear scan
+                # 16 times a second for the whole playback.
+                time_idx, line_starts = self._pq_playback_caches()
                 cur = None
-                for (s_abs, e_abs, w) in word_idx:
-                    ws = float(w.get("start", 0.0))
-                    we = float(w.get("end",   ws))
-                    if ws <= playhead < we:
-                        cur = (s_abs, e_abs)
-                        break
+                if time_idx:
+                    j = bisect.bisect_right(
+                        time_idx, playhead, key=lambda it: it[0]) - 1
+                    if 0 <= j < len(time_idx):
+                        ws, we, s_abs, e_abs = time_idx[j]
+                        if ws <= playhead < we:
+                            cur = (s_abs, e_abs)
                 tx.tag_remove("body_playing", "1.0", "end")
                 if cur is not None:
-                    tx.tag_add(
-                        "body_playing",
-                        "1.0 + {}c".format(cur[0]),
-                        "1.0 + {}c".format(cur[1]))
+                    # Literal "line.column" indices — "1.0 + Nc" makes Tk
+                    # walk forward N chars from the buffer origin, and
+                    # this ran three times per tick.
+                    _i0 = self._pq_abs_index(cur[0], line_starts)
+                    _i1 = self._pq_abs_index(cur[1], line_starts)
+                    tx.tag_add("body_playing", _i0, _i1)
                     # Keep the playing word on screen without
                     # snapping the user back to it on every tick if
                     # they intentionally scrolled away — tx.see only
                     # scrolls if the index is offscreen.
-                    tx.see("1.0 + {}c".format(cur[0]))
+                    tx.see(_i0)
             except tk.TclError:
                 pass
         # Schedule next tick.  Cancel handle stored so stop can kill
