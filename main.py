@@ -3397,27 +3397,106 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.after(20, _do)
 
     def _apply_setup_data(self, data):
-        """Apply a setup dict (from _save_setup) to the current pool. Called from _step2."""
-        assignments = data.get("assignments", {})
-        missing = []
+        """Apply a setup dict (from _save_setup) to the current pool.
+
+        Two-phase, screen-early construction:
+
+          1. Build the first _APPLY_SETUP_FIRST_BATCH rows synchronously.
+             That's enough to fill the visible area of the pool at a
+             typical window height; the user sees a fully populated
+             pool the instant Step 2 paints.
+
+          2. Schedule the rest in batches of _APPLY_SETUP_BATCH via
+             self.after(0), which yields to the Tk event loop between
+             batches so the app stays responsive.  On a 43-file session
+             that means the fold-of-screen appears in one paint and the
+             rest fill in over ~2-3 idle ticks (~30-60 ms total wall
+             clock, but the main thread is free between them).
+
+        Trade-off: rows below the fold arrive a couple of frames after
+        the first paint, so any code that eagerly iterates self._pool
+        ._rows immediately after _apply_setup_data returns will see a
+        partial list.  All in-tree callers already use _bulk_loading /
+        the trace to react to individual row additions, so this is
+        safe today; a comment on the pool marks the invariant.
+        """
+        assignments = list(data.get("assignments", {}).items())
         self._pool._bulk_loading = True
-        try:
-            for fpath, token in assignments.items():
-                if os.path.exists(fpath):
-                    self._pool._add(fpath)
-                else:
-                    missing.append(fpath)
-            for r in self._pool._rows:
-                saved_tok = assignments.get(r["path"])
-                if saved_tok:
-                    r["var"].set(saved_tok)
-        finally:
+
+        # Filter existence up front so the two-phase loop below doesn't
+        # need to re-stat.  os.path.exists is a network hazard on Mac
+        # shares — bounded by _safe_exists.
+        existing, missing = [], []
+        for fpath, token in assignments:
+            if engines._safe_exists(fpath):
+                existing.append((fpath, token))
+            else:
+                missing.append(fpath)
+
+        FIRST = self._APPLY_SETUP_FIRST_BATCH
+        BATCH = self._APPLY_SETUP_BATCH
+
+        # Phase 1: synchronous first batch — this is what paints.
+        for fpath, _ in existing[:FIRST]:
+            self._pool._add(fpath)
+
+        # Restore tokens for what we built in phase 1 so those rows
+        # arrive already assigned.  The remaining rows get their token
+        # applied as they're built in phase 2.
+        assign_map = dict(assignments)
+        for r in self._pool._rows:
+            saved_tok = assign_map.get(r["path"])
+            if saved_tok:
+                r["var"].set(saved_tok)
+
+        # If everything fit in the first batch, we're done synchronously.
+        if len(existing) <= FIRST:
             self._pool._bulk_loading = False
-        self._pool._refresh_count()
-        if missing:
-            messagebox.showwarning("Missing files",
-                "{} file(s) from the saved session were not found:\n{}".format(
-                    len(missing), "\n".join(basename(p) for p in missing[:5])))
+            self._pool._refresh_count()
+            if missing:
+                self._report_missing_setup_files(missing)
+            return
+
+        # Phase 2: stream the rest.  Closure over assign_map + missing so
+        # the tail can finish the same _bulk_loading epoch and pop the
+        # missing dialog when it's done.
+        _remaining = existing[FIRST:]
+        _idx = [0]
+
+        def _build_batch():
+            end = min(_idx[0] + BATCH, len(_remaining))
+            for fpath, _ in _remaining[_idx[0]:end]:
+                self._pool._add(fpath)
+                tok = assign_map.get(fpath)
+                if tok and self._pool._rows:
+                    # The row we just added is the last one in _rows —
+                    # assign directly rather than re-scanning.
+                    self._pool._rows[-1]["var"].set(tok)
+            _idx[0] = end
+            if _idx[0] < len(_remaining):
+                self.after(0, _build_batch)
+            else:
+                self._pool._bulk_loading = False
+                self._pool._refresh_count()
+                if missing:
+                    self._report_missing_setup_files(missing)
+
+        self.after(0, _build_batch)
+
+    # Tunables — how many pool rows to build synchronously and per idle
+    # tick during a session-load bulk restore.  FIRST is sized so that a
+    # typical 900x700 window shows a fully populated pool on first paint
+    # (rows are ~24 px tall, so ~20 fit above the fold); BATCH is small
+    # enough that the main loop stays responsive between ticks (each row
+    # is ~9 ms of Tk widget creation, so a batch of 8 is ~72 ms —
+    # imperceptible, and the user can scroll / interact between them).
+    _APPLY_SETUP_FIRST_BATCH = 20
+    _APPLY_SETUP_BATCH       = 8
+
+    def _report_missing_setup_files(self, missing):
+        messagebox.showwarning("Missing files",
+            "{} file(s) from the saved session were not found:\n{}".format(
+                len(missing), "\n".join(basename(p) for p in missing[:5])))
 
     # ── Cross-machine session path remapping ──────────────────────────────────
 
