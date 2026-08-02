@@ -1047,12 +1047,18 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         def _press(e, w=w, f=cmd):
             # Immediate visual feedback: darken to a pressed shade, then restore.
             w.config(bg="#a84400")
-            w.update_idletasks()  # flush render so the color actually shows
+            # No forced update_idletasks() — that was an APP-WIDE layout+paint
+            # flush before every single button click, purely to guarantee the
+            # colour change was visible.  On Step 4 (200+ cards with pending
+            # scrollregion work) that was a real hitch on every navigation
+            # click.  Deferring the command by one event-loop tick with
+            # after(0, ...) lets Tk paint the colour change naturally first,
+            # then run f.  Same visual, no forced flush.
             def _restore():
                 try: w.config(bg=ACCENT)   # cursor likely still over the button
                 except Exception: pass
             w.after(130, _restore)
-            f()
+            w.after(0, f)
         w.bind("<Button-1>", _press)
         return w
 
@@ -9367,7 +9373,15 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # the unified bottom bar this only fires on really small windows
         # — the user can always toggle it back manually.
         if not hasattr(self, "_pq_info_collapsed"):
-            self.update_idletasks()
+            # winfo_height() reflects the LAST completed layout — no forced
+            # flush needed.  The old code called self.update_idletasks()
+            # here just to make the reading fresh, which forced a full
+            # app-wide layout+paint MID-BUILD of the PQ session view.
+            # That is why the session screen used to paint half-built and
+            # then fill in.  Reading the pre-render value is fine: on
+            # first open the app is already sized (either the maximised
+            # zoom on Windows or the _center default on macOS/Linux), and
+            # this branch runs only when the collapse flag doesn't exist.
             cur_h = self.winfo_height() or 800
             self._pq_info_collapsed = cur_h < 620
         self._pq_info_chevron = tk.Label(

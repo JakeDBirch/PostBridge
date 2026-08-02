@@ -4085,6 +4085,12 @@ class AafWorkflowMixin:
         for i, p in enumerate(paths):
             if total > 1:
                 self._aaf_set_status("Adding file {} of {}…".format(i + 1, total))
+                # Deliberate throttle: flush every 5th file so the "N of M"
+                # counter is visible, but let Tk coalesce the rest.  This
+                # used to be silently defeated by _aaf_set_status itself
+                # calling update_idletasks() on every call, so the loop
+                # ran a full app-wide repaint per file — the per-file
+                # paint on saved-session restore.
                 if i % 5 == 0:
                     self.update_idletasks()
             self._aaf_add_video(p, _batch=True)
@@ -4146,10 +4152,20 @@ class AafWorkflowMixin:
             "Added {} new file{}.".format(total, "s" if total != 1 else ""))
 
     def _aaf_set_status(self, msg):
-        """Update the import status label (no-op if label not yet created)."""
+        """Update the import status label (no-op if label not yet created).
+
+        No forced flush.  The old code called self.update_idletasks() at
+        the end so a "N of M" status would be visible during a batch
+        import — but that ran a full app-wide layout+paint every call.
+        On saved-session restore, _aaf_add_video_batch calls this per
+        file, and that was silently defeating the i % 5 throttle two
+        lines below its own call site.  Callers that genuinely need a
+        mid-loop flush should do it themselves at a sensible cadence
+        (or, better, do the work on a bg thread and post updates via
+        self._ui).
+        """
         if hasattr(self, "_aaf_status_lbl"):
             self._aaf_status_lbl.config(text=msg)
-            self.update_idletasks()
 
     def _aaf_sidecar_path(self):
         if not hasattr(self, "_aaf_path") or not self._aaf_path:
