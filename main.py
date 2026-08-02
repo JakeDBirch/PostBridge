@@ -7025,593 +7025,6 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         _STRIPE_ACC = SUCCESS
         _STRIPE_IGN = ERR
 
-        for res in self.results:
-            st  = res.get("status", "")
-            sc  = STATUS_COLOR.get(st, SUB)
-            sl  = STATUS_LABEL.get(st, st)
-            pi  = res.get("part_index", 0)
-
-            # ── Part divider ───────────────────────────────────────────────────
-            if pi != _cur_part_idx:
-                _cur_part_idx = pi
-                part_name = next((p["name"] for p in self.parts
-                                  if p["index"] == pi), "Part {}".format(pi))
-                _div = tk.Frame(sf, bg=BG)
-                _div.pack(fill="x", pady=(10, 2), padx=2)
-                tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
-                tk.Label(_div, text="  \u25c6  {}".format(part_name.upper()),
-                         font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(2, 0))
-                _part_dividers[pi] = _div
-
-            # ── Card shell ─────────────────────────────────────────────────────
-            card = tk.Frame(sf, bg=SURF,
-                            highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=(0, 4), padx=2)
-
-            # Left color stripe — 4px, reflects accept/ignore/normal state
-            _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
-            _stripe.pack(side="left", fill="y")
-
-            _inner = tk.Frame(card, bg=SURF)
-            _inner.pack(side="left", fill="both", expand=True)
-
-            hdr = tk.Frame(_inner, bg=SURF, cursor="hand2")
-            hdr.pack(fill="x", padx=(4, 10), pady=(6, 6))
-
-            _accepted_flag = [False]
-
-            # ── Header left ────────────────────────────────────────────────────
-            ord_lbl  = tk.Label(hdr, text="#{:03d}".format(res["order"]),
-                                font=FL, bg=SURF, fg=SUB,
-                                width=5, anchor="w", cursor="hand2")
-            ord_lbl.pack(side="left")
-            tok_lbl  = tk.Label(hdr, text=res["token"],
-                                font=FL, bg=SURF, fg=ACCENT,
-                                width=14, anchor="w", cursor="hand2")
-            tok_lbl.pack(side="left")
-            stat_lbl = tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc,
-                                cursor="hand2")
-            stat_lbl.pack(side="left", padx=8)
-
-            # Right-click status → context menu to change/revert it.
-            # Solves accidental "adjusted" via stray click in the
-            # waveform editor: pick "matched" (or Restore original) and
-            # the flag flips back.  Only user-facing statuses are
-            # offered — internal/error states aren't picker-safe.
-            #
-            # A FACTORY, not free-standing defs: previously
-            # _change_status / _restore_original were loop-scoped names
-            # that got rebound every iteration.  The popup's menu
-            # lambdas closed over the ENCLOSING scope's names — which,
-            # by the time the user right-clicked, all pointed at the
-            # LAST card's version.  So clicking a menu on card N would
-            # mutate the last card in self.results.  Wrapping the
-            # per-row helpers in a factory rebinds them as locals to
-            # each _make_status_popup call, so each stat_lbl gets its
-            # own truly captured closures.
-            def _make_status_popup(r, sl_w):
-                # A "success"-family status means the row belongs in
-                # the CONFIRMED bucket if _s4_accepted is True.  Any
-                # right-click change AWAY from that family (to a
-                # review-y status like low_confidence / no_match /
-                # provisional / not_run) implies the user is walking
-                # the row BACK to unconfirmed, so drop the accepted
-                # flag to keep the state consistent.  Otherwise the
-                # row keeps showing in the CONFIRMED tab despite the
-                # label saying otherwise.
-                _SUCCESS_STATUSES = self.SUCCESS_STATUSES
-                def _change(new_status):
-                    self._s4_push_undo()
-                    if "_original_status" not in r:
-                        r["_original_status"] = r.get("status", "")
-                    r["status"] = new_status
-                    sl_w.config(
-                        text=STATUS_LABEL.get(new_status, new_status),
-                        fg=STATUS_COLOR.get(new_status, SUB))
-                    # If moving off a success status, un-accept so the
-                    # CONFIRMED counter drops this row and the card
-                    # visual state (stripe + right-side ACCEPTED lbl)
-                    # reverts to the default look.  A full rebuild
-                    # picks up the new state cleanly.
-                    if (new_status not in _SUCCESS_STATUSES
-                            and r.get("_s4_accepted")):
-                        r.pop("_s4_accepted", None)
-                        try:
-                            _cv = getattr(self, "_s4_scroll_canvas", None)
-                            if _cv is not None:
-                                self._s4_pending_scroll_frac = float(_cv.yview()[0])
-                        except Exception:
-                            pass
-                        self._s4_save()
-                        self._step4()
-                        return
-                    self._s4_save()
-
-                def _restore():
-                    orig = r.get("_original_status") or ""
-                    if not orig or orig == r.get("status"):
-                        return
-                    self._s4_push_undo()
-                    r["status"] = orig
-                    r.pop("_original_status", None)
-                    sl_w.config(text=STATUS_LABEL.get(orig, orig),
-                                fg=STATUS_COLOR.get(orig, SUB))
-                    # Same un-accept rule for Restore — if the ORIGINAL
-                    # status was a review-y one, don't leave the row
-                    # confirmed with a mismatched label.
-                    if (orig not in _SUCCESS_STATUSES
-                            and r.get("_s4_accepted")):
-                        r.pop("_s4_accepted", None)
-                        try:
-                            _cv = getattr(self, "_s4_scroll_canvas", None)
-                            if _cv is not None:
-                                self._s4_pending_scroll_frac = float(_cv.yview()[0])
-                        except Exception:
-                            pass
-                        self._s4_save()
-                        self._step4()
-                        return
-                    self._s4_save()
-
-                def _popup(event):
-                    m = tk.Menu(self, tearoff=0, bg=SURF, fg=TEXT,
-                                activebackground=ACCENT,
-                                activeforeground=BG, bd=0)
-                    _orig = r.get("_original_status") or ""
-                    _cur  = r.get("status", "")
-                    if _orig and _orig != _cur:
-                        m.add_command(
-                            label="Restore original ({})".format(
-                                STATUS_LABEL.get(_orig, _orig)
-                                    .lstrip("✓✗⚠–… ").strip()),
-                            command=_restore)
-                        m.add_separator()
-                    # Curated status options — user-facing labels only,
-                    # skipping internal states (no_quote / error /
-                    # no_file / cancelled) that shouldn't be user-settable.
-                    for _key in ("ok", "manual", "low_confidence",
-                                 "no_match", "provisional", "not_run"):
-                        m.add_command(
-                            label=STATUS_LABEL.get(_key, _key),
-                            command=lambda k=_key: _change(k))
-                    try:
-                        m.tk_popup(event.x_root, event.y_root)
-                    finally:
-                        m.grab_release()
-                return _popup
-
-            stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
-
-            conf_hdr = res.get("confidence", 0)
-            if conf_hdr:
-                tk.Label(hdr, text="{:.0%}".format(conf_hdr),
-                         font=FS, bg=SURF, fg=sc, cursor="hand2").pack(
-                             side="left", padx=(0, 6))
-
-
-            # Sub-clip count (number of segments) — always created, shown when > 1
-            _clips_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=WARN,
-                                  cursor="hand2")
-
-            def _refresh_clips_lbl(cl=_clips_lbl, r=res):
-                n = len(r.get("segments") or [(0, 0)])
-                if n > 1:
-                    cl.config(text="{} clips".format(n))
-                    cl.pack(side="left", padx=(0, 6))
-                else:
-                    cl.pack_forget()
-
-            _refresh_clips_lbl()
-
-            # Timecode label — shown right after the status text when accepted
-            _tc_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB)
-            # initially not packed
-
-            d_in  = res.get("delta_in",  0)
-            d_out = res.get("delta_out", 0)
-            delta_lbl = None
-            if st == "ok" and (abs(d_in) > 0.5 or abs(d_out) > 0.5):
-                delta_lbl = tk.Label(hdr,
-                            text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
-                            font=FB, bg=SURF, fg=INFO, cursor="hand2")
-                delta_lbl.pack(side="left", padx=4)
-                self._tooltip(delta_lbl,
-                    "Δin = matched IN point differs from script timecode by this amount\n"
-                    "Δout = matched OUT point differs from script timecode by this amount\n"
-                    "Positive = later in file  ·  Negative = earlier in file")
-
-            skip_var = tk.BooleanVar(value=False)
-
-            # ── Header right — state container ─────────────────────────────────
-            # Normal: [ADJUST] [IGNORE]  |  Accepted: [✓ ACCEPTED]  |  Ignored: [⊘ IGNORED]
-            _hdr_right = tk.Frame(hdr, bg=SURF)
-            _hdr_right.pack(side="right")
-
-            _norm_frame    = tk.Frame(_hdr_right, bg=SURF)
-            _norm_frame.pack(side="left")
-
-            _acc_state_lbl = tk.Label(_hdr_right, text="\u2713 ACCEPTED",
-                                      font=FS, bg=SURF, fg=SUCCESS, cursor="hand2")
-            # initially not packed
-
-            _ign_state_lbl = tk.Label(_hdr_right, text="\u2298 IGNORED",
-                                      font=FS, bg=SURF, fg=ERR, cursor="hand2")
-            # initially not packed
-
-            # source_audio: prefer explicit audio path, fall back to video path
-            # so that clips sourced from video assets can still be reviewed.
-            _src_audio = (res.get("source_audio", "") or
-                          res.get("source_video", "") or "")
-
-            # IGNORE button (only interactive control besides clicking to review)
-            ignore_lbl = tk.Label(_norm_frame, text="IGNORE", font=FS,
-                                  bg=SURF, fg=SUB, cursor="hand2")
-            ignore_lbl.pack(side="right", padx=(4, 0))
-            ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
-            ignore_lbl.bind("<Leave>", lambda e, w=ignore_lbl: w.config(fg=SUB))
-
-            # REASSIGN — opens a picker to swap this pull/VO's source
-            # file without going through the cross-token phrase search,
-            # which only helps when the quote is findable in another
-            # already-transcribed sidecar.  Interview and VO share the
-            # same entry point; the dialog adapts its layout + apply
-            # logic based on res["is_vo"].
-            reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
-                                    bg=SURF, fg=SUB, cursor="hand2")
-            reassign_lbl.pack(side="right", padx=(4, 0))
-            reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
-            reassign_lbl.bind("<Leave>", lambda e, w=reassign_lbl: w.config(fg=SUB))
-            reassign_lbl.bind(
-                "<Button-1>",
-                lambda e, r=res: self._s4_reassign_dialog(r))
-
-            # ── State management helpers ────────────────────────────────────────
-            def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
-                            il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                al.pack_forget(); il.pack_forget(); tl.pack_forget()
-                nf.pack(side="left")
-                sw.config(bg=_STRIPE_DEF)
-                c.config(highlightbackground=BORDER, highlightthickness=1)
-
-            def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
-                              il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
-                              c=card, r=res):
-                nf.pack_forget(); il.pack_forget()
-                al.pack(side="left")
-                in_tc  = r.get("rec_in_tc",  r.get("in_tc",  ""))
-                out_tc = r.get("rec_out_tc", r.get("out_tc", ""))
-                if in_tc and out_tc:
-                    tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
-                    tl.pack(side="left", padx=(4, 0))
-                sw.config(bg=_STRIPE_ACC)
-                c.config(highlightbackground=SUCCESS, highlightthickness=2)
-
-            def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
-                             il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                nf.pack_forget(); al.pack_forget(); tl.pack_forget()
-                il.pack(side="left")
-                sw.config(bg=_STRIPE_IGN)
-                c.config(highlightbackground=ERR, highlightthickness=2)
-
-            def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
-                self._s4_push_undo()
-                af[0] = False
-                r["_s4_accepted"] = False   # clear persisted accepted flag
-                ss_n()
-                # Use _original_status so we return the item to the right bucket
-                eff_status = r.get("_original_status") or r.get("status", "")
-                _decrement_confirmed(eff_status)
-                self._s4_save()
-
-            def _toggle_ignore(sv=skip_var, ss_n=_set_normal, ss_i=_set_ignored,
-                               from_restore=False):
-                if not from_restore:
-                    self._s4_push_undo()
-                sv.set(not sv.get())
-                if sv.get():
-                    ss_i()
-                    _increment_ignored()
-                else:
-                    ss_n()
-                    _decrement_ignored()
-                if not from_restore:
-                    self._s4_save()
-
-            # ── Open waveform editor — primary card action ──────────────────────
-            def _open_review(event=None, r=res, af=_accepted_flag,
-                             ss=_set_accepted, sl=stat_lbl,
-                             rcl=_refresh_clips_lbl):
-                # Resolve source audio with a fallback ladder so cards
-                # from restored sessions / provisional-first / post-
-                # reassign flows all open cleanly.  A silent return here
-                # was the reason many cards appeared "dead to clicks".
-                tried = []
-                def _try(path, label):
-                    tried.append((label, path or "(unset)"))
-                    return path and os.path.isfile(path)
-
-                sa = r.get("source_audio", "") or ""
-                if not _try(sa, "source_audio"):
-                    sa = r.get("source_video", "") or ""
-                    if not _try(sa, "source_video"):
-                        sa = ""
-
-                # For VO rows the winning take's apath is the canonical
-                # source — try it before any pool guessing.
-                if not sa and r.get("is_vo"):
-                    _td = r.get("takes_data") or []
-                    _bi = r.get("best_take_index", 0) or 0
-                    if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
-                        _apath = _td[_bi].get("apath", "") or ""
-                        if _try(_apath, "takes_data[{}].apath".format(_bi)):
-                            sa = _apath
-                            r["source_audio"] = _apath   # cache
-
-                # Pool fallbacks — prefer audio, then video (existing
-                # behavior extended: audio was never tried before).
-                if not sa:
-                    tok = r.get("token", "")
-                    _pool = getattr(self, "_pool", None)
-                    if _pool is not None:
-                        if r.get("is_vo"):
-                            _pi = r.get("part_index", -1)
-                            try:
-                                _bin = _pool.get_vo_assets().get(_pi, {}) or {}
-                            except Exception:
-                                _bin = {}
-                            _audios = _bin.get("audios", []) or []
-                            _videos = _bin.get("videos", []) or []
-                        else:
-                            _assigned = _pool.get_interview_assets().get(tok, []) or []
-                            _audios = [p for p in _assigned if not is_video(p)]
-                            _videos = [p for p in _assigned if is_video(p)]
-
-                        _aud = next((p for p in _audios if os.path.isfile(p)), None)
-                        if _try(_aud, "pool audio"):
-                            sa = _aud
-                            r["source_audio"] = _aud   # cache
-                        else:
-                            _vid = next((p for p in _videos if os.path.isfile(p)), None)
-                            if _try(_vid, "pool video"):
-                                sa = _vid
-                                r["source_video"] = _vid   # cache
-
-                if not sa or not os.path.isfile(sa):
-                    # Explain WHY the editor can't open — not silent.
-                    _msg  = ("Can't open the waveform editor for #{:03d}  {}\n\n"
-                             "No usable source audio/video found.  Sources "
-                             "checked:\n\n".format(
-                                 r.get("order", 0), r.get("token", "?")))
-                    for _lbl, _path in tried:
-                        _msg += "  • {:20}  {}\n".format(_lbl, _path)
-                    _msg += ("\nUse the REASSIGN button on this card to point "
-                             "it at a valid file, or add the missing file to "
-                             "the pool via Step 2.")
-                    messagebox.showwarning("No source available", _msg, parent=self)
-                    return
-                segs_r = r.get("segments") or [(0.0, 30.0)]
-                fps    = getattr(self, "_seq_fps", 24.0)
-
-                def _accept(new_segs, new_token=None, new_audio_path=None,
-                            r=r, af=af, ss=ss, sl=sl, rcl=rcl):
-                    self._s4_push_undo()
-                    old_status = r.get("status", "")
-                    # Cross-token ADOPT from the match-review search: also
-                    # reassign this pull to the new token + audio file and
-                    # refresh the scripted timecode fields.  segments arg
-                    # is a single-hit window (in_s, out_s) from the sidecar.
-                    if new_token and new_token != r.get("token"):
-                        r["token"] = new_token
-                    if new_audio_path:
-                        r["source_audio"] = new_audio_path
-                        # source_video was a fallback for restored sessions;
-                        # once we've reassigned, clear it so future opens
-                        # use the new audio path.
-                        r.pop("source_video", None)
-                        if is_video(new_audio_path):
-                            r["source_video"] = new_audio_path
-                    r["segments"]   = new_segs
-                    r["rec_in_s"]   = new_segs[0][0]
-                    r["rec_out_s"]  = new_segs[-1][1]
-                    r["rec_in_tc"]  = secs_tc(new_segs[0][0])
-                    r["rec_out_tc"] = secs_tc(new_segs[-1][1])
-                    r["_s4_accepted"] = True   # persist across Step 4 re-entries
-                    # For VO clips, build_aaf reads takes_data[best_i]["segments"],
-                    # not the top-level segments, so keep them in sync.
-                    if r.get("is_vo"):
-                        _best_i = r.get("best_take_index", 0)
-                        _td = r.get("takes_data") or []
-                        if _td and _best_i < len(_td) and isinstance(_td[_best_i], dict):
-                            # Matched VO: update the winning take's segments in-place.
-                            _td[_best_i] = dict(_td[_best_i], segments=list(new_segs))
-                        elif not _td:
-                            # No-match VO: takes_data was empty so build_aaf would
-                            # skip this clip entirely.  Synthesise a minimal entry
-                            # from the audio file the waveform editor just used.
-                            r["takes_data"]      = [{"apath": sa, "segments": list(new_segs)}]
-                            r["best_take_index"] = 0
-                    if old_status not in self.SUCCESS_STATUSES:
-                        # Remember the original status so restore/un-accept
-                        # can decrement the correct tally bucket.
-                        r["_original_status"] = old_status
-                        r["status"] = "manual"
-                        sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
-                                  fg=STATUS_COLOR.get("manual", SUCCESS))
-                    af[0] = True
-                    ss()
-                    rcl()   # refresh sub-clip count badge
-                    _increment_confirmed(old_status)
-                    self._s4_save()
-
-                # Gather neighbouring quote text for script context
-                _ctx_before = _ctx_after = ""
-                _this_order = r.get("order", -1)
-                for _ri, _rr in enumerate(self.results):
-                    if _rr.get("order") == _this_order:
-                        if _ri > 0:
-                            _ctx_before = (self.results[_ri - 1]
-                                           .get("quote_text", "") or "")
-                        if _ri < len(self.results) - 1:
-                            _ctx_after  = (self.results[_ri + 1]
-                                           .get("quote_text", "") or "")
-                        break
-
-                # Words: prefer per-result transcription (interview pulls store
-                # their windowed words there); fall back to full-file cache
-                # (VO takes are cached against the take file path).
-                _words = (r.get("words")
-                          or engines.cache_load(sa)
-                          or [])
-
-                # Format scripted timecode range for display in the editor
-                _stc_in  = r.get("in_tc",  "")
-                _stc_out = r.get("out_tc", "")
-                _scripted_tc = (
-                    "{}  \u2192  {}".format(_stc_in, _stc_out)
-                    if _stc_in and _stc_out else ""
-                )
-
-                # Build {token: [audio_paths]} from the media pool so the
-                # dialog's "🌐 all pulls" search can cross-check the
-                # phrase against every OTHER token's transcript sidecar.
-                # Used when the assigned token is itself wrong and the
-                # quote lives in a completely different audio file.
-                _pool_by_token = {}
-                try:
-                    for _prow in getattr(self._pool, "_rows", []) or []:
-                        _tok = _prow["var"].get()
-                        _pth = _prow.get("path")
-                        if _tok and _pth and _tok != "— unassigned —":
-                            _pool_by_token.setdefault(_tok, []).append(_pth)
-                except Exception:
-                    _pool_by_token = {}
-
-                MatchReviewDialog(self, sa, segs_r,
-                                  title=r.get("token", ""),
-                                  quote_text=r.get("quote_text", ""),
-                                  matched_text=r.get("matched_text", ""),
-                                  context_before=_ctx_before,
-                                  context_after=_ctx_after,
-                                  scripted_tc=_scripted_tc,
-                                  words=_words,
-                                  on_accept=_accept, fps=fps,
-                                  pool_by_token=_pool_by_token)
-
-            # ── Bind labels ────────────────────────────────────────────────────
-            ignore_lbl.bind("<Button-1>",
-                            lambda e, f=_toggle_ignore: f())
-            _acc_state_lbl.bind("<Button-1>",
-                                lambda e, f=_un_accept: f())
-            _ign_state_lbl.bind("<Button-1>",
-                                lambda e, f=_toggle_ignore: f())
-
-            # ── Card click → open waveform editor ──────────────────────────────
-            def _hdr_click(event=None, sv=skip_var, fn=_open_review,
-                           ti=_toggle_ignore):
-                self._s4_active_toggle = ti  # track for X shortcut
-                if not sv.get():   # ignored cards do nothing on click
-                    fn()
-
-            for _w in [hdr, card, _inner, ord_lbl, tok_lbl, stat_lbl]:
-                _w.bind("<Button-1>", _hdr_click)
-            if delta_lbl:
-                delta_lbl.bind("<Button-1>", _hdr_click)
-
-            self._rv.append({
-                "skip_var": skip_var, "res": res, "card": card,
-                "ignore_lbl": ignore_lbl,
-                "accepted_flag": _accepted_flag,
-                "toggle_ignore_fn": _toggle_ignore,
-                "set_accepted_fn": _set_accepted,
-                "set_normal_fn":   _set_normal,
-                # Stashed for surgical single-card updates (see
-                # _s4_patch_card_status) so state changes on ONE row
-                # don't have to full-rebuild all ~200 cards.
-                "stat_lbl":       stat_lbl,
-            })
-
-            # ── Restore saved state ────────────────────────────────────────────
-            if res.get("_s4_ignored") and not skip_var.get():
-                _toggle_ignore(from_restore=True)
-            elif res.get("_s4_accepted"):
-                _accepted_flag[0] = True
-                _set_accepted()
-                # Use _original_status if available so we decrement the right bucket
-                # (items that were low_confidence/no_match get status="manual" after
-                # accept; without _original_status they would never clear _review_count)
-                eff = res.get("_original_status") or res.get("status", "")
-                _increment_confirmed(eff)
-
-        # Build finished — live edits from here on should update the
-        # UNCONFIRMED label and re-filter normally again.
-        self._s4_building = False
-
-        # Store tally callbacks on self so _s4_apply_state can reach them
-        self._s4_increment_confirmed = _increment_confirmed
-        self._s4_decrement_confirmed = _decrement_confirmed
-        # ...and the refresh, so a bulk apply can suppress the per-row
-        # storm and re-sync exactly once when it is done.
-        self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
-
-        # Recompute the UNCONFIRMED count from the live _rv state now that
-        # card restoration has run (accepted_flag / skip_var are authoritative).
-        _unc = sum(1 for e in self._rv
-                   if not e["accepted_flag"][0] and not e["skip_var"].get())
-        _unconfirmed_count[0] = _unc
-        if "unconfirmed" in _fbtns:
-            _fbtns["unconfirmed"].config(text="UNCONFIRMED  {}".format(_unc))
-
-        # Restore scrollregion binding now that all cards are packed, then do
-        # one layout pass so the canvas knows the full scroll extent.
-        # Rebind _scroll_frame's own guarded handler rather than a fresh
-        # lambda, so the only-when-changed check survives the rebuild.
-        _cv = self._s4_scroll_canvas
-        _sr = getattr(sf, "_pb_sync_scrollregion", None)
-        if _sr is not None:
-            sf.bind("<Configure>", _sr)
-        sf.update_idletasks()
-        _cv.configure(scrollregion=_cv.bbox("all"))
-
-        # Re-apply persisted filter mode (persisted via self._s4_fstate);
-        # falls back to "all" on first entry.  This is what stops a
-        # mid-review rebuild (reassign apply, status change, etc.) from
-        # bouncing the user back to the ALL/Script default.
-        _apply_filter(mode=self._s4_fstate.get("mode", "all"))
-
-        # Restore scroll fraction requested by the caller (e.g. reassign
-        # apply captures yview()[0] pre-rebuild; consumed once here so
-        # normal Step 4 entry still opens at the top).
-        _pend_scroll = getattr(self, "_s4_pending_scroll_frac", None)
-        if _pend_scroll is not None:
-            self._s4_pending_scroll_frac = None
-            try:
-                # Small delay so layout settles before we scroll.
-                self.after(30, lambda f=_pend_scroll:
-                    self._s4_scroll_canvas.yview_moveto(f))
-            except Exception:
-                pass
-
-        # If this Step 4 was triggered by a selective re-reconcile, restore the
-        # confirmed states for all tokens that were NOT re-reconciled.
-        _rr = getattr(self, "_s4_rereconcile_restore", None)
-        if _rr is not None:
-            self._s4_apply_state(_rr)
-            self._s4_rereconcile_restore = None
-
-        # Flush the current (fully-restored) state to the sidecar so that if
-        # the user clicks ← BACK and re-runs reconciliation, the next Step 4
-        # entry can reload the correct positions from the sidecar rather than
-        # showing stale cache-reconciliation results.
-        self._s4_save()
-
-        # One-shot clean baseline for an OPENED session that lands at
-        # Step 4.  Only fires on open-restore (flag set by _open_session),
-        # never on normal forward navigation — so reconciling and landing
-        # here still reads as unsaved until the user actually saves.
-        if getattr(self, "_pending_mark_saved", False):
-            self._pending_mark_saved = False
-            self._mark_saved()
-
         nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
@@ -7645,6 +7058,622 @@ class App(AafWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
         # X — toggle IGNORE on the most-recently-clicked card
         self.bind_all("<x>", self._s4_x_toggle_ignore)
         self.bind_all("<X>", self._s4_x_toggle_ignore)
+
+        # ── Card-build + finalize deferred to the next event loop
+        # tick so the chrome (header, filter tabs, scroll frame,
+        # nav bar packed above) paints first.  On a saved-session
+        # auto-jump into Step 4 this is what makes the shell appear
+        # immediately instead of after ~5 s of card construction.
+        def _s4_defer_body():
+            # _cur_part_idx is defined in _step4's outer scope and
+            # REASSIGNED per-iteration below (part-divider tracking).
+            # Without nonlocal, the loop's `if pi != _cur_part_idx`
+            # would try to read a not-yet-bound local of the same
+            # name and UnboundLocalError.
+            nonlocal _cur_part_idx
+            for res in self.results:
+                st  = res.get("status", "")
+                sc  = STATUS_COLOR.get(st, SUB)
+                sl  = STATUS_LABEL.get(st, st)
+                pi  = res.get("part_index", 0)
+
+                # ── Part divider ───────────────────────────────────────────────────
+                if pi != _cur_part_idx:
+                    _cur_part_idx = pi
+                    part_name = next((p["name"] for p in self.parts
+                                      if p["index"] == pi), "Part {}".format(pi))
+                    _div = tk.Frame(sf, bg=BG)
+                    _div.pack(fill="x", pady=(10, 2), padx=2)
+                    tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
+                    tk.Label(_div, text="  \u25c6  {}".format(part_name.upper()),
+                             font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(2, 0))
+                    _part_dividers[pi] = _div
+
+                # ── Card shell ─────────────────────────────────────────────────────
+                card = tk.Frame(sf, bg=SURF,
+                                highlightbackground=BORDER, highlightthickness=1)
+                card.pack(fill="x", pady=(0, 4), padx=2)
+
+                # Left color stripe — 4px, reflects accept/ignore/normal state
+                _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
+                _stripe.pack(side="left", fill="y")
+
+                _inner = tk.Frame(card, bg=SURF)
+                _inner.pack(side="left", fill="both", expand=True)
+
+                hdr = tk.Frame(_inner, bg=SURF, cursor="hand2")
+                hdr.pack(fill="x", padx=(4, 10), pady=(6, 6))
+
+                _accepted_flag = [False]
+
+                # ── Header left ────────────────────────────────────────────────────
+                ord_lbl  = tk.Label(hdr, text="#{:03d}".format(res["order"]),
+                                    font=FL, bg=SURF, fg=SUB,
+                                    width=5, anchor="w", cursor="hand2")
+                ord_lbl.pack(side="left")
+                tok_lbl  = tk.Label(hdr, text=res["token"],
+                                    font=FL, bg=SURF, fg=ACCENT,
+                                    width=14, anchor="w", cursor="hand2")
+                tok_lbl.pack(side="left")
+                stat_lbl = tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc,
+                                    cursor="hand2")
+                stat_lbl.pack(side="left", padx=8)
+
+                # Right-click status → context menu to change/revert it.
+                # Solves accidental "adjusted" via stray click in the
+                # waveform editor: pick "matched" (or Restore original) and
+                # the flag flips back.  Only user-facing statuses are
+                # offered — internal/error states aren't picker-safe.
+                #
+                # A FACTORY, not free-standing defs: previously
+                # _change_status / _restore_original were loop-scoped names
+                # that got rebound every iteration.  The popup's menu
+                # lambdas closed over the ENCLOSING scope's names — which,
+                # by the time the user right-clicked, all pointed at the
+                # LAST card's version.  So clicking a menu on card N would
+                # mutate the last card in self.results.  Wrapping the
+                # per-row helpers in a factory rebinds them as locals to
+                # each _make_status_popup call, so each stat_lbl gets its
+                # own truly captured closures.
+                def _make_status_popup(r, sl_w):
+                    # A "success"-family status means the row belongs in
+                    # the CONFIRMED bucket if _s4_accepted is True.  Any
+                    # right-click change AWAY from that family (to a
+                    # review-y status like low_confidence / no_match /
+                    # provisional / not_run) implies the user is walking
+                    # the row BACK to unconfirmed, so drop the accepted
+                    # flag to keep the state consistent.  Otherwise the
+                    # row keeps showing in the CONFIRMED tab despite the
+                    # label saying otherwise.
+                    _SUCCESS_STATUSES = self.SUCCESS_STATUSES
+                    def _change(new_status):
+                        self._s4_push_undo()
+                        if "_original_status" not in r:
+                            r["_original_status"] = r.get("status", "")
+                        r["status"] = new_status
+                        sl_w.config(
+                            text=STATUS_LABEL.get(new_status, new_status),
+                            fg=STATUS_COLOR.get(new_status, SUB))
+                        # If moving off a success status, un-accept so the
+                        # CONFIRMED counter drops this row and the card
+                        # visual state (stripe + right-side ACCEPTED lbl)
+                        # reverts to the default look.  A full rebuild
+                        # picks up the new state cleanly.
+                        if (new_status not in _SUCCESS_STATUSES
+                                and r.get("_s4_accepted")):
+                            r.pop("_s4_accepted", None)
+                            try:
+                                _cv = getattr(self, "_s4_scroll_canvas", None)
+                                if _cv is not None:
+                                    self._s4_pending_scroll_frac = float(_cv.yview()[0])
+                            except Exception:
+                                pass
+                            self._s4_save()
+                            self._step4()
+                            return
+                        self._s4_save()
+
+                    def _restore():
+                        orig = r.get("_original_status") or ""
+                        if not orig or orig == r.get("status"):
+                            return
+                        self._s4_push_undo()
+                        r["status"] = orig
+                        r.pop("_original_status", None)
+                        sl_w.config(text=STATUS_LABEL.get(orig, orig),
+                                    fg=STATUS_COLOR.get(orig, SUB))
+                        # Same un-accept rule for Restore — if the ORIGINAL
+                        # status was a review-y one, don't leave the row
+                        # confirmed with a mismatched label.
+                        if (orig not in _SUCCESS_STATUSES
+                                and r.get("_s4_accepted")):
+                            r.pop("_s4_accepted", None)
+                            try:
+                                _cv = getattr(self, "_s4_scroll_canvas", None)
+                                if _cv is not None:
+                                    self._s4_pending_scroll_frac = float(_cv.yview()[0])
+                            except Exception:
+                                pass
+                            self._s4_save()
+                            self._step4()
+                            return
+                        self._s4_save()
+
+                    def _popup(event):
+                        m = tk.Menu(self, tearoff=0, bg=SURF, fg=TEXT,
+                                    activebackground=ACCENT,
+                                    activeforeground=BG, bd=0)
+                        _orig = r.get("_original_status") or ""
+                        _cur  = r.get("status", "")
+                        if _orig and _orig != _cur:
+                            m.add_command(
+                                label="Restore original ({})".format(
+                                    STATUS_LABEL.get(_orig, _orig)
+                                        .lstrip("✓✗⚠–… ").strip()),
+                                command=_restore)
+                            m.add_separator()
+                        # Curated status options — user-facing labels only,
+                        # skipping internal states (no_quote / error /
+                        # no_file / cancelled) that shouldn't be user-settable.
+                        for _key in ("ok", "manual", "low_confidence",
+                                     "no_match", "provisional", "not_run"):
+                            m.add_command(
+                                label=STATUS_LABEL.get(_key, _key),
+                                command=lambda k=_key: _change(k))
+                        try:
+                            m.tk_popup(event.x_root, event.y_root)
+                        finally:
+                            m.grab_release()
+                    return _popup
+
+                stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
+
+                conf_hdr = res.get("confidence", 0)
+                if conf_hdr:
+                    tk.Label(hdr, text="{:.0%}".format(conf_hdr),
+                             font=FS, bg=SURF, fg=sc, cursor="hand2").pack(
+                                 side="left", padx=(0, 6))
+
+
+                # Sub-clip count (number of segments) — always created, shown when > 1
+                _clips_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=WARN,
+                                      cursor="hand2")
+
+                def _refresh_clips_lbl(cl=_clips_lbl, r=res):
+                    n = len(r.get("segments") or [(0, 0)])
+                    if n > 1:
+                        cl.config(text="{} clips".format(n))
+                        cl.pack(side="left", padx=(0, 6))
+                    else:
+                        cl.pack_forget()
+
+                _refresh_clips_lbl()
+
+                # Timecode label — shown right after the status text when accepted
+                _tc_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB)
+                # initially not packed
+
+                d_in  = res.get("delta_in",  0)
+                d_out = res.get("delta_out", 0)
+                delta_lbl = None
+                if st == "ok" and (abs(d_in) > 0.5 or abs(d_out) > 0.5):
+                    delta_lbl = tk.Label(hdr,
+                                text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
+                                font=FB, bg=SURF, fg=INFO, cursor="hand2")
+                    delta_lbl.pack(side="left", padx=4)
+                    self._tooltip(delta_lbl,
+                        "Δin = matched IN point differs from script timecode by this amount\n"
+                        "Δout = matched OUT point differs from script timecode by this amount\n"
+                        "Positive = later in file  ·  Negative = earlier in file")
+
+                skip_var = tk.BooleanVar(value=False)
+
+                # ── Header right — state container ─────────────────────────────────
+                # Normal: [ADJUST] [IGNORE]  |  Accepted: [✓ ACCEPTED]  |  Ignored: [⊘ IGNORED]
+                _hdr_right = tk.Frame(hdr, bg=SURF)
+                _hdr_right.pack(side="right")
+
+                _norm_frame    = tk.Frame(_hdr_right, bg=SURF)
+                _norm_frame.pack(side="left")
+
+                _acc_state_lbl = tk.Label(_hdr_right, text="\u2713 ACCEPTED",
+                                          font=FS, bg=SURF, fg=SUCCESS, cursor="hand2")
+                # initially not packed
+
+                _ign_state_lbl = tk.Label(_hdr_right, text="\u2298 IGNORED",
+                                          font=FS, bg=SURF, fg=ERR, cursor="hand2")
+                # initially not packed
+
+                # source_audio: prefer explicit audio path, fall back to video path
+                # so that clips sourced from video assets can still be reviewed.
+                _src_audio = (res.get("source_audio", "") or
+                              res.get("source_video", "") or "")
+
+                # IGNORE button (only interactive control besides clicking to review)
+                ignore_lbl = tk.Label(_norm_frame, text="IGNORE", font=FS,
+                                      bg=SURF, fg=SUB, cursor="hand2")
+                ignore_lbl.pack(side="right", padx=(4, 0))
+                ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
+                ignore_lbl.bind("<Leave>", lambda e, w=ignore_lbl: w.config(fg=SUB))
+
+                # REASSIGN — opens a picker to swap this pull/VO's source
+                # file without going through the cross-token phrase search,
+                # which only helps when the quote is findable in another
+                # already-transcribed sidecar.  Interview and VO share the
+                # same entry point; the dialog adapts its layout + apply
+                # logic based on res["is_vo"].
+                reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
+                                        bg=SURF, fg=SUB, cursor="hand2")
+                reassign_lbl.pack(side="right", padx=(4, 0))
+                reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
+                reassign_lbl.bind("<Leave>", lambda e, w=reassign_lbl: w.config(fg=SUB))
+                reassign_lbl.bind(
+                    "<Button-1>",
+                    lambda e, r=res: self._s4_reassign_dialog(r))
+
+                # ── State management helpers ────────────────────────────────────────
+                def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
+                                il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
+                    al.pack_forget(); il.pack_forget(); tl.pack_forget()
+                    nf.pack(side="left")
+                    sw.config(bg=_STRIPE_DEF)
+                    c.config(highlightbackground=BORDER, highlightthickness=1)
+
+                def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
+                                  il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
+                                  c=card, r=res):
+                    nf.pack_forget(); il.pack_forget()
+                    al.pack(side="left")
+                    in_tc  = r.get("rec_in_tc",  r.get("in_tc",  ""))
+                    out_tc = r.get("rec_out_tc", r.get("out_tc", ""))
+                    if in_tc and out_tc:
+                        tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
+                        tl.pack(side="left", padx=(4, 0))
+                    sw.config(bg=_STRIPE_ACC)
+                    c.config(highlightbackground=SUCCESS, highlightthickness=2)
+
+                def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
+                                 il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
+                    nf.pack_forget(); al.pack_forget(); tl.pack_forget()
+                    il.pack(side="left")
+                    sw.config(bg=_STRIPE_IGN)
+                    c.config(highlightbackground=ERR, highlightthickness=2)
+
+                def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
+                    self._s4_push_undo()
+                    af[0] = False
+                    r["_s4_accepted"] = False   # clear persisted accepted flag
+                    ss_n()
+                    # Use _original_status so we return the item to the right bucket
+                    eff_status = r.get("_original_status") or r.get("status", "")
+                    _decrement_confirmed(eff_status)
+                    self._s4_save()
+
+                def _toggle_ignore(sv=skip_var, ss_n=_set_normal, ss_i=_set_ignored,
+                                   from_restore=False):
+                    if not from_restore:
+                        self._s4_push_undo()
+                    sv.set(not sv.get())
+                    if sv.get():
+                        ss_i()
+                        _increment_ignored()
+                    else:
+                        ss_n()
+                        _decrement_ignored()
+                    if not from_restore:
+                        self._s4_save()
+
+                # ── Open waveform editor — primary card action ──────────────────────
+                def _open_review(event=None, r=res, af=_accepted_flag,
+                                 ss=_set_accepted, sl=stat_lbl,
+                                 rcl=_refresh_clips_lbl):
+                    # Resolve source audio with a fallback ladder so cards
+                    # from restored sessions / provisional-first / post-
+                    # reassign flows all open cleanly.  A silent return here
+                    # was the reason many cards appeared "dead to clicks".
+                    tried = []
+                    def _try(path, label):
+                        tried.append((label, path or "(unset)"))
+                        return path and os.path.isfile(path)
+
+                    sa = r.get("source_audio", "") or ""
+                    if not _try(sa, "source_audio"):
+                        sa = r.get("source_video", "") or ""
+                        if not _try(sa, "source_video"):
+                            sa = ""
+
+                    # For VO rows the winning take's apath is the canonical
+                    # source — try it before any pool guessing.
+                    if not sa and r.get("is_vo"):
+                        _td = r.get("takes_data") or []
+                        _bi = r.get("best_take_index", 0) or 0
+                        if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
+                            _apath = _td[_bi].get("apath", "") or ""
+                            if _try(_apath, "takes_data[{}].apath".format(_bi)):
+                                sa = _apath
+                                r["source_audio"] = _apath   # cache
+
+                    # Pool fallbacks — prefer audio, then video (existing
+                    # behavior extended: audio was never tried before).
+                    if not sa:
+                        tok = r.get("token", "")
+                        _pool = getattr(self, "_pool", None)
+                        if _pool is not None:
+                            if r.get("is_vo"):
+                                _pi = r.get("part_index", -1)
+                                try:
+                                    _bin = _pool.get_vo_assets().get(_pi, {}) or {}
+                                except Exception:
+                                    _bin = {}
+                                _audios = _bin.get("audios", []) or []
+                                _videos = _bin.get("videos", []) or []
+                            else:
+                                _assigned = _pool.get_interview_assets().get(tok, []) or []
+                                _audios = [p for p in _assigned if not is_video(p)]
+                                _videos = [p for p in _assigned if is_video(p)]
+
+                            _aud = next((p for p in _audios if os.path.isfile(p)), None)
+                            if _try(_aud, "pool audio"):
+                                sa = _aud
+                                r["source_audio"] = _aud   # cache
+                            else:
+                                _vid = next((p for p in _videos if os.path.isfile(p)), None)
+                                if _try(_vid, "pool video"):
+                                    sa = _vid
+                                    r["source_video"] = _vid   # cache
+
+                    if not sa or not os.path.isfile(sa):
+                        # Explain WHY the editor can't open — not silent.
+                        _msg  = ("Can't open the waveform editor for #{:03d}  {}\n\n"
+                                 "No usable source audio/video found.  Sources "
+                                 "checked:\n\n".format(
+                                     r.get("order", 0), r.get("token", "?")))
+                        for _lbl, _path in tried:
+                            _msg += "  • {:20}  {}\n".format(_lbl, _path)
+                        _msg += ("\nUse the REASSIGN button on this card to point "
+                                 "it at a valid file, or add the missing file to "
+                                 "the pool via Step 2.")
+                        messagebox.showwarning("No source available", _msg, parent=self)
+                        return
+                    segs_r = r.get("segments") or [(0.0, 30.0)]
+                    fps    = getattr(self, "_seq_fps", 24.0)
+
+                    def _accept(new_segs, new_token=None, new_audio_path=None,
+                                r=r, af=af, ss=ss, sl=sl, rcl=rcl):
+                        self._s4_push_undo()
+                        old_status = r.get("status", "")
+                        # Cross-token ADOPT from the match-review search: also
+                        # reassign this pull to the new token + audio file and
+                        # refresh the scripted timecode fields.  segments arg
+                        # is a single-hit window (in_s, out_s) from the sidecar.
+                        if new_token and new_token != r.get("token"):
+                            r["token"] = new_token
+                        if new_audio_path:
+                            r["source_audio"] = new_audio_path
+                            # source_video was a fallback for restored sessions;
+                            # once we've reassigned, clear it so future opens
+                            # use the new audio path.
+                            r.pop("source_video", None)
+                            if is_video(new_audio_path):
+                                r["source_video"] = new_audio_path
+                        r["segments"]   = new_segs
+                        r["rec_in_s"]   = new_segs[0][0]
+                        r["rec_out_s"]  = new_segs[-1][1]
+                        r["rec_in_tc"]  = secs_tc(new_segs[0][0])
+                        r["rec_out_tc"] = secs_tc(new_segs[-1][1])
+                        r["_s4_accepted"] = True   # persist across Step 4 re-entries
+                        # For VO clips, build_aaf reads takes_data[best_i]["segments"],
+                        # not the top-level segments, so keep them in sync.
+                        if r.get("is_vo"):
+                            _best_i = r.get("best_take_index", 0)
+                            _td = r.get("takes_data") or []
+                            if _td and _best_i < len(_td) and isinstance(_td[_best_i], dict):
+                                # Matched VO: update the winning take's segments in-place.
+                                _td[_best_i] = dict(_td[_best_i], segments=list(new_segs))
+                            elif not _td:
+                                # No-match VO: takes_data was empty so build_aaf would
+                                # skip this clip entirely.  Synthesise a minimal entry
+                                # from the audio file the waveform editor just used.
+                                r["takes_data"]      = [{"apath": sa, "segments": list(new_segs)}]
+                                r["best_take_index"] = 0
+                        if old_status not in self.SUCCESS_STATUSES:
+                            # Remember the original status so restore/un-accept
+                            # can decrement the correct tally bucket.
+                            r["_original_status"] = old_status
+                            r["status"] = "manual"
+                            sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
+                                      fg=STATUS_COLOR.get("manual", SUCCESS))
+                        af[0] = True
+                        ss()
+                        rcl()   # refresh sub-clip count badge
+                        _increment_confirmed(old_status)
+                        self._s4_save()
+
+                    # Gather neighbouring quote text for script context
+                    _ctx_before = _ctx_after = ""
+                    _this_order = r.get("order", -1)
+                    for _ri, _rr in enumerate(self.results):
+                        if _rr.get("order") == _this_order:
+                            if _ri > 0:
+                                _ctx_before = (self.results[_ri - 1]
+                                               .get("quote_text", "") or "")
+                            if _ri < len(self.results) - 1:
+                                _ctx_after  = (self.results[_ri + 1]
+                                               .get("quote_text", "") or "")
+                            break
+
+                    # Words: prefer per-result transcription (interview pulls store
+                    # their windowed words there); fall back to full-file cache
+                    # (VO takes are cached against the take file path).
+                    _words = (r.get("words")
+                              or engines.cache_load(sa)
+                              or [])
+
+                    # Format scripted timecode range for display in the editor
+                    _stc_in  = r.get("in_tc",  "")
+                    _stc_out = r.get("out_tc", "")
+                    _scripted_tc = (
+                        "{}  \u2192  {}".format(_stc_in, _stc_out)
+                        if _stc_in and _stc_out else ""
+                    )
+
+                    # Build {token: [audio_paths]} from the media pool so the
+                    # dialog's "🌐 all pulls" search can cross-check the
+                    # phrase against every OTHER token's transcript sidecar.
+                    # Used when the assigned token is itself wrong and the
+                    # quote lives in a completely different audio file.
+                    _pool_by_token = {}
+                    try:
+                        for _prow in getattr(self._pool, "_rows", []) or []:
+                            _tok = _prow["var"].get()
+                            _pth = _prow.get("path")
+                            if _tok and _pth and _tok != "— unassigned —":
+                                _pool_by_token.setdefault(_tok, []).append(_pth)
+                    except Exception:
+                        _pool_by_token = {}
+
+                    MatchReviewDialog(self, sa, segs_r,
+                                      title=r.get("token", ""),
+                                      quote_text=r.get("quote_text", ""),
+                                      matched_text=r.get("matched_text", ""),
+                                      context_before=_ctx_before,
+                                      context_after=_ctx_after,
+                                      scripted_tc=_scripted_tc,
+                                      words=_words,
+                                      on_accept=_accept, fps=fps,
+                                      pool_by_token=_pool_by_token)
+
+                # ── Bind labels ────────────────────────────────────────────────────
+                ignore_lbl.bind("<Button-1>",
+                                lambda e, f=_toggle_ignore: f())
+                _acc_state_lbl.bind("<Button-1>",
+                                    lambda e, f=_un_accept: f())
+                _ign_state_lbl.bind("<Button-1>",
+                                    lambda e, f=_toggle_ignore: f())
+
+                # ── Card click → open waveform editor ──────────────────────────────
+                def _hdr_click(event=None, sv=skip_var, fn=_open_review,
+                               ti=_toggle_ignore):
+                    self._s4_active_toggle = ti  # track for X shortcut
+                    if not sv.get():   # ignored cards do nothing on click
+                        fn()
+
+                for _w in [hdr, card, _inner, ord_lbl, tok_lbl, stat_lbl]:
+                    _w.bind("<Button-1>", _hdr_click)
+                if delta_lbl:
+                    delta_lbl.bind("<Button-1>", _hdr_click)
+
+                self._rv.append({
+                    "skip_var": skip_var, "res": res, "card": card,
+                    "ignore_lbl": ignore_lbl,
+                    "accepted_flag": _accepted_flag,
+                    "toggle_ignore_fn": _toggle_ignore,
+                    "set_accepted_fn": _set_accepted,
+                    "set_normal_fn":   _set_normal,
+                    # Stashed for surgical single-card updates (see
+                    # _s4_patch_card_status) so state changes on ONE row
+                    # don't have to full-rebuild all ~200 cards.
+                    "stat_lbl":       stat_lbl,
+                })
+
+                # ── Restore saved state ────────────────────────────────────────────
+                if res.get("_s4_ignored") and not skip_var.get():
+                    _toggle_ignore(from_restore=True)
+                elif res.get("_s4_accepted"):
+                    _accepted_flag[0] = True
+                    _set_accepted()
+                    # Use _original_status if available so we decrement the right bucket
+                    # (items that were low_confidence/no_match get status="manual" after
+                    # accept; without _original_status they would never clear _review_count)
+                    eff = res.get("_original_status") or res.get("status", "")
+                    _increment_confirmed(eff)
+
+            # Build finished — live edits from here on should update the
+            # UNCONFIRMED label and re-filter normally again.
+            self._s4_building = False
+
+            # Store tally callbacks on self so _s4_apply_state can reach them
+            self._s4_increment_confirmed = _increment_confirmed
+            self._s4_decrement_confirmed = _decrement_confirmed
+            # ...and the refresh, so a bulk apply can suppress the per-row
+            # storm and re-sync exactly once when it is done.
+            self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
+
+            # Recompute the UNCONFIRMED count from the live _rv state now that
+            # card restoration has run (accepted_flag / skip_var are authoritative).
+            _unc = sum(1 for e in self._rv
+                       if not e["accepted_flag"][0] and not e["skip_var"].get())
+            _unconfirmed_count[0] = _unc
+            if "unconfirmed" in _fbtns:
+                _fbtns["unconfirmed"].config(text="UNCONFIRMED  {}".format(_unc))
+
+            # Restore scrollregion binding now that all cards are packed, then do
+            # one layout pass so the canvas knows the full scroll extent.
+            # Rebind _scroll_frame's own guarded handler rather than a fresh
+            # lambda, so the only-when-changed check survives the rebuild.
+            _cv = self._s4_scroll_canvas
+            _sr = getattr(sf, "_pb_sync_scrollregion", None)
+            if _sr is not None:
+                sf.bind("<Configure>", _sr)
+            sf.update_idletasks()
+            _cv.configure(scrollregion=_cv.bbox("all"))
+
+            # Re-apply persisted filter mode (persisted via self._s4_fstate);
+            # falls back to "all" on first entry.  This is what stops a
+            # mid-review rebuild (reassign apply, status change, etc.) from
+            # bouncing the user back to the ALL/Script default.
+            _apply_filter(mode=self._s4_fstate.get("mode", "all"))
+
+            # Restore scroll fraction requested by the caller (e.g. reassign
+            # apply captures yview()[0] pre-rebuild; consumed once here so
+            # normal Step 4 entry still opens at the top).
+            _pend_scroll = getattr(self, "_s4_pending_scroll_frac", None)
+            if _pend_scroll is not None:
+                self._s4_pending_scroll_frac = None
+                try:
+                    # Small delay so layout settles before we scroll.
+                    self.after(30, lambda f=_pend_scroll:
+                        self._s4_scroll_canvas.yview_moveto(f))
+                except Exception:
+                    pass
+
+            # If this Step 4 was triggered by a selective re-reconcile, restore the
+            # confirmed states for all tokens that were NOT re-reconciled.
+            _rr = getattr(self, "_s4_rereconcile_restore", None)
+            if _rr is not None:
+                self._s4_apply_state(_rr)
+                self._s4_rereconcile_restore = None
+
+            # Flush the current (fully-restored) state to the sidecar so that if
+            # the user clicks ← BACK and re-runs reconciliation, the next Step 4
+            # entry can reload the correct positions from the sidecar rather than
+            # showing stale cache-reconciliation results.
+            self._s4_save()
+
+            # One-shot clean baseline for an OPENED session that lands at
+            # Step 4.  Only fires on open-restore (flag set by _open_session),
+            # never on normal forward navigation — so reconciling and landing
+            # here still reads as unsaved until the user actually saves.
+            if getattr(self, "_pending_mark_saved", False):
+                self._pending_mark_saved = False
+                self._mark_saved()
+
+        # Force the chrome (header, filter tabs, scroll frame, nav bar)
+        # to paint NOW, before scheduling the ~5 s card build.  Windows
+        # can coalesce paints across a chain of after() callbacks — we
+        # tried after(1), after_idle and after(30), and Windows chose
+        # to render only after cards finished building on most runs.
+        # A synchronous update() drains events AND processes Windows
+        # messages, so the frame is on screen before this call returns.
+        #
+        # This particular update() is safe against re-entrancy: the
+        # only interactive handlers that could fire against this
+        # partly-built Step 4 (the nav bar's own buttons) all tolerate
+        # empty _rv — undo/redo are no-ops on an empty history and the
+        # navigation buttons only rebuild the screen.  Well worth the
+        # one-shot flush to make the shell visible right away.
+        self.update()
+        self.after_idle(_s4_defer_body)
 
     # ── Inline card-level audio playback ──────────────────────────────────────
 
