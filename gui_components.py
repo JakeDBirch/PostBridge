@@ -1088,11 +1088,35 @@ class MediaPool(tk.Frame):
 
     def _set_link_group(self, path, dur_key):
         """Called on the main thread after the background duration fetch.
-        Assigns link_id to the row and refreshes the link indicators."""
+        Assigns link_id to the row and refreshes the link indicators.
+
+        The refresh is debounced.  Bulk pool imports (session load,
+        drag-and-drop of a folder) spawn one probe thread per file, and
+        each completion used to call _update_link_visuals immediately —
+        so the link indicators appeared to materialise one at a time
+        instead of all together once probing settled.  50 ms means the
+        refresh runs at most ~20x/second no matter how many probes are
+        finishing.
+        """
         for r in self._rows:
             if r["path"] == path:
                 r["link_id"] = dur_key
                 break
+        self._schedule_link_refresh()
+
+    def _schedule_link_refresh(self):
+        _prev = getattr(self, "_link_refresh_after", None)
+        if _prev is not None:
+            try: self.after_cancel(_prev)
+            except Exception: pass
+        try:
+            self._link_refresh_after = self.after(50, self._flush_link_refresh)
+        except tk.TclError:
+            # Widget was destroyed between probes and this call.
+            pass
+
+    def _flush_link_refresh(self):
+        self._link_refresh_after = None
         self._update_link_visuals()
 
     def _handle_link_change(self, path, new_token):
