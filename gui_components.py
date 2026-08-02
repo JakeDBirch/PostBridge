@@ -728,7 +728,15 @@ class MediaPool(tk.Frame):
                 else:
                     self._user_unassigned.discard(_p)
             _apply_token_style(_v.get())
-            if not getattr(self, "_link_propagating", False):
+            # _mirror_assignment walks every other row doing filename
+            # similarity — O(N^2) across a bulk restore.  Session restore
+            # already carries the mirrored assignments verbatim, so
+            # firing it per row here is pure re-derivation.  Was 51 ms /
+            # 64-file pool measured, alongside 320 ms cumulative in
+            # _on_token_change; this was the single biggest post-open
+            # cost in a session load.
+            if (not getattr(self, "_link_propagating", False)
+                    and not self._bulk_loading):
                 self._mirror_assignment(_p, _v.get())
             if (not getattr(self, "_in_mirror", False)
                     and not getattr(self, "_link_propagating", False)
@@ -853,7 +861,11 @@ class MediaPool(tk.Frame):
                    lambda e, r=rec: self._wipe_cache(r))
 
         self._dz_lbl.config(text="")
-        self._refresh_count()
+        # During bulk restore, _apply_setup_data calls _refresh_count once
+        # at the end.  The intermediate 43 label rewrites (~2 Tcl calls
+        # each) buy nothing the user can see.
+        if not self._bulk_loading:
+            self._refresh_count()
         if not self._sort_scheduled:
             self._sort_scheduled = True
             self.after(50, self._deferred_sort)
