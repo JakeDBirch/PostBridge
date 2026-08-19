@@ -4276,8 +4276,8 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
                       mix_path=None, include_camera_audio=False,
-                      warnings_out=None, close_gaps_max_frames=0,
-                      stats_out=None):
+                      warnings_out=None, close_gaps_max_secs=0.0,
+                      close_gaps_across_sources=False, stats_out=None):
     fps        = seq_fps
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
@@ -4460,14 +4460,18 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     # Cutting a breath or a stumble in the DAW leaves a hole a few frames
     # wide in the timeline.  Picture had no reason to cut there — the hole
     # is an artifact of making the audio work, and it flashes black in the
-    # handoff.  When close_gaps_max_frames is set, every hole no wider than
+    # handoff.  When close_gaps_max_secs is set, every hole no longer than
     # that is closed by growing the picture on either side of it toward the
     # middle, half the hole each, so the cut lands where the hole was
     # instead of sliding the edit.  Audio placement is never touched: only
-    # picture moves, and holes wider than the cap are real picture gaps
+    # picture moves, and holes longer than the cap are real picture gaps
     # that stay exactly as authored.
+    #
+    # A hole WITHIN one shot is pure audio-edit debris and always closes.
+    # A hole AT A SOURCE CHANGE is an authored cut that happens to have air
+    # in it, so it only closes when close_gaps_across_sources says so.
     gaps_closed = 0
-    max_gap_fr  = int(close_gaps_max_frames or 0)
+    max_gap_fr  = f2fr(max(0.0, float(close_gaps_max_secs or 0.0)), fps)
     if max_gap_fr > 0:
         vid_places = [p for p in placements if p["vp"] and p["tn"] in v_tracks]
 
@@ -4495,6 +4499,9 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             in_clips  = [p for p in vid_places if p["v_start_fr"] == hi]
             if not out_clips or not in_clips:
                 continue
+            if not close_gaps_across_sources and (
+                    {p["vp"] for p in out_clips} != {p["vp"] for p in in_clips}):
+                continue                          # authored cut, not debris
             # Source room: an outgoing clip needs frames after its out point,
             # an incoming clip needs frames before its in point.  Stacked
             # angles move together, so the tightest one sets the distance.

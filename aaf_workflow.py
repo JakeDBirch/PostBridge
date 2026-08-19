@@ -731,30 +731,53 @@ class AafWorkflowMixin:
                        activebackground=SURF, activeforeground=TEXT,
                        relief="flat", bd=0).pack(side="left")
 
-        # ── Orphaned video-gap closing ───────────────────────────────────
-        # An audio edit (a cut breath, a removed stumble) leaves a few-frame
-        # hole that picture never asked for.  Closing it grows the two
-        # neighbouring video clips toward each other — half the gap each —
-        # so the cut lands where the hole was.  Audio placement is untouched.
+        # ── Video-gap closing ───────────────────────────────────────────
+        # An audio edit (a cut breath, a removed stumble) leaves a short hole
+        # that picture never asked for.  Closing it grows the video on either
+        # side toward the middle — half the hole each — so the cut lands
+        # where the hole was.  Audio placement is untouched.  Holes at a
+        # SOURCE CHANGE are authored cuts, so they need the second box.
         if not hasattr(self, "_aaf_close_gaps_var"):
             self._aaf_close_gaps_var = tk.BooleanVar(value=False)
-        if not hasattr(self, "_aaf_close_gaps_fr_var"):
-            self._aaf_close_gaps_fr_var = tk.StringVar(value="10")
+        if not hasattr(self, "_aaf_close_gaps_secs_var"):
+            self._aaf_close_gaps_secs_var = tk.StringVar(value="0.3")
+        if not hasattr(self, "_aaf_close_gaps_src_var"):
+            self._aaf_close_gaps_src_var = tk.BooleanVar(value=False)
+
         gap_row = tk.Frame(sf, bg=SURF)
-        gap_row.pack(fill="x", padx=14, pady=(0, 8))
-        tk.Checkbutton(gap_row, text="Close orphaned video gaps up to",
+        gap_row.pack(fill="x", padx=14, pady=(0, 2))
+        tk.Checkbutton(gap_row, text="Close video gaps up to:",
                        variable=self._aaf_close_gaps_var,
                        font=FB, bg=SURF, fg=TEXT, selectcolor=SURF2,
                        activebackground=SURF, activeforeground=TEXT,
                        relief="flat", bd=0).pack(side="left")
-        tk.Entry(gap_row, textvariable=self._aaf_close_gaps_fr_var,
+        tk.Entry(gap_row, textvariable=self._aaf_close_gaps_secs_var,
                  font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
                  relief="flat", width=4, justify="center").pack(side="left",
                                                                padx=(2, 5))
-        tk.Label(gap_row,
-                 text="frames   (picture closes in equally from both sides; "
-                      "audio is untouched, wider gaps stay)",
-                 font=FB, bg=SURF, fg=SUB).pack(side="left")
+        tk.Label(gap_row, text="sec", font=FB, bg=SURF, fg=SUB).pack(side="left")
+
+        src_row = tk.Frame(sf, bg=SURF)
+        src_row.pack(fill="x", padx=14, pady=(0, 8))
+        self._aaf_close_gaps_src_ck = tk.Checkbutton(
+            src_row, text="Including gaps at a source change",
+            variable=self._aaf_close_gaps_src_var,
+            font=FB, bg=SURF, fg=TEXT, selectcolor=SURF2,
+            activebackground=SURF, activeforeground=TEXT,
+            disabledforeground=SUB, relief="flat", bd=0)
+        self._aaf_close_gaps_src_ck.pack(side="left", padx=(26, 0))
+
+        def _sync_gap_sub(*_):
+            # Greys out the sub-option while gap closing is off.  Re-entering
+            # Step 2 re-points the widget, so a stale trace is harmless.
+            try:
+                self._aaf_close_gaps_src_ck.config(
+                    state="normal" if self._aaf_close_gaps_var.get()
+                    else "disabled")
+            except Exception:
+                pass
+        self._aaf_close_gaps_var.trace_add("write", _sync_gap_sub)
+        _sync_gap_sub()
 
         # Restore pool contents: back-navigation takes priority over prefetch
         if _saved_vpaths or _saved_apaths:
@@ -4265,8 +4288,10 @@ class AafWorkflowMixin:
             "camera_audio":  getattr(self, "_aaf_cam_audio_var", tk.BooleanVar()).get(),
             "close_gaps":    getattr(self, "_aaf_close_gaps_var",
                                      tk.BooleanVar()).get(),
-            "close_gaps_frames": getattr(self, "_aaf_close_gaps_fr_var",
-                                         tk.StringVar(value="10")).get(),
+            "close_gaps_secs": getattr(self, "_aaf_close_gaps_secs_var",
+                                       tk.StringVar(value="0.3")).get(),
+            "close_gaps_across_sources": getattr(
+                self, "_aaf_close_gaps_src_var", tk.BooleanVar()).get(),
         }
 
     def _aaf_save_setup(self, prompt=True):
@@ -4494,10 +4519,15 @@ class AafWorkflowMixin:
             if not hasattr(self, "_aaf_close_gaps_var"):
                 self._aaf_close_gaps_var = tk.BooleanVar()
             self._aaf_close_gaps_var.set(bool(data["close_gaps"]))
-        if "close_gaps_frames" in data:
-            if not hasattr(self, "_aaf_close_gaps_fr_var"):
-                self._aaf_close_gaps_fr_var = tk.StringVar()
-            self._aaf_close_gaps_fr_var.set(str(data["close_gaps_frames"]))
+        if "close_gaps_secs" in data:
+            if not hasattr(self, "_aaf_close_gaps_secs_var"):
+                self._aaf_close_gaps_secs_var = tk.StringVar()
+            self._aaf_close_gaps_secs_var.set(str(data["close_gaps_secs"]))
+        if "close_gaps_across_sources" in data:
+            if not hasattr(self, "_aaf_close_gaps_src_var"):
+                self._aaf_close_gaps_src_var = tk.BooleanVar()
+            self._aaf_close_gaps_src_var.set(
+                bool(data["close_gaps_across_sources"]))
 
         # Probe loaded files and populate the "Detected from source" preset entries
         self._aaf_update_seq_presets()
@@ -4557,22 +4587,28 @@ class AafWorkflowMixin:
             messagebox.showerror("Invalid FPS", "Enter a valid frame rate (e.g. 29.97).")
             return
 
-        # Orphaned-gap cap — validated here (alongside FPS) so a bad value is
-        # caught before the user picks an output file.
-        close_gaps_fr = 0
+        # Gap cap — validated here (alongside FPS) so a bad value is caught
+        # before the user picks an output file.  Resolution is tenths of a
+        # second; the field is rewritten to the snapped value so what the
+        # build used is what the user sees.
+        close_gaps_secs = 0.0
         _cg_var = getattr(self, "_aaf_close_gaps_var", None)
         if _cg_var is not None and _cg_var.get():
             try:
-                close_gaps_fr = int(float(
-                    self._aaf_close_gaps_fr_var.get().strip()))
+                close_gaps_secs = round(float(
+                    self._aaf_close_gaps_secs_var.get().strip()), 1)
             except (ValueError, AttributeError):
-                close_gaps_fr = 0
-            if close_gaps_fr <= 0:
+                close_gaps_secs = 0.0
+            if close_gaps_secs <= 0:
                 messagebox.showerror(
                     "Invalid Gap Length",
-                    "Enter the maximum orphaned gap as a whole number of "
-                    "frames (e.g. 10), or turn the option off.")
+                    "Enter the maximum gap length in seconds (e.g. 0.3), "
+                    "or turn the option off.")
                 return
+            self._aaf_close_gaps_secs_var.set("{:.1f}".format(close_gaps_secs))
+        close_gaps_src = bool(
+            getattr(self, "_aaf_close_gaps_src_var", None)
+            and self._aaf_close_gaps_src_var.get())
 
         group_mode = self._aaf_group_var.get()   # "single" or "by_source"
 
@@ -4887,12 +4923,15 @@ class AafWorkflowMixin:
                     mix_path=mix_path or None,
                     include_camera_audio=cam_audio_v,
                     warnings_out=_oor_warnings,
-                    close_gaps_max_frames=close_gaps_fr,
+                    close_gaps_max_secs=close_gaps_secs,
+                    close_gaps_across_sources=close_gaps_src,
                     stats_out=_build_stats)
                 _gaps_closed = _build_stats.get("gaps_closed", 0)
-                if close_gaps_fr:
-                    print("Orphaned video gaps closed (\u2264{} frames): {}".format(
-                        close_gaps_fr, _gaps_closed))
+                if close_gaps_secs:
+                    print("Video gaps closed (\u2264{:.1f}s{}): {}".format(
+                        close_gaps_secs,
+                        ", source changes included" if close_gaps_src else "",
+                        _gaps_closed))
 
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
