@@ -1,4 +1,4 @@
-import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading, bisect
+import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -4460,72 +4460,70 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     # Cutting a breath or a stumble in the DAW leaves a hole a few frames
     # wide in the timeline.  Picture had no reason to cut there — the hole
     # is an artifact of making the audio work, and it flashes black in the
-    # handoff.  When close_gaps_max_frames is set, every gap no wider than
-    # that AND not covered by another video track ("orphaned") is closed by
-    # growing the two neighbouring picture clips toward each other, half the
-    # gap each, so the cut lands where the hole was instead of sliding the
-    # edit.  Audio placement is never touched: only picture moves.  Gaps
-    # wider than the cap are real picture gaps and are left alone.
+    # handoff.  When close_gaps_max_frames is set, every hole no wider than
+    # that is closed by growing the picture on either side of it toward the
+    # middle, half the hole each, so the cut lands where the hole was
+    # instead of sliding the edit.  Audio placement is never touched: only
+    # picture moves, and holes wider than the cap are real picture gaps
+    # that stay exactly as authored.
     gaps_closed = 0
     max_gap_fr  = int(close_gaps_max_frames or 0)
     if max_gap_fr > 0:
         vid_places = [p for p in placements if p["vp"] and p["tn"] in v_tracks]
 
-        # Merged coverage across EVERY video track — a gap that another
-        # angle already covers isn't a hole in picture, so it stays.
+        # Holes are found in the COMPOSITE picture (every video track merged),
+        # not per track.  That's what "orphaned" means: nothing anywhere is
+        # covering that span.  A gap sitting under another angle merges away
+        # and is correctly left alone, and a hole between two different
+        # sources — which land on separate tracks under "group by source"
+        # — is still seen as the one hole it is on screen.
         merged = []
         for cs, ce in sorted((p["v_start_fr"], p["v_end_fr"]) for p in vid_places):
             if merged and cs <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], ce)
             else:
                 merged.append([cs, ce])
-        m_starts = [m[0] for m in merged]
 
-        def _covered(lo, hi):
-            """True if any picture clip overlaps the open span (lo, hi).  The
-            gap's own two neighbours never can — one ends at lo, the other
-            starts at hi — so no exclusion is needed."""
-            i = bisect.bisect_right(m_starts, lo)
-            if i and merged[i - 1][1] > lo:
-                return True
-            return i < len(merged) and merged[i][0] < hi
-
-        by_track = {}
-        for p in vid_places:
-            by_track.setdefault(p["tn"], []).append(p)
-
-        for row in by_track.values():
-            for a, b in zip(row, row[1:]):
-                gap = b["v_start_fr"] - a["v_end_fr"]
-                if gap <= 0 or gap > max_gap_fr:
-                    continue
-                if _covered(a["v_end_fr"], b["v_start_fr"]):
-                    continue
-                # Source room: the outgoing clip needs frames after its out
-                # point, the incoming clip needs frames before its in point.
-                # An unprobed video (vfc None) is treated as having room —
-                # same posture as the out-of-range guard above.
-                room_l = max(0, a["vfc"] - a["v_src_out"]) if a["vfc"] else gap
-                room_r = max(0, b["v_src_in"])
-                want_l = gap - gap // 2          # odd frame → the outgoing clip
-                take_l = min(want_l, room_l)
-                take_r = min(gap - want_l, room_r)
-                # If one side ran out of media, let the other cover the rest
-                # rather than leaving a partial hole.
-                short = gap - take_l - take_r
-                if short > 0:
-                    add     = min(short, room_l - take_l)
-                    take_l += add
-                    short  -= add
-                if short > 0:
-                    take_r += min(short, room_r - take_r)
-                if take_l <= 0 and take_r <= 0:
-                    continue                      # no source room on either side
-                a["v_end_fr"]   += take_l
-                a["v_src_out"]  += take_l
-                b["v_start_fr"] -= take_r
-                b["v_src_in"]   -= take_r
-                gaps_closed += 1
+        for (_, lo), (hi, _) in zip(merged, merged[1:]):
+            gap = hi - lo
+            if gap > max_gap_fr:
+                continue                          # a real picture gap — leave it
+            # Whatever ends where the hole starts grows later; whatever
+            # starts where it ends grows earlier (usually one clip each,
+            # more when angles are stacked).
+            out_clips = [p for p in vid_places if p["v_end_fr"]   == lo]
+            in_clips  = [p for p in vid_places if p["v_start_fr"] == hi]
+            if not out_clips or not in_clips:
+                continue
+            # Source room: an outgoing clip needs frames after its out point,
+            # an incoming clip needs frames before its in point.  Stacked
+            # angles move together, so the tightest one sets the distance.
+            # An unprobed video (vfc None) counts as having room — same
+            # posture as the out-of-range guard above.
+            room_l = min((max(0, p["vfc"] - p["v_src_out"]) if p["vfc"] else gap)
+                         for p in out_clips)
+            room_r = min(max(0, p["v_src_in"]) for p in in_clips)
+            want_l = gap - gap // 2               # odd frame → the outgoing clip
+            take_l = min(want_l, room_l)
+            take_r = min(gap - want_l, room_r)
+            # If one side ran out of media, let the other cover the rest
+            # rather than leaving a partial hole.
+            short = gap - take_l - take_r
+            if short > 0:
+                add     = min(short, room_l - take_l)
+                take_l += add
+                short  -= add
+            if short > 0:
+                take_r += min(short, room_r - take_r)
+            if take_l <= 0 and take_r <= 0:
+                continue                          # no source room on either side
+            for p in out_clips:
+                p["v_end_fr"]  += take_l
+                p["v_src_out"] += take_l
+            for p in in_clips:
+                p["v_start_fr"] -= take_r
+                p["v_src_in"]   -= take_r
+            gaps_closed += 1
 
     if stats_out is not None:
         stats_out["gaps_closed"] = gaps_closed
