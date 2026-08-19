@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(pip install pyaaf2)",
-      "Bash(python -m pip install pyaaf2)",
-      "Bash(python -c \":*)"
-    ]
-  }
-}

@@ -11,3 +11,9 @@ _pq_stream.log
 sync_preview_log.txt
 match_review_log.txt
 waveform_cache/
+
+# Per-user / per-machine editor + tool state — Claude Code auto-grows
+# settings.local.json every session; .vs is Visual Studio's per-user
+# state.  Both showed up in `git status` on every commit.
+.claude/settings.local.json
+.vs/
