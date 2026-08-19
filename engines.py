@@ -1,4 +1,4 @@
-import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
+import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading, bisect
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -4276,7 +4276,8 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
                       mix_path=None, include_camera_audio=False,
-                      warnings_out=None):
+                      warnings_out=None, close_gaps_max_frames=0,
+                      stats_out=None):
     fps        = seq_fps
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
@@ -4322,6 +4323,12 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     # Track per-track previous clip end (after fade extension) so head extensions
     # don't cause overlap with the preceding clip.
     track_prev_end = {}   # tn → end_fr after extension
+
+    # Pass 1 places every clip on the timeline; the orphaned-gap pass then
+    # nudges picture edges; pass 3 emits the clipitems.  Placement and
+    # emission are separate so a gap can be closed with full knowledge of
+    # what every other track ends up covering.
+    placements = []
 
     for clip in sorted_clips:
         tn         = clip["track_name"]
@@ -4432,13 +4439,108 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                             "{} — clamped into range (re-sync needed).".format(
                                 _base, v_offset, _vbn))
 
+        placements.append({
+            "tn":         tn,
+            "vp":         vp,
+            "ap":         ap,
+            "start_fr":   start_fr,
+            "end_fr":     end_fr,
+            # Picture carries its own timeline bounds so the orphaned-gap
+            # pass can move video edges without disturbing audio placement.
+            "v_start_fr": start_fr,
+            "v_end_fr":   end_fr,
+            "v_src_in":   v_src_in,
+            "v_src_out":  v_src_out,
+            "a_src_in":   a_src_in,
+            "a_src_out":  a_src_out,
+            "vfc":        _video_frame_count(vp) if vp else None,
+        })
+
+    # ── Orphaned-gap closing (picture only) ────────────────────────────────
+    # Cutting a breath or a stumble in the DAW leaves a hole a few frames
+    # wide in the timeline.  Picture had no reason to cut there — the hole
+    # is an artifact of making the audio work, and it flashes black in the
+    # handoff.  When close_gaps_max_frames is set, every gap no wider than
+    # that AND not covered by another video track ("orphaned") is closed by
+    # growing the two neighbouring picture clips toward each other, half the
+    # gap each, so the cut lands where the hole was instead of sliding the
+    # edit.  Audio placement is never touched: only picture moves.  Gaps
+    # wider than the cap are real picture gaps and are left alone.
+    gaps_closed = 0
+    max_gap_fr  = int(close_gaps_max_frames or 0)
+    if max_gap_fr > 0:
+        vid_places = [p for p in placements if p["vp"] and p["tn"] in v_tracks]
+
+        # Merged coverage across EVERY video track — a gap that another
+        # angle already covers isn't a hole in picture, so it stays.
+        merged = []
+        for cs, ce in sorted((p["v_start_fr"], p["v_end_fr"]) for p in vid_places):
+            if merged and cs <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], ce)
+            else:
+                merged.append([cs, ce])
+        m_starts = [m[0] for m in merged]
+
+        def _covered(lo, hi):
+            """True if any picture clip overlaps the open span (lo, hi).  The
+            gap's own two neighbours never can — one ends at lo, the other
+            starts at hi — so no exclusion is needed."""
+            i = bisect.bisect_right(m_starts, lo)
+            if i and merged[i - 1][1] > lo:
+                return True
+            return i < len(merged) and merged[i][0] < hi
+
+        by_track = {}
+        for p in vid_places:
+            by_track.setdefault(p["tn"], []).append(p)
+
+        for row in by_track.values():
+            for a, b in zip(row, row[1:]):
+                gap = b["v_start_fr"] - a["v_end_fr"]
+                if gap <= 0 or gap > max_gap_fr:
+                    continue
+                if _covered(a["v_end_fr"], b["v_start_fr"]):
+                    continue
+                # Source room: the outgoing clip needs frames after its out
+                # point, the incoming clip needs frames before its in point.
+                # An unprobed video (vfc None) is treated as having room —
+                # same posture as the out-of-range guard above.
+                room_l = max(0, a["vfc"] - a["v_src_out"]) if a["vfc"] else gap
+                room_r = max(0, b["v_src_in"])
+                want_l = gap - gap // 2          # odd frame → the outgoing clip
+                take_l = min(want_l, room_l)
+                take_r = min(gap - want_l, room_r)
+                # If one side ran out of media, let the other cover the rest
+                # rather than leaving a partial hole.
+                short = gap - take_l - take_r
+                if short > 0:
+                    add     = min(short, room_l - take_l)
+                    take_l += add
+                    short  -= add
+                if short > 0:
+                    take_r += min(short, room_r - take_r)
+                if take_l <= 0 and take_r <= 0:
+                    continue                      # no source room on either side
+                a["v_end_fr"]   += take_l
+                a["v_src_out"]  += take_l
+                b["v_start_fr"] -= take_r
+                b["v_src_in"]   -= take_r
+                gaps_closed += 1
+
+    if stats_out is not None:
+        stats_out["gaps_closed"] = gaps_closed
+
+    # ── Emit clipitems ─────────────────────────────────────────────────
+    for p in placements:
+        tn, vp, ap = p["tn"], p["vp"], p["ap"]
+
         if vp and tn in v_tracks:
             fid   = "file-v-{}".format(os.path.basename(vp).replace(" ", "_"))
             cid   = "clip-{}".format(ctr); ctr += 1
             first = fid not in defined
             if first: defined.add(fid)
-            ci = _make_clipitem(cid, fid, vp, start_fr, end_fr,
-                                v_src_in, v_src_out, fps,
+            ci = _make_clipitem(cid, fid, vp, p["v_start_fr"], p["v_end_fr"],
+                                p["v_src_in"], p["v_src_out"], fps,
                                 True, first, seq_w, seq_h, seq_sr)
             v_tracks[tn].append(ci)
 
@@ -4448,9 +4550,12 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                 # clipitem reference the *same* fid — a separate file-cam-... fid
                 # silently prevents linking even when clip IDs cross-reference.
                 # <sourcetrack> is still needed to tell Premiere which stream to read.
+                # Camera audio mirrors the picture bounds (gap fill included) —
+                # a linked pair has to stay the same length to stay linked.
                 cam_cid = "clip-{}".format(ctr); ctr += 1
-                cam_ci  = _make_clipitem(cam_cid, fid, vp, start_fr, end_fr,
-                                         v_src_in, v_src_out, fps,
+                cam_ci  = _make_clipitem(cam_cid, fid, vp,
+                                         p["v_start_fr"], p["v_end_fr"],
+                                         p["v_src_in"], p["v_src_out"], fps,
                                          False, False, seq_w, seq_h, seq_sr,
                                          audio_source_track=1)
                 cam_tracks[tn].append(cam_ci)
@@ -4463,8 +4568,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             cid   = "clip-{}".format(ctr); ctr += 1
             first = fid not in defined
             if first: defined.add(fid)
-            ci = _make_clipitem(cid, fid, ap, start_fr, end_fr,
-                                a_src_in, a_src_out, fps,
+            ci = _make_clipitem(cid, fid, ap, p["start_fr"], p["end_fr"],
+                                p["a_src_in"], p["a_src_out"], fps,
                                 False, first, seq_w, seq_h, seq_sr)
             a_tracks[tn].append(ci)
 

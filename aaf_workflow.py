@@ -731,6 +731,31 @@ class AafWorkflowMixin:
                        activebackground=SURF, activeforeground=TEXT,
                        relief="flat", bd=0).pack(side="left")
 
+        # ── Orphaned video-gap closing ───────────────────────────────────
+        # An audio edit (a cut breath, a removed stumble) leaves a few-frame
+        # hole that picture never asked for.  Closing it grows the two
+        # neighbouring video clips toward each other — half the gap each —
+        # so the cut lands where the hole was.  Audio placement is untouched.
+        if not hasattr(self, "_aaf_close_gaps_var"):
+            self._aaf_close_gaps_var = tk.BooleanVar(value=False)
+        if not hasattr(self, "_aaf_close_gaps_fr_var"):
+            self._aaf_close_gaps_fr_var = tk.StringVar(value="10")
+        gap_row = tk.Frame(sf, bg=SURF)
+        gap_row.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Checkbutton(gap_row, text="Close orphaned video gaps up to",
+                       variable=self._aaf_close_gaps_var,
+                       font=FB, bg=SURF, fg=TEXT, selectcolor=SURF2,
+                       activebackground=SURF, activeforeground=TEXT,
+                       relief="flat", bd=0).pack(side="left")
+        tk.Entry(gap_row, textvariable=self._aaf_close_gaps_fr_var,
+                 font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", width=4, justify="center").pack(side="left",
+                                                               padx=(2, 5))
+        tk.Label(gap_row,
+                 text="frames   (picture closes in equally from both sides; "
+                      "audio is untouched, wider gaps stay)",
+                 font=FB, bg=SURF, fg=SUB).pack(side="left")
+
         # Restore pool contents: back-navigation takes priority over prefetch
         if _saved_vpaths or _saved_apaths:
             if _saved_vpaths: self._aaf_add_video_batch(_saved_vpaths)
@@ -4238,6 +4263,10 @@ class AafWorkflowMixin:
             "seq_name":      self.seq_name.get(),
             "mix_path":      getattr(self, "_aaf_mix_var", tk.StringVar()).get(),
             "camera_audio":  getattr(self, "_aaf_cam_audio_var", tk.BooleanVar()).get(),
+            "close_gaps":    getattr(self, "_aaf_close_gaps_var",
+                                     tk.BooleanVar()).get(),
+            "close_gaps_frames": getattr(self, "_aaf_close_gaps_fr_var",
+                                         tk.StringVar(value="10")).get(),
         }
 
     def _aaf_save_setup(self, prompt=True):
@@ -4461,6 +4490,14 @@ class AafWorkflowMixin:
             if not hasattr(self, "_aaf_cam_audio_var"):
                 self._aaf_cam_audio_var = tk.BooleanVar()
             self._aaf_cam_audio_var.set(bool(data["camera_audio"]))
+        if "close_gaps" in data:
+            if not hasattr(self, "_aaf_close_gaps_var"):
+                self._aaf_close_gaps_var = tk.BooleanVar()
+            self._aaf_close_gaps_var.set(bool(data["close_gaps"]))
+        if "close_gaps_frames" in data:
+            if not hasattr(self, "_aaf_close_gaps_fr_var"):
+                self._aaf_close_gaps_fr_var = tk.StringVar()
+            self._aaf_close_gaps_fr_var.set(str(data["close_gaps_frames"]))
 
         # Probe loaded files and populate the "Detected from source" preset entries
         self._aaf_update_seq_presets()
@@ -4519,6 +4556,23 @@ class AafWorkflowMixin:
         except ValueError:
             messagebox.showerror("Invalid FPS", "Enter a valid frame rate (e.g. 29.97).")
             return
+
+        # Orphaned-gap cap — validated here (alongside FPS) so a bad value is
+        # caught before the user picks an output file.
+        close_gaps_fr = 0
+        _cg_var = getattr(self, "_aaf_close_gaps_var", None)
+        if _cg_var is not None and _cg_var.get():
+            try:
+                close_gaps_fr = int(float(
+                    self._aaf_close_gaps_fr_var.get().strip()))
+            except (ValueError, AttributeError):
+                close_gaps_fr = 0
+            if close_gaps_fr <= 0:
+                messagebox.showerror(
+                    "Invalid Gap Length",
+                    "Enter the maximum orphaned gap as a whole number of "
+                    "frames (e.g. 10), or turn the option off.")
+                return
 
         group_mode = self._aaf_group_var.get()   # "single" or "by_source"
 
@@ -4824,6 +4878,7 @@ class AafWorkflowMixin:
 
                 self._aaf_build_progress(80, "Building XML\u2026")
                 _oor_warnings = []
+                _build_stats  = {}
                 xmeml = engines.build_xml_from_pt(
                     clips_with_media,
                     track_names_ordered,
@@ -4831,7 +4886,13 @@ class AafWorkflowMixin:
                     seq_w=_seq_w, seq_h=_seq_h, seq_fps=fps, seq_sr=sr,
                     mix_path=mix_path or None,
                     include_camera_audio=cam_audio_v,
-                    warnings_out=_oor_warnings)
+                    warnings_out=_oor_warnings,
+                    close_gaps_max_frames=close_gaps_fr,
+                    stats_out=_build_stats)
+                _gaps_closed = _build_stats.get("gaps_closed", 0)
+                if close_gaps_fr:
+                    print("Orphaned video gaps closed (\u2264{} frames): {}".format(
+                        close_gaps_fr, _gaps_closed))
 
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
@@ -4840,7 +4901,8 @@ class AafWorkflowMixin:
                 def _finish():
                     self.out_path.set(out)
                     self._aaf_done(matched, unmatched,
-                                   len(clips_with_media), clip_results)
+                                   len(clips_with_media), clip_results,
+                                   gaps_closed=_gaps_closed)
                     # Surface any clips whose sync offset placed them
                     # outside their media \u2014 clamped (not dropped), but
                     # they need a re-sync.
@@ -4871,7 +4933,8 @@ class AafWorkflowMixin:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _aaf_done(self, matched, unmatched, total, clip_results=None):
+    def _aaf_done(self, matched, unmatched, total, clip_results=None,
+                  gaps_closed=0):
         self._clear()
         tk.Frame(self.body, bg=BG, height=20).pack()
         tk.Label(self.body, text="\u2713",
@@ -4885,11 +4948,14 @@ class AafWorkflowMixin:
         card = tk.Frame(self.body, bg=SURF,
                         highlightbackground=BORDER, highlightthickness=1)
         card.pack(padx=60, fill="x")
-        for lbl, val, col in [
+        _rows = [
             ("Total AAF clips",   str(total),     TEXT),
             ("Matched to video",  str(matched),   SUCCESS),
             ("Unmatched",         str(unmatched), WARN if unmatched else SUB),
-        ]:
+        ]
+        if gaps_closed:
+            _rows.append(("Video gaps closed", str(gaps_closed), SUCCESS))
+        for lbl, val, col in _rows:
             r = tk.Frame(card, bg=SURF); r.pack(fill="x", padx=16, pady=3)
             tk.Label(r, text="{:<22}".format(lbl),
                      font=FB, bg=SURF, fg=SUB).pack(side="left")
