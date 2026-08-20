@@ -1188,7 +1188,11 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
                                         audio_path, start_offset,
                                         DUR1, _SR1_EXTR)
     if raw_vid1 is None or raw_aud1 is None:
-        return 0.0, 0.0
+        # 3-tuple, not 2 — every caller unpacks (T, conf, alts).  Returning
+        # a bare (0.0, 0.0) here raised "not enough values to unpack" out of
+        # detect_sync_offset, which the SYNC button surfaced as "⚠ error"
+        # instead of the honest "no confident match" result this path means.
+        return 0.0, 0.0, []
 
     # ── Pass A: 50 Hz, first 60 s, ±30 s ─────────────────────────────────
     _WIN_A   = _SR1_EXTR // 50          # 160 samples = 20 ms

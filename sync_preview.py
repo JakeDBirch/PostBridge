@@ -26,6 +26,7 @@ _log = logging.getLogger("sync_preview")
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     SUCCESS, WARN, FB, FBT, FH, WAVE_REF, WAVE_VID)
 from engines import extract_mono_pcm, extract_audio_segment
+from utils import offline_media, offline_media_message
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SR           = 8000       # extraction sample rate for waveform display
@@ -292,6 +293,15 @@ class SyncPreviewDialog:
     def _extract(self):
         _log.info("extracting waveforms: vid=%s  ref=%s", self._vp, self._ap)
         import numpy as _np
+        # Refuse to start on cloud placeholders.  extract_mono_pcm decodes the
+        # file end to end, so an online-only source hydrates in full first —
+        # the dialog just sits on "loading waveforms" for as long as the
+        # download takes, with nothing to distinguish it from a hang.
+        _stale = offline_media([self._vp, self._ap])
+        if _stale:
+            _log.error("aborting: cloud placeholders: %s",
+                       [p for p, _f, _s in _stale])
+            raise RuntimeError(offline_media_message(_stale, action="load"))
         vid = extract_mono_pcm(self._vp, sample_rate=_SR)
         ref = extract_mono_pcm(self._ap, sample_rate=_SR)
         _log.info("extracted  vid=%d samples  ref=%d samples", len(vid), len(ref))
@@ -319,8 +329,12 @@ class SyncPreviewDialog:
         except Exception as exc:
             def _err():
                 try:
+                    # justify/wraplength so a multi-line diagnostic (e.g. the
+                    # cloud-placeholder report) stays inside the canvas
+                    # instead of running off both edges.
                     self._loading_lbl.config(
-                        text="Extraction failed: {}".format(exc))
+                        text="Extraction failed:\n\n{}".format(exc),
+                        justify="left", wraplength=520, fg=WARN)
                 except Exception:
                     pass
             self._win.after(0, _err)

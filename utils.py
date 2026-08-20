@@ -29,6 +29,120 @@ def run_hidden(cmd, **kwargs):
 def basename(p):
     return ntpath.basename(p) or os.path.basename(p)
 
+# ── Cloud-placeholder (Dropbox / OneDrive / iCloud) detection ────────────────
+# Files synced by a cloud provider in "online-only" mode exist as zero-byte
+# reparse-point placeholders: os.path.isfile() is True and st_size reports the
+# FULL logical size, so every existence/size check in the app passes.  The
+# bytes only arrive when something reads the file, and that read blocks for as
+# long as the download takes — minutes for a 700 MB WAV, hours for a 20 GB MP4.
+#
+# That is indistinguishable from a hang: ffmpeg sits there producing nothing
+# until our subprocess timeout fires, and the caller reports a generic failure.
+# Detecting it up front lets us say what is actually wrong.
+#
+# Both APIs used here read metadata only — neither triggers hydration.
+_FILE_ATTRIBUTE_OFFLINE               = 0x00001000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x00040000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+_RECALL_MASK = (_FILE_ATTRIBUTE_OFFLINE
+                | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def local_fraction(path):
+    """Fraction (0.0-1.0) of *path* whose bytes are actually on local disk.
+
+    Returns 1.0 when the file is fully local, when the platform gives us no
+    way to tell, or on any error — callers must never block work on a
+    negative answer they cannot trust.
+    """
+    try:
+        logical = os.path.getsize(path)
+    except OSError:
+        return 1.0
+    if logical <= 0:
+        return 1.0
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+            k32.GetFileAttributesW.restype  = wintypes.DWORD
+            attrs = k32.GetFileAttributesW(path)
+            if attrs == 0xFFFFFFFF or not (attrs & _RECALL_MASK):
+                # No recall-on-access flag → ordinary local file.  Skip the
+                # size probe so genuinely sparse local media isn't flagged.
+                return 1.0
+
+            k32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR,
+                                                   ctypes.POINTER(wintypes.DWORD)]
+            k32.GetCompressedFileSizeW.restype  = wintypes.DWORD
+            hi = wintypes.DWORD(0)
+            lo = k32.GetCompressedFileSizeW(path, ctypes.byref(hi))
+            if lo == 0xFFFFFFFF and ctypes.get_last_error() != 0:
+                return 1.0
+            on_disk = (hi.value << 32) | lo
+        except Exception:
+            return 1.0
+    else:
+        try:
+            on_disk = os.stat(path).st_blocks * 512
+        except (AttributeError, OSError):
+            return 1.0
+
+    return max(0.0, min(1.0, float(on_disk) / float(logical)))
+
+
+def offline_media(paths, threshold=0.9):
+    """Filter *paths* down to the ones not sufficiently present on local disk.
+
+    Returns a list of ``(path, local_fraction, logical_size_bytes)`` tuples,
+    in the order given.  An empty list means everything is ready to read.
+    """
+    out = []
+    for p in paths:
+        if not p or not os.path.isfile(p):
+            continue
+        frac = local_fraction(p)
+        if frac < threshold:
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = 0
+            out.append((p, frac, size))
+    return out
+
+
+def _human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "{:.1f} {}".format(n, unit)
+        n /= 1024.0
+
+
+def offline_media_message(stale, action="read"):
+    """Human-readable explanation for a non-empty offline_media() result."""
+    lines = ["These files are cloud placeholders — their data is not on local "
+             "disk, so any attempt to {} them stalls while the cloud client "
+             "downloads them:".format(action), ""]
+    pending = 0
+    for p, frac, size in stale:
+        pending += size * (1.0 - frac)
+        lines.append("  • {}  ({}, {:.0f}% local)".format(
+            basename(p), _human_bytes(size), frac * 100))
+    lines += ["",
+              "About {} would have to download first.".format(
+                  _human_bytes(pending)),
+              "",
+              "Make them available offline in your cloud client (Dropbox: "
+              "right-click → Make available offline), wait for the download "
+              "to finish, then run this again."]
+    return chr(10).join(lines)
+
+
 def pathurl(p):
     """Convert an absolute file path to a file:// URL suitable for FCP/Premiere XMEML."""
     p = os.path.abspath(p)

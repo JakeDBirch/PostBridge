@@ -29,7 +29,8 @@ except ImportError:
 from config import *
 from config import _SANS
 from utils import (basename, is_video, is_audio, is_media,
-                   MEDIA_EXTS, VIDEO_EXTS, run_hidden)
+                   MEDIA_EXTS, VIDEO_EXTS, run_hidden,
+                   offline_media, offline_media_message)
 from parsers import (get_clip_base_name, parse_aaf_session,
                      match_source_to_video, detect_sync_offset,
                      verify_sync_at_offset)
@@ -2661,6 +2662,19 @@ class AafWorkflowMixin:
         if not os.path.isfile(ap):
             messagebox.showwarning("Missing Audio",
                 "Reference audio file not found:\n{}".format(ap))
+            return
+
+        # Cloud-placeholder preflight.  os.path.isfile() above passes for a
+        # Dropbox/OneDrive online-only file even though none of its bytes are
+        # local, and every ffmpeg call downstream then blocks on hydration
+        # until its timeout expires.  Detect it here and say so, rather than
+        # letting the user watch SYNCING… spin for ten minutes and land on a
+        # generic failure.
+        _stale = offline_media(_all_vps + [ap])
+        if _stale:
+            messagebox.showwarning(
+                "Media Not Downloaded",
+                offline_media_message(_stale, action="sync"))
             return
 
         start_offset = 0.0
