@@ -19,5 +19,6 @@ pyaaf2>=1.7.0
 # ── NumPy for waveform blob detection (optional — gracefully disabled if absent)
 numpy>=1.24.0
 
-# ── Audio playback for sync preview panel
-simpleaudio>=1.0.4
+# ── Audio playback
+# No third-party dependency: playback goes through winsound on Windows.
+# macOS/Linux currently have no playback backend — see MAC_BUILD.md.

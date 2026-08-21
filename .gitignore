@@ -17,3 +17,6 @@ waveform_cache/
 # state.  Both showed up in `git status` on every commit.
 .claude/settings.local.json
 .vs/
+
+# macOS build venv (created by build.sh)
+.venv-build/
