@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings regardless of the committer's
+# core.autocrlf setting — a CRLF build.sh fails on macOS with
+# "bad interpreter: /usr/bin/env: no such file or directory".
+*.sh text eol=lf
+
+# Windows batch files are the mirror case.
+*.bat text eol=crlf
