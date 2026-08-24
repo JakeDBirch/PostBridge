@@ -2768,6 +2768,25 @@ class AafWorkflowMixin:
                 best_fn = self._aaf_vid_label(best_vp)
                 sv = self._aaf_source_file_vars.get(base)
                 if sv and sv.get() != best_fn:
+                    # SWAP with the slot the winner already occupies — never
+                    # a plain overwrite.  Every candidate came FROM this
+                    # source's slots, so the winner is almost always sitting
+                    # in an extra slot; assigning it to slot 1 without
+                    # vacating that slot leaves it in both, which duplicates
+                    # one camera and silently drops whatever slot 1 held.
+                    # (Seen in the field: slots went [CAM 1, CAM 2, CAM 3] ->
+                    # [CAM 2, CAM 2, CAM 3], so the build stacked CAM 2 twice
+                    # and never used CAM 1.)  Only the file labels trade
+                    # places: the parallel per-slot sync/audio/offset lists
+                    # are unbuilt plumbing whose slot-1 entries are the
+                    # source's real reference audio and offset, and swapping
+                    # those would clear them.
+                    _prev_fn = sv.get()
+                    for _ev in getattr(self, "_aaf_source_extra_vars",
+                                       {}).get(base, []):
+                        if _ev.get() == best_fn:
+                            _ev.set(_prev_fn)
+                            break
                     sv.set(best_fn)
                     # For single-slot view, update the button label directly
                     n_slots = getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
@@ -4630,25 +4649,40 @@ class AafWorkflowMixin:
         source_video = {}
         for base, sv in self._aaf_source_file_vars.items():
             _paths = []
-            fn = sv.get()
-            if fn != "— no video —" and fn in path_by_fn:
-                _paths.append(path_by_fn[fn])
+            # A source's slots are meant to be DISTINCT files — stacking the
+            # same camera twice just doubles a lane, and in positional mode it
+            # spends a slot on a repeat.  Dedupe defensively so a duplicate
+            # assignment can never reach the XML, and say so.
+            _seen_vp = set()
+            def _add_slot(_fn, _base=base, _paths=_paths, _seen=_seen_vp):
+                if _fn == "— no video —" or _fn not in path_by_fn:
+                    return
+                _vp = path_by_fn[_fn]
+                if _vp in _seen:
+                    print("  {}: '{}' assigned to more than one slot — "
+                          "using it once.".format(_base, _fn))
+                    return
+                _seen.add(_vp)
+                _paths.append(_vp)
+            _add_slot(sv.get())
             for _ev in getattr(self, "_aaf_source_extra_vars", {}).get(base, []):
-                fn2 = _ev.get()
-                if fn2 != "— no video —" and fn2 in path_by_fn:
-                    _paths.append(path_by_fn[fn2])
+                _add_slot(_ev.get())
             if _paths:
                 source_video[base] = _paths
 
-        # Warn if any multi-slot source has unfilled slots
+        # Warn if any multi-slot source has unfilled slots.  DISTINCT files
+        # is the count that matters: a file sitting in two slots covers no
+        # more angles than one in a single slot, so it reads as an unfilled
+        # slot here rather than slipping through as "3/3 filled".
         _partial_fills = []
         for base in self._aaf_sources:
             _n = getattr(self, "_aaf_source_slot_counts", {}).get(base, 1)
             if _n > 1:
                 _sv0 = self._aaf_source_file_vars.get(base)
                 _evs = getattr(self, "_aaf_source_extra_vars", {}).get(base, [])
-                _filled = (1 if _sv0 and _sv0.get() != "— no video —" else 0) + sum(
-                    1 for _ev in _evs if _ev.get() != "— no video —")
+                _assigned = {v.get() for v in ([_sv0] if _sv0 else []) + list(_evs)
+                             if v.get() != "— no video —"}
+                _filled = len(_assigned)
                 if _filled < _n:
                     _partial_fills.append((base, _filled, _n))
         if _partial_fills:
