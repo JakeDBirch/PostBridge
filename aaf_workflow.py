@@ -382,8 +382,6 @@ class AafWorkflowMixin:
         self._aaf_count_lbl.pack(side="right")
         self._btn(ph, "\u21bb REFRESH", self._aaf_refresh_pool,
                   small=True).pack(side="right", padx=(0, 4))
-        self._btn(ph, "\u26d3 JOIN SPLIT", self._aaf_join_split_dialog,
-                  small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FOLDER", self._aaf_browse_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(ph, "+ BROWSE FILES",  self._aaf_browse_files,
@@ -405,6 +403,12 @@ class AafWorkflowMixin:
         # Body starts collapsed
         self._aaf_video_paths = []
         self._aaf_video_rows  = {}   # full path → row Frame (identity, not label text)
+        # Pool-scoped tools live inside the drawer so they only show when open
+        v_tools = tk.Frame(v_body, bg=SURF)
+        v_tools.pack(fill="x", padx=12, pady=(0, 6))
+        self._btn(v_tools, "\u26d3 JOIN SPLIT", self._aaf_join_split_dialog,
+                  small=True).pack(side="right")
+
         self._aaf_file_list   = tk.Frame(v_body, bg=SURF)
         self._aaf_file_list.pack(fill="x", padx=12)
 
@@ -440,8 +444,6 @@ class AafWorkflowMixin:
         self._aaf_audio_count_lbl.pack(side="right")
         self._btn(aph, "\u21bb REFRESH", self._aaf_refresh_pool,
                   small=True).pack(side="right", padx=(0, 4))
-        self._btn(aph, "\u26d3 MIX TO REF", self._aaf_mix_reference_dialog,
-                  small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FOLDER", self._aaf_browse_audio_folder,
                   small=True).pack(side="right", padx=(0, 4))
         self._btn(aph, "+ BROWSE FILES",  self._aaf_browse_audio_files,
@@ -463,6 +465,12 @@ class AafWorkflowMixin:
         # Body starts collapsed
         self._aaf_audio_paths     = []
         self._aaf_audio_rows      = {}   # full path → row Frame (sister of _aaf_video_rows)
+        # Pool-scoped tools live inside the drawer so they only show when open
+        a_tools = tk.Frame(a_body, bg=SURF)
+        a_tools.pack(fill="x", padx=12, pady=(0, 6))
+        self._btn(a_tools, "\u26d3 MIX TO REF", self._aaf_mix_reference_dialog,
+                  small=True).pack(side="right")
+
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
 
