@@ -4857,6 +4857,12 @@ class AafWorkflowMixin:
 
         # Snapshot Tkinter vars before handing off to the worker thread.
         sr       = self._aaf_data.get("sample_rate", 48000)
+        # Session start timecode - the composition's clip positions are all
+        # relative to this.  Without it the XML asserts the sequence begins at
+        # 00:00:00:00 and Premiere lands the whole conform off by the session
+        # start (an hour, on any session started at 01:00:00:00).
+        start_tc  = float(self._aaf_data.get("start_tc_secs", 0.0) or 0.0)
+        drop_fr   = bool(self._aaf_data.get("drop_frame", False))
         try:
             seq_w = int(getattr(self, "_aaf_seq_w_var", tk.StringVar()).get() or "0")
             seq_h = int(getattr(self, "_aaf_seq_h_var", tk.StringVar()).get() or "0")
@@ -4969,6 +4975,9 @@ class AafWorkflowMixin:
                         pass
 
                 self._aaf_build_progress(80, "Building XML\u2026")
+                print("Sequence start timecode: {} ({}) - from AAF".format(
+                    engines.secs_to_tc(start_tc, fps, drop_fr)[0],
+                    "drop-frame" if drop_fr else "non-drop"))
                 _oor_warnings = []
                 _build_stats  = {}
                 xmeml = engines.build_xml_from_pt(
@@ -4981,7 +4990,8 @@ class AafWorkflowMixin:
                     warnings_out=_oor_warnings,
                     close_gaps_max_secs=close_gaps_secs,
                     close_gaps_across_sources=close_gaps_src,
-                    stats_out=_build_stats)
+                    stats_out=_build_stats,
+                    seq_start_secs=start_tc, seq_drop_frame=drop_fr)
                 _gaps_closed = _build_stats.get("gaps_closed", 0)
                 if close_gaps_secs:
                     print("Video gaps closed (\u2264{:.1f}s{}): {}".format(

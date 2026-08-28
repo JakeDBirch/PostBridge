@@ -3321,12 +3321,46 @@ def make_rate(el, fps):
     SubElement(r, "timebase").text = str(int(round(base)))
     SubElement(r, "ntsc").text     = ntsc
 
-def make_tc(el, fps):
+def secs_to_tc(secs, fps, drop=False):
+    """
+    Format seconds as an SMPTE timecode string.
+
+    Returns (string, frame_number).  `frame_number` is the plain frame count
+    Premiere wants in <frame>; `string` is the human-readable label, which for
+    drop-frame counts differently (it skips labels, not frames).
+    """
+    if not fps or fps <= 0:
+        return "00:00:00:00", 0
+    total = int(round(max(0.0, secs) * fps))
+    nominal = int(round(fps))          # 29.97 -> 30, 23.976 -> 24
+
+    n = total
+    if drop and nominal in (30, 60):
+        # Standard drop-frame renumbering: two labels (four at 59.94) are
+        # skipped at the top of every minute except every tenth.
+        dropped        = 2 if nominal == 30 else 4
+        per_10_minutes = int(round(fps * 600))
+        per_minute     = nominal * 60 - dropped
+        d, m = divmod(n, per_10_minutes)
+        n += dropped * 9 * d
+        if m > dropped:
+            n += dropped * ((m - dropped) // per_minute)
+
+    fr   = n % nominal
+    rest = n // nominal
+    sec  = rest % 60
+    mins = (rest // 60) % 60
+    hrs  = (rest // 3600) % 24
+    return "{:02d}:{:02d}:{:02d}{}{:02d}".format(
+        hrs, mins, sec, ";" if drop else ":", fr), total
+
+def make_tc(el, fps, start_secs=0.0, drop_frame=False):
     tc = SubElement(el, "timecode")
     make_rate(tc, fps)
-    SubElement(tc, "string").text        = "00:00:00:00"
-    SubElement(tc, "frame").text         = "0"
-    SubElement(tc, "displayformat").text = "NDF"
+    label, frame = secs_to_tc(start_secs, fps, drop_frame)
+    SubElement(tc, "string").text        = label
+    SubElement(tc, "frame").text         = str(frame)
+    SubElement(tc, "displayformat").text = "DF" if drop_frame else "NDF"
 
 def detect_av_offset(audio_path, video_path, search_secs=60, sr=1000):
     if not audio_path or not video_path:
@@ -4277,7 +4311,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
                       mix_path=None, include_camera_audio=False,
                       warnings_out=None, close_gaps_max_secs=0.0,
-                      close_gaps_across_sources=False, stats_out=None):
+                      close_gaps_across_sources=False, stats_out=None,
+                      seq_start_secs=0.0, seq_drop_frame=False):
     fps        = seq_fps
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
@@ -4589,7 +4624,7 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     seq   = SubElement(xmeml, "sequence", id="sequence-1")
     SubElement(seq, "name").text     = seq_name
     SubElement(seq, "duration").text = str(total)
-    make_rate(seq, fps); make_tc(seq, fps)
+    make_rate(seq, fps); make_tc(seq, fps, seq_start_secs, seq_drop_frame)
 
     media = SubElement(seq, "media")
     vel   = SubElement(media, "video")

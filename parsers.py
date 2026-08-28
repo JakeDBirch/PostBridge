@@ -1881,6 +1881,10 @@ def parse_aaf_session(aaf_path):
         session_name  : str,
         fps           : float,        # always 29.97 — audio AAF has no FPS slot
         sample_rate   : int,
+        start_tc_secs : float,        # session start timecode, in seconds
+        start_tc_frames: int,         # ...and in frames at tc_fps
+        tc_fps        : float,        # rate the timecode slot counts at
+        drop_frame    : bool,         # True when the session counts drop-frame
         tracks        : [
             { name: str,
               clips : [
@@ -1921,11 +1925,15 @@ def parse_aaf_session(aaf_path):
             return ""
 
     result = {
-        "session_name": os.path.splitext(os.path.basename(aaf_path))[0],
-        "fps":          29.97,
-        "sample_rate":  48000,
-        "tracks":       [],
-        "markers":      [],
+        "session_name":    os.path.splitext(os.path.basename(aaf_path))[0],
+        "fps":             29.97,
+        "sample_rate":     48000,
+        "tracks":          [],
+        "markers":         [],
+        "start_tc_secs":   0.0,
+        "start_tc_frames": 0,
+        "tc_fps":          0.0,
+        "drop_frame":      False,
     }
 
     def _cn(obj):
@@ -1963,6 +1971,78 @@ def parse_aaf_session(aaf_path):
                 result["session_name"] = comp_mob.name
         except Exception:
             pass
+
+        # ── Session start timecode ────────────────────────────────────────────
+        # Every clip position below is accumulated from the composition's zero.
+        # That zero is only meaningful next to the session's start timecode,
+        # which lives in a separate Timecode slot.  Without it the XML claims
+        # the sequence starts at 00:00:00:00 and the whole conform lands off by
+        # exactly the session start (typically one hour).
+        def _read_tc(component):
+            """Pull (start_frames, fps, drop) off a Timecode component."""
+            def _get(name):
+                try:    return component[name].value
+                except Exception: pass
+                try:    return getattr(component, name.lower())
+                except Exception: return None
+            start = _get('Start')
+            tcfps = _get('FPS')
+            drop  = _get('Drop')
+            if start is None:
+                return None
+            return (int(start),
+                    float(tcfps) if tcfps else 0.0,
+                    bool(drop))
+
+        def _find_tc(mob):
+            """First Timecode component on a mob, direct or inside a Sequence."""
+            try:    slots = list(mob.slots)
+            except Exception: return None
+            for sl in slots:
+                try:    sseg = sl.segment
+                except Exception: continue
+                if _cn(sseg) == 'Timecode':
+                    got = _read_tc(sseg)
+                    if got:
+                        return got + (_rate(sl),)
+                elif _cn(sseg) == 'Sequence':
+                    try:    subs = list(sseg.components)
+                    except Exception: continue
+                    for sub in subs:
+                        if _cn(sub) == 'Timecode':
+                            got = _read_tc(sub)
+                            if got:
+                                return got + (_rate(sl),)
+            return None
+
+        found = _find_tc(comp_mob)
+        if found is None:
+            # Some exporters hang the timecode off a source mob instead.
+            for mob in mobs:
+                if mob is comp_mob:
+                    continue
+                found = _find_tc(mob)
+                if found and found[0]:
+                    break
+                found = None
+
+        if found:
+            start_frames, tc_fps, drop, slot_rate = found
+            # Prefer the Timecode component's own FPS; fall back to the slot's
+            # edit rate, which for a timecode slot is the frame rate.
+            if not tc_fps or tc_fps <= 0:
+                # _rate() falls back to the sample rate when a slot has no edit
+                # rate — only trust it if it looks like a frame rate.
+                tc_fps = slot_rate if (slot_rate and 1.0 <= slot_rate <= 120.0) else 0.0
+            # Drop-frame sessions store a 30 (not 29.97) nominal rate; the real
+            # counting rate is 30000/1001.  Same for 60 -> 59.94.
+            eff_fps = tc_fps
+            if drop and tc_fps in (30.0, 60.0):
+                eff_fps = tc_fps * 1000.0 / 1001.0
+            result["start_tc_frames"] = start_frames
+            result["tc_fps"]          = tc_fps
+            result["drop_frame"]      = drop
+            result["start_tc_secs"]   = (start_frames / eff_fps) if eff_fps else 0.0
 
         for slot in comp_mob.slots:
             rate      = _rate(slot)
