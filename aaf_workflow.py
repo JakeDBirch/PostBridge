@@ -486,6 +486,26 @@ class AafWorkflowMixin:
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
 
+        # -- Seed the pool with the AAF's own source media ------------------
+        # Every clip's src_in is measured against a specific file, named in
+        # the AAF.  When that file is on disk it is the only reference that
+        # yields an offset in the right origin: a rendered nest starts
+        # wherever the nest began inside the footage, so syncing against a
+        # different recording of the same session gives a confident answer
+        # in the wrong coordinate system.  Put it in the pool up front so it
+        # is present and pre-selected rather than something to know about.
+        _pool_ci = {os.path.normcase(os.path.abspath(_q))
+                    for _q in self._aaf_audio_paths}
+        for _p in dict.fromkeys(
+                getattr(self, "_aaf_source_media", {}).values()):
+            if not _p or not os.path.isfile(_p):
+                continue
+            _p = os.path.abspath(_p)
+            if os.path.normcase(_p) in _pool_ci:
+                continue
+            self._aaf_add_audio(_p)
+            _pool_ci.add(os.path.normcase(_p))
+
         if HAS_DND:
             for w in [apool_frame, aph]:
                 w.drop_target_register(DND_FILES)
@@ -1131,7 +1151,18 @@ class AafWorkflowMixin:
             if base not in self._aaf_source_sync_vars:
                 self._aaf_source_sync_vars[base]       = tk.BooleanVar(value=False)
             if base not in self._aaf_source_syncaudio_vars:
-                self._aaf_source_syncaudio_vars[base]  = tk.StringVar(value="")
+                # Default to the file the AAF measures this source's src_in
+                # against.  A user pick overwrites it and survives rebuilds;
+                # only a new AAF (which prunes these dicts) resets it.
+                # is_media() gates pool membership, so a file the pool
+                # would reject must not become the default either - that
+                # would point the picker at something it cannot show.
+                _dflt = getattr(self, "_aaf_source_media", {}).get(base, "")
+                _dflt = os.path.abspath(_dflt) if (
+                    _dflt and os.path.isfile(_dflt)
+                    and is_media(_dflt)) else ""
+                self._aaf_source_syncaudio_vars[base]  = tk.StringVar(
+                    value=_dflt)
             if base not in self._aaf_source_offset_vars:
                 self._aaf_source_offset_vars[base]     = tk.StringVar(value="0.000")
             # Per-extra-slot parallels + multi-mode.  Empty lists / default
