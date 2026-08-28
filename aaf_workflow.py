@@ -171,6 +171,18 @@ class AafWorkflowMixin:
                     continue
                 sources.setdefault(base, set()).add(track["name"])
                 clip_counts[base] = clip_counts.get(base, 0) + 1
+        # The AAF states, per clip, which file its src_in values are measured
+        # against.  That file is the ONLY correct sync reference: an offset
+        # measured against any other recording of the same session is in a
+        # different origin, and every video in-point inherits the difference.
+        source_media = {}
+        for track in parsed["tracks"]:
+            for clip in track["clips"]:
+                b = get_clip_base_name(clip.get("clip_name", ""))
+                sf = clip.get("source_file") or ""
+                if b is not None and sf and b not in source_media:
+                    source_media[b] = sf
+        self._aaf_source_media = source_media   # base -> file src_in refers to
         self._aaf_sources            = sorted(sources.keys())
         self._aaf_source_tracks      = sources     # base_name -> set of track names
         self._aaf_source_clip_counts = clip_counts # base_name -> total clip count
@@ -4719,6 +4731,31 @@ class AafWorkflowMixin:
                 ap = self._aaf_source_syncaudio_vars[base].get()
                 if ap and os.path.isfile(ap):
                     source_syncaudio[base] = ap
+
+        # ---- Reference-origin check -------------------------------------
+        # src_in is expressed against the AAF's own source file.  Syncing to a
+        # different recording of the same session yields a valid-looking offset
+        # in the wrong origin, so the picture locks to the raw audio while
+        # missing the edit by the distance between the two files.
+        def _same_file(a, b):
+            try:
+                return os.path.samefile(a, b)
+            except Exception:
+                return (os.path.normcase(os.path.abspath(a))
+                        == os.path.normcase(os.path.abspath(b)))
+
+        for base, ap in sorted(source_syncaudio.items()):
+            aaf_media = getattr(self, "_aaf_source_media", {}).get(base, "")
+            if not aaf_media or not os.path.isfile(aaf_media):
+                continue
+            if _same_file(ap, aaf_media):
+                continue
+            print("WARNING  {}: reference audio is {!r} but the AAF measures "
+                  "src_in against {!r}.  Unless those two files share a start "
+                  "point, the sync offset is in the wrong origin and every "
+                  "video in-point is off by the distance between them."
+                  .format(base, os.path.basename(ap),
+                          os.path.basename(aaf_media)))
 
         self._aaf_build_progress(10, "Processing clips\u2026")
 
