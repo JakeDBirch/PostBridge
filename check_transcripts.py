@@ -18,6 +18,7 @@ Nothing is written and no audio is decoded -- this is read-only.
 import os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engines
 from parsers import parse_script, discover_pq_sessions
 from utils import MEDIA_EXTS, is_video
 from config import AUTO_FULL_TRANSCRIBE_THRESHOLD
@@ -142,9 +143,12 @@ def main():
             verdict = "no audio matched by filename - can't forecast"
             free    = True
         else:
+            covered   = [m for m in audios if m in hits]
+            pooled_ok = (len(audios) > 1 and len(covered) == len(audios)
+                         and engines.pooled_transcript_load(audios)[0] is not None)
             free, verdict = token_forecast(
-                n, audios, tok in pq_ok, [m for m in audios if m in hits],
-                AUTO_FULL_TRANSCRIBE_THRESHOLD)
+                n, audios, tok in pq_ok, covered,
+                AUTO_FULL_TRANSCRIBE_THRESHOLD, pooled_ok=pooled_ok)
         if not free:
             cost += 1
         print("  [{:<14}] {:>3} pull{}  |  {}".format(

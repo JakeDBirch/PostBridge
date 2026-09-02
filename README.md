@@ -155,6 +155,8 @@ PostBridge picks the fastest path per token:
 - **5+ pulls and no cache** → transcribes the full audio once and caches it, then looks up each pull
 - **Under 5 pulls** → traditional per-pull Whisper on padded windows
 
+When a token has **two or more audio files**, reconcile mixes them and transcribes the mix — so a sidecar on one individual track doesn't help, and the Pull Quotes session is dropped as possibly stale. What does help is every track carrying the *same* transcript, which is exactly how Pull Quotes mirrors one when you save a session: reconcile reuses it for the mix and stamps it onto the mix for next time. A partial set (only some tracks have a sidecar) or a disagreeing set is rejected, and the mix is transcribed.
+
 A sidecar is accepted when the media's mtime still matches it (±2 s). If the mtime drifted — copying media off a shared drive, restoring from backup, and re-saving all rewrite it — PostBridge falls back to the sidecar's baked `audio_signature` (size → duration → SHA-256) and reuses the transcript when the audio is provably identical. Sidecars written before signatures existed remain mtime-gated.
 
 **CHECK TRANSCRIPTS (Step 2):** shows which path each token will take *before* you commit to a run — a ✓/✗ per token and VO take, the reason behind every sidecar hit or miss, and every Pull Quotes session with its signature verification. Read-only; it decodes no audio.

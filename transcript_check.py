@@ -114,30 +114,51 @@ def pq_session_status(session_path, quick=False):
     return True, nw, "{} words".format(nw)
 
 
-def token_forecast(n_pulls, audio_paths, has_pq, covered, full_threshold):
+def token_forecast(n_pulls, audio_paths, has_pq, covered, full_threshold,
+                   pooled_ok=False):
     """Predict reconcile's path for one interview token.
 
-    Returns (free, verdict).  `free` is True when no Whisper time will be
-    spent.  `covered` is the subset of `audio_paths` with a usable
-    sidecar; `has_pq` is whether a verified PQ session exists.
+    Returns (free, verdict); `free` is True when no Whisper time is spent.
+    `covered` is the subset of `audio_paths` with a usable sidecar,
+    `pooled_ok` whether those sidecars all carry the same transcript (so
+    a mix can reuse them), and `has_pq` whether a verified Pull Quotes
+    session exists for the token.
+
+    Branch order follows reconcile's, which turns on how many audio files
+    the token has: with two or more it MIXES them and transcribes the mix,
+    so what matters is whether the mix can inherit a transcript -- not
+    whether any individual track happens to have one.
     """
     audios = [p for p in audio_paths if not is_video(p)]
 
-    if has_pq and len(audios) >= 2:
-        return False, ("POOL-MIX WINS - the PQ session will be DISCARDED and "
-                       "these {} pool files remixed + re-transcribed".format(
-                           len(audios)))
+    if not audios:
+        return True, "no audio assigned - nothing to transcribe"
+
+    if len(audios) >= 2:
+        # Pool-mix-wins: a PQ session is discarded here as possibly stale,
+        # so it cannot save this token.  What can is every track carrying
+        # the same mirrored transcript, which pooled_transcript_load hands
+        # to the mix.
+        if pooled_ok and len(covered) == len(audios):
+            return True, ("instant - the same transcript is mirrored beside "
+                          "all {} sources{}".format(
+                              len(audios),
+                              " (the PQ session is bypassed, but this covers "
+                              "it)" if has_pq else ""))
+        pq_note = ("the PQ session will be DISCARDED as possibly stale, and "
+                   if has_pq else "")
+        if covered:
+            return False, ("{}only {} of {} tracks carry a sidecar - they must "
+                           "ALL agree for the mix to reuse them".format(
+                               pq_note, len(covered), len(audios)))
+        return False, ("{}these {} tracks get mixed and the mix transcribed "
+                       "once".format(pq_note, len(audios)))
+
     if has_pq:
         return True, "instant - Pull Quotes transcript"
     if covered:
         return True, "instant - sidecar on {}".format(
             os.path.basename(covered[0]))
-    if len(audios) >= 2:
-        return False, ("mix {} tracks, then transcribe the mix once (a mix that "
-                       "hasn't been built yet can't have a sidecar)".format(
-                           len(audios)))
-    if not audios:
-        return True, "no audio assigned - nothing to transcribe"
     if n_pulls >= full_threshold:
         return False, "FULL-AUDIO TRANSCRIBE ({} pulls, no cache)".format(n_pulls)
     return False, "{} per-pull Whisper call{}".format(

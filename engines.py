@@ -732,6 +732,46 @@ def pb_transcript_save(media_path, words, blobs=None):
     except Exception:
         pass
 
+def pooled_transcript_load(paths):
+    """Return (words, blobs) when every audio file in `paths` carries the
+    SAME .pb_transcript.json, else (None, None).
+
+    Why this exists: when a token has several audio files, reconcile mixes
+    them and transcribes the mix -- and looks for a sidecar next to that
+    mix, which on a first run cannot exist.  Meanwhile Pull Quotes has
+    already mirrored its full-conversation transcript next to EVERY source
+    file (see PqWorkflowMixin's session save, which does this expressly so
+    "the Script->Session reconcile workflow can re-use this transcript
+    without re-running Whisper").  Those sidecars were unreachable: the
+    mix has a different name, so nothing ever read them.
+
+    Requiring every source to agree is what makes this safe.  A transcript
+    mirrored across all of a token's tracks came from a mix and therefore
+    covers every speaker.  A sidecar on only ONE track is ambiguous -- it
+    may be that track alone, missing the other side of the conversation --
+    so a partial or disagreeing set is rejected and the caller transcribes
+    as before.
+    """
+    audio = [p for p in (paths or []) if p and not is_video(p)]
+    if not audio:
+        return None, None
+
+    first_words = first_blobs = None
+    first_key   = None
+    for ap in audio:
+        words, blobs = pb_transcript_load(ap)
+        if not words:
+            return None, None          # a source with no usable sidecar
+        key = (len(words),
+               round(float(words[0].get("start") or 0.0), 3),
+               round(float(words[-1].get("end") or 0.0), 3))
+        if first_key is None:
+            first_key, first_words, first_blobs = key, words, blobs
+        elif key != first_key:
+            return None, None          # sources disagree -- not a shared mix
+    return first_words, first_blobs
+
+
 def transcribe_file(media_path, progress_cb=None):
     """Transcribe an entire media file using the same chunked pipeline as VO
     reconcile.  Returns (words, blobs).  progress_cb(fraction, status_str) is

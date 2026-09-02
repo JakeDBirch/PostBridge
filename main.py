@@ -5898,11 +5898,39 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             #      best, includes speaker diarisation
             #   2. A .pb_transcript.json sitting next to the audio (from any
             #      prior run, VO transcription, or PQ session)
+            #   2b. For a MIXED source: the sidecars beside the pool files
+            #      the mix was built from, when they all agree.  The mix is
+            #      a fresh file with a hashed name, so it can never have a
+            #      sidecar on a first run — without this the transcript
+            #      Pull Quotes deliberately mirrored next to every source
+            #      file is unreachable, and a full re-transcribe happens
+            #      with a complete transcript sitting right there.
             #   3. Auto-promote: transcribe the full audio now if pulls ≥
             #      AUTO_FULL_TRANSCRIBE_THRESHOLD and the source exists
             _pq_data = (getattr(self, "_pq_session_data", None) or {}).get(token)
             if _pq_data is None and tsrc:
                 _pb_words, _ = engines.pb_transcript_load(tsrc)
+                _pooled_from = None
+                if not _pb_words:
+                    _pool_srcs = token_audio_paths.get(token) or []
+                    if len(_pool_srcs) > 1:
+                        _pb_words, _pb_blobs = engines.pooled_transcript_load(
+                            _pool_srcs)
+                        if _pb_words:
+                            _pooled_from = len(_pool_srcs)
+                            # Stamp it onto the mix so later runs (and the
+                            # CHECK TRANSCRIPTS forecast) hit directly.
+                            try:
+                                engines.pb_transcript_save(
+                                    tsrc, _pb_words, blobs=_pb_blobs)
+                            except Exception:
+                                pass
+                            self._log_line(
+                                "  [{}] reusing the transcript mirrored beside "
+                                "all {} pool sources ({} words) — no re-"
+                                "transcribe needed".format(
+                                    token, _pooled_from, len(_pb_words)),
+                                SUCCESS)
                 if _pb_words:
                     _pq_data = {
                         "transcript":  _pb_words,
@@ -5911,10 +5939,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         "id":          token,
                         "_file_path":  tsrc,
                     }
-                    self._log_line(
-                        "  [{}] using cached full-audio transcript ({} words)".format(
-                            token, len(_pb_words)),
-                        SUCCESS)
+                    if not _pooled_from:      # pooled path already logged
+                        self._log_line(
+                            "  [{}] using cached full-audio transcript "
+                            "({} words)".format(token, len(_pb_words)),
+                            SUCCESS)
                 elif (len(token_pulls) >= AUTO_FULL_TRANSCRIBE_THRESHOLD
                       and not self._cancel.is_set()):
                     self._log_line(
@@ -7901,8 +7930,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 if ok:
                     covered.append(ap)
                 media.append({"path": ap, "ok": ok, "detail": detail})
+            # Does the mix have a transcript to inherit?  Same check
+            # reconcile makes, so the forecast can't disagree with it.
+            pooled_ok = False
+            if len(audios) > 1 and len(covered) == len(audios):
+                pooled_ok = engines.pooled_transcript_load(audios)[0] is not None
             free, verdict = tc.token_forecast(
-                n, audios, tok in pq_ok, covered, AUTO_FULL_TRANSCRIBE_THRESHOLD)
+                n, audios, tok in pq_ok, covered, AUTO_FULL_TRANSCRIBE_THRESHOLD,
+                pooled_ok=pooled_ok)
             rows.append({"kind": "token", "label": tok,
                          "sub": "{} pull{}".format(n, "s" if n != 1 else ""),
                          "free": free, "verdict": verdict, "media": media})
