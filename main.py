@@ -7274,26 +7274,36 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
                 _stripe.pack(side="left", fill="y")
 
-                _inner = tk.Frame(card, bg=SURF)
-                _inner.pack(side="left", fill="both", expand=True)
-
-                hdr = tk.Frame(_inner, bg=SURF, cursor="hand2")
-                hdr.pack(fill="x", padx=(4, 10), pady=(6, 6))
+                # Scroll cost is roughly proportional to the number of
+                # widgets in the list, so the header is built from as few as
+                # it can be: the _inner wrapper existed only to sit between
+                # the stripe and the header, and hdr can do that itself.
+                hdr = tk.Frame(card, bg=SURF, cursor="hand2")
+                hdr.pack(side="left", fill="both", expand=True,
+                         padx=(8, 10), pady=(6, 6))
 
                 _accepted_flag = [False]
 
                 # ── Header left ────────────────────────────────────────────────────
-                ord_lbl  = tk.Label(hdr, text="#{:03d}".format(res["order"]),
-                                    font=FL, bg=SURF, fg=SUB,
-                                    width=5, anchor="w", cursor="hand2")
-                ord_lbl.pack(side="left")
-                tok_lbl  = tk.Label(hdr, text=res["token"],
-                                    font=FL, bg=SURF, fg=ACCENT,
-                                    width=14, anchor="w", cursor="hand2")
-                tok_lbl.pack(side="left")
-                stat_lbl = tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc,
-                                    cursor="hand2")
-                stat_lbl.pack(side="left", padx=8)
+                # Order number + token in one label.  The number gives up
+                # its muted grey for the token's accent — the one colour this
+                # merge costs on the left of the row.
+                id_lbl = tk.Label(hdr,
+                                  text="#{:03d}   {}".format(res["order"],
+                                                             res["token"]),
+                                  font=FL, bg=SURF, fg=ACCENT, width=21,
+                                  anchor="w", cursor="hand2")
+                id_lbl.pack(side="left")
+                # Status carries the confidence: they were always drawn in the
+                # same colour, so nothing is lost by merging them, and the
+                # fixed width keeps the detail column aligned down the list.
+                _conf = res.get("confidence", 0)
+                stat_lbl = tk.Label(
+                    hdr,
+                    text=sl + ("   {:.0%}".format(_conf) if _conf else ""),
+                    font=FB, bg=SURF, fg=sc, width=22, anchor="w",
+                    cursor="hand2")
+                stat_lbl.pack(side="left", padx=(8, 0))
 
                 # Right-click status → context menu to change/revert it.
                 # Solves accidental "adjusted" via stray click in the
@@ -7404,60 +7414,57 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
                 stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
 
-                conf_hdr = res.get("confidence", 0)
-                if conf_hdr:
-                    tk.Label(hdr, text="{:.0%}".format(conf_hdr),
-                             font=FS, bg=SURF, fg=sc, cursor="hand2").pack(
-                                 side="left", padx=(0, 6))
+                # ── Detail line ────────────────────────────────────────────────────
+                # Sub-clip count, timecode drift and the recorded timecode
+                # range were three separate labels in three colours.  They are
+                # one grey line now: the amber on "N clips" and the orange on
+                # the deltas are the other colours this merge costs.  Every
+                # STATE signal — status colour, stripe, border — is untouched.
+                _detail_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB,
+                                       anchor="w", cursor="hand2")
+                _detail_lbl.pack(side="left", fill="x", expand=True,
+                                 padx=(6, 0))
 
+                def _refresh_clips_lbl(dl=_detail_lbl, r=res, af=None):
+                    """Rebuild the detail line from the row's current state.
 
-                # Sub-clip count (number of segments) — always created, shown when > 1
-                _clips_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=WARN,
-                                      cursor="hand2")
-
-                def _refresh_clips_lbl(cl=_clips_lbl, r=res):
+                    Named for what it used to be (the sub-clip badge) because
+                    _open_review's accept path calls it under that name.
+                    """
+                    bits = []
                     n = len(r.get("segments") or [(0, 0)])
                     if n > 1:
-                        cl.config(text="{} clips".format(n))
-                        cl.pack(side="left", padx=(0, 6))
-                    else:
-                        cl.pack_forget()
+                        bits.append("{} clips".format(n))
+                    _di, _do = r.get("delta_in", 0), r.get("delta_out", 0)
+                    if (r.get("status", "") == "ok"
+                            and (abs(_di) > 0.5 or abs(_do) > 0.5)):
+                        bits.append("Δ {:+.1f} / {:+.1f}s".format(_di, _do))
+                    if r.get("_s4_accepted"):
+                        _i = r.get("rec_in_tc",  r.get("in_tc",  ""))
+                        _o = r.get("rec_out_tc", r.get("out_tc", ""))
+                        if _i and _o:
+                            bits.append("{} → {}".format(_i, _o))
+                    dl.config(text="   ·   ".join(bits))
 
                 _refresh_clips_lbl()
-
-                # Timecode label — shown right after the status text when accepted
-                _tc_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB)
-                # initially not packed
-
-                d_in  = res.get("delta_in",  0)
-                d_out = res.get("delta_out", 0)
-                delta_lbl = None
-                if st == "ok" and (abs(d_in) > 0.5 or abs(d_out) > 0.5):
-                    delta_lbl = tk.Label(hdr,
-                                text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
-                                font=FB, bg=SURF, fg=INFO, cursor="hand2")
-                    delta_lbl.pack(side="left", padx=4)
-                    self._tooltip(delta_lbl,
-                        "Δin = matched IN point differs from script timecode by this amount\n"
-                        "Δout = matched OUT point differs from script timecode by this amount\n"
-                        "Positive = later in file  ·  Negative = earlier in file")
+                self._tooltip(
+                    _detail_lbl,
+                    "Δ = how far the matched IN / OUT points moved from the "
+                    "script timecodes\n"
+                    "Positive = later in file  ·  Negative = earlier in file")
+                delta_lbl = None      # merged into the detail line above
 
                 skip_var = tk.BooleanVar(value=False)
 
                 # ── Header right — state container ─────────────────────────────────
                 # Normal: [ADJUST] [IGNORE]  |  Accepted: [✓ ACCEPTED]  |  Ignored: [⊘ IGNORED]
-                _hdr_right = tk.Frame(hdr, bg=SURF)
-                _hdr_right.pack(side="right")
-
-                _norm_frame    = tk.Frame(_hdr_right, bg=SURF)
-                _norm_frame.pack(side="left")
-
-                _acc_state_lbl = tk.Label(_hdr_right, text="\u2713 ACCEPTED",
-                                          font=FS, bg=SURF, fg=SUCCESS, cursor="hand2")
-                # initially not packed
-
-                _ign_state_lbl = tk.Label(_hdr_right, text="\u2298 IGNORED",
-                                          font=FS, bg=SURF, fg=ERR, cursor="hand2")
+                # ACCEPTED and IGNORED were two labels that were never shown
+                # at the same time — one label that swaps text and colour does
+                # the same job.  The two wrapper frames that grouped them and
+                # the action labels are gone with them; side="right" packing
+                # gives the same right-aligned order.
+                _state_lbl = tk.Label(hdr, text="", font=FS, bg=SURF,
+                                      fg=SUCCESS, cursor="hand2")
                 # initially not packed
 
                 # source_audio: prefer explicit audio path, fall back to video path
@@ -7466,7 +7473,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                               res.get("source_video", "") or "")
 
                 # IGNORE button (only interactive control besides clicking to review)
-                ignore_lbl = tk.Label(_norm_frame, text="IGNORE", font=FS,
+                ignore_lbl = tk.Label(hdr, text="IGNORE", font=FS,
                                       bg=SURF, fg=SUB, cursor="hand2")
                 ignore_lbl.pack(side="right", padx=(4, 0))
                 ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
@@ -7478,7 +7485,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 # already-transcribed sidecar.  Interview and VO share the
                 # same entry point; the dialog adapts its layout + apply
                 # logic based on res["is_vo"].
-                reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
+                reassign_lbl = tk.Label(hdr, text="REASSIGN", font=FS,
                                         bg=SURF, fg=SUB, cursor="hand2")
                 reassign_lbl.pack(side="right", padx=(4, 0))
                 reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
@@ -7488,32 +7495,44 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     lambda e, r=res: self._s4_reassign_dialog(r))
 
                 # ── State management helpers ────────────────────────────────────────
-                def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
-                                il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                    al.pack_forget(); il.pack_forget(); tl.pack_forget()
-                    nf.pack(side="left")
+                def _show_actions(ig=ignore_lbl, ra=reassign_lbl, show=True):
+                    """IGNORE / REASSIGN only make sense on an un-actioned row."""
+                    if show:
+                        ig.pack(side="right", padx=(6, 0))
+                        ra.pack(side="right", padx=(6, 0))
+                    else:
+                        ig.pack_forget(); ra.pack_forget()
+
+                def _set_normal(stl=_state_lbl, sw=_stripe, c=card,
+                                sa=_show_actions, rcl=None):
+                    stl.pack_forget()
+                    sa(show=True)
                     sw.config(bg=_STRIPE_DEF)
-                    c.config(highlightbackground=BORDER, highlightthickness=_CARD_BORDER)
+                    c.config(highlightbackground=BORDER,
+                             highlightthickness=_CARD_BORDER)
 
-                def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
-                                  il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
-                                  c=card, r=res):
-                    nf.pack_forget(); il.pack_forget()
-                    al.pack(side="left")
-                    in_tc  = r.get("rec_in_tc",  r.get("in_tc",  ""))
-                    out_tc = r.get("rec_out_tc", r.get("out_tc", ""))
-                    if in_tc and out_tc:
-                        tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
-                        tl.pack(side="left", padx=(4, 0))
+                def _set_accepted(stl=_state_lbl, sw=_stripe, c=card, r=res,
+                                  sa=_show_actions):
+                    sa(show=False)
+                    stl.config(text="\u2713 ACCEPTED", fg=SUCCESS)
+                    stl.pack(side="right")
+                    # The recorded timecode range lives in the detail line now.
+                    r["_s4_accepted"] = True
+                    _refresh_clips_lbl()
                     sw.config(bg=_STRIPE_ACC)
-                    c.config(highlightbackground=SUCCESS, highlightthickness=_CARD_BORDER)
+                    c.config(highlightbackground=SUCCESS,
+                             highlightthickness=_CARD_BORDER)
 
-                def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
-                                 il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                    nf.pack_forget(); al.pack_forget(); tl.pack_forget()
-                    il.pack(side="left")
+                def _set_ignored(stl=_state_lbl, sw=_stripe, c=card,
+                                 sa=_show_actions):
+                    sa(show=False)
+                    stl.config(text="\u2298 IGNORED", fg=ERR)
+                    stl.pack(side="right")
                     sw.config(bg=_STRIPE_IGN)
-                    c.config(highlightbackground=ERR, highlightthickness=_CARD_BORDER)
+                    c.config(highlightbackground=ERR,
+                             highlightthickness=_CARD_BORDER)
+
+                _show_actions(show=True)
 
                 def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
                     self._s4_push_undo()
@@ -7722,10 +7741,15 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 # ── Bind labels ────────────────────────────────────────────────────
                 ignore_lbl.bind("<Button-1>",
                                 lambda e, f=_toggle_ignore: f())
-                _acc_state_lbl.bind("<Button-1>",
-                                    lambda e, f=_un_accept: f())
-                _ign_state_lbl.bind("<Button-1>",
-                                    lambda e, f=_toggle_ignore: f())
+                # One state label, so which action it triggers depends on
+                # which state it is showing.
+                def _state_click(e=None, af=_accepted_flag, sv=skip_var,
+                                 ua=_un_accept, ti=_toggle_ignore):
+                    if sv.get():
+                        ti()
+                    elif af[0]:
+                        ua()
+                _state_lbl.bind("<Button-1>", _state_click)
 
                 # ── Card click → open waveform editor ──────────────────────────────
                 def _hdr_click(event=None, sv=skip_var, fn=_open_review,
@@ -7734,10 +7758,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     if not sv.get():   # ignored cards do nothing on click
                         fn()
 
-                for _w in [hdr, card, _inner, ord_lbl, tok_lbl, stat_lbl]:
+                for _w in [hdr, card, id_lbl, stat_lbl, _detail_lbl]:
                     _w.bind("<Button-1>", _hdr_click)
-                if delta_lbl:
-                    delta_lbl.bind("<Button-1>", _hdr_click)
 
                 self._rv.append({
                     "skip_var": skip_var, "res": res, "card": card,

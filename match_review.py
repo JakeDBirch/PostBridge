@@ -672,13 +672,21 @@ class MatchReviewDialog:
         _pb("\u25b6 PLAY", self._play_or_edit)
         _pb("\u25a0 STOP", self._stop)
 
-        # Speed — click to step up, right-click to step down, [ and ] on
-        # the keyboard.  Applies to the NEXT play rather than restarting
-        # what is already sounding, so tapping through speeds mid-audition
-        # does not keep throwing you back to the top of the clip.
-        self._rate_btn = _pb("", self._cycle_rate)
-        self._rate_btn.bind("<ButtonRelease-3>",
-                            lambda e: self._cycle_rate(-1))
+        # Speed — a  −  [1.5×]  +  stepper, or [ and ] on the keyboard.
+        # Applies to the NEXT play rather than restarting what is already
+        # sounding, so stepping through speeds mid-audition does not keep
+        # throwing you back to the top of the clip.
+        self._rate_down = _pb("−", lambda: self._cycle_rate(-1))
+        self._rate_lbl  = tk.Label(prow, text="", font=FB, bg=SURF2, fg=TEXT,
+                                   width=5, padx=6, pady=4, bd=0,
+                                   highlightbackground=BORDER,
+                                   highlightthickness=1)
+        self._rate_lbl.pack(side="left", padx=(0, 6))
+        self._rate_up   = _pb("+", lambda: self._cycle_rate(1))
+        # _pb's hover restores the button's ORIGINAL fg on leave, which would
+        # wipe the end-stop dimming.  Re-apply it after the hover resets.
+        for _b in (self._rate_down, self._rate_up):
+            _b.bind("<Leave>", lambda e: self._sync_rate_btn(), add="+")
         self._sync_rate_btn()
 
         # SKIP CUTS checkbox — stitches segments, skipping excised gaps (ON by default)
@@ -2502,15 +2510,24 @@ class MatchReviewDialog:
             self._on_accept(segs)
 
     def _sync_rate_btn(self):
-        """Repaint the speed button and remember the choice for the next card."""
+        """Repaint the speed stepper and remember the choice for the next card."""
         global _LAST_PLAY_RATE
         _LAST_PLAY_RATE = self._play_rate
-        btn = getattr(self, "_rate_btn", None)
-        if btn is None:
+        lbl = getattr(self, "_rate_lbl", None)
+        if lbl is None:
             return
         try:
-            btn.config(text="{:g}\u00d7".format(self._play_rate),
+            lbl.config(text="{:g}\u00d7".format(self._play_rate),
                        fg=TEXT if self._play_rate == 1.0 else ACCENT)
+            # Dim the end stops so it is obvious the range has run out \u2014
+            # the buttons still take the click, they just have nowhere left
+            # to go.
+            i = _PLAY_RATES.index(self._play_rate)
+            for btn, spent in ((getattr(self, "_rate_down", None), i == 0),
+                               (getattr(self, "_rate_up", None),
+                                i == len(_PLAY_RATES) - 1)):
+                if btn is not None:
+                    btn.config(fg=BORDER if spent else TEXT)
         except Exception:
             pass
 
