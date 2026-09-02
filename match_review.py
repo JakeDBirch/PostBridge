@@ -1732,7 +1732,7 @@ class MatchReviewDialog:
                 new_t = max(0.0, min(self._px_to_t(event.x), self._ctx_dur))
                 self._playhead_s = new_t
                 self._drag = "playhead"
-                was_playing = self._playback_start_wall is not None
+                was_playing = self._is_playing()
                 self._draw()
                 if was_playing:
                     if self._play_edit_mode and self._play_edit_mode.get():
@@ -2036,7 +2036,7 @@ class MatchReviewDialog:
             # the region (including jump-to position during playback).
             new_t = max(0.0, min(self._px_to_t(event.x), self._ctx_dur))
             self._playhead_s = new_t
-            was_playing = self._playback_start_wall is not None
+            was_playing = self._is_playing()
             self._draw()
             if was_playing:
                 if self._play_edit_mode and self._play_edit_mode.get():
@@ -2644,6 +2644,21 @@ class MatchReviewDialog:
 
     # ── Playback ──────────────────────────────────────────────────────────
 
+    def _is_playing(self):
+        """True while audio is actually sounding, on EITHER playback path.
+
+        The live engine deliberately leaves _playback_start_wall as None —
+        its position comes from the stream, not a wall clock — so the bare
+        flag check this replaced reported "stopped" all through live
+        playback.  That silently disabled three things at once: click-to-
+        seek-and-keep-playing, the return-to-where-you-were point, and the
+        spacebar stop.  One predicate so those cannot drift apart again.
+        """
+        p = getattr(self, "_player", None)
+        if p is not None and p.is_playing():
+            return True
+        return self._playback_start_wall is not None
+
     def _toggle_play(self):
         """Spacebar handler — stop if playing, play/edit if stopped.
 
@@ -2654,7 +2669,7 @@ class MatchReviewDialog:
         plays from IN.  If a real bug ever shifts the playhead
         during load, fix it at the source rather than snapping here.
         """
-        if self._playback_start_wall is not None:
+        if self._is_playing():
             self._stop()
         else:
             self._play_or_edit()
@@ -3142,7 +3157,11 @@ class MatchReviewDialog:
         # because it IS the position the audio is being generated from.
         p = self._player
         if p is not None and p.is_playing():
-            self._playhead_s = p.position()
+            # While the user is dragging the playhead, their hand wins —
+            # otherwise the engine's cursor overwrites the drag 25 times a
+            # second and the marker will not move.
+            if self._drag != "playhead":
+                self._playhead_s = p.position()
             self._draw_playhead_only()
             try:
                 self._playhead_anim = self._win.after(40, self._animate_playhead)
