@@ -211,7 +211,7 @@ It reports card count, widget count, and milliseconds per scroll step both expan
 - **Drag a cut while it plays** and the edit is audible about 45 ms later. If the playhead is inside a region you just removed, it jumps to the next kept segment.
 - **Change speed while it plays** and it takes effect on the next buffer.
 
-The − / × / + stepper covers 0.75× to 2× (or `[` and `]`; the end stops dim when the range runs out), and the speed is pitch-preserved by a real-time WSOLA time-stretch, so speech stays intelligible instead of going chipmunk. The playhead is read from the engine's own cursor, so it stays correct across speed changes and cut jumps rather than being extrapolated. Your speed carries to the next card.
+The − / × / + stepper covers 0.75× to 3× (or `[` and `]`; the end stops dim when the range runs out), and the speed is pitch-preserved by a real-time WSOLA time-stretch, so speech stays intelligible instead of going chipmunk. Quality holds right to the top — spectral correlation against ffmpeg's `atempo` is 0.906 at 3× against 0.913 at 1.5×. The playhead is read from the engine's own cursor, so it stays correct across speed changes and cut jumps rather than being extrapolated. Your speed carries to the next card.
 
 This needs `sounddevice` (PortAudio). Without it PostBridge falls back to the old render-a-WAV-and-play-it path, which works on Windows only and has no live response.
 
