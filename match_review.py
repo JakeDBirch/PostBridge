@@ -27,6 +27,7 @@ _log = logging.getLogger("match_review")
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     SUCCESS, WARN, ERR, FB, FBT, FH,
                     SNAP_IN_OFFSET, SNAP_OUT_OFFSET)
+import playback as _pb
 from engines import (extract_audio_segment, extract_mono_pcm,
                      get_media_duration,
                      time_stretch_wav as engines_time_stretch)
@@ -273,6 +274,11 @@ class MatchReviewDialog:
         self._words_draw_key  = None      # cache key for _draw_words dedup
         self._playback_end_file = None    # file-time at which playback should auto-stop
         self._play_rate       = _LAST_PLAY_RATE  # pitch-preserved speed multiplier
+        # Live playback engine (see playback.py).  Created on first play and
+        # kept for the life of the dialog; None means we fell back to the
+        # render-a-file-and-hand-it-to-winsound path.
+        self._player          = None
+        self._live_stitched   = False   # player is following the edit list
         self._play_rate_active = 1.0      # rate the CURRENTLY sounding audio was
                                           # rendered at; the playhead advances by
                                           # this per wall-second, and it must not
@@ -1101,6 +1107,10 @@ class MatchReviewDialog:
     def _draw(self):
         if self._samples is None:
             return
+        # Every edit redraws, so this is the one place that catches them all:
+        # drag a cut and the running stream picks up the new list on its next
+        # buffer.  No-op when nothing is playing.
+        self._live_push_segments()
         import numpy as _np
         cv = self._cv
         cv.delete("all")
@@ -1546,6 +1556,7 @@ class MatchReviewDialog:
                     prev_right = px + tw
 
     def _draw_playhead_only(self):
+        # (see _live_push_segments — hooked from _draw, not from here)
         """Redraw only the playhead — called every 40 ms during playback.
         Avoids the full delete("all") + redraw cycle for a static waveform."""
         cv = self._cv
@@ -2542,6 +2553,10 @@ class MatchReviewDialog:
         self._play_rate = _PLAY_RATES[
             max(0, min(len(_PLAY_RATES) - 1, i + step))]
         self._sync_rate_btn()
+        # Live: the next buffer is generated at the new speed, so this is
+        # heard immediately instead of on the next play.
+        if self._player is not None:
+            self._player.set_rate(self._play_rate)
 
     def _play_in(self):
         """Zoom to IN; stitched if PLAY EDIT on, else raw from IN."""
@@ -2683,10 +2698,13 @@ class MatchReviewDialog:
         return result
 
     def _play_stitched(self, seg_list):
-        """Extract seg_list segments, concatenate PCM, play, animate playhead."""
+        """Play the kept segments, skipping the excised gaps."""
         if not seg_list:
             return
         import time as _time
+        _abs = [(a, a + d) for a, d in seg_list]
+        if self._live_play(_abs[0][0], _abs[-1][1], segments=_abs):
+            return
         self._stop()
         self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
         self._playback_end_file = seg_list[-1][0] + seg_list[-1][1]
@@ -2926,6 +2944,90 @@ class MatchReviewDialog:
         self._refresh_displays()
         self._draw()
 
+    # ── Live playback ─────────────────────────────────────────────────────
+    # The engine streams from memory and re-reads its edit list, speed and
+    # position on every buffer, so a cut you drag or a speed you change is
+    # heard about 45 ms later without stopping.  Everything below falls back
+    # to the old render-and-play path when PortAudio is not available.
+
+    _LIVE_PAD_S = 3.0        # seconds of source kept either side of the edit
+
+    def _live_ready(self, lo, hi):
+        """Return a player whose buffer spans [lo, hi], or None to fall back."""
+        if not _pb.available():
+            return None
+        if self._player is None:
+            try:
+                self._player = _pb.LivePlayer(samplerate=_PLAYBACK_SR,
+                                              gain=0.85)
+            except Exception:
+                _log.exception("could not start the live player")
+                return None
+        if self._player.covers(lo, hi):
+            return self._player
+        # Extract just the window around the edit.  A whole interview at
+        # 44.1 kHz would be gigabytes; the edit points are always inside the
+        # context window, so that is all the engine ever needs.
+        a = max(0.0, lo - self._LIVE_PAD_S)
+        b = min(self._file_dur_s or (hi + self._LIVE_PAD_S),
+                hi + self._LIVE_PAD_S) if self._file_dur_s else hi + self._LIVE_PAD_S
+        if b <= a:
+            return None
+        import numpy as _np
+        import wave as _wave
+        tmp = os.path.join(self._tmp_dir, "_live_src.wav")
+        try:
+            extract_audio_segment(self._audio_path, a, b - a, tmp,
+                                  sample_rate=_PLAYBACK_SR)
+            with _wave.open(tmp, "rb") as wf:
+                raw = wf.readframes(wf.getnframes())
+            pcm = _np.frombuffer(raw, _np.int16).astype(_np.float32) / 32768.0
+            peak = float(_np.max(_np.abs(pcm))) if len(pcm) else 0.0
+            if peak > 1e-6:
+                pcm = pcm / peak * 0.9      # match the old path's normalisation
+            self._player.load(pcm, t0=a)
+        except Exception:
+            _log.exception("live source extract failed")
+            return None
+        return self._player
+
+    def _live_play(self, lo, hi, segments=None):
+        """Start live playback of [lo, hi], optionally following `segments`
+        (absolute [(in_s, out_s)]).  False means the caller should fall back."""
+        p = self._live_ready(lo, hi)
+        if p is None:
+            return False
+        self._stop()
+        self._pre_play_pos = self._playhead_s
+        p.set_segments(segments)
+        p.set_rate(self._play_rate)
+        self._live_stitched = bool(segments)
+        self._playback_end_file = hi
+        if not p.play(lo, hi):
+            return False
+        self._playhead_s          = lo
+        self._playback_start_wall = None     # position comes from the engine
+        self._play_edit_segs      = None
+        self._animate_playhead()
+        return True
+
+    def _live_push_segments(self):
+        """Hand the current edit list to a running player.
+
+        Called from _draw, which every edit already goes through — so moving
+        a cut updates what you are hearing without any extra plumbing at the
+        drag sites.
+        """
+        p = self._player
+        if p is None or not self._live_stitched or not p.is_playing():
+            return
+        try:
+            segs = [(a, a + d) for a, d in self._build_stitched_segs()]
+            if segs:
+                p.set_segments(segs)
+        except Exception:
+            pass
+
     def _stretch(self, arr, sr):
         """Time-stretch `arr` to the current playback rate, pitch preserved.
 
@@ -2964,6 +3066,10 @@ class MatchReviewDialog:
 
     def _play(self, start_s, duration_s):
         import time as _time
+        # Live engine first; the block below is the fallback for machines
+        # with no PortAudio.
+        if self._live_play(start_s, start_s + duration_s, segments=None):
+            return
         self._stop()
         self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
         self._playback_end_file = start_s + duration_s
@@ -3031,6 +3137,30 @@ class MatchReviewDialog:
 
     def _animate_playhead(self):
         import time as _time
+        # Live engine: read the cursor rather than extrapolating a wall clock.
+        # It is correct across speed changes and cut jumps by construction,
+        # because it IS the position the audio is being generated from.
+        p = self._player
+        if p is not None and p.is_playing():
+            self._playhead_s = p.position()
+            self._draw_playhead_only()
+            try:
+                self._playhead_anim = self._win.after(40, self._animate_playhead)
+            except Exception:
+                pass
+            return
+        if p is not None and self._playback_start_wall is None:
+            # Live playback just ended — restore the pre-roll position the
+            # same way _stop would.
+            if self._pre_play_pos is not None:
+                self._playhead_s   = self._pre_play_pos
+                self._pre_play_pos = None
+            self._playhead_anim = None
+            try:
+                self._draw()
+            except Exception:
+                pass
+            return
         if self._playback_start_wall is None:
             return
         # Clamp elapsed at 0 — the play routines anchor start_wall a bit
@@ -3059,6 +3189,12 @@ class MatchReviewDialog:
             pass
 
     def _stop(self):
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._live_stitched = False
         if self._pre_play_pos is not None:
             self._playhead_s   = self._pre_play_pos
             self._pre_play_pos = None
@@ -3101,6 +3237,12 @@ class MatchReviewDialog:
 
     def _cleanup(self):
         self._stop()
+        if self._player is not None:
+            try:
+                self._player.close()
+            except Exception:
+                pass
+            self._player = None
         # Cancel any pending debounced callbacks — search, resize, tip
         # — before destroying the window.  Without this, an in-flight
         # after() fires against the destroyed Toplevel and _search_update

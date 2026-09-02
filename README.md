@@ -204,7 +204,14 @@ python profile_step4.py "C:/path/to/your_session.json"
 
 It reports card count, widget count, and milliseconds per scroll step both expanded and collapsed. Read-only.
 
-**Playback speed:** the waveform editor's transport carries a − / × / + speed stepper (0.75× to 2×) for getting through a lot of dialogue quickly — or use `[` and `]`. The end stops dim when the range runs out. The speed-up is pitch-preserved (ffmpeg `atempo`), so speech stays intelligible rather than going chipmunk, and the playhead tracks it. Your choice carries to the next card — Step 4 opens a fresh editor per clip, and a speed that reset every time would defeat the point. It applies to the next play rather than restarting audio already sounding.
+**Live playback:** the waveform editor streams its audio rather than rendering a file and playing it, so what you change is what you hear — immediately, with no gap and no restart:
+
+- **Drag a cut while it plays** and the edit is audible about 45 ms later. If the playhead is inside a region you just removed, it jumps to the next kept segment.
+- **Change speed while it plays** and it takes effect on the next buffer.
+
+The − / × / + stepper covers 0.75× to 2× (or `[` and `]`; the end stops dim when the range runs out), and the speed is pitch-preserved by a real-time WSOLA time-stretch, so speech stays intelligible instead of going chipmunk. The playhead is read from the engine's own cursor, so it stays correct across speed changes and cut jumps rather than being extrapolated. Your speed carries to the next card.
+
+This needs `sounddevice` (PortAudio). Without it PostBridge falls back to the old render-a-WAV-and-play-it path, which works on Windows only and has no live response.
 
 Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.
 

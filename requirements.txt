@@ -20,5 +20,9 @@ pyaaf2>=1.7.0
 numpy>=1.24.0
 
 # ── Audio playback
-# No third-party dependency: playback goes through winsound on Windows.
-# macOS/Linux currently have no playback backend — see MAC_BUILD.md.
+# Live, callback-driven playback for the Step 4 waveform editor: edits and
+# speed changes are heard without restarting.  Also the first playback
+# backend that is not Windows-only.  If it is absent PostBridge falls back
+# to rendering a WAV and handing it to winsound (Windows only, no live
+# response), so this is strongly recommended rather than strictly required.
+sounddevice>=0.4.6
