@@ -1474,6 +1474,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         cache_row.pack(side="bottom", fill="x", pady=(4,0))
         self._btn(cache_row, "CLEAR TRANSCRIPTS", lambda: self._clear_cache("transcripts"),
                   small=True).pack(side="right", padx=(0, 4))
+        # Pre-flight: which tokens will reuse an existing transcript and
+        # which will spend Whisper time — answered BEFORE the run, with a
+        # way to point PostBridge at transcripts it isn't finding.
+        self._btn(cache_row, "CHECK TRANSCRIPTS", self._check_transcripts,
+                  small=True).pack(side="left")
         self._btn(cache_row, "CLEAR RESULTS", lambda: self._clear_cache("results"),
                   small=True).pack(side="right", padx=(0, 8))
 
@@ -7819,6 +7824,398 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                              relief="flat", bd=6, cursor="hand2",
                              command=win.destroy)
         close_btn.pack(side="left")
+
+    # ── Transcript coverage pre-flight (Step 2 → CHECK TRANSCRIPTS) ───────────
+    # Answers "will reconcile reuse the transcripts I already have, or spend
+    # 20 minutes rediscovering them?" BEFORE the run starts, and gives the
+    # user a way to point PostBridge at a transcript it isn't finding.
+    # The forecast rules live in transcript_check.py, shared with the
+    # check_transcripts.py CLI.
+
+    def _tc_collect_inputs(self):
+        """Snapshot everything the report needs, ON THE MAIN THREAD.
+
+        MediaPool.get_assignments() reads StringVars, and Tk variable access
+        from a worker thread deadlocks on Python 3.14+ (same reason
+        _start_reconcile snapshots assignments before spawning its thread).
+        So the worker only ever sees this plain dict.
+        """
+        asgn = self._pool.get_assignments() if self._pool else {}
+        vo   = self._pool.get_vo_assets()   if self._pool else {}
+        pulls_per_token = {}
+        for p in (self.pulls or []):
+            pulls_per_token[p["token"]] = pulls_per_token.get(p["token"], 0) + 1
+        return {
+            "tokens":    list(self.tokens or []),
+            "assign":    {t: list(v) for t, v in asgn.items()},
+            "vo":        {pi: {"audios": list(d.get("audios", [])),
+                               "videos": list(d.get("videos", []))}
+                          for pi, d in vo.items()},
+            "part_name": {p["index"]: p["name"] for p in (self.parts or [])},
+            "pulls":     pulls_per_token,
+            "script":    getattr(self, "_script_path", "") or "",
+        }
+
+    def _tc_build_report(self, inp, quick, progress=None):
+        """Compute the coverage report.  Worker-thread safe: pure file I/O."""
+        import transcript_check as tc
+        try:
+            from parsers import discover_pq_sessions
+        except Exception:
+            discover_pq_sessions = lambda *a, **k: {}
+
+        def _prog(msg):
+            if progress:
+                try: progress(msg)
+                except Exception: pass
+
+        # ── Pull Quotes sessions ──────────────────────────────────────────
+        _prog("Looking for Pull Quotes sessions…")
+        pq_rows, pq_ok = [], set()
+        try:
+            pq = discover_pq_sessions(inp["script"]) or {}
+        except Exception:
+            pq = {}
+        pq.pop("__warnings__", None)
+        for tok in sorted(pq):
+            _prog("Verifying Pull Quotes session for {}…".format(tok))
+            ok, nw, detail = tc.pq_session_status(pq[tok], quick=quick)
+            if ok:
+                pq_ok.add(tok)
+            pq_rows.append({"token": tok, "ok": ok, "detail": detail,
+                            "path": pq[tok],
+                            "unused": tok not in inp["pulls"]})
+
+        # ── Interview tokens ──────────────────────────────────────────────
+        rows = []
+        for tok in inp["tokens"]:
+            n      = inp["pulls"].get(tok, 0)
+            if not n:
+                continue                      # token declared but never pulled
+            audios = [p for p in inp["assign"].get(tok, []) if not is_video(p)]
+            media  = []
+            covered = []
+            for ap in audios:
+                _prog("Checking {}…".format(os.path.basename(ap)))
+                ok, detail = tc.sidecar_status(ap, quick=quick)
+                if ok:
+                    covered.append(ap)
+                media.append({"path": ap, "ok": ok, "detail": detail})
+            free, verdict = tc.token_forecast(
+                n, audios, tok in pq_ok, covered, AUTO_FULL_TRANSCRIBE_THRESHOLD)
+            rows.append({"kind": "token", "label": tok,
+                         "sub": "{} pull{}".format(n, "s" if n != 1 else ""),
+                         "free": free, "verdict": verdict, "media": media})
+
+        # ── VO parts ──────────────────────────────────────────────────────
+        for pi in sorted(inp["vo"]):
+            d     = inp["vo"][pi]
+            takes = engines.pair_takes(d["videos"] + d["audios"])
+            for ti, (_vp, ap) in enumerate(takes):
+                label = "VO Part {} — {}".format(pi, inp["part_name"].get(pi, "?"))
+                sub   = "take {}".format(ti + 1) if len(takes) > 1 else ""
+                if not ap:
+                    rows.append({"kind": "vo", "label": label, "sub": sub,
+                                 "free": True, "media": [],
+                                 "verdict": "no audio in this take - skipped"})
+                    continue
+                _prog("Checking {}…".format(os.path.basename(ap)))
+                # Mirror reconcile's VO order: .pb_cache first, then sidecar.
+                if engines.cache_load(ap) is not None:
+                    rows.append({"kind": "vo", "label": label, "sub": sub,
+                                 "free": True,
+                                 "verdict": "instant - cached in .pb_cache",
+                                 "media": [{"path": ap, "ok": True,
+                                            "detail": "cached in .pb_cache"}]})
+                    continue
+                ok, detail = tc.sidecar_status(ap, quick=quick)
+                rows.append({
+                    "kind": "vo", "label": label, "sub": sub, "free": ok,
+                    "verdict": ("instant - sidecar on {}".format(
+                        os.path.basename(ap)) if ok
+                        else "will transcribe this take"),
+                    "media": [{"path": ap, "ok": ok, "detail": detail}]})
+
+        return {"pq": pq_rows, "rows": rows, "quick": quick}
+
+    def _check_transcripts(self):
+        """Open the transcript-coverage window (Step 2 → CHECK TRANSCRIPTS)."""
+        if not getattr(self, "_pool", None):
+            messagebox.showinfo("No media", "Assign media first.", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Transcript coverage")
+        win.configure(bg=BG, cursor="arrow")
+        win.minsize(720, 460)
+        win.geometry("880x620")
+
+        head = tk.Frame(win, bg=BG)
+        head.pack(fill="x", padx=14, pady=(14, 4))
+        tk.Label(head, text="Will reconcile reuse what you already have?",
+                 font=FL, bg=BG, fg=TEXT).pack(anchor="w")
+        status = tk.Label(head, text="", font=FS, bg=BG, fg=SUB,
+                          wraplength=820, justify="left")
+        status.pack(anchor="w", pady=(2, 0))
+
+        body_outer = tk.Frame(win, bg=BG)
+        body_outer.pack(fill="both", expand=True, padx=14, pady=(6, 0))
+        canvas = tk.Canvas(body_outer, bg=BG, bd=0, highlightthickness=0)
+        sb     = _SlimScrollbar(body_outer, command=canvas.yview)
+        inner  = tk.Frame(canvas, bg=BG)
+        _win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win_id, width=e.width))
+        # Bind the wheel to the DIALOG, not bind_all: the app installs a
+        # global "all"-tag handler in _scroll_frame, and a bind_all here
+        # would replace it app-wide and leave Step 2 unscrollable after
+        # this window closed.  A Toplevel sits in its children's bindtag
+        # chain, so this catches the wheel anywhere inside the dialog.
+        def _on_wheel(e):
+            units = (int(-1 * e.delta) if sys.platform == "darwin"
+                     else int(-1 * (e.delta / 120)))
+            canvas.yview_scroll(units, "units")
+        win.bind("<MouseWheel>", _on_wheel)
+
+        foot = tk.Frame(win, bg=BG)
+        foot.pack(fill="x", padx=14, pady=12)
+
+        quick_var = tk.BooleanVar(value=False)
+        state = {"report": None, "busy": False}
+
+        # ── Rendering ─────────────────────────────────────────────────────
+        def _clear_inner():
+            for w in inner.winfo_children():
+                w.destroy()
+
+        def _sub_header(txt):
+            tk.Label(inner, text=txt, font=FL, bg=BG, fg=SUB
+                     ).pack(anchor="w", pady=(12, 4))
+
+        def _media_row(parent, m):
+            r = tk.Frame(parent, bg=SURF2)
+            r.pack(fill="x", pady=(2, 0))
+            tk.Label(r, text="   {}".format(os.path.basename(m["path"])),
+                     font=FB, bg=SURF2, fg=TEXT, anchor="w"
+                     ).pack(side="left", padx=(6, 8))
+            tk.Label(r, text=m["detail"], font=FS, bg=SURF2,
+                     fg=SUCCESS if m["ok"] else WARN, anchor="w"
+                     ).pack(side="left", fill="x", expand=True)
+            if not m["ok"]:
+                self._btn(r, "Locate transcript…",
+                          lambda p=m["path"]: _locate_one(p),
+                          small=True).pack(side="right", padx=6, pady=3)
+
+        def _render():
+            _clear_inner()
+            rep = state["report"]
+            if rep is None:
+                return
+            if rep["pq"]:
+                _sub_header("PULL QUOTES SESSIONS")
+                for p in rep["pq"]:
+                    r = tk.Frame(inner, bg=SURF)
+                    r.pack(fill="x", pady=(2, 0))
+                    tk.Label(r, text="{}  {}".format(
+                        "OK" if p["ok"] else "REJECTED", p["token"]),
+                        font=FL, bg=SURF, fg=SUCCESS if p["ok"] else ERR,
+                        width=22, anchor="w").pack(side="left", padx=6, pady=4)
+                    note = p["detail"] + ("   (no pulls use this token)"
+                                          if p["unused"] else "")
+                    tk.Label(r, text=note, font=FB, bg=SURF, fg=SUB, anchor="w",
+                             wraplength=560, justify="left"
+                             ).pack(side="left", fill="x", expand=True)
+
+            _sub_header("PER TOKEN / VO PART")
+            for row in rep["rows"]:
+                box = tk.Frame(inner, bg=SURF)
+                box.pack(fill="x", pady=(4, 0))
+                hdr = tk.Frame(box, bg=SURF)
+                hdr.pack(fill="x")
+                tk.Label(hdr, text="✓" if row["free"] else "✗",
+                         font=FL, bg=SURF,
+                         fg=SUCCESS if row["free"] else WARN, width=3
+                         ).pack(side="left", padx=(6, 0), pady=4)
+                tk.Label(hdr, text=row["label"], font=FL, bg=SURF, fg=TEXT,
+                         width=20, anchor="w").pack(side="left")
+                tk.Label(hdr, text=row["sub"], font=FS, bg=SURF, fg=SUB,
+                         width=10, anchor="w").pack(side="left")
+                tk.Label(hdr, text=row["verdict"], font=FB, bg=SURF,
+                         fg=SUB if row["free"] else WARN, anchor="w",
+                         wraplength=460, justify="left"
+                         ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+                for m in row["media"]:
+                    _media_row(box, m)
+
+            cost = sum(1 for r in rep["rows"] if not r["free"])
+            tot  = len(rep["rows"])
+            if cost:
+                status.config(
+                    text="{} of {} will reuse an existing transcript.  {} will "
+                         "spend Whisper time — use “Locate transcript…” or "
+                         "“Adopt from folder…” to point PostBridge at the "
+                         "files it's missing.".format(tot - cost, tot, cost),
+                    fg=WARN)
+            else:
+                status.config(
+                    text="All {} will reuse an existing transcript. "
+                         "Reconcile should be near-instant.".format(tot),
+                    fg=SUCCESS)
+
+        # ── Running the check ─────────────────────────────────────────────
+        def _run():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            _clear_inner()
+            status.config(text="Checking…", fg=SUB)
+            inp   = self._tc_collect_inputs()      # main thread — Tk vars
+            quick = quick_var.get()
+
+            def _worker():
+                # Marshal every widget touch through self._ui (the main-thread
+                # queue drained by _pump_ui).  self.after() from a worker
+                # thread calls Tcl's createcommand off-thread -- the same
+                # latent crash _log_line documents.
+                def _status(text, fg):
+                    def _do(text=text, fg=fg):
+                        try:
+                            if status.winfo_exists():
+                                status.config(text=text, fg=fg)
+                        except tk.TclError:
+                            pass
+                    self._ui(_do)
+                try:
+                    rep = self._tc_build_report(
+                        inp, quick, progress=lambda m: _status(m, SUB))
+                except Exception as e:
+                    rep = None
+                    _status("Check failed: {}".format(e), ERR)
+                def _done():
+                    state["busy"] = False
+                    try:
+                        if not win.winfo_exists():
+                            return          # user closed it mid-check
+                    except tk.TclError:
+                        return
+                    if rep is not None:
+                        state["report"] = rep
+                        _render()
+                self._ui(_done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ── Adoption ──────────────────────────────────────────────────────
+        def _adopt(media_path, src_path, silent=False):
+            """Returns True when the transcript was adopted."""
+            import transcript_check as tc
+            words, blobs, err = tc.load_transcript_words(src_path)
+            if err:
+                if not silent:
+                    messagebox.showerror(
+                        "Can't use that file",
+                        "{}\n\n{}".format(os.path.basename(src_path), err),
+                        parent=win)
+                return False
+            warn = tc.adopt_warning(media_path, words)
+            if warn and not messagebox.askyesno(
+                    "Transcript may not match",
+                    "{}\n\n{}\n\nAdopt it anyway?".format(warn, os.path.basename(
+                        src_path)),
+                    icon="warning", parent=win):
+                return False
+            ok, msg = tc.adopt_transcript(media_path, words, blobs)
+            if not ok and not silent:
+                messagebox.showerror("Adoption failed", msg, parent=win)
+            return ok
+
+        def _locate_one(media_path):
+            src = filedialog.askopenfilename(
+                parent=win,
+                title="Transcript for {}".format(os.path.basename(media_path)),
+                filetypes=[("PostBridge transcript",
+                            "*.pb_transcript.json *.pb_session.json"),
+                           ("JSON", "*.json"), ("All", "*.*")])
+            if not src:
+                return
+            if _adopt(media_path, src):
+                _run()
+
+        def _adopt_folder():
+            import transcript_check as tc
+            rep = state["report"]
+            if not rep:
+                return
+            missing = [m["path"] for r in rep["rows"] for m in r["media"]
+                       if not m["ok"]]
+            if not missing:
+                messagebox.showinfo(
+                    "Nothing missing",
+                    "Every assigned file already has a usable transcript.",
+                    parent=win)
+                return
+            folder = filedialog.askdirectory(
+                parent=win, title="Folder containing the transcript files")
+            if not folder:
+                return
+            cand = tc.find_candidates_in_folder(folder, missing)
+            if not cand:
+                messagebox.showinfo(
+                    "No matches",
+                    "No .pb_transcript.json or .pb_session.json in that folder "
+                    "matches the filenames of the media still missing a "
+                    "transcript.\n\nMatching is by filename stem — "
+                    "INT_JORDAN.wav needs INT_JORDAN.pb_transcript.json.",
+                    parent=win)
+                return
+            preview = "\n".join(
+                "  {}  ←  {}".format(os.path.basename(k), os.path.basename(v))
+                for k, v in list(cand.items())[:12])
+            if len(cand) > 12:
+                preview += "\n  …and {} more".format(len(cand) - 12)
+            if not messagebox.askyesno(
+                    "Adopt {} transcript{}?".format(
+                        len(cand), "s" if len(cand) != 1 else ""),
+                    "These transcripts will be stamped onto the matching "
+                    "media so reconcile reuses them:\n\n{}\n\n"
+                    "The original files are not moved or changed.".format(preview),
+                    parent=win):
+                return
+            n = sum(1 for mp, sp in cand.items() if _adopt(mp, sp, silent=True))
+            messagebox.showinfo(
+                "Adopted",
+                "{} of {} transcript{} adopted.".format(
+                    n, len(cand), "s" if len(cand) != 1 else ""),
+                parent=win)
+            _run()
+
+        # ── Footer ────────────────────────────────────────────────────────
+        self._btn(foot, "ADOPT FROM FOLDER…", _adopt_folder,
+                  small=True).pack(side="left")
+        self._btn(foot, "RE-CHECK", _run, small=True).pack(side="left", padx=8)
+        self._btn(foot, "Close", win.destroy, small=True).pack(side="right")
+
+        qk = tk.Label(foot, text="☐", font=(_SANS, 15), bg=BG, fg=SUB,
+                      cursor="hand2", padx=4)
+        qk.pack(side="right", padx=(0, 6))
+        ql = tk.Label(foot, text="Quick (skip SHA-256)", font=FB, bg=BG, fg=SUB,
+                      cursor="hand2")
+        ql.pack(side="right", padx=(0, 2))
+
+        def _toggle_quick(_e=None):
+            quick_var.set(not quick_var.get())
+            on = quick_var.get()
+            qk.config(text="☑" if on else "☐", fg=ACCENT if on else SUB)
+            _run()
+        qk.bind("<Button-1>", _toggle_quick)
+        ql.bind("<Button-1>", _toggle_quick)
+
+        _run()
 
     def _step5(self):
         self._clear()

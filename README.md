@@ -157,13 +157,20 @@ PostBridge picks the fastest path per token:
 
 A sidecar is accepted when the media's mtime still matches it (±2 s). If the mtime drifted — copying media off a shared drive, restoring from backup, and re-saving all rewrite it — PostBridge falls back to the sidecar's baked `audio_signature` (size → duration → SHA-256) and reuses the transcript when the audio is provably identical. Sidecars written before signatures existed remain mtime-gated.
 
-To see which path each token will take **before** committing to a run, use the pre-flight checker — it is read-only and decodes no audio:
+**CHECK TRANSCRIPTS (Step 2):** shows which path each token will take *before* you commit to a run — a ✓/✗ per token and VO take, the reason behind every sidecar hit or miss, and every Pull Quotes session with its signature verification. Read-only; it decodes no audio.
+
+When something is missing, point PostBridge at it from the same window:
+
+- **Locate transcript…** — pick a `.pb_transcript.json` or `.pb_session.json` for one file. PostBridge re-stamps it onto that media with a current mtime and signature, so whatever was causing the rejection stops mattering.
+- **Adopt from folder…** — point at a folder of delivered transcripts and every file matching a media filename stem is adopted at once.
+
+Adoption warns first if the transcript's timings don't fit the audio's duration — the usual sign it belongs to a different recording. Originals are never moved or modified.
+
+The same report is available without opening the app, though it has to guess token→media assignments from filenames rather than reading your pool:
 
 ```bash
 python check_transcripts.py "C:/path/to/script.txt"
 ```
-
-It reports every Pull Quotes session (including signature rejections), a HIT/MISS line with a reason for every sidecar, and a per-token forecast naming the tokens that will actually spend Whisper time.
 
 A live progress log shows per-clip status. A **resource monitor** above the log shows GPU/RAM utilization. A **memory pre-flight check** warns before launch if Windows commit headroom is too tight (Whisper allocations can fail mid-run if the page file is near full).
 

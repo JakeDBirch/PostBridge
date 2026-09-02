@@ -139,6 +139,7 @@ Key files:
 |------|---------|
 | `main.py` | App entry point, App class, all workflow steps |
 | `engines.py` | Audio/video processing: transcription, reconcile, sync, mix |
+| `transcript_check.py` | Transcript-coverage rules shared by the Step 2 CHECK TRANSCRIPTS dialog and the `check_transcripts.py` CLI. Mirrors reconcile's reuse rules — when those change, change these or the forecast starts lying. Also holds `adopt_transcript`, the only writer: it re-stamps an existing transcript onto a media file so a rejected sidecar starts being reused. |
 | `gui_components.py` | MediaPool, VoBin, _FlatDropdown, _SlimScrollbar widgets |
 | `match_review.py` | Waveform editor (Step 4 clip review) |
 | `mix_test.py` | Standalone test tool for the multi-track mix feature |
