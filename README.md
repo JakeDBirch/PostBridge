@@ -190,6 +190,10 @@ Status badges:
 
 Review flagged clips. Adjust timecodes in the waveform editor. Manually accept or reject. All edits persist in the session JSON.
 
+**Collapsible sections:** each part header is a fold control — click it to collapse that part, and the header reports how many clips are hidden. **COLLAPSE ALL** / **EXPAND ALL** sit on the sort row. Folding is remembered across rebuilds, so finishing a part and folding it away survives the next reassign or status change. It applies in Script order, where the part dividers show; the other sorts interleave parts, so there is nothing coherent to fold.
+
+**Fixed row heights:** cards keep the same height in every state. Confirming or ignoring changes only the border and stripe colour — it does not resize the row and shift everything below it.
+
 **Playback speed:** the waveform editor's transport carries a speed control (0.75× to 2×) for getting through a lot of dialogue quickly. Click it to step up, right-click to step down, or use `[` and `]`. The speed-up is pitch-preserved (ffmpeg `atempo`), so speech stays intelligible rather than going chipmunk, and the playhead tracks it. Your choice carries to the next card — Step 4 opens a fresh editor per clip, and a speed that reset every time would defeat the point. It applies to the next play rather than restarting audio already sounding.
 
 Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.

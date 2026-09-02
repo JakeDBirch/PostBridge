@@ -1124,6 +1124,19 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         # Store so callers can access for programmatic scroll
         self._last_scroll_canvas = canvas
 
+        _wheel_accum   = [0]
+        _wheel_pending = [False]
+
+        def _flush_wheel():
+            _wheel_pending[0] = False
+            n, _wheel_accum[0] = _wheel_accum[0], 0
+            if not n:
+                return
+            try:
+                canvas.yview_scroll(n, "units")
+            except tk.TclError:
+                pass          # canvas destroyed between the notch and the flush
+
         def _on_wheel(e):
             # Don't scroll when focus is in a popup (e.g. combobox dropdown).
             # Wrapped in try/except: Tk's focus_get() raises KeyError on
@@ -1138,7 +1151,23 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 pass
             # macOS uses delta 1/-1 per notch; Windows uses 120/-120
             units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
-            canvas.yview_scroll(units, "units")
+            # COALESCE.  Windows delivers a wheel event per notch, and a
+            # single flick of the wheel lands 5-10 of them in the queue at
+            # once.  Scrolling on each one made Tk shift the canvas and
+            # repaint the embedded frame that many times for one gesture —
+            # on a Step 4 with hundreds of cards each repaint is expensive
+            # enough that the frames land visibly out of step with the
+            # pointer, which reads as smeared or "lossy" tracking.
+            # Accumulating the notches and issuing ONE yview_scroll per idle
+            # cycle turns a flick into a single shift + single repaint, and
+            # scrolls exactly as far.
+            _wheel_accum[0] += units
+            if not _wheel_pending[0]:
+                _wheel_pending[0] = True
+                try:
+                    canvas.after_idle(_flush_wheel)
+                except tk.TclError:
+                    _wheel_pending[0] = False
             # NO update_idletasks() here.  It used to force a synchronous
             # layout+paint flush on every wheel notch, which:
             #   * ran the <Configure> handler above, recomputing
@@ -6928,6 +6957,50 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         "subclips":     "Sub-clips"}
 
         _part_dividers = {}   # part_index → divider Frame (filled during card loop)
+        _part_lbls     = {}   # part_index → (Label, part name)
+        # Collapse state lives on self, not in this scope, so it survives
+        # the Step 4 rebuilds triggered by reassign-apply and status
+        # changes — collapsing a finished part and having it spring back
+        # open on the next edit would make the feature pointless.
+        if not hasattr(self, "_s4_collapsed"):
+            self._s4_collapsed = set()
+
+        def _sync_part_lbl(pi, n_cards, collapsible=True):
+            """Repaint one part header: chevron, name, and what is folded."""
+            ent = _part_lbls.get(pi)
+            if not ent:
+                return
+            lbl, name = ent
+            collapsed = collapsible and pi in self._s4_collapsed
+            if not collapsible:
+                mark, tail = "\u25c6", ""
+            elif collapsed:
+                mark = "\u25b8"
+                tail = "   ({} hidden)".format(n_cards) if n_cards else "   (empty)"
+            else:
+                mark = "\u25be"
+                tail = "   ({})".format(n_cards) if n_cards else "   (empty)"
+            try:
+                lbl.config(text="  {}  {}{}".format(mark, name.upper(), tail))
+            except Exception:
+                pass
+
+        def _toggle_part(pi):
+            """Fold / unfold one part.  Routed through _apply_filter rather
+            than packing by hand so collapse, filter and sort all share the
+            one repack path and cannot disagree about ordering."""
+            if pi in self._s4_collapsed:
+                self._s4_collapsed.discard(pi)
+            else:
+                self._s4_collapsed.add(pi)
+            _apply_filter()
+
+        def _set_all_parts(collapsed):
+            if collapsed:
+                self._s4_collapsed = set(_part_dividers.keys())
+            else:
+                self._s4_collapsed = set()
+            _apply_filter()
 
         def _apply_filter(mode=None, sort=None):
             if mode is not None:
@@ -7004,6 +7077,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
             # Repack — only show part dividers in ascending script order
             use_dividers = (cur_sort == "script" and cur_dir > 0)
+            # Collapsing is only meaningful while the part dividers are on
+            # screen; every other sort interleaves parts, so there is nothing
+            # coherent to fold.  The collapse set is remembered either way and
+            # takes effect again on returning to Script order.
+            _per_part = {}
+            for e in visible:
+                _per_part[e["res"].get("part_index", 0)] = \
+                    _per_part.get(e["res"].get("part_index", 0), 0) + 1
             cur_pi = object()  # sentinel
             for e in visible:
                 if use_dividers:
@@ -7011,7 +7092,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     if pi != cur_pi and pi in _part_dividers:
                         _part_dividers[pi].pack(fill="x", pady=(10, 2), padx=2)
                         cur_pi = pi
+                    if pi in self._s4_collapsed:
+                        continue          # header shown, cards folded away
                 e["card"].pack(fill="x", pady=(0, 4), padx=2)
+            for pi in _part_lbls:
+                _sync_part_lbl(pi, _per_part.get(pi, 0), use_dividers)
 
             # Unfreeze scrollregion — one layout pass covers all repacked cards
             if _s4cv:
@@ -7057,6 +7142,17 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             b.bind("<Button-1>", lambda e, s=_sk: _apply_filter(sort=s))
             _sbtns[_sk] = b
 
+        # Fold controls — only bite in Script order, where the dividers show.
+        for _lbl, _fn in (("EXPAND ALL",   lambda: _set_all_parts(False)),
+                          ("COLLAPSE ALL", lambda: _set_all_parts(True))):
+            _cb = tk.Label(srow, text=_lbl, font=FB, bg=SURF2, fg=SUB,
+                           cursor="hand2", padx=10, pady=4, bd=0,
+                           highlightbackground=BORDER, highlightthickness=1)
+            _cb.pack(side="right", padx=(4, 0))
+            _cb.bind("<Enter>", lambda e, w=_cb: w.config(bg=ACCENT, fg=BG))
+            _cb.bind("<Leave>", lambda e, w=_cb: w.config(bg=SURF2, fg=SUB))
+            _cb.bind("<Button-1>", lambda e, f=_fn: f())
+
         sf = self._scroll_frame(self.body, height=380)
         self._s4_scroll_canvas = self._last_scroll_canvas
         # Freeze scrollregion updates during card building — rebind after loop
@@ -7088,6 +7184,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         _STRIPE_DEF = BORDER
         _STRIPE_ACC = SUCCESS
         _STRIPE_IGN = ERR
+        _CARD_BORDER = 2      # constant across all card states — see the card
+                              # shell below for why this must not vary
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
@@ -7149,13 +7247,27 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     _div = tk.Frame(sf, bg=BG)
                     _div.pack(fill="x", pady=(10, 2), padx=2)
                     tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
-                    tk.Label(_div, text="  \u25c6  {}".format(part_name.upper()),
-                             font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(2, 0))
+                    _plbl = tk.Label(_div, text="", font=FL, bg=BG, fg=ACCENT,
+                                     anchor="w", cursor="hand2")
+                    _plbl.pack(anchor="w", fill="x", pady=(2, 0))
+                    _plbl.bind("<Button-1>", lambda e, _p=pi: _toggle_part(_p))
+                    _plbl.bind("<Enter>", lambda e, w=_plbl: w.config(fg=TEXT))
+                    _plbl.bind("<Leave>", lambda e, w=_plbl: w.config(fg=ACCENT))
                     _part_dividers[pi] = _div
+                    _part_lbls[pi]     = (_plbl, part_name)
+                    _sync_part_lbl(pi, 0)
 
                 # ── Card shell ─────────────────────────────────────────────────────
+                # highlightthickness is FIXED at _CARD_BORDER for every
+                # state.  It used to be 1 normally and 2 once accepted or
+                # ignored, so confirming a card grew it by 2px and reflowed
+                # every row below it — visible as the list jumping under the
+                # cursor mid-review.  Only the border COLOUR changes now; the
+                # cost is that an unconfirmed card carries the same 2px border
+                # in BORDER grey, which is exactly the trade asked for.
                 card = tk.Frame(sf, bg=SURF,
-                                highlightbackground=BORDER, highlightthickness=1)
+                                highlightbackground=BORDER,
+                                highlightthickness=_CARD_BORDER)
                 card.pack(fill="x", pady=(0, 4), padx=2)
 
                 # Left color stripe — 4px, reflects accept/ignore/normal state
@@ -7381,7 +7493,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     al.pack_forget(); il.pack_forget(); tl.pack_forget()
                     nf.pack(side="left")
                     sw.config(bg=_STRIPE_DEF)
-                    c.config(highlightbackground=BORDER, highlightthickness=1)
+                    c.config(highlightbackground=BORDER, highlightthickness=_CARD_BORDER)
 
                 def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
                                   il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
@@ -7394,14 +7506,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
                         tl.pack(side="left", padx=(4, 0))
                     sw.config(bg=_STRIPE_ACC)
-                    c.config(highlightbackground=SUCCESS, highlightthickness=2)
+                    c.config(highlightbackground=SUCCESS, highlightthickness=_CARD_BORDER)
 
                 def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
                                  il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
                     nf.pack_forget(); al.pack_forget(); tl.pack_forget()
                     il.pack(side="left")
                     sw.config(bg=_STRIPE_IGN)
-                    c.config(highlightbackground=ERR, highlightthickness=2)
+                    c.config(highlightbackground=ERR, highlightthickness=_CARD_BORDER)
 
                 def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
                     self._s4_push_undo()
@@ -7662,6 +7774,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # ...and the refresh, so a bulk apply can suppress the per-row
             # storm and re-sync exactly once when it is done.
             self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
+            # Section folding, published on self for the same reason as the
+            # tally callbacks above: they're closures over _step4's scope and
+            # anything outside it (keyboard handlers, tests) needs a handle.
+            self._s4_toggle_part  = _toggle_part
+            self._s4_set_all_parts = _set_all_parts
+            self._s4_apply_filter  = _apply_filter
 
             # Recompute the UNCONFIRMED count from the live _rv state now that
             # card restoration has run (accepted_flag / skip_var are authoritative).
