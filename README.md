@@ -219,21 +219,23 @@ Click **Build XML** once all sources are synced. PostBridge generates an XMEML f
 PostBridge scripts use a bracketed markup:
 
 ```
+Episode Title
+
 [TOKENS]
 NATALIE
 DAN
-PART_0_NARRATOR
 [/TOKENS]
 
 [PART Cold Open]
 
+[VO PART_1_NARRATOR]
 When detectives stepped into the canvas tent, they thought the man on the
 ground had been attacked by a bear.
 
 [NATALIE 00:01:12-00:01:23]
 "I was on my way home, he met me on my doorstep with dinner."
 
-[VO PART_0_NARRATOR]
+[VO PART_1_NARRATOR]
 But the evidence inside pointed to someone else entirely.
 ```
 
@@ -244,6 +246,19 @@ But the evidence inside pointed to someone else entirely.
 - Lines starting with `//` (or whitespace + `//`) are ignored as comments
 
 Blank lines between blocks become a natural gap in the output timeline.
+
+### Easy mistakes
+
+- **The first line is the episode title.** It becomes `doc_title` (and the
+  sequence name). Without it, the first bare line in the file is used
+  instead — which, if `[TOKENS]` comes first, means your episode gets named
+  after a speaker.
+- **Every block of narration needs its own `[VO <id>]` header.** Prose sitting
+  under a `[PART …]` with no `[VO …]` above it belongs to no block and is
+  **silently dropped** — no error, no warning.
+- **`[TOKENS]` lists interview speakers only.** VO ids live in `[VO …]`
+  headers and must *not* be declared here; a VO id in `[TOKENS]` registers a
+  phantom speaker that will then ask you for media.
 
 ---
 

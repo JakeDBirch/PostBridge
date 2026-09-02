@@ -43,7 +43,7 @@ designed to remove friction from Jordan's quote-pulling step.
 - `_pq_copy_as_pull()` — bound to Ctrl+C in the transcript Text widget AND
   to the action button.  Reads the user's selection, looks up start/end
   timestamps from `_pq_word_index` (built when transcript renders), formats
-  as `@PULL TOKEN [HH:MM:SS-HH:MM:SS]\n<text>` and copies to clipboard.
+  as `[TOKEN HH:MM:SS-HH:MM:SS]\n<text>` and copies to clipboard.
 
 ### Routing in `_open_session()`
 
@@ -142,7 +142,7 @@ Key files:
 | `gui_components.py` | MediaPool, VoBin, _FlatDropdown, _SlimScrollbar widgets |
 | `match_review.py` | Waveform editor (Step 4 clip review) |
 | `mix_test.py` | Standalone test tool for the multi-track mix feature |
-| `parsers.py` | @PULL / @VO / @PART script parser |
+| `parsers.py` | bracketed script parser ([PART …] / [VO …] / [TOKEN in-out]) |
 | `config.py` | Theme colours, font constants |
 | `utils.py` | Filename helpers, similarity, token suggestion |
 

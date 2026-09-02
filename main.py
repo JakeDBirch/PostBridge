@@ -1375,8 +1375,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         if not pulls:
             _clear_pending_restore()
             messagebox.showerror("Nothing Found",
-                "No @PULL markers found.\n"
-                "Make sure the script is in PostBridge format.")
+                "No interview pulls found.\n\n"
+                "PostBridge expects bracketed headers at column 0:\n"
+                "    [PART <name>]\n"
+                "    [VO <vo_id>]\n"
+                "    [<TOKEN> HH:MM:SS-HH:MM:SS]\n\n"
+                "The older @PULL / @VO / @PART markers are no longer read.\n"
+                "Use Script Formatter \u2192 Copy AI Prompt to convert a script.")
             return
 
         no_quote = sum(1 for p in pulls if not p["quote_text"])
@@ -1398,11 +1403,30 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
         if hasattr(self, "_s1"):
             self._s1.config(
-                text="✓  {}  ·  {} pulls  ·  {} parts  ·  {} tokens: {}{}".format(
-                    doc_title, len(pulls), len(parts), len(tokens),
+                text="✓  {}  ·  {} pulls  ·  {} VO  ·  {} parts  ·  {} tokens: {}{}".format(
+                    doc_title, len(pulls), len(vo_blocks), len(parts), len(tokens),
                     "  ".join(tokens),
                     "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
                 fg=SUCCESS if not no_quote else WARN)
+
+        # A script in the obsolete @PULL/@VO/@PART syntax still yields valid
+        # pulls (pull headers were always bracketed), but every narration
+        # block and section marker is dropped without error.  Surface that
+        # instead of loading a silently gutted script.
+        _shape = []
+        if not vo_blocks:
+            _shape.append("\u2022  0 VO blocks \u2014 no narration was parsed.")
+        if not parts:
+            _shape.append("\u2022  0 parts \u2014 no [PART \u2026] headers were found.")
+        if _shape:
+            messagebox.showwarning(
+                "Check Script Format",
+                "This script parsed {} pulls but:\n\n{}\n\n"
+                "Most often the script still uses the old @VO / @PART "
+                "markers, or narration is missing its [VO <id>] headers "
+                "\u2014 that text is dropped silently.\n\n"
+                "Script Formatter \u2192 Copy AI Prompt will convert it.".format(
+                    len(pulls), "\n".join(_shape)))
 
         if warnings:
             messagebox.showwarning("Warnings", "\n".join(warnings[:10]))
