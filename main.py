@@ -794,43 +794,15 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         tk.Label(self.body, text="Choose a workflow",
                  font=FBT, bg=BG, fg=SUB).pack(pady=(0, 16))
 
-        # ── Resume last project (shown only when a previous script is known) ──
-        # engines._safe_isfile has a hard timeout for exactly this case —
-        # bare os.path.isfile blocks INDEFINITELY on a sleeping network
-        # share, which would hang the whole home screen (and every
-        # HOME navigation) until the volume woke up.
-        _last_script = self._prefs.get("last_script", "")
-        if _last_script and engines._safe_isfile(_last_script):
-            _ls_name = os.path.splitext(os.path.basename(_last_script))[0]
-            resume_row = tk.Frame(self.body, bg=SURF,
-                                  highlightbackground=BORDER, highlightthickness=1)
-            resume_row.pack(fill="x", padx=20, pady=(0, 16))
-            tk.Frame(resume_row, bg=ACCENT, width=4).pack(side="left", fill="y")
-            _ri = tk.Frame(resume_row, bg=SURF)
-            _ri.pack(fill="x", padx=24, pady=10)
-            tk.Label(_ri, text="Resume last project",
-                     font=(_SANS, 11, "bold"), bg=SURF, fg=SUB).pack(side="left")
-            tk.Label(_ri, text="  —  " + _ls_name,
-                     font=(_SANS, 11), bg=SURF, fg=TEXT).pack(side="left")
-            _ra = tk.Label(_ri, text="\u2192", font=(_SANS, 16, "bold"),
-                           bg=SURF, fg=BORDER, padx=8)
-            _ra.pack(side="right")
-            _rw = [resume_row, _ri, _ra]
-            def _resume_enter(e, ws=_rw, c=resume_row, a=_ra):
-                for w in ws: w.config(bg="#303030")
-                c.config(highlightbackground=ACCENT); a.config(fg=ACCENT)
-            def _resume_leave(e, ws=_rw, c=resume_row, a=_ra):
-                for w in ws: w.config(bg=SURF)
-                c.config(highlightbackground=BORDER); a.config(fg=BORDER)
-            def _resume_click(e, sp=_last_script):
-                self.workflow = "script_session"
-                self._export_fmt = None
-                self._load_script(sp)
-            for _lbl in _ri.winfo_children(): _rw.append(_lbl)
-            for _w in _rw:
-                _w.bind("<Enter>",    _resume_enter)
-                _w.bind("<Leave>",    _resume_leave)
-                _w.bind("<Button-1>", _resume_click)
+        # The "Resume last project" row that used to sit here is gone.  It
+        # opened the remembered script but always forced
+        # workflow="script_session", so a project that was AAF or XML came
+        # back as the wrong workflow.  Owner's call was to drop it rather
+        # than fix it — OPEN in the header does the same job and takes the
+        # workflow from the session file instead of assuming one.
+        #
+        # The `last_script` preference is still written, and still used by
+        # _select_workflow to start the file dialog in the right folder.
 
         cards_frame = tk.Frame(self.body, bg=BG)
         cards_frame.pack(fill="x", padx=20)
