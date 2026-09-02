@@ -194,6 +194,14 @@ Review flagged clips. Adjust timecodes in the waveform editor. Manually accept o
 
 **Fixed row heights:** cards keep the same height in every state. Confirming or ignoring changes only the border and stripe colour — it does not resize the row and shift everything below it.
 
+**If the list feels heavy to scroll:** cost tracks how many cards are laid out, so collapsing the parts you've finished is the lever — measured on a 240-card list, folding 8 of 10 parts took a scroll step from 51ms to 11ms. To get the numbers for your own episode, point the profiler at a saved session:
+
+```bash
+python profile_step4.py "C:/path/to/your_session.json"
+```
+
+It reports card count, widget count, and milliseconds per scroll step both expanded and collapsed. Read-only.
+
 **Playback speed:** the waveform editor's transport carries a speed control (0.75× to 2×) for getting through a lot of dialogue quickly. Click it to step up, right-click to step down, or use `[` and `]`. The speed-up is pitch-preserved (ffmpeg `atempo`), so speech stays intelligible rather than going chipmunk, and the playhead tracks it. Your choice carries to the next card — Step 4 opens a fresh editor per clip, and a speed that reset every time would defeat the point. It applies to the next play rather than restarting audio already sounding.
 
 Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.
