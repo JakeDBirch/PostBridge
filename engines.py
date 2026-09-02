@@ -681,9 +681,27 @@ def pb_transcript_load(media_path):
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
         mtime = _safe_getmtime(media_path)
-        # Reject if the media file was replaced since transcription
+        # Reject if the media file was replaced since transcription.
+        # mtime alone is fragile: copying media off a shared drive,
+        # restoring from backup, or re-saving all rewrite mtime while
+        # leaving the audio bit-identical — and re-transcribing a
+        # 90-minute interview to rediscover the same words is the most
+        # expensive thing this app can do.  So when mtime drifts, fall
+        # back to the baked audio_signature (size → duration → sha256,
+        # short-circuiting on the cheap checks) and accept the sidecar
+        # if the content still proves identical.  Sidecars written
+        # before signatures existed have no signature and stay
+        # mtime-gated.
         if abs(data.get("mtime", 0) - mtime) > 2:
-            return None, None
+            _sig = data.get("audio_signature")
+            if not _sig:
+                return None, None
+            try:
+                _ok, _ = audio_signature_matches(_sig, media_path)
+            except Exception:
+                _ok = False
+            if not _ok:
+                return None, None
         words = data.get("words")
         if not words:
             return None, None

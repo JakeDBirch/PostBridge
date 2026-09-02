@@ -155,6 +155,16 @@ PostBridge picks the fastest path per token:
 - **5+ pulls and no cache** → transcribes the full audio once and caches it, then looks up each pull
 - **Under 5 pulls** → traditional per-pull Whisper on padded windows
 
+A sidecar is accepted when the media's mtime still matches it (±2 s). If the mtime drifted — copying media off a shared drive, restoring from backup, and re-saving all rewrite it — PostBridge falls back to the sidecar's baked `audio_signature` (size → duration → SHA-256) and reuses the transcript when the audio is provably identical. Sidecars written before signatures existed remain mtime-gated.
+
+To see which path each token will take **before** committing to a run, use the pre-flight checker — it is read-only and decodes no audio:
+
+```bash
+python check_transcripts.py "C:/path/to/script.txt"
+```
+
+It reports every Pull Quotes session (including signature rejections), a HIT/MISS line with a reason for every sidecar, and a per-token forecast naming the tokens that will actually spend Whisper time.
+
 A live progress log shows per-clip status. A **resource monitor** above the log shows GPU/RAM utilization. A **memory pre-flight check** warns before launch if Windows commit headroom is too tight (Whisper allocations can fail mid-run if the page file is near full).
 
 **Script-conform editing:** when a full transcript is available, PostBridge aligns the script's quote text against the transcript and generates internal cuts for any words on tape that aren't in the script — e.g. "you know" or "um" survivors get cut automatically. Safe by design: if alignment confidence is low, falls back to single-segment match.
@@ -270,7 +280,7 @@ Two flavours, both human-readable JSON:
 |---|---|---|
 | `*_session.json` | Script→Session state: assignments, reconciliation results, Step 4 edits | Wherever you saved it |
 | `<TOKEN>.pb_session.json` | Pull Quotes session: media list, transcript, notes, speaker labels | `<project>/03_AUDIO/00_RAW AUDIO/` |
-| `<media>.pb_transcript.json` | Cached transcript word list | Next to the source audio |
+| `<media>.pb_transcript.json` | Cached transcript word list + audio signature | Next to the source audio |
 
 The `.pb_transcript.json` sidecars are shared between workflows: transcribing in Pull Quotes populates them; reconcile in Script→Session reads them.
 

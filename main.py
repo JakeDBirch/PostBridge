@@ -4442,7 +4442,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     with open(_pbt, encoding="utf-8") as _f:
                         _d = json.load(_f)
                     if abs(_d.get("mtime", 0) - os.path.getmtime(ap)) > 2:
-                        pbt_reason = "pb_transcript mtime changed"
+                        pbt_reason = ("pb_transcript mtime changed"
+                                      + ("" if _d.get("audio_signature")
+                                         else " (no signature to fall back on)"))
                     elif not _d.get("words"):
                         pbt_reason = "pb_transcript empty"
                     else:
@@ -5721,7 +5723,10 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                                 _pd = json.load(_pf)
                             _pm = os.path.getmtime(ap)
                             if abs(_pd.get("mtime", 0) - _pm) > 2:
-                                _why.append(".pb_transcript: mtime stale")
+                                _why.append(
+                                    ".pb_transcript: mtime stale"
+                                    + ("" if _pd.get("audio_signature")
+                                       else " / no signature"))
                             elif not _pd.get("words"):
                                 _why.append(".pb_transcript: no words")
                             else:
