@@ -190,6 +190,10 @@ Status badges:
 
 Review flagged clips. Adjust timecodes in the waveform editor. Manually accept or reject. All edits persist in the session JSON.
 
+**Playback speed:** the waveform editor's transport carries a speed control (0.75× to 2×) for getting through a lot of dialogue quickly. Click it to step up, right-click to step down, or use `[` and `]`. The speed-up is pitch-preserved (ffmpeg `atempo`), so speech stays intelligible rather than going chipmunk, and the playhead tracks it. Your choice carries to the next card — Step 4 opens a fresh editor per clip, and a speed that reset every time would defeat the point. It applies to the next play rather than restarting audio already sounding.
+
+Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.
+
 ### Step 5 — Export
 
 Choose **AAF** or **XML**, set sequence name and inter-part gap, then export.

@@ -262,6 +262,47 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     return True
 
 
+def time_stretch_wav(in_wav_path, out_wav_path, rate):
+    """Time-stretch a WAV by `rate` with the pitch preserved.
+
+    rate > 1 plays faster, < 1 slower.  Used by review playback so a
+    2x pass through an interview still sounds like speech rather than a
+    chipmunk -- resampling would be one flag, but shifts pitch by the
+    same factor and is unusable for reviewing dialogue.
+
+    ffmpeg's atempo accepts 0.5-2.0 per instance, so wider ratios are
+    chained (2.5x becomes atempo=2.0,atempo=1.25).  Returns True on
+    success; on any failure returns False and leaves out_wav_path
+    untouched, so callers can fall back to the unstretched audio.
+    """
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return False
+    if not (0.1 <= rate <= 8.0):
+        return False
+    if abs(rate - 1.0) < 1e-3:
+        return False              # nothing to do -- caller keeps the original
+
+    factors = []
+    remaining = rate
+    while remaining > 2.0:
+        factors.append(2.0);  remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5);  remaining /= 0.5
+    factors.append(remaining)
+    chain = ",".join("atempo={:.6f}".format(f) for f in factors)
+
+    cmd = _ffmpeg_cmd() + ["-y", "-i", in_wav_path,
+                           "-filter:a", chain,
+                           "-acodec", "pcm_s16le", "-vn", out_wav_path]
+    try:
+        r = _run(cmd, capture_output=True, timeout=60)
+    except Exception:
+        return False
+    return r.returncode == 0 and os.path.isfile(out_wav_path)
+
+
 def _ffprobe_csv(path, entries, select=None, timeout=10):
     """Run a single-value `-of csv=p=0` ffprobe query and return the
     stripped stdout, or None on any failure (missing file, timeout,

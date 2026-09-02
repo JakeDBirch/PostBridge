@@ -27,7 +27,9 @@ _log = logging.getLogger("match_review")
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     SUCCESS, WARN, ERR, FB, FBT, FH,
                     SNAP_IN_OFFSET, SNAP_OUT_OFFSET)
-from engines import extract_audio_segment, extract_mono_pcm, get_media_duration
+from engines import (extract_audio_segment, extract_mono_pcm,
+                     get_media_duration,
+                     time_stretch_wav as engines_time_stretch)
 
 # ── Waveform disk cache ────────────────────────────────────────────────────────
 # Keyed on file path + mtime + size so stale entries are automatically ignored.
@@ -91,6 +93,14 @@ _PLAYBACK_SR = 44100    # playback sample rate
 # animation is offset by the same amount so the visual cursor stays
 # aligned with what the user hears.
 _LEAD_IN_MS = 120
+
+# Playback speed.  Reviewing a reconciled episode means auditioning a lot
+# of speech, so the transport offers a pitch-preserved speed-up (ffmpeg
+# atempo -- see engines.time_stretch_wav).  The choice is module-level,
+# not per-dialog: Step 4 opens a NEW MatchReviewDialog for every card, and
+# a speed that reset to 1x on each one would be worse than not having it.
+_PLAY_RATES     = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+_LAST_PLAY_RATE = 1.0
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
 _CUT_HIT     = 18       # wider radius for interior CUT IN / CUT OUT lines —
@@ -262,6 +272,12 @@ class MatchReviewDialog:
         self._pre_play_pos    = None      # playhead position saved before playback starts
         self._words_draw_key  = None      # cache key for _draw_words dedup
         self._playback_end_file = None    # file-time at which playback should auto-stop
+        self._play_rate       = _LAST_PLAY_RATE  # pitch-preserved speed multiplier
+        self._play_rate_active = 1.0      # rate the CURRENTLY sounding audio was
+                                          # rendered at; the playhead advances by
+                                          # this per wall-second, and it must not
+                                          # change mid-playback just because the
+                                          # user picked a new speed for next time
 
         # Word-search state — for hunting a phrase in a transcript that
         # diverges wildly from what the script said.  self._search_hits
@@ -532,6 +548,10 @@ class MatchReviewDialog:
         win.bind("<Shift-S>", _toggle_skip_cuts)
         win.bind("<Shift-s>", _toggle_skip_cuts)
 
+        # [ / ] — playback speed down / up
+        win.bind("<bracketleft>",  lambda e: self._cycle_rate(-1))
+        win.bind("<bracketright>", lambda e: self._cycle_rate(1))
+
         # + / - zoom in / out — viewport centre stays fixed
         win.bind("<plus>",       lambda e: self._zoom_by(1.0/1.5))
         win.bind("<minus>",      lambda e: self._zoom_by(1.5))
@@ -651,6 +671,15 @@ class MatchReviewDialog:
 
         _pb("\u25b6 PLAY", self._play_or_edit)
         _pb("\u25a0 STOP", self._stop)
+
+        # Speed — click to step up, right-click to step down, [ and ] on
+        # the keyboard.  Applies to the NEXT play rather than restarting
+        # what is already sounding, so tapping through speeds mid-audition
+        # does not keep throwing you back to the top of the clip.
+        self._rate_btn = _pb("", self._cycle_rate)
+        self._rate_btn.bind("<ButtonRelease-3>",
+                            lambda e: self._cycle_rate(-1))
+        self._sync_rate_btn()
 
         # SKIP CUTS checkbox — stitches segments, skipping excised gaps (ON by default)
         # Packed to far right so it's visually separate from transport buttons
@@ -2419,6 +2448,7 @@ class MatchReviewDialog:
             peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
             if peak > 1e-6:
                 arr = arr / peak * 0.85
+            arr, _ = self._stretch(arr, _PLAYBACK_SR)
             lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
             if lead_samps:
                 arr = _np.concatenate(
@@ -2470,6 +2500,31 @@ class MatchReviewDialog:
             # Caller uses the old single-arg signature — fall back
             # gracefully; the token change is dropped in that case.
             self._on_accept(segs)
+
+    def _sync_rate_btn(self):
+        """Repaint the speed button and remember the choice for the next card."""
+        global _LAST_PLAY_RATE
+        _LAST_PLAY_RATE = self._play_rate
+        btn = getattr(self, "_rate_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.config(text="{:g}\u00d7".format(self._play_rate),
+                       fg=TEXT if self._play_rate == 1.0 else ACCENT)
+        except Exception:
+            pass
+
+    def _cycle_rate(self, step=1):
+        """Step through _PLAY_RATES.  Clamps at the ends rather than
+        wrapping — wrapping from 2x straight back to 0.75x is a nasty
+        surprise when you are tapping ] to go faster."""
+        try:
+            i = _PLAY_RATES.index(self._play_rate)
+        except ValueError:
+            i = _PLAY_RATES.index(1.0)
+        self._play_rate = _PLAY_RATES[
+            max(0, min(len(_PLAY_RATES) - 1, i + step))]
+        self._sync_rate_btn()
 
     def _play_in(self):
         """Zoom to IN; stitched if PLAY EDIT on, else raw from IN."""
@@ -2637,6 +2692,7 @@ class MatchReviewDialog:
             peak = float(_np.max(_np.abs(combined))) if len(combined) else 0.0
             if peak > 1e-6:
                 combined = combined / peak * 0.85
+            combined, _rate = self._stretch(combined, _PLAYBACK_SR)
             # Prepend silent lead-in — see _play() for rationale.  For
             # stitched playback the lead-in goes at the head of the
             # combined stream only (NOT between segments — that would
@@ -2651,11 +2707,11 @@ class MatchReviewDialog:
                 wf.setnchannels(1); wf.setsampwidth(2)
                 wf.setframerate(_PLAYBACK_SR)
                 wf.writeframes(pcm.tobytes())
-            return out_wav
+            return out_wav, _rate
 
         def _done(fut):
             try:
-                path = fut.result()
+                path, rate = fut.result()
             except Exception:
                 _log.exception("play_stitched failed")
                 return
@@ -2675,6 +2731,7 @@ class MatchReviewDialog:
                     _time.perf_counter() + _LEAD_IN_MS / 1000.0)
                 self._playback_start_file = seg_list[0][0]
                 self._play_edit_segs      = list(seg_list)
+                self._play_rate_active    = rate
                 self._animate_playhead()
             try:
                 self._win.after(0, _do_play)
@@ -2852,6 +2909,42 @@ class MatchReviewDialog:
         self._refresh_displays()
         self._draw()
 
+    def _stretch(self, arr, sr):
+        """Time-stretch `arr` to the current playback rate, pitch preserved.
+
+        Round-trips through ffmpeg (engines.time_stretch_wav) because a
+        pitch-preserving stretch is a real DSP job -- resampling is one
+        line but shifts pitch by the same factor, which is unusable on
+        speech.  Returns `arr` unchanged at 1x or if ffmpeg fails, so a
+        stretch problem costs the speed-up and never the playback.
+
+        Call this BEFORE the silent lead-in is prepended: the lead-in
+        exists to absorb Windows' audio startup ramp and must keep its
+        full wall-clock length at every speed.
+        """
+        import numpy as _np
+        rate = float(getattr(self, "_play_rate", 1.0) or 1.0)
+        if abs(rate - 1.0) < 1e-3 or arr is None or not len(arr):
+            return arr, 1.0
+        import wave as _wave
+        raw = os.path.join(self._tmp_dir, "_rate_in.wav")
+        out = os.path.join(self._tmp_dir, "_rate_out.wav")
+        try:
+            pcm = (_np.clip(arr, -1.0, 1.0) * 32767).astype(_np.int16)
+            with _wave.open(raw, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(pcm.tobytes())
+            if not engines_time_stretch(raw, out, rate):
+                return arr, 1.0
+            with _wave.open(out, "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+            return (_np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0,
+                    rate)
+        except Exception:
+            _log.exception("time-stretch failed; playing at 1x")
+            return arr, 1.0
+
     def _play(self, start_s, duration_s):
         import time as _time
         self._stop()
@@ -2870,6 +2963,7 @@ class MatchReviewDialog:
             peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
             if peak > 1e-6:
                 arr = arr / peak * 0.85
+            arr, _rate = self._stretch(arr, _PLAYBACK_SR)
             # Prepend silent lead-in so Windows' PlaySound startup ramp
             # happens over silence and the real audio starts at full level.
             lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
@@ -2881,11 +2975,11 @@ class MatchReviewDialog:
                 wf.setnchannels(1); wf.setsampwidth(2)
                 wf.setframerate(_PLAYBACK_SR)
                 wf.writeframes(pcm.tobytes())
-            return out_wav
+            return out_wav, _rate
 
         def _done(fut):
             try:
-                path = fut.result()
+                path, rate = fut.result()
             except Exception:
                 _log.exception("play extract failed")
                 return
@@ -2906,6 +3000,7 @@ class MatchReviewDialog:
                 self._playback_start_wall    = (
                     _time.perf_counter() + _LEAD_IN_MS / 1000.0)
                 self._playback_start_file    = start_s
+                self._play_rate_active       = rate
                 self._animate_playhead()
             try:
                 self._win.after(0, _do_play)
@@ -2927,6 +3022,10 @@ class MatchReviewDialog:
         # startup ramp.
         elapsed = max(0.0,
                       _time.perf_counter() - self._playback_start_wall)
+        # At 1.5x, one wall-second covers 1.5 seconds of the file, so the
+        # cursor has to travel at the rate the SOUNDING audio was rendered
+        # at -- not whatever the user has since dialled in for next time.
+        elapsed *= float(getattr(self, "_play_rate_active", 1.0) or 1.0)
         if self._play_edit_segs:
             self._playhead_s = self._stitched_t_to_file_t(elapsed)
         else:
