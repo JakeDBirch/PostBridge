@@ -196,7 +196,9 @@ Review flagged clips. Adjust timecodes in the waveform editor. Manually accept o
 
 **Compact card header:** each row is built from as few widgets as it can be, because scroll cost tracks the widget count. The order number and token share a label; status carries its confidence; sub-clip count, timecode drift and the recorded range share one grey detail line; and one state label swaps between ACCEPTED and IGNORED. Measured on a 240-card list: 3905 widgets → 2185, and a scroll step from 54ms to 36ms. The trade is two accent colours — the order number takes the token's orange, and the clips / Δ badges go grey. Every state signal (status colour, stripe, border) is unchanged.
 
-**If the list feels heavy to scroll:** cost tracks how many cards are laid out, so collapsing the parts you've finished is the lever — measured on a 240-card list, folding 8 of 10 parts took a scroll step from 51ms to 11ms. To get the numbers for your own episode, point the profiler at a saved session:
+**FOCUS:** the toggle on the sort row keeps one part open at a time — opening a part folds the rest. Scroll cost tracks how many cards are laid out and nothing else, so this is the whole game: measured on a 184-card episode, **16.5 ms per scroll step with every part open, 0.8 ms with FOCUS on**. The setting is remembered between sessions. EXPAND ALL / COLLAPSE ALL sit beside it for manual control.
+
+To get the numbers for your own episode, point the profiler at a saved session:
 
 ```bash
 python profile_step4.py "C:/path/to/your_session.json"
