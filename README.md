@@ -258,6 +258,10 @@ Sync results are cached to disk — re-running is fast.
 
 Click **Build XML** once all sources are synced. PostBridge generates an XMEML file with audio and video aligned.
 
+Picture can only land on whole frames; the audio it is matched to cannot. Some sub-frame residual is therefore unavoidable, but *which* frame a clip lands on is a choice. PostBridge rounds the sync offset once per source and applies that same whole-frame shift to every clip from it, so the residual stays under half a frame and clips from one camera never disagree with each other. Near-ties break toward picture-early, since sound arriving after the picture is the direction viewers tolerate (ATSC IS-191 allows audio to lag video by 45 ms but lead it by only 15 ms).
+
+After each build the console lists the leftover per source — how many milliseconds, and which way — so a source sitting close to half a frame can be nudged in Pro Tools instead of being found on the timeline. A residual near half a frame means the offset genuinely falls between two frames; it is not a sign the sync is wrong.
+
 Each source is declared with its own audio channel count, probed from the file. This matters when the media imports offline — a project opened on a different drive, or media moved after the build. Premiere creates offline clips with whatever layout the XML claims, and refuses to relink a file whose real layout differs ("the selected file cannot be linked because it has 1 audio channel(s) and the clip was created with 2"). Mono sources — isolated participant tracks, Riverside `raw-audio` exports — are the usual casualties. If a file cannot be probed at build time, the count is left out rather than guessed, and Premiere reads it off the media.
 
 ---

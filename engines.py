@@ -1,4 +1,4 @@
-import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
+import os, sys, re, io, json, math, tempfile, subprocess, wave, hashlib, threading
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -3429,6 +3429,46 @@ def reconcile_vo_block(vo_block, takes):
 def f2fr(secs, fps):
     return round(secs * fps)
 
+
+# How close to an exact half-frame still counts as a genuine tie, in frames.
+# 0.05 frame is ~2 ms at 24p — inside this band the two candidate frames are
+# perceptually interchangeable, so the choice is made on direction instead.
+_SYNC_TIE_BAND_FR = 0.05
+
+def video_shift_frames(offset_secs, fps):
+    """Whole-frame shift to apply to picture for a sync offset, as a SINGLE
+    rounding of the offset itself.
+
+    Picture can only land on frames; the audio it has to match cannot.  Some
+    residual is therefore unavoidable — but which frame we land on is a
+    choice, and making it badly is what leaves one clip a frame out of step
+    with its neighbours.
+
+    Rounding `src_in + offset` and `src_in` separately (the obvious way to
+    write it) makes the shift depend on where each clip happens to fall
+    against the frame grid, so two clips from the same camera with the same
+    offset can land a full frame apart — worst near a half-frame offset,
+    where the choice is close to a coin flip per clip.  Rounding the offset
+    once gives every clip from a source the same shift and bounds the
+    residual at half a frame instead of a whole one.
+
+    Ties break toward the later source frame, which puts picture early and
+    sound late.  Sound arriving after the picture is the direction viewers
+    tolerate — ATSC IS-191 allows audio to lag video by 45 ms but lead it by
+    only 15 ms — and it also sidesteps round()'s round-half-to-even, which
+    would otherwise settle an exact tie on the parity of the frame number."""
+    d    = offset_secs * fps
+    frac = d - math.floor(d)
+    if abs(frac - 0.5) <= _SYNC_TIE_BAND_FR:
+        return int(math.ceil(d))
+    return int(math.floor(d + 0.5))
+
+
+def sync_residual_frames(offset_secs, fps):
+    """Signed leftover after video_shift_frames(), in frames.  Negative means
+    picture lands early and sound lags it; positive means sound leads."""
+    return offset_secs * fps - video_shift_frames(offset_secs, fps)
+
 def make_rate(el, fps):
     _NTSC_MAP = {
         23.976: 24, 47.952: 48,
@@ -4117,8 +4157,9 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     group = []
 
                     if vp and tv_idx < len(v_tracks):
-                        v_in_fr  = f2fr(seg_in_s  + v_off, fps)
-                        v_out_fr = f2fr(seg_out_s + v_off, fps)
+                        _v_shift = video_shift_frames(v_off, fps)
+                        v_in_fr  = seg_in_fr  + _v_shift
+                        v_out_fr = seg_out_fr + _v_shift
                         fid  = "file-vo-v-{}-{}".format(pi, take_i)
                         cid  = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
@@ -4458,6 +4499,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         _vfc_cache[vp] = fr
         return fr
     _oor_seen = set()   # source bases already warned (dedupe per source)
+    # base -> (offset_secs, shift_fr): what picture was actually moved by,
+    # against what the measured offset asked for.  Reported after the build
+    # so the sub-frame leftover on every synced source is visible rather
+    # than something you have to notice in the timeline.
+    _sync_applied = {}
 
     v_tracks   = {tn: [] for tn in track_names}
     a_tracks   = {tn: [] for tn in track_names}
@@ -4524,16 +4570,26 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # Audio uses the reference-audio src position directly (no camera offset).
         # Video ADDS v_offset: positive offset = camera started before DAW (common),
         # negative offset = audio started before camera (both are valid).
-        a_src_in  = max(0, f2fr(src_in_s,          fps) - head_ext)
+        # Picture is the audio's own source window shifted by ONE rounded
+        # offset, not a second independent rounding of (src_in + offset).
+        # That keeps every clip from a source on the same shift, and keeps
+        # the video window exactly as long as the audio window.
+        v_shift   = video_shift_frames(v_offset, fps)
+        a_src_in  = max(0, f2fr(src_in_s,  fps) - head_ext)
         a_src_out = f2fr(src_out_s, fps) + fo_fr
-        v_src_in  = max(0, f2fr(src_in_s + v_offset, fps) - head_ext)
-        v_src_out = max(0, f2fr(src_out_s + v_offset, fps)) + fo_fr
+        v_src_in  = max(0, f2fr(src_in_s,  fps) + v_shift - head_ext)
+        v_src_out = max(0, f2fr(src_out_s, fps) + v_shift) + fo_fr
         # If clamping collapsed the video window, push out by clip duration
         if v_src_out <= v_src_in:
             v_src_out = v_src_in + (end_fr - start_fr)
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
+
+        if vp and v_offset:
+            _sync_applied.setdefault(
+                clip.get("source_base") or os.path.basename(vp),
+                (v_offset, v_shift))
 
         # ── Out-of-range guard ────────────────────────────────────────
         # When the sync offset is badly wrong (e.g. the joined footage is
@@ -4561,8 +4617,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             _vfc = _video_frame_count(vp)
             if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
                 # Content-only bounds (strip the fade extensions back off).
-                _content_in  = f2fr(src_in_s + v_offset,  fps)
-                _content_out = f2fr(src_out_s + v_offset, fps)
+                _content_in  = f2fr(src_in_s,  fps) + v_shift
+                _content_out = f2fr(src_out_s, fps) + v_shift
                 _content_overshoot = max(
                     -_content_in,                  # head before video frame 0
                     _content_out - _vfc,           # tail past video end
@@ -4696,6 +4752,15 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
 
     if stats_out is not None:
         stats_out["gaps_closed"] = gaps_closed
+        # Sorted worst-first so a marginal source is the first thing read.
+        stats_out["sync_residuals"] = sorted(
+            ({"source":      base,
+              "offset_secs": off,
+              "shift_fr":    shift,
+              "residual_fr": off * fps - shift,
+              "residual_ms": (off * fps - shift) / fps * 1000.0 if fps else 0.0}
+             for base, (off, shift) in _sync_applied.items()),
+            key=lambda r: -abs(r["residual_fr"]))
 
     # ── Emit clipitems ─────────────────────────────────────────────────
     for p in placements:
