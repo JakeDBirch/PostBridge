@@ -75,7 +75,7 @@ class BuildCancelled(Exception):
 
 # ── Globals ────────────────────────────────────────────────────────────────────
 _cache_dir = None   # Will be set by App when script is loaded
-_channel_cache = {}
+_channel_cache = {}   # normcased path -> first audio stream's channel count
 _model_cache = {}
 _model_lock  = threading.Lock()
 
@@ -330,9 +330,34 @@ def get_media_duration(path):
     except (TypeError, ValueError):
         return None
 
-def get_audio_channels(path):
+def probe_audio_channels(path):
+    """Real channel count of a file's first audio stream, memoised per path.
+
+    Returns None when the count cannot be determined — the file is missing,
+    unreadable, or carries no audio stream at all.
+
+    Callers that write a channel count into an NLE interchange file must keep
+    "unknown" distinct from a guess.  Media that imports offline (moved drive,
+    different root) is created with whatever the XML claims, and Premiere then
+    refuses to relink the real file: "the selected file cannot be linked
+    because it has 1 audio channel(s) and the clip was created with 2 audio
+    channel(s) with a different channel type."  Leaving the element out lets
+    Premiere read the count off the media instead of trusting a wrong one."""
+    key = os.path.normcase(os.path.abspath(path))
+    if key in _channel_cache:
+        return _channel_cache[key]
     out = _ffprobe_csv(path, "stream=channels", select="a:0")
-    return int(out) if out and out.isdigit() else 2
+    if not (out and out.isdigit()):
+        return None          # unknown — do NOT cache, the file may appear later
+    n = int(out)
+    _channel_cache[key] = n
+    return n
+
+
+def get_audio_channels(path):
+    """Channel count with a stereo fallback, for callers that need a number
+    no matter what.  Use probe_audio_channels() where "unknown" matters."""
+    return probe_audio_channels(path) or 2
 
 # ── Split-clip join (gapless file-size splits → one continuous file) ─────────
 def _concat_stream_sig(path):
@@ -3831,26 +3856,29 @@ def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
         SubElement(f_el, "name").text    = basename(filepath)
         SubElement(f_el, "pathurl").text = pathurl(filepath)
         make_rate(f_el, fps)
+
+        # The channel count has to describe the *file*, not the sequence.
+        # Declaring stereo for a mono source makes Premiere build the clip as
+        # stereo, and any later relink of the real mono file is rejected with
+        # "Cannot Link Media".  Mono camera/interview sources (isolated
+        # participant tracks, Riverside "raw-audio" exports) hit this every
+        # time.  None = unknown; omit the element and let Premiere read it.
+        n_ch = (file_audio_channels if file_audio_channels is not None
+                else probe_audio_channels(filepath))
+
+        mc = SubElement(f_el, "media")
         if is_video:
-            mc = SubElement(f_el, "media")
             vc = SubElement(mc, "video")
             vc_ch = SubElement(vc, "samplecharacteristics")
             make_rate(vc_ch, fps)
             SubElement(vc_ch, "width").text  = str(seq_w)
             SubElement(vc_ch, "height").text = str(seq_h)
-            ac = SubElement(mc, "audio")
-            ac_ch = SubElement(ac, "samplecharacteristics")
-            SubElement(ac_ch, "depth").text      = "16"
-            SubElement(ac_ch, "samplerate").text = str(seq_sr)
-            SubElement(ac, "channelcount").text  = "2"
-        else:
-            mc = SubElement(f_el, "media")
-            ac = SubElement(mc, "audio")
-            ac_ch = SubElement(ac, "samplecharacteristics")
-            SubElement(ac_ch, "depth").text      = "16"
-            SubElement(ac_ch, "samplerate").text = str(seq_sr)
-            if file_audio_channels is not None:
-                SubElement(ac, "channelcount").text = str(file_audio_channels)
+        ac = SubElement(mc, "audio")
+        ac_ch = SubElement(ac, "samplecharacteristics")
+        SubElement(ac_ch, "depth").text      = "16"
+        SubElement(ac_ch, "samplerate").text = str(seq_sr)
+        if n_ch:
+            SubElement(ac, "channelcount").text = str(n_ch)
 
     # Tell the NLE which stream to read (needed when a video file is used on an
     # audio track so it reads the audio channel instead of defaulting to video).
@@ -4793,6 +4821,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # imports as a stereo pair in Premiere.  <link> elements (direct children
         # of each clipitem, no wrapper) cross-reference the two clips so Premiere
         # treats them as locked/stereo rather than independent mono tracks.
+        # A mono mix gets a single track instead: splitting it would declare a
+        # channel 2 the file does not have, which breaks relinking the same way
+        # a wrong <channelcount> does.
+        mix_ch     = probe_audio_channels(mix_path)
+        mix_stereo = mix_ch != 1
         mix_L_tidx = n_audio_written + n_cam_written + 1
         mix_R_tidx = n_audio_written + n_cam_written + 2
 
@@ -4818,7 +4851,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                 ac_ch = SubElement(ac2, "samplecharacteristics")
                 SubElement(ac_ch, "depth").text      = "16"
                 SubElement(ac_ch, "samplerate").text = str(seq_sr)
-                SubElement(ac2, "channelcount").text = "2"
+                if mix_ch:
+                    SubElement(ac2, "channelcount").text = str(mix_ch)
             else:
                 SubElement(el, "file", id=fid)   # reference only, no redefinition
             st = SubElement(el, "sourcetrack")
@@ -4827,25 +4861,27 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             return el
 
         ci_L = _mix_ci("clip-mix-L", 1, True)
-        ci_R = _mix_ci("clip-mix-R", 2, False)
+        ci_R = _mix_ci("clip-mix-R", 2, False) if mix_stereo else None
 
         # Cross-links — direct <link> children, no wrapper element
-        for target_ci in (ci_L, ci_R):
-            for ref_cid, ref_tidx in (("clip-mix-L", mix_L_tidx),
-                                      ("clip-mix-R", mix_R_tidx)):
-                lk = SubElement(target_ci, "link")
-                SubElement(lk, "linkclipref").text = ref_cid
-                SubElement(lk, "mediatype").text   = "audio"
-                SubElement(lk, "trackindex").text  = str(ref_tidx)
-                SubElement(lk, "clipindex").text   = "1"
+        if mix_stereo:
+            for target_ci in (ci_L, ci_R):
+                for ref_cid, ref_tidx in (("clip-mix-L", mix_L_tidx),
+                                          ("clip-mix-R", mix_R_tidx)):
+                    lk = SubElement(target_ci, "link")
+                    SubElement(lk, "linkclipref").text = ref_cid
+                    SubElement(lk, "mediatype").text   = "audio"
+                    SubElement(lk, "trackindex").text  = str(ref_tidx)
+                    SubElement(lk, "clipindex").text   = "1"
 
         mix_track_L = SubElement(ael, "track")
         mix_track_L.append(ci_L)
         SubElement(mix_track_L, "outputchannelindex").text = "1"
 
-        mix_track_R = SubElement(ael, "track")
-        mix_track_R.append(ci_R)
-        SubElement(mix_track_R, "outputchannelindex").text = "2"
+        if mix_stereo:
+            mix_track_R = SubElement(ael, "track")
+            mix_track_R.append(ci_R)
+            SubElement(mix_track_R, "outputchannelindex").text = "2"
 
     # ── Patch video↔camera-audio links ───────────────────────────────────────
     # Now that we know which tracks are non-empty (and their 1-based indices),

@@ -258,6 +258,8 @@ Sync results are cached to disk — re-running is fast.
 
 Click **Build XML** once all sources are synced. PostBridge generates an XMEML file with audio and video aligned.
 
+Each source is declared with its own audio channel count, probed from the file. This matters when the media imports offline — a project opened on a different drive, or media moved after the build. Premiere creates offline clips with whatever layout the XML claims, and refuses to relink a file whose real layout differs ("the selected file cannot be linked because it has 1 audio channel(s) and the clip was created with 2"). Mono sources — isolated participant tracks, Riverside `raw-audio` exports — are the usual casualties. If a file cannot be probed at build time, the count is left out rather than guessed, and Premiere reads it off the media.
+
 ---
 
 ## Script Format
