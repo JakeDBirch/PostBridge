@@ -335,6 +335,13 @@ class SyncPreviewDialog:
                     self._loading_lbl.config(
                         text="Extraction failed:\n\n{}".format(exc),
                         justify="left", wraplength=520, fg=WARN)
+                    # A multi-line diagnostic is taller than the canvas
+                    # when centred, so it runs off both ends and the one
+                    # line that names the cause is the first to go.  Pin
+                    # it to the top-left instead: the message then reads
+                    # from its beginning, whatever its length.
+                    self._loading_lbl.place_configure(
+                        relx=0.0, rely=0.0, anchor="nw", x=12, y=10)
                 except Exception:
                     pass
             self._win.after(0, _err)

@@ -215,6 +215,15 @@ def extract_mono_pcm(media_path, sample_rate=8000):
     ]
     r = _run(cmd, capture_output=True, timeout=600)
     if r.returncode != 0:
+        # The commonest failure by far is a video-only file — Riverside's
+        # "raw-video" exports and most camera proxies carry no audio track,
+        # so ffmpeg exits with "does not contain any stream".  Say that in
+        # plain English instead of handing the caller 400 characters of
+        # stream banner with the one useful line off the end.
+        if not _probe_codec(media_path, "a:0"):
+            raise RuntimeError(
+                "{} has no audio track — there is nothing to read a "
+                "waveform from.".format(os.path.basename(media_path)))
         raise RuntimeError(
             "ffmpeg failed extracting PCM from {}:\n{}".format(
                 os.path.basename(media_path),
