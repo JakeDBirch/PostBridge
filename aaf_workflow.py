@@ -626,7 +626,8 @@ class AafWorkflowMixin:
             # so anyone with a saved-since-a94bac2 session gets the
             # same export they had before.
             self._aaf_source_multi_mode_vars      = {}
-        self._aaf_sync_btns = {}   # always reset — widget refs are stale after _clear()
+        self._aaf_sync_btns  = {}  # always reset — widget refs are stale after _clear()
+        self._aaf_align_btns = {}
         # Close any sync preview dialogs left open from a previous visit
         for _dlg in getattr(self, "_aaf_sync_previews", {}).values():
             try: _dlg.close()
@@ -901,6 +902,7 @@ class AafWorkflowMixin:
         self._aaf_ctr_n_labels.clear()
         self._aaf_ctr_minus_btns.clear()
         self._aaf_sync_btns       = {}   # stale widget refs — repopulated below
+        self._aaf_align_btns      = {}   # stale widget refs — repopulated below
         self._aaf_sync_dot_labels = getattr(self, "_aaf_sync_dot_labels", {})
         self._aaf_sync_dot_labels.clear()
         self._aaf_qa_btns = getattr(self, "_aaf_qa_btns", {})
@@ -1567,6 +1569,10 @@ class AafWorkflowMixin:
                     align_btn.bind("<Leave>",  lambda e, w=align_btn: w.config(bg=SURF3))
                     align_btn.bind("<ButtonRelease-1>",
                                    lambda e, b=base: self._aaf_open_align(b))
+                self._aaf_align_btns[base] = align_btn
+                # Grey out when the assigned video carries no audio track
+                # (kicks off the probe on first sight of the file).
+                self._aaf_refresh_align_btn(base)
 
                 # ↺ Reset
                 rst_btn = tk.Label(row1, text="\u21ba", font=FB, bg=SURF3,
@@ -1919,6 +1925,9 @@ class AafWorkflowMixin:
                 n_lbl.config(fg=WARN if partial else TEXT)
         except tk.TclError:
             pass
+        # The newly-assigned file may be video-only — ALIGN follows the
+        # assignment, not just the row rebuild.
+        self._aaf_refresh_align_btn(base)
 
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
@@ -2917,6 +2926,95 @@ class AafWorkflowMixin:
 
     # ── Sync Preview ────────────────────────────────────────────────────────
 
+    # ── Video-only sources ───────────────────────────────────────────────────
+    # Riverside "raw-video" exports and most camera proxies carry no audio
+    # track at all.  There is no second waveform to align against, so ALIGN
+    # is a dead end on those rows — grey it out rather than let the user
+    # open a dialog that can only report a failure.
+
+    def _aaf_assigned_video_path(self, base):
+        """Absolute path of the video in *base*'s first slot, or None."""
+        sv = self._aaf_source_file_vars.get(base)
+        fn = sv.get() if sv is not None else ""
+        if not fn or fn == "— no video —":
+            return None
+        for p in getattr(self, "_aaf_video_paths", []):
+            if self._aaf_vid_label(p) == fn:
+                return p
+        return None
+
+    def _aaf_video_has_audio(self, path, on_ready=None):
+        """True / False for *path* carrying an audio stream, or None when it
+        has not been probed yet.
+
+        ffprobe is far too slow to run inline on every row — a 30-source AAF
+        would stall the rebuild for about a second — so the answer is cached
+        and filled in from a worker thread.  Callers treat None as "assume
+        audio for now" and re-render via *on_ready* once the probe lands.
+        """
+        cache = getattr(self, "_aaf_vid_audio_cache", None)
+        if cache is None:
+            cache = self._aaf_vid_audio_cache = {}
+        if path in cache:
+            return cache[path]
+
+        pending = getattr(self, "_aaf_vid_audio_pending", None)
+        if pending is None:
+            pending = self._aaf_vid_audio_pending = set()
+        if path in pending:
+            return None
+        pending.add(path)
+
+        def _work():
+            from engines import has_audio_track
+            return has_audio_track(path)
+
+        def _done(fut):
+            try:
+                has = fut.result()
+            except Exception:
+                has = True     # probe itself failed — do not punish the row
+            def _apply():
+                pending.discard(path)
+                cache[path] = has
+                if on_ready:
+                    on_ready()
+            self._ui(_apply)
+
+        from concurrent.futures import ThreadPoolExecutor
+        ex  = ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_work)
+        fut.add_done_callback(_done)
+        ex.shutdown(wait=False)
+        return None
+
+    def _aaf_refresh_align_btn(self, base):
+        """Enable / grey the row's ALIGN button for the current assignment."""
+        btn = getattr(self, "_aaf_align_btns", {}).get(base)
+        if btn is None:
+            return
+        try:
+            if not btn.winfo_exists():
+                return
+        except Exception:
+            return
+
+        locked = self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get()
+        vp     = self._aaf_assigned_video_path(base)
+        # None (not probed yet) reads as "has audio" so the button never
+        # flickers disabled on a file that turns out to be fine.
+        silent = (vp is not None
+                  and self._aaf_video_has_audio(
+                      vp, on_ready=lambda b=base: self._aaf_refresh_align_btn(b))
+                  is False)
+        dead = locked or silent
+        try:
+            btn.config(fg=SUB if dead else TEXT,
+                       cursor="" if dead else "hand2",
+                       bg=SURF3)
+        except tk.TclError:
+            pass
+
     def _aaf_open_align(self, base):
         """Open the waveform alignment dialog for manual verification/adjustment."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
@@ -2929,6 +3027,17 @@ class AafWorkflowMixin:
         path_by_fn = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
         vp = path_by_fn.get(fn)
         if not vp:
+            return
+        # A cold probe returns None and the dialog opens anyway — it now
+        # reports the missing track clearly — but the button greys itself
+        # once the answer lands, so the dead end is only ever hit once.
+        if self._aaf_video_has_audio(
+                vp, on_ready=lambda b=base: self._aaf_refresh_align_btn(b)) is False:
+            messagebox.showwarning("Video Has No Audio",
+                "{}\n\nThis file has no audio track, so there is no waveform "
+                "to align against the reference. Assign the video that carries "
+                "the scratch mic for this source."
+                .format(os.path.basename(vp)))
             return
         ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
         if not ap or not os.path.isfile(ap):

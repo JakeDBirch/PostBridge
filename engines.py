@@ -220,7 +220,7 @@ def extract_mono_pcm(media_path, sample_rate=8000):
         # so ffmpeg exits with "does not contain any stream".  Say that in
         # plain English instead of handing the caller 400 characters of
         # stream banner with the one useful line off the end.
-        if not _probe_codec(media_path, "a:0"):
+        if not has_audio_track(media_path):
             raise RuntimeError(
                 "{} has no audio track — there is nothing to read a "
                 "waveform from.".format(os.path.basename(media_path)))
@@ -301,6 +301,17 @@ def get_media_duration(path):
 def get_audio_channels(path):
     out = _ffprobe_csv(path, "stream=channels", select="a:0")
     return int(out) if out and out.isdigit() else 2
+
+
+def has_audio_track(path):
+    """True when *path* carries at least one audio stream.
+
+    Video-only files are common enough in this pipeline to be worth naming:
+    Riverside "raw-video" exports ship the audio as a separate WAV, and most
+    camera proxies drop audio entirely.  Anything that wants a waveform out
+    of a file needs to know this before it tries.  Memoised via _probe_codec,
+    so repeat calls across the UI cost nothing."""
+    return bool(_probe_codec(path, "a:0"))
 
 # ── Split-clip join (gapless file-size splits → one continuous file) ─────────
 def _concat_stream_sig(path):
