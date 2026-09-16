@@ -2998,6 +2998,266 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 target=self._s4_transcribe_and_reconcile_vo,
                 args=(res, new_file), daemon=True).start()
 
+    # ── Live merge of background reconcile results into Step 4 ─────────────
+    #
+    # REVIEW NOW lets the user work on provisional rows (script timecodes)
+    # while matching runs.  Real results arrive one token / VO part at a
+    # time and are merged INTO the existing row dicts rather than swapping
+    # self.results for a new list: every card closure and any open
+    # waveform editor holds a reference to the old dict, so a swap left
+    # them editing an orphan the export never saw.
+
+    _PRE_MATCH_STATUSES = ("provisional", "not_run")
+    # Keys Step 4 owns on a row; a fresh reconcile result never overwrites them.
+    _S4_OWNED_KEYS = ("_s4_accepted", "_s4_ignored", "_bg_note", "_prov_segs")
+
+    def _s4_is_live(self):
+        rv = getattr(self, "_rv", None)
+        try:
+            return bool(rv) and bool(rv[0]["card"].winfo_exists())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _segs_same(a, b, tol=0.05):
+        a = list(a or [])
+        b = list(b or [])
+        if len(a) != len(b):
+            return False
+        return all(abs(float(x[0]) - float(y[0])) <= tol
+                   and abs(float(x[1]) - float(y[1])) <= tol
+                   for x, y in zip(a, b))
+
+    def _bg_merge_row(self, cur, fresh):
+        """Fold one reconciled result into its existing row dict (data only).
+
+        Returns "upgraded" (row now carries the real match), "reopened"
+        (row was accepted with untouched script timecodes — it takes the
+        real match and goes back to unconfirmed), "kept" (hand-edited or
+        reassigned — the user's version stays), or None (nothing to do).
+        """
+        if cur.get("_bg_matched"):
+            return None
+        cur["_bg_matched"] = True
+        pre = (cur.get("_original_status") or cur.get("status", "")) \
+            in self._PRE_MATCH_STATUSES
+        if not pre:
+            # Already resolved against real data (carried over from a
+            # previous run) or its status was set by hand.
+            return None
+
+        # Reassigned while provisional: the fresh result is for the OLD
+        # token, so it is wrong for this row now.
+        if fresh.get("token") and cur.get("token") \
+                and fresh.get("token") != cur.get("token"):
+            cur["_bg_note"] = "reassigned before matching finished — kept"
+            return "kept"
+
+        accepted = bool(cur.get("_s4_accepted"))
+        if accepted and not self._segs_same(cur.get("segments"),
+                                            cur.get("_prov_segs")):
+            # Hand-edited: their cut wins.  Re-point the bucket bookkeeping
+            # at the real status so a later un-accept lands correctly.
+            cur["_original_status"] = fresh.get("status", "")
+            _i, _o = fresh.get("rec_in_tc", ""), fresh.get("rec_out_tc", "")
+            cur["_bg_note"] = ("kept your edit — matcher found {} → {}".format(_i, _o)
+                               if _i and _o else "kept your edit")
+            return "kept"
+
+        keep = {k: cur[k] for k in self._S4_OWNED_KEYS if k in cur}
+        cur.clear()
+        cur.update(fresh)
+        cur.update(keep)
+        cur["_bg_matched"] = True
+        if accepted:
+            cur["_s4_accepted"] = False
+            cur["_bg_note"] = ("real match arrived after you accepted the "
+                               "script timecodes — check again")
+            return "reopened"
+        return "upgraded"
+
+    def _bg_apply_batch(self, batch, final=False, _tries=0):
+        """Main thread.  Merge a batch of reconciled rows and patch Step 4."""
+        if getattr(self, "_s4_building", False) and _tries < 120:
+            # Cards half-built — try again once the build finishes.  Capped:
+            # a build that raised leaves the latch set (see _step4).
+            self.after(250, lambda: self._bg_apply_batch(batch, final, _tries + 1))
+            return
+        if self.results is None:
+            self.results = []
+        by_order = {r.get("order"): r for r in self.results}
+        editing  = getattr(self, "_s4_editing_row", None)
+        deferred = self.__dict__.setdefault("_bg_deferred", {})
+        stats    = self.__dict__.setdefault(
+            "_bg_stats", {"upgraded": 0, "reopened": 0, "kept": 0})
+        touched  = []
+        added    = False
+        for fresh in batch:
+            order = fresh.get("order")
+            cur = by_order.get(order)
+            if cur is None:
+                self.results.append(fresh)      # no card; export still sees it
+                by_order[order] = fresh
+                added = True
+                continue
+            if cur is fresh:
+                continue
+            if editing is not None and cur is editing:
+                deferred[order] = fresh         # applied when the editor closes
+                continue
+            deferred.pop(order, None)
+            action = self._bg_merge_row(cur, fresh)
+            if action:
+                stats[action] += 1
+                touched.append((cur, action))
+        if added:
+            self.results.sort(key=lambda r: r.get("order", 0))
+        if touched:
+            self._bg_patch_undo(touched)
+        if self._s4_is_live():
+            self._bg_patch_cards(touched)
+            if touched:
+                self._s4_save()
+        self._bg_strip_refresh()
+        if final:
+            self._bg_finish_live()
+
+    def _bg_flush_deferred(self, row):
+        """Editor on `row` closed — apply the match that waited for it."""
+        if getattr(self, "_s4_editing_row", None) is row:
+            self._s4_editing_row = None
+        fresh = (getattr(self, "_bg_deferred", None) or {}).pop(row.get("order"), None)
+        if fresh is None:
+            self._bg_strip_refresh()
+            return
+        self._bg_apply_batch([fresh])
+        if not getattr(self, "_bg_reconcile_active", False):
+            self._bg_finish_live()
+
+    def _bg_patch_undo(self, touched):
+        """Undo must not put a replaced row back to its script timecodes."""
+        stacks = [getattr(self, "_s4_undo_stack", None) or [],
+                  getattr(self, "_s4_redo_stack", None) or []]
+        for r, action in touched:
+            if action == "kept":
+                continue
+            key = str(r.get("order"))
+            for stack in stacks:
+                for snap in stack:
+                    ent = snap.get(key)
+                    if ent is None:
+                        continue
+                    ent.update(segments=r.get("segments", []),
+                               rec_in_tc=r.get("rec_in_tc", ""),
+                               rec_out_tc=r.get("rec_out_tc", ""),
+                               rec_in_s=r.get("rec_in_s", 0.0),
+                               rec_out_s=r.get("rec_out_s", 0.0),
+                               status=r.get("status", ""))
+                    if action == "reopened":
+                        ent["accepted"] = False
+                    if r.get("is_vo") and r.get("takes_data"):
+                        ent["takes_data"] = r["takes_data"]
+
+    def _bg_patch_cards(self, touched):
+        rv = {id(e["res"]): e for e in (getattr(self, "_rv", None) or [])}
+        for r, action in touched:
+            e = rv.get(id(r))
+            if e is None:
+                continue
+            try:
+                if e["accepted_flag"][0] and not r.get("_s4_accepted"):
+                    e["accepted_flag"][0] = False
+                    e["set_normal_fn"]()
+                self._s4_patch_card_status(r)
+                fn = e.get("refresh_detail_fn")
+                if fn:
+                    fn()
+            except tk.TclError:
+                pass
+        _rc = getattr(self, "_s4_recount_tallies", None)
+        if _rc and touched:
+            _rc()
+
+    def _bg_strip_refresh(self):
+        """Say what the background reconcile is actually doing right now."""
+        if not getattr(self, "_bg_reconcile_active", False) \
+                and not getattr(self, "_bg_deferred", None):
+            return
+        lbl = getattr(self, "_bg_strip_msg_lbl", None)
+        cnt = getattr(self, "_bg_strip_count_lbl", None)
+        try:
+            if lbl is None or not lbl.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        rows    = self.results or []
+        total   = len(rows)
+        pending = sum(1 for r in rows
+                      if not r.get("_bg_matched")
+                      and (r.get("_original_status") or r.get("status"))
+                      in self._PRE_MATCH_STATUSES)
+        matched = total - pending
+        stats   = getattr(self, "_bg_stats", None) or {}
+        waiting = len(getattr(self, "_bg_deferred", None) or {})
+        if not getattr(self, "_bg_reconcile_active", False):
+            msg = "Matching finished"
+        elif matched == 0:
+            msg = ("Transcribing in background — nothing matched yet.  Clips "
+                   "show script timecodes until their speaker or VO part "
+                   "finishes, then switch over a batch at a time.")
+        else:
+            msg = ("Matching in background — {} of {} clips have real matches; "
+                   "the rest still show script timecodes.".format(matched, total))
+        extra = []
+        if stats.get("reopened"):
+            extra.append("{} accepted clip{} reopened to re-check".format(
+                stats["reopened"], "" if stats["reopened"] == 1 else "s"))
+        if waiting:
+            extra.append("{} match{} waiting for the editor to close".format(
+                waiting, "" if waiting == 1 else "es"))
+        if extra:
+            msg += "   ·   " + "   ·   ".join(extra)
+        try:
+            lbl.config(text=msg)
+            if cnt is not None:
+                cnt.config(text="{} still provisional".format(pending))
+        except tk.TclError:
+            pass
+
+    def _bg_finish_live(self):
+        """Reconcile done while the user is on Step 4: settle in place, no rebuild."""
+        if getattr(self, "_bg_deferred", None):
+            self._bg_strip_refresh()        # still waiting on an open editor
+            return
+        _af = getattr(self, "_s4_apply_filter", None)
+        if _af and self._s4_is_live():
+            try:
+                _af()                        # re-sort now statuses are real
+            except Exception:
+                pass
+        frm = getattr(self, "_bg_strip_frame", None)
+        lbl = getattr(self, "_bg_strip_msg_lbl", None)
+        cnt = getattr(self, "_bg_strip_count_lbl", None)
+        stats = getattr(self, "_bg_stats", None) or {}
+        try:
+            if frm is None or not frm.winfo_exists():
+                return
+            n = stats.get("upgraded", 0) + stats.get("reopened", 0)
+            bits = ["Matching finished — {} clip{} updated".format(
+                n, "" if n == 1 else "s")]
+            if stats.get("reopened"):
+                bits.append("{} reopened to re-check".format(stats["reopened"]))
+            if stats.get("kept"):
+                bits.append("{} hand-edited clip{} kept".format(
+                    stats["kept"], "" if stats["kept"] == 1 else "s"))
+            frm.config(highlightbackground=SUCCESS)
+            lbl.config(text="   ·   ".join(bits))
+            if cnt is not None:
+                cnt.config(text="")
+            self.after(10000, lambda f=frm: f.winfo_exists() and f.destroy())
+        except tk.TclError:
+            pass
+
     def _s4_patch_card_status(self, res):
         """Surgical single-card status refresh — avoids a full _step4
         rebuild when only ONE row's status changed.  Looks up the
@@ -4341,6 +4601,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             r["status"] = "provisional"
             r["confidence"] = 0.0
             r["matched_text"] = pull.get("quote_text", "")
+            # What the row looked like before any match — lets the live
+            # merge tell "accepted the script TCs as-is" from "hand-edited".
+            r["_prov_segs"] = [tuple(sg) for sg in (r.get("segments") or [])]
             tok = pull.get("token", "")
             files = [p for p in int_assets.get(tok, []) if not is_video(p)]
             if files:
@@ -4508,6 +4771,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         # still running in the background.
         self.results = self._build_provisional_results(int_assets)
         self._bg_reconcile_active = True
+        self._bg_stats      = {"upgraded": 0, "reopened": 0, "kept": 0}
+        self._bg_deferred   = {}
+        self._final_results = None
 
         self._clear()
         self._section("STEP 3 — RECONCILING")
@@ -6374,6 +6640,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                                             status="error", matched_text=str(e))
                                         for b in blocks]
 
+                    if getattr(self, "_bg_reconcile_active", False) \
+                            and not self._cancel.is_set():
+                        self._ui(lambda b=list(res_list):
+                                 self._bg_apply_batch(b))
+
                     for res in res_list:
                         results.append(res)
                         done += 1
@@ -6591,13 +6862,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         # Rows the user already marked _s4_accepted or _s4_ignored win —
         # their TCs and any manual segments are preserved verbatim.  Every
         # other row is replaced by the fresh reconciled result.
-        _prev = getattr(self, "results", None) or []
-        _kept = {r["order"]: r for r in _prev
-                 if r.get("_s4_accepted") or r.get("_s4_ignored")}
-        if _kept:
-            sorted_results = [_kept.get(r["order"], r) for r in sorted_results]
-
-        self.results          = sorted_results
+        # The merge into self.results happens on the main thread in
+        # _finish_reconcile — it may have to patch live Step 4 cards, and
+        # swapping the list here would orphan every row dict a card or an
+        # open waveform editor is holding.
+        self._final_results   = sorted_results
         self._vo_takes_by_part = vo_takes_by_part
         self._pending_summary = sum_lines   # consumed by _finish_reconcile
 
@@ -6626,12 +6895,26 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         """Called on the main thread after _run_reconcile completes.
         Appends the pre-computed summary lines to the log widget then
         transitions to Step 4.  All Tk operations happen here, safely."""
+        # Read before _stop_reconcile_runners clears it.
+        _was_bg = getattr(self, "_bg_reconcile_active", False)
         self._stop_reconcile_runners()
         for txt, color in getattr(self, "_pending_summary", []):
             self._log_line(txt, color)
         self._pending_summary = []
         self._confirmed_carryover = {}   # consumed; clear for next run
-        self._bg_reconcile_active = False   # provisional-first strip auto-hides
+        self._bg_reconcile_active = False
+        _final = getattr(self, "_final_results", None) or []
+        self._final_results = None
+        _live = _was_bg and self._s4_is_live()
+        if _live:
+            # Same in-place merge the per-token batches used; rows already
+            # merged are skipped, so this only catches stragglers.
+            self._bg_apply_batch(_final, final=True)
+        elif _was_bg:
+            self._s4_editing_row = None   # not on Step 4 — no editor open
+            self._bg_apply_batch(_final)
+        else:
+            self.results = _final
         # Mix files (_temp_mix_files) are intentionally kept alive here so the
         # waveform editor can use them during Step 4.  They are cleaned up at the
         # start of the next reconcile run, or when the window closes.
@@ -6643,12 +6926,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             self._write_conform_baseline()
         except Exception:
             pass
-        # Rebuild Step 4 to show fully-reconciled rows.  This covers both
-        # cases: (a) user is still on Step 3, so this is the normal
-        # transition; (b) user jumped to Step 4 via → REVIEW NOW, so the
-        # rebuild swaps their provisional rows for the merged real ones
-        # (confirmed/ignored preserved — see the merge in _run_reconcile).
-        self.after(800, self._step4)
+        # Still on Step 3: normal transition.  Already on Step 4 via
+        # → REVIEW NOW: rows were updated in place — no rebuild, so scroll
+        # position, an open editor and undo history all survive.
+        if not _live:
+            self.after(800, self._step4)
 
     def _cancel_reconcile(self):
         if not messagebox.askyesno(
@@ -6735,10 +7017,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             self._bg_strip_frame = _bg_strip
             self._bg_strip_count_lbl = _count_lbl
             self._bg_strip_msg_lbl   = _msg_lbl
+            self._bg_strip_refresh()
             # Simple dot-cycle spinner tied to the strip's lifetime.
             def _tick_spin(step=0, lbl=_spin_lbl, frm=_bg_strip):
                 try:
                     if not frm.winfo_exists():
+                        return
+                    if not getattr(self, "_bg_reconcile_active", False):
+                        lbl.config(text="\u2713", fg=SUCCESS)
                         return
                     lbl.config(text=("·  ", "·· ", "···", " ··",
                                      "  ·", "   ")[step % 6])
@@ -6891,9 +7177,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         # ── Stat cell: no file (static) ────────────────────────────────────
         _nf_cell = tk.Frame(srow, bg=SURF)
         _nf_cell.pack(side="left", padx=20, pady=6)
-        tk.Label(_nf_cell, text=str(skips),
-                 font=("Courier New",18,"bold"), bg=SURF,
-                 fg=ERR if skips else SUB).pack()
+        _skips_var = tk.StringVar(value=str(skips))
+        _nf_num_lbl = tk.Label(_nf_cell, textvariable=_skips_var,
+                               font=("Courier New",18,"bold"), bg=SURF,
+                               fg=ERR if skips else SUB)
+        _nf_num_lbl.pack()
         tk.Label(_nf_cell, text="no file", font=FB, bg=SURF, fg=SUB).pack()
 
         # ── Stat cell: confirmed (live) ────────────────────────────────────
@@ -7477,7 +7765,10 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         _o = r.get("rec_out_tc", r.get("out_tc", ""))
                         if _i and _o:
                             bits.append("{} → {}".format(_i, _o))
-                    dl.config(text="   ·   ".join(bits))
+                    if r.get("_bg_note"):
+                        bits.append(r["_bg_note"])
+                    dl.config(text="   ·   ".join(bits),
+                              fg=WARN if r.get("_bg_note") else SUB)
 
                 _refresh_clips_lbl()
                 self._tooltip(
@@ -7764,7 +8055,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     except Exception:
                         _pool_by_token = {}
 
-                    MatchReviewDialog(self, sa, segs_r,
+                    # A background match for this row waits until the editor
+                    # closes (_bg_flush_deferred) instead of changing the
+                    # data out from under it.
+                    self._s4_editing_row = r
+                    _dlg = MatchReviewDialog(self, sa, segs_r,
                                       title=r.get("token", ""),
                                       quote_text=r.get("quote_text", ""),
                                       matched_text=r.get("matched_text", ""),
@@ -7774,6 +8069,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                                       words=_words,
                                       on_accept=_accept, fps=fps,
                                       pool_by_token=_pool_by_token)
+                    try:
+                        _w = _dlg._win
+                        _w.bind("<Destroy>",
+                                lambda ev, w=_w, row=r:
+                                    ev.widget is w and self._bg_flush_deferred(row),
+                                add="+")
+                    except Exception:
+                        self._s4_editing_row = None
 
                 # ── Bind labels ────────────────────────────────────────────────────
                 ignore_lbl.bind("<Button-1>",
@@ -7809,6 +8112,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     # _s4_patch_card_status) so state changes on ONE row
                     # don't have to full-rebuild all ~200 cards.
                     "stat_lbl":       stat_lbl,
+                    "refresh_detail_fn": _refresh_clips_lbl,
                 })
 
                 # ── Restore saved state ────────────────────────────────────────────
@@ -7833,6 +8137,40 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # ...and the refresh, so a bulk apply can suppress the per-row
             # storm and re-sync exactly once when it is done.
             self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
+
+            def _recount_tallies():
+                """Recount every stat cell from the cards — used when
+                background matches change statuses under the user."""
+                _acc = _ign = _unc = _ok = _rev = _skp = 0
+                for _e in self._rv:
+                    _a  = bool(_e["accepted_flag"][0])
+                    _g  = bool(_e["skip_var"].get())
+                    _st = _e["res"].get("status", "")
+                    _acc += _a
+                    _ign += _g
+                    _unc += (not _a and not _g)
+                    if not _a:
+                        _ok  += _st in OK_STATUSES
+                        _rev += _st in REVIEW_STATUSES
+                    _skp += _st in ("no_file", "cancelled")
+                _confirmed_count[0], _ignored_count[0] = _acc, _ign
+                _unconfirmed_count[0] = _unc
+                _ok_count[0], _review_count[0] = _ok, _rev
+                try:
+                    _confirmed_var.set(str(_acc))
+                    _ignored_var.set(str(_ign))
+                    _ok_var.set(str(_ok))
+                    _review_var.set(str(_rev))
+                    _skips_var.set(str(_skp))
+                    _confirmed_num_lbl.config(fg=SUCCESS if _acc else SUB)
+                    _ign_num_lbl.config(fg=ERR if _ign else SUB)
+                    _ok_num_lbl.config(fg=SUCCESS if _ok else SUB)
+                    _review_num_lbl.config(fg=WARN if _rev else SUB)
+                    _nf_num_lbl.config(fg=ERR if _skp else SUB)
+                except tk.TclError:
+                    pass
+                _sync_unconfirmed_btn()
+            self._s4_recount_tallies = _recount_tallies
             # Section folding, published on self for the same reason as the
             # tally callbacks above: they're closures over _step4's scope and
             # anything outside it (keyboard handlers, tests) needs a handle.
