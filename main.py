@@ -6809,7 +6809,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             try:
                 _fbtns["unconfirmed"].config(
                     text="UNCONFIRMED  {}".format(_unconfirmed_count[0]))
-                if _fstate["mode"] == "unconfirmed":
+                # CONFIRMED tab used to be painted once at build time and
+                # never again, so it sat frozen while the stat cell counted.
+                _fbtns["confirmed"].config(
+                    text="CONFIRMED  {}".format(_confirmed_count[0]))
+                if _fstate["mode"] in ("unconfirmed", "confirmed"):
                     _apply_filter()
             except Exception:
                 pass
@@ -7666,6 +7670,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                                 r=r, af=af, ss=ss, sl=sl, rcl=rcl):
                         self._s4_push_undo()
                         old_status = r.get("status", "")
+                        # Re-accepting an already-accepted row must not count
+                        # it twice.
+                        _was_accepted = af[0]
                         # Cross-token ADOPT from the match-review search: also
                         # reassign this pull to the new token + audio file and
                         # refresh the scripted timecode fields.  segments arg
@@ -7710,7 +7717,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         af[0] = True
                         ss()
                         rcl()   # refresh sub-clip count badge
-                        _increment_confirmed(old_status)
+                        if not _was_accepted:
+                            _increment_confirmed(old_status)
                         self._s4_save()
 
                     # Gather neighbouring quote text for script context
@@ -7839,6 +7847,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             _unconfirmed_count[0] = _unc
             if "unconfirmed" in _fbtns:
                 _fbtns["unconfirmed"].config(text="UNCONFIRMED  {}".format(_unc))
+            if "confirmed" in _fbtns:
+                _fbtns["confirmed"].config(
+                    text="CONFIRMED  {}".format(_confirmed_count[0]))
 
             # Restore scrollregion binding now that all cards are packed, then do
             # one layout pass so the canvas knows the full scroll extent.
