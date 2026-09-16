@@ -5176,6 +5176,25 @@ class AafWorkflowMixin:
                         ", source changes included" if close_gaps_src else "",
                         _gaps_closed))
 
+                # Sub-frame sync leftover per source.  Picture can only sit on
+                # frames, so a fraction of a frame always remains; this says
+                # how much and which way, so a marginal source can be nudged
+                # in Pro Tools rather than discovered on the timeline.
+                _resid = _build_stats.get("sync_residuals") or []
+                if _resid:
+                    print("Sub-frame sync residual "
+                          "(picture is on the frame grid, sound is not):")
+                    for _r in _resid:
+                        _dir = ("sound leads picture" if _r["residual_fr"] > 0
+                                else "sound lags picture")
+                        _mark = ("   <-- within a hair of half a frame"
+                                 if abs(_r["residual_fr"]) > 0.45 else "")
+                        print("  {:<30} offset {:+.3f}s -> {:+d} frames, "
+                              "{:.1f}ms {}{}".format(
+                                  _r["source"][:30], _r["offset_secs"],
+                                  _r["shift_fr"], abs(_r["residual_ms"]),
+                                  _dir, _mark))
+
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
                 engines.clear_rx_cache()

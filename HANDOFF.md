@@ -43,7 +43,7 @@ designed to remove friction from Jordan's quote-pulling step.
 - `_pq_copy_as_pull()` — bound to Ctrl+C in the transcript Text widget AND
   to the action button.  Reads the user's selection, looks up start/end
   timestamps from `_pq_word_index` (built when transcript renders), formats
-  as `@PULL TOKEN [HH:MM:SS-HH:MM:SS]\n<text>` and copies to clipboard.
+  as `[TOKEN HH:MM:SS-HH:MM:SS]\n<text>` and copies to clipboard.
 
 ### Routing in `_open_session()`
 
@@ -139,10 +139,11 @@ Key files:
 |------|---------|
 | `main.py` | App entry point, App class, all workflow steps |
 | `engines.py` | Audio/video processing: transcription, reconcile, sync, mix |
+| `transcript_check.py` | Transcript-coverage rules shared by the Step 2 CHECK TRANSCRIPTS dialog and the `check_transcripts.py` CLI. Mirrors reconcile's reuse rules — when those change, change these or the forecast starts lying. Also holds `adopt_transcript`, the only writer: it re-stamps an existing transcript onto a media file so a rejected sidecar starts being reused. |
 | `gui_components.py` | MediaPool, VoBin, _FlatDropdown, _SlimScrollbar widgets |
 | `match_review.py` | Waveform editor (Step 4 clip review) |
 | `mix_test.py` | Standalone test tool for the multi-track mix feature |
-| `parsers.py` | @PULL / @VO / @PART script parser |
+| `parsers.py` | bracketed script parser ([PART …] / [VO …] / [TOKEN in-out]) |
 | `config.py` | Theme colours, font constants |
 | `utils.py` | Filename helpers, similarity, token suggestion |
 

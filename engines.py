@@ -1,4 +1,4 @@
-import os, sys, re, io, json, tempfile, subprocess, wave, hashlib, threading
+import os, sys, re, io, json, math, tempfile, subprocess, wave, hashlib, threading
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -75,7 +75,7 @@ class BuildCancelled(Exception):
 
 # ── Globals ────────────────────────────────────────────────────────────────────
 _cache_dir = None   # Will be set by App when script is loaded
-_channel_cache = {}
+_channel_cache = {}   # normcased path -> first audio stream's channel count
 _model_cache = {}
 _model_lock  = threading.Lock()
 
@@ -271,6 +271,47 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     return True
 
 
+def time_stretch_wav(in_wav_path, out_wav_path, rate):
+    """Time-stretch a WAV by `rate` with the pitch preserved.
+
+    rate > 1 plays faster, < 1 slower.  Used by review playback so a
+    2x pass through an interview still sounds like speech rather than a
+    chipmunk -- resampling would be one flag, but shifts pitch by the
+    same factor and is unusable for reviewing dialogue.
+
+    ffmpeg's atempo accepts 0.5-2.0 per instance, so wider ratios are
+    chained (2.5x becomes atempo=2.0,atempo=1.25).  Returns True on
+    success; on any failure returns False and leaves out_wav_path
+    untouched, so callers can fall back to the unstretched audio.
+    """
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return False
+    if not (0.1 <= rate <= 8.0):
+        return False
+    if abs(rate - 1.0) < 1e-3:
+        return False              # nothing to do -- caller keeps the original
+
+    factors = []
+    remaining = rate
+    while remaining > 2.0:
+        factors.append(2.0);  remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5);  remaining /= 0.5
+    factors.append(remaining)
+    chain = ",".join("atempo={:.6f}".format(f) for f in factors)
+
+    cmd = _ffmpeg_cmd() + ["-y", "-i", in_wav_path,
+                           "-filter:a", chain,
+                           "-acodec", "pcm_s16le", "-vn", out_wav_path]
+    try:
+        r = _run(cmd, capture_output=True, timeout=60)
+    except Exception:
+        return False
+    return r.returncode == 0 and os.path.isfile(out_wav_path)
+
+
 def _ffprobe_csv(path, entries, select=None, timeout=10):
     """Run a single-value `-of csv=p=0` ffprobe query and return the
     stripped stdout, or None on any failure (missing file, timeout,
@@ -298,9 +339,34 @@ def get_media_duration(path):
     except (TypeError, ValueError):
         return None
 
-def get_audio_channels(path):
+def probe_audio_channels(path):
+    """Real channel count of a file's first audio stream, memoised per path.
+
+    Returns None when the count cannot be determined — the file is missing,
+    unreadable, or carries no audio stream at all.
+
+    Callers that write a channel count into an NLE interchange file must keep
+    "unknown" distinct from a guess.  Media that imports offline (moved drive,
+    different root) is created with whatever the XML claims, and Premiere then
+    refuses to relink the real file: "the selected file cannot be linked
+    because it has 1 audio channel(s) and the clip was created with 2 audio
+    channel(s) with a different channel type."  Leaving the element out lets
+    Premiere read the count off the media instead of trusting a wrong one."""
+    key = os.path.normcase(os.path.abspath(path))
+    if key in _channel_cache:
+        return _channel_cache[key]
     out = _ffprobe_csv(path, "stream=channels", select="a:0")
-    return int(out) if out and out.isdigit() else 2
+    if not (out and out.isdigit()):
+        return None          # unknown — do NOT cache, the file may appear later
+    n = int(out)
+    _channel_cache[key] = n
+    return n
+
+
+def get_audio_channels(path):
+    """Channel count with a stereo fallback, for callers that need a number
+    no matter what.  Use probe_audio_channels() where "unknown" matters."""
+    return probe_audio_channels(path) or 2
 
 
 def has_audio_track(path):
@@ -701,9 +767,27 @@ def pb_transcript_load(media_path):
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
         mtime = _safe_getmtime(media_path)
-        # Reject if the media file was replaced since transcription
+        # Reject if the media file was replaced since transcription.
+        # mtime alone is fragile: copying media off a shared drive,
+        # restoring from backup, or re-saving all rewrite mtime while
+        # leaving the audio bit-identical — and re-transcribing a
+        # 90-minute interview to rediscover the same words is the most
+        # expensive thing this app can do.  So when mtime drifts, fall
+        # back to the baked audio_signature (size → duration → sha256,
+        # short-circuiting on the cheap checks) and accept the sidecar
+        # if the content still proves identical.  Sidecars written
+        # before signatures existed have no signature and stay
+        # mtime-gated.
         if abs(data.get("mtime", 0) - mtime) > 2:
-            return None, None
+            _sig = data.get("audio_signature")
+            if not _sig:
+                return None, None
+            try:
+                _ok, _ = audio_signature_matches(_sig, media_path)
+            except Exception:
+                _ok = False
+            if not _ok:
+                return None, None
         words = data.get("words")
         if not words:
             return None, None
@@ -733,6 +817,46 @@ def pb_transcript_save(media_path, words, blobs=None):
             json.dump(data, f, indent=2)
     except Exception:
         pass
+
+def pooled_transcript_load(paths):
+    """Return (words, blobs) when every audio file in `paths` carries the
+    SAME .pb_transcript.json, else (None, None).
+
+    Why this exists: when a token has several audio files, reconcile mixes
+    them and transcribes the mix -- and looks for a sidecar next to that
+    mix, which on a first run cannot exist.  Meanwhile Pull Quotes has
+    already mirrored its full-conversation transcript next to EVERY source
+    file (see PqWorkflowMixin's session save, which does this expressly so
+    "the Script->Session reconcile workflow can re-use this transcript
+    without re-running Whisper").  Those sidecars were unreachable: the
+    mix has a different name, so nothing ever read them.
+
+    Requiring every source to agree is what makes this safe.  A transcript
+    mirrored across all of a token's tracks came from a mix and therefore
+    covers every speaker.  A sidecar on only ONE track is ambiguous -- it
+    may be that track alone, missing the other side of the conversation --
+    so a partial or disagreeing set is rejected and the caller transcribes
+    as before.
+    """
+    audio = [p for p in (paths or []) if p and not is_video(p)]
+    if not audio:
+        return None, None
+
+    first_words = first_blobs = None
+    first_key   = None
+    for ap in audio:
+        words, blobs = pb_transcript_load(ap)
+        if not words:
+            return None, None          # a source with no usable sidecar
+        key = (len(words),
+               round(float(words[0].get("start") or 0.0), 3),
+               round(float(words[-1].get("end") or 0.0), 3))
+        if first_key is None:
+            first_key, first_words, first_blobs = key, words, blobs
+        elif key != first_key:
+            return None, None          # sources disagree -- not a shared mix
+    return first_words, first_blobs
+
 
 def transcribe_file(media_path, progress_cb=None):
     """Transcribe an entire media file using the same chunked pipeline as VO
@@ -3325,6 +3449,46 @@ def reconcile_vo_block(vo_block, takes):
 def f2fr(secs, fps):
     return round(secs * fps)
 
+
+# How close to an exact half-frame still counts as a genuine tie, in frames.
+# 0.05 frame is ~2 ms at 24p — inside this band the two candidate frames are
+# perceptually interchangeable, so the choice is made on direction instead.
+_SYNC_TIE_BAND_FR = 0.05
+
+def video_shift_frames(offset_secs, fps):
+    """Whole-frame shift to apply to picture for a sync offset, as a SINGLE
+    rounding of the offset itself.
+
+    Picture can only land on frames; the audio it has to match cannot.  Some
+    residual is therefore unavoidable — but which frame we land on is a
+    choice, and making it badly is what leaves one clip a frame out of step
+    with its neighbours.
+
+    Rounding `src_in + offset` and `src_in` separately (the obvious way to
+    write it) makes the shift depend on where each clip happens to fall
+    against the frame grid, so two clips from the same camera with the same
+    offset can land a full frame apart — worst near a half-frame offset,
+    where the choice is close to a coin flip per clip.  Rounding the offset
+    once gives every clip from a source the same shift and bounds the
+    residual at half a frame instead of a whole one.
+
+    Ties break toward the later source frame, which puts picture early and
+    sound late.  Sound arriving after the picture is the direction viewers
+    tolerate — ATSC IS-191 allows audio to lag video by 45 ms but lead it by
+    only 15 ms — and it also sidesteps round()'s round-half-to-even, which
+    would otherwise settle an exact tie on the parity of the frame number."""
+    d    = offset_secs * fps
+    frac = d - math.floor(d)
+    if abs(frac - 0.5) <= _SYNC_TIE_BAND_FR:
+        return int(math.ceil(d))
+    return int(math.floor(d + 0.5))
+
+
+def sync_residual_frames(offset_secs, fps):
+    """Signed leftover after video_shift_frames(), in frames.  Negative means
+    picture lands early and sound lags it; positive means sound leads."""
+    return offset_secs * fps - video_shift_frames(offset_secs, fps)
+
 def make_rate(el, fps):
     _NTSC_MAP = {
         23.976: 24, 47.952: 48,
@@ -3752,26 +3916,29 @@ def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
         SubElement(f_el, "name").text    = basename(filepath)
         SubElement(f_el, "pathurl").text = pathurl(filepath)
         make_rate(f_el, fps)
+
+        # The channel count has to describe the *file*, not the sequence.
+        # Declaring stereo for a mono source makes Premiere build the clip as
+        # stereo, and any later relink of the real mono file is rejected with
+        # "Cannot Link Media".  Mono camera/interview sources (isolated
+        # participant tracks, Riverside "raw-audio" exports) hit this every
+        # time.  None = unknown; omit the element and let Premiere read it.
+        n_ch = (file_audio_channels if file_audio_channels is not None
+                else probe_audio_channels(filepath))
+
+        mc = SubElement(f_el, "media")
         if is_video:
-            mc = SubElement(f_el, "media")
             vc = SubElement(mc, "video")
             vc_ch = SubElement(vc, "samplecharacteristics")
             make_rate(vc_ch, fps)
             SubElement(vc_ch, "width").text  = str(seq_w)
             SubElement(vc_ch, "height").text = str(seq_h)
-            ac = SubElement(mc, "audio")
-            ac_ch = SubElement(ac, "samplecharacteristics")
-            SubElement(ac_ch, "depth").text      = "16"
-            SubElement(ac_ch, "samplerate").text = str(seq_sr)
-            SubElement(ac, "channelcount").text  = "2"
-        else:
-            mc = SubElement(f_el, "media")
-            ac = SubElement(mc, "audio")
-            ac_ch = SubElement(ac, "samplecharacteristics")
-            SubElement(ac_ch, "depth").text      = "16"
-            SubElement(ac_ch, "samplerate").text = str(seq_sr)
-            if file_audio_channels is not None:
-                SubElement(ac, "channelcount").text = str(file_audio_channels)
+        ac = SubElement(mc, "audio")
+        ac_ch = SubElement(ac, "samplecharacteristics")
+        SubElement(ac_ch, "depth").text      = "16"
+        SubElement(ac_ch, "samplerate").text = str(seq_sr)
+        if n_ch:
+            SubElement(ac, "channelcount").text = str(n_ch)
 
     # Tell the NLE which stream to read (needed when a video file is used on an
     # audio track so it reads the audio channel instead of defaulting to video).
@@ -4010,8 +4177,9 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     group = []
 
                     if vp and tv_idx < len(v_tracks):
-                        v_in_fr  = f2fr(seg_in_s  + v_off, fps)
-                        v_out_fr = f2fr(seg_out_s + v_off, fps)
+                        _v_shift = video_shift_frames(v_off, fps)
+                        v_in_fr  = seg_in_fr  + _v_shift
+                        v_out_fr = seg_out_fr + _v_shift
                         fid  = "file-vo-v-{}-{}".format(pi, take_i)
                         cid  = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
@@ -4351,6 +4519,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         _vfc_cache[vp] = fr
         return fr
     _oor_seen = set()   # source bases already warned (dedupe per source)
+    # base -> (offset_secs, shift_fr): what picture was actually moved by,
+    # against what the measured offset asked for.  Reported after the build
+    # so the sub-frame leftover on every synced source is visible rather
+    # than something you have to notice in the timeline.
+    _sync_applied = {}
 
     v_tracks   = {tn: [] for tn in track_names}
     a_tracks   = {tn: [] for tn in track_names}
@@ -4417,16 +4590,26 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # Audio uses the reference-audio src position directly (no camera offset).
         # Video ADDS v_offset: positive offset = camera started before DAW (common),
         # negative offset = audio started before camera (both are valid).
-        a_src_in  = max(0, f2fr(src_in_s,          fps) - head_ext)
+        # Picture is the audio's own source window shifted by ONE rounded
+        # offset, not a second independent rounding of (src_in + offset).
+        # That keeps every clip from a source on the same shift, and keeps
+        # the video window exactly as long as the audio window.
+        v_shift   = video_shift_frames(v_offset, fps)
+        a_src_in  = max(0, f2fr(src_in_s,  fps) - head_ext)
         a_src_out = f2fr(src_out_s, fps) + fo_fr
-        v_src_in  = max(0, f2fr(src_in_s + v_offset, fps) - head_ext)
-        v_src_out = max(0, f2fr(src_out_s + v_offset, fps)) + fo_fr
+        v_src_in  = max(0, f2fr(src_in_s,  fps) + v_shift - head_ext)
+        v_src_out = max(0, f2fr(src_out_s, fps) + v_shift) + fo_fr
         # If clamping collapsed the video window, push out by clip duration
         if v_src_out <= v_src_in:
             v_src_out = v_src_in + (end_fr - start_fr)
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
+
+        if vp and v_offset:
+            _sync_applied.setdefault(
+                clip.get("source_base") or os.path.basename(vp),
+                (v_offset, v_shift))
 
         # ── Out-of-range guard ────────────────────────────────────────
         # When the sync offset is badly wrong (e.g. the joined footage is
@@ -4454,8 +4637,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             _vfc = _video_frame_count(vp)
             if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
                 # Content-only bounds (strip the fade extensions back off).
-                _content_in  = f2fr(src_in_s + v_offset,  fps)
-                _content_out = f2fr(src_out_s + v_offset, fps)
+                _content_in  = f2fr(src_in_s,  fps) + v_shift
+                _content_out = f2fr(src_out_s, fps) + v_shift
                 _content_overshoot = max(
                     -_content_in,                  # head before video frame 0
                     _content_out - _vfc,           # tail past video end
@@ -4589,6 +4772,15 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
 
     if stats_out is not None:
         stats_out["gaps_closed"] = gaps_closed
+        # Sorted worst-first so a marginal source is the first thing read.
+        stats_out["sync_residuals"] = sorted(
+            ({"source":      base,
+              "offset_secs": off,
+              "shift_fr":    shift,
+              "residual_fr": off * fps - shift,
+              "residual_ms": (off * fps - shift) / fps * 1000.0 if fps else 0.0}
+             for base, (off, shift) in _sync_applied.items()),
+            key=lambda r: -abs(r["residual_fr"]))
 
     # ── Emit clipitems ─────────────────────────────────────────────────
     for p in placements:
@@ -4714,6 +4906,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # imports as a stereo pair in Premiere.  <link> elements (direct children
         # of each clipitem, no wrapper) cross-reference the two clips so Premiere
         # treats them as locked/stereo rather than independent mono tracks.
+        # A mono mix gets a single track instead: splitting it would declare a
+        # channel 2 the file does not have, which breaks relinking the same way
+        # a wrong <channelcount> does.
+        mix_ch     = probe_audio_channels(mix_path)
+        mix_stereo = mix_ch != 1
         mix_L_tidx = n_audio_written + n_cam_written + 1
         mix_R_tidx = n_audio_written + n_cam_written + 2
 
@@ -4739,7 +4936,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                 ac_ch = SubElement(ac2, "samplecharacteristics")
                 SubElement(ac_ch, "depth").text      = "16"
                 SubElement(ac_ch, "samplerate").text = str(seq_sr)
-                SubElement(ac2, "channelcount").text = "2"
+                if mix_ch:
+                    SubElement(ac2, "channelcount").text = str(mix_ch)
             else:
                 SubElement(el, "file", id=fid)   # reference only, no redefinition
             st = SubElement(el, "sourcetrack")
@@ -4748,25 +4946,27 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             return el
 
         ci_L = _mix_ci("clip-mix-L", 1, True)
-        ci_R = _mix_ci("clip-mix-R", 2, False)
+        ci_R = _mix_ci("clip-mix-R", 2, False) if mix_stereo else None
 
         # Cross-links — direct <link> children, no wrapper element
-        for target_ci in (ci_L, ci_R):
-            for ref_cid, ref_tidx in (("clip-mix-L", mix_L_tidx),
-                                      ("clip-mix-R", mix_R_tidx)):
-                lk = SubElement(target_ci, "link")
-                SubElement(lk, "linkclipref").text = ref_cid
-                SubElement(lk, "mediatype").text   = "audio"
-                SubElement(lk, "trackindex").text  = str(ref_tidx)
-                SubElement(lk, "clipindex").text   = "1"
+        if mix_stereo:
+            for target_ci in (ci_L, ci_R):
+                for ref_cid, ref_tidx in (("clip-mix-L", mix_L_tidx),
+                                          ("clip-mix-R", mix_R_tidx)):
+                    lk = SubElement(target_ci, "link")
+                    SubElement(lk, "linkclipref").text = ref_cid
+                    SubElement(lk, "mediatype").text   = "audio"
+                    SubElement(lk, "trackindex").text  = str(ref_tidx)
+                    SubElement(lk, "clipindex").text   = "1"
 
         mix_track_L = SubElement(ael, "track")
         mix_track_L.append(ci_L)
         SubElement(mix_track_L, "outputchannelindex").text = "1"
 
-        mix_track_R = SubElement(ael, "track")
-        mix_track_R.append(ci_R)
-        SubElement(mix_track_R, "outputchannelindex").text = "2"
+        if mix_stereo:
+            mix_track_R = SubElement(ael, "track")
+            mix_track_R.append(ci_R)
+            SubElement(mix_track_R, "outputchannelindex").text = "2"
 
     # ── Patch video↔camera-audio links ───────────────────────────────────────
     # Now that we know which tracks are non-empty (and their 1-based indices),

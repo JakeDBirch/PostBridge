@@ -67,6 +67,14 @@ Same code, same behaviour, ~2 s startup. Only rebuild to test bundling
 
 ## 4. Known macOS gaps
 
+> **Partly addressed.** The Step 4 waveform editor now plays through
+> `playback.LivePlayer` (PortAudio via `sounddevice`), which is
+> cross-platform — so the editor's transport, scrubbing and speed control
+> should work on macOS as soon as `sounddevice` is installed. The section
+> below still applies to every OTHER playback path in the app (Pull Quotes
+> auditioning, the AAF QA player), which remain on `winsound`. Nobody has
+> run this on a Mac yet; it is reasoning from the code, not a test.
+
 ### 4.1 Audio playback is silent on macOS — the real one
 
 **Verified by reading the code.** Every playback path in the app goes through

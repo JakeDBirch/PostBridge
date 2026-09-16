@@ -794,43 +794,15 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         tk.Label(self.body, text="Choose a workflow",
                  font=FBT, bg=BG, fg=SUB).pack(pady=(0, 16))
 
-        # ── Resume last project (shown only when a previous script is known) ──
-        # engines._safe_isfile has a hard timeout for exactly this case —
-        # bare os.path.isfile blocks INDEFINITELY on a sleeping network
-        # share, which would hang the whole home screen (and every
-        # HOME navigation) until the volume woke up.
-        _last_script = self._prefs.get("last_script", "")
-        if _last_script and engines._safe_isfile(_last_script):
-            _ls_name = os.path.splitext(os.path.basename(_last_script))[0]
-            resume_row = tk.Frame(self.body, bg=SURF,
-                                  highlightbackground=BORDER, highlightthickness=1)
-            resume_row.pack(fill="x", padx=20, pady=(0, 16))
-            tk.Frame(resume_row, bg=ACCENT, width=4).pack(side="left", fill="y")
-            _ri = tk.Frame(resume_row, bg=SURF)
-            _ri.pack(fill="x", padx=24, pady=10)
-            tk.Label(_ri, text="Resume last project",
-                     font=(_SANS, 11, "bold"), bg=SURF, fg=SUB).pack(side="left")
-            tk.Label(_ri, text="  —  " + _ls_name,
-                     font=(_SANS, 11), bg=SURF, fg=TEXT).pack(side="left")
-            _ra = tk.Label(_ri, text="\u2192", font=(_SANS, 16, "bold"),
-                           bg=SURF, fg=BORDER, padx=8)
-            _ra.pack(side="right")
-            _rw = [resume_row, _ri, _ra]
-            def _resume_enter(e, ws=_rw, c=resume_row, a=_ra):
-                for w in ws: w.config(bg="#303030")
-                c.config(highlightbackground=ACCENT); a.config(fg=ACCENT)
-            def _resume_leave(e, ws=_rw, c=resume_row, a=_ra):
-                for w in ws: w.config(bg=SURF)
-                c.config(highlightbackground=BORDER); a.config(fg=BORDER)
-            def _resume_click(e, sp=_last_script):
-                self.workflow = "script_session"
-                self._export_fmt = None
-                self._load_script(sp)
-            for _lbl in _ri.winfo_children(): _rw.append(_lbl)
-            for _w in _rw:
-                _w.bind("<Enter>",    _resume_enter)
-                _w.bind("<Leave>",    _resume_leave)
-                _w.bind("<Button-1>", _resume_click)
+        # The "Resume last project" row that used to sit here is gone.  It
+        # opened the remembered script but always forced
+        # workflow="script_session", so a project that was AAF or XML came
+        # back as the wrong workflow.  Owner's call was to drop it rather
+        # than fix it — OPEN in the header does the same job and takes the
+        # workflow from the session file instead of assuming one.
+        #
+        # The `last_script` preference is still written, and still used by
+        # _select_workflow to start the file dialog in the right folder.
 
         cards_frame = tk.Frame(self.body, bg=BG)
         cards_frame.pack(fill="x", padx=20)
@@ -1124,6 +1096,19 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         # Store so callers can access for programmatic scroll
         self._last_scroll_canvas = canvas
 
+        _wheel_accum   = [0]
+        _wheel_pending = [False]
+
+        def _flush_wheel():
+            _wheel_pending[0] = False
+            n, _wheel_accum[0] = _wheel_accum[0], 0
+            if not n:
+                return
+            try:
+                canvas.yview_scroll(n, "units")
+            except tk.TclError:
+                pass          # canvas destroyed between the notch and the flush
+
         def _on_wheel(e):
             # Don't scroll when focus is in a popup (e.g. combobox dropdown).
             # Wrapped in try/except: Tk's focus_get() raises KeyError on
@@ -1138,7 +1123,23 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 pass
             # macOS uses delta 1/-1 per notch; Windows uses 120/-120
             units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
-            canvas.yview_scroll(units, "units")
+            # COALESCE.  Windows delivers a wheel event per notch, and a
+            # single flick of the wheel lands 5-10 of them in the queue at
+            # once.  Scrolling on each one made Tk shift the canvas and
+            # repaint the embedded frame that many times for one gesture —
+            # on a Step 4 with hundreds of cards each repaint is expensive
+            # enough that the frames land visibly out of step with the
+            # pointer, which reads as smeared or "lossy" tracking.
+            # Accumulating the notches and issuing ONE yview_scroll per idle
+            # cycle turns a flick into a single shift + single repaint, and
+            # scrolls exactly as far.
+            _wheel_accum[0] += units
+            if not _wheel_pending[0]:
+                _wheel_pending[0] = True
+                try:
+                    canvas.after_idle(_flush_wheel)
+                except tk.TclError:
+                    _wheel_pending[0] = False
             # NO update_idletasks() here.  It used to force a synchronous
             # layout+paint flush on every wheel notch, which:
             #   * ran the <Configure> handler above, recomputing
@@ -1375,8 +1376,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         if not pulls:
             _clear_pending_restore()
             messagebox.showerror("Nothing Found",
-                "No @PULL markers found.\n"
-                "Make sure the script is in PostBridge format.")
+                "No interview pulls found.\n\n"
+                "PostBridge expects bracketed headers at column 0:\n"
+                "    [PART <name>]\n"
+                "    [VO <vo_id>]\n"
+                "    [<TOKEN> HH:MM:SS-HH:MM:SS]\n\n"
+                "The older @PULL / @VO / @PART markers are no longer read.\n"
+                "Use Script Formatter \u2192 Copy AI Prompt to convert a script.")
             return
 
         no_quote = sum(1 for p in pulls if not p["quote_text"])
@@ -1398,11 +1404,30 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
         if hasattr(self, "_s1"):
             self._s1.config(
-                text="✓  {}  ·  {} pulls  ·  {} parts  ·  {} tokens: {}{}".format(
-                    doc_title, len(pulls), len(parts), len(tokens),
+                text="✓  {}  ·  {} pulls  ·  {} VO  ·  {} parts  ·  {} tokens: {}{}".format(
+                    doc_title, len(pulls), len(vo_blocks), len(parts), len(tokens),
                     "  ".join(tokens),
                     "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
                 fg=SUCCESS if not no_quote else WARN)
+
+        # A script in the obsolete @PULL/@VO/@PART syntax still yields valid
+        # pulls (pull headers were always bracketed), but every narration
+        # block and section marker is dropped without error.  Surface that
+        # instead of loading a silently gutted script.
+        _shape = []
+        if not vo_blocks:
+            _shape.append("\u2022  0 VO blocks \u2014 no narration was parsed.")
+        if not parts:
+            _shape.append("\u2022  0 parts \u2014 no [PART \u2026] headers were found.")
+        if _shape:
+            messagebox.showwarning(
+                "Check Script Format",
+                "This script parsed {} pulls but:\n\n{}\n\n"
+                "Most often the script still uses the old @VO / @PART "
+                "markers, or narration is missing its [VO <id>] headers "
+                "\u2014 that text is dropped silently.\n\n"
+                "Script Formatter \u2192 Copy AI Prompt will convert it.".format(
+                    len(pulls), "\n".join(_shape)))
 
         if warnings:
             messagebox.showwarning("Warnings", "\n".join(warnings[:10]))
@@ -1450,6 +1475,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         cache_row.pack(side="bottom", fill="x", pady=(4,0))
         self._btn(cache_row, "CLEAR TRANSCRIPTS", lambda: self._clear_cache("transcripts"),
                   small=True).pack(side="right", padx=(0, 4))
+        # Pre-flight: which tokens will reuse an existing transcript and
+        # which will spend Whisper time — answered BEFORE the run, with a
+        # way to point PostBridge at transcripts it isn't finding.
+        self._btn(cache_row, "CHECK TRANSCRIPTS", self._check_transcripts,
+                  small=True).pack(side="left")
         self._btn(cache_row, "CLEAR RESULTS", lambda: self._clear_cache("results"),
                   small=True).pack(side="right", padx=(0, 8))
 
@@ -4418,7 +4448,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     with open(_pbt, encoding="utf-8") as _f:
                         _d = json.load(_f)
                     if abs(_d.get("mtime", 0) - os.path.getmtime(ap)) > 2:
-                        pbt_reason = "pb_transcript mtime changed"
+                        pbt_reason = ("pb_transcript mtime changed"
+                                      + ("" if _d.get("audio_signature")
+                                         else " (no signature to fall back on)"))
                     elif not _d.get("words"):
                         pbt_reason = "pb_transcript empty"
                     else:
@@ -5697,7 +5729,10 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                                 _pd = json.load(_pf)
                             _pm = os.path.getmtime(ap)
                             if abs(_pd.get("mtime", 0) - _pm) > 2:
-                                _why.append(".pb_transcript: mtime stale")
+                                _why.append(
+                                    ".pb_transcript: mtime stale"
+                                    + ("" if _pd.get("audio_signature")
+                                       else " / no signature"))
                             elif not _pd.get("words"):
                                 _why.append(".pb_transcript: no words")
                             else:
@@ -5864,11 +5899,39 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             #      best, includes speaker diarisation
             #   2. A .pb_transcript.json sitting next to the audio (from any
             #      prior run, VO transcription, or PQ session)
+            #   2b. For a MIXED source: the sidecars beside the pool files
+            #      the mix was built from, when they all agree.  The mix is
+            #      a fresh file with a hashed name, so it can never have a
+            #      sidecar on a first run — without this the transcript
+            #      Pull Quotes deliberately mirrored next to every source
+            #      file is unreachable, and a full re-transcribe happens
+            #      with a complete transcript sitting right there.
             #   3. Auto-promote: transcribe the full audio now if pulls ≥
             #      AUTO_FULL_TRANSCRIBE_THRESHOLD and the source exists
             _pq_data = (getattr(self, "_pq_session_data", None) or {}).get(token)
             if _pq_data is None and tsrc:
                 _pb_words, _ = engines.pb_transcript_load(tsrc)
+                _pooled_from = None
+                if not _pb_words:
+                    _pool_srcs = token_audio_paths.get(token) or []
+                    if len(_pool_srcs) > 1:
+                        _pb_words, _pb_blobs = engines.pooled_transcript_load(
+                            _pool_srcs)
+                        if _pb_words:
+                            _pooled_from = len(_pool_srcs)
+                            # Stamp it onto the mix so later runs (and the
+                            # CHECK TRANSCRIPTS forecast) hit directly.
+                            try:
+                                engines.pb_transcript_save(
+                                    tsrc, _pb_words, blobs=_pb_blobs)
+                            except Exception:
+                                pass
+                            self._log_line(
+                                "  [{}] reusing the transcript mirrored beside "
+                                "all {} pool sources ({} words) — no re-"
+                                "transcribe needed".format(
+                                    token, _pooled_from, len(_pb_words)),
+                                SUCCESS)
                 if _pb_words:
                     _pq_data = {
                         "transcript":  _pb_words,
@@ -5877,10 +5940,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         "id":          token,
                         "_file_path":  tsrc,
                     }
-                    self._log_line(
-                        "  [{}] using cached full-audio transcript ({} words)".format(
-                            token, len(_pb_words)),
-                        SUCCESS)
+                    if not _pooled_from:      # pooled path already logged
+                        self._log_line(
+                            "  [{}] using cached full-audio transcript "
+                            "({} words)".format(token, len(_pb_words)),
+                            SUCCESS)
                 elif (len(token_pulls) >= AUTO_FULL_TRANSCRIBE_THRESHOLD
                       and not self._cancel.is_set()):
                     self._log_line(
@@ -6865,6 +6929,60 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         "subclips":     "Sub-clips"}
 
         _part_dividers = {}   # part_index → divider Frame (filled during card loop)
+        _part_lbls     = {}   # part_index → (Label, part name)
+        # Collapse state lives on self, not in this scope, so it survives
+        # the Step 4 rebuilds triggered by reassign-apply and status
+        # changes — collapsing a finished part and having it spring back
+        # open on the next edit would make the feature pointless.
+        if not hasattr(self, "_s4_collapsed"):
+            self._s4_collapsed = set()
+
+        def _sync_part_lbl(pi, n_cards, collapsible=True):
+            """Repaint one part header: chevron, name, and what is folded."""
+            ent = _part_lbls.get(pi)
+            if not ent:
+                return
+            lbl, name = ent
+            collapsed = collapsible and pi in self._s4_collapsed
+            if not collapsible:
+                mark, tail = "\u25c6", ""
+            elif collapsed:
+                mark = "\u25b8"
+                tail = "   ({} hidden)".format(n_cards) if n_cards else "   (empty)"
+            else:
+                mark = "\u25be"
+                tail = "   ({})".format(n_cards) if n_cards else "   (empty)"
+            try:
+                lbl.config(text="  {}  {}{}".format(mark, name.upper(), tail))
+            except Exception:
+                pass
+
+        def _toggle_part(pi):
+            """Fold / unfold one part.  Routed through _apply_filter rather
+            than packing by hand so collapse, filter and sort all share the
+            one repack path and cannot disagree about ordering."""
+            if pi in self._s4_collapsed:
+                self._s4_collapsed.discard(pi)
+                # FOCUS: opening a part folds the rest.  Scroll cost tracks
+                # how many rows are laid out and nothing else -- measured on a
+                # 240-row list, folding 8 of 10 parts took a scroll step from
+                # 51ms to 11ms.  Keeping one part open is the only lever that
+                # reaches the floor, so this makes it the default gesture
+                # rather than something you have to keep doing by hand.
+                if self._s4_focus_mode.get():
+                    for _p in _part_dividers:
+                        if _p != pi:
+                            self._s4_collapsed.add(_p)
+            else:
+                self._s4_collapsed.add(pi)
+            _apply_filter()
+
+        def _set_all_parts(collapsed):
+            if collapsed:
+                self._s4_collapsed = set(_part_dividers.keys())
+            else:
+                self._s4_collapsed = set()
+            _apply_filter()
 
         def _apply_filter(mode=None, sort=None):
             if mode is not None:
@@ -6941,6 +7059,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
             # Repack — only show part dividers in ascending script order
             use_dividers = (cur_sort == "script" and cur_dir > 0)
+            # Collapsing is only meaningful while the part dividers are on
+            # screen; every other sort interleaves parts, so there is nothing
+            # coherent to fold.  The collapse set is remembered either way and
+            # takes effect again on returning to Script order.
+            _per_part = {}
+            for e in visible:
+                _per_part[e["res"].get("part_index", 0)] = \
+                    _per_part.get(e["res"].get("part_index", 0), 0) + 1
             cur_pi = object()  # sentinel
             for e in visible:
                 if use_dividers:
@@ -6948,7 +7074,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     if pi != cur_pi and pi in _part_dividers:
                         _part_dividers[pi].pack(fill="x", pady=(10, 2), padx=2)
                         cur_pi = pi
+                    if pi in self._s4_collapsed:
+                        continue          # header shown, cards folded away
                 e["card"].pack(fill="x", pady=(0, 4), padx=2)
+            for pi in _part_lbls:
+                _sync_part_lbl(pi, _per_part.get(pi, 0), use_dividers)
 
             # Unfreeze scrollregion — one layout pass covers all repacked cards
             if _s4cv:
@@ -6994,6 +7124,64 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             b.bind("<Button-1>", lambda e, s=_sk: _apply_filter(sort=s))
             _sbtns[_sk] = b
 
+        # ── FOCUS toggle ──────────────────────────────────────────────────
+        # Remembered across Step 4 visits: it is a way of working, not a
+        # per-screen setting.
+        if not hasattr(self, "_s4_focus_mode"):
+            self._s4_focus_mode = tk.BooleanVar(
+                value=bool(self._prefs.get("s4_focus_mode", False)))
+
+        _focus_lbl = tk.Label(srow, text="", font=FB, bg=SURF2, fg=SUB,
+                              cursor="hand2", padx=10, pady=4, bd=0,
+                              highlightbackground=BORDER, highlightthickness=1)
+        _focus_lbl.pack(side="right", padx=(4, 0))
+
+        def _sync_focus_lbl():
+            on = self._s4_focus_mode.get()
+            _focus_lbl.config(
+                text=("\u2611  FOCUS" if on else "\u2610  FOCUS"),
+                bg=ACCENT if on else SURF2, fg=BG if on else SUB)
+
+        def _toggle_focus(_e=None):
+            on = not self._s4_focus_mode.get()
+            self._s4_focus_mode.set(on)
+            self._prefs["s4_focus_mode"] = on
+            try:
+                self._save_prefs()
+            except Exception:
+                pass
+            _sync_focus_lbl()
+            if on:
+                # Fold everything except the first part still showing, so
+                # turning it on takes effect immediately rather than on the
+                # next part you happen to open.
+                _open = [pi for pi in sorted(_part_dividers)
+                         if pi not in self._s4_collapsed]
+                keep = _open[0] if _open else None
+                self._s4_collapsed = set(
+                    pi for pi in _part_dividers if pi != keep)
+                _apply_filter()
+
+        _focus_lbl.bind("<Button-1>", _toggle_focus)
+        self._tooltip(
+            _focus_lbl,
+            "Keep one part open at a time.\n"
+            "Scroll cost tracks how many rows are laid out — on a long\n"
+            "episode this is the difference between ~50 ms and ~11 ms\n"
+            "per scroll step.")
+        _sync_focus_lbl()
+
+        # Fold controls — only bite in Script order, where the dividers show.
+        for _lbl, _fn in (("EXPAND ALL",   lambda: _set_all_parts(False)),
+                          ("COLLAPSE ALL", lambda: _set_all_parts(True))):
+            _cb = tk.Label(srow, text=_lbl, font=FB, bg=SURF2, fg=SUB,
+                           cursor="hand2", padx=10, pady=4, bd=0,
+                           highlightbackground=BORDER, highlightthickness=1)
+            _cb.pack(side="right", padx=(4, 0))
+            _cb.bind("<Enter>", lambda e, w=_cb: w.config(bg=ACCENT, fg=BG))
+            _cb.bind("<Leave>", lambda e, w=_cb: w.config(bg=SURF2, fg=SUB))
+            _cb.bind("<Button-1>", lambda e, f=_fn: f())
+
         sf = self._scroll_frame(self.body, height=380)
         self._s4_scroll_canvas = self._last_scroll_canvas
         # Freeze scrollregion updates during card building — rebind after loop
@@ -7025,6 +7213,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         _STRIPE_DEF = BORDER
         _STRIPE_ACC = SUCCESS
         _STRIPE_IGN = ERR
+        _CARD_BORDER = 2      # constant across all card states — see the card
+                              # shell below for why this must not vary
 
         nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
@@ -7086,39 +7276,63 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     _div = tk.Frame(sf, bg=BG)
                     _div.pack(fill="x", pady=(10, 2), padx=2)
                     tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
-                    tk.Label(_div, text="  \u25c6  {}".format(part_name.upper()),
-                             font=FL, bg=BG, fg=ACCENT).pack(anchor="w", pady=(2, 0))
+                    _plbl = tk.Label(_div, text="", font=FL, bg=BG, fg=ACCENT,
+                                     anchor="w", cursor="hand2")
+                    _plbl.pack(anchor="w", fill="x", pady=(2, 0))
+                    _plbl.bind("<Button-1>", lambda e, _p=pi: _toggle_part(_p))
+                    _plbl.bind("<Enter>", lambda e, w=_plbl: w.config(fg=TEXT))
+                    _plbl.bind("<Leave>", lambda e, w=_plbl: w.config(fg=ACCENT))
                     _part_dividers[pi] = _div
+                    _part_lbls[pi]     = (_plbl, part_name)
+                    _sync_part_lbl(pi, 0)
 
                 # ── Card shell ─────────────────────────────────────────────────────
+                # highlightthickness is FIXED at _CARD_BORDER for every
+                # state.  It used to be 1 normally and 2 once accepted or
+                # ignored, so confirming a card grew it by 2px and reflowed
+                # every row below it — visible as the list jumping under the
+                # cursor mid-review.  Only the border COLOUR changes now; the
+                # cost is that an unconfirmed card carries the same 2px border
+                # in BORDER grey, which is exactly the trade asked for.
                 card = tk.Frame(sf, bg=SURF,
-                                highlightbackground=BORDER, highlightthickness=1)
+                                highlightbackground=BORDER,
+                                highlightthickness=_CARD_BORDER)
                 card.pack(fill="x", pady=(0, 4), padx=2)
 
                 # Left color stripe — 4px, reflects accept/ignore/normal state
                 _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
                 _stripe.pack(side="left", fill="y")
 
-                _inner = tk.Frame(card, bg=SURF)
-                _inner.pack(side="left", fill="both", expand=True)
-
-                hdr = tk.Frame(_inner, bg=SURF, cursor="hand2")
-                hdr.pack(fill="x", padx=(4, 10), pady=(6, 6))
+                # Scroll cost is roughly proportional to the number of
+                # widgets in the list, so the header is built from as few as
+                # it can be: the _inner wrapper existed only to sit between
+                # the stripe and the header, and hdr can do that itself.
+                hdr = tk.Frame(card, bg=SURF, cursor="hand2")
+                hdr.pack(side="left", fill="both", expand=True,
+                         padx=(8, 10), pady=(6, 6))
 
                 _accepted_flag = [False]
 
                 # ── Header left ────────────────────────────────────────────────────
-                ord_lbl  = tk.Label(hdr, text="#{:03d}".format(res["order"]),
-                                    font=FL, bg=SURF, fg=SUB,
-                                    width=5, anchor="w", cursor="hand2")
-                ord_lbl.pack(side="left")
-                tok_lbl  = tk.Label(hdr, text=res["token"],
-                                    font=FL, bg=SURF, fg=ACCENT,
-                                    width=14, anchor="w", cursor="hand2")
-                tok_lbl.pack(side="left")
-                stat_lbl = tk.Label(hdr, text=sl, font=FB, bg=SURF, fg=sc,
-                                    cursor="hand2")
-                stat_lbl.pack(side="left", padx=8)
+                # Order number + token in one label.  The number gives up
+                # its muted grey for the token's accent — the one colour this
+                # merge costs on the left of the row.
+                id_lbl = tk.Label(hdr,
+                                  text="#{:03d}   {}".format(res["order"],
+                                                             res["token"]),
+                                  font=FL, bg=SURF, fg=ACCENT, width=21,
+                                  anchor="w", cursor="hand2")
+                id_lbl.pack(side="left")
+                # Status carries the confidence: they were always drawn in the
+                # same colour, so nothing is lost by merging them, and the
+                # fixed width keeps the detail column aligned down the list.
+                _conf = res.get("confidence", 0)
+                stat_lbl = tk.Label(
+                    hdr,
+                    text=sl + ("   {:.0%}".format(_conf) if _conf else ""),
+                    font=FB, bg=SURF, fg=sc, width=22, anchor="w",
+                    cursor="hand2")
+                stat_lbl.pack(side="left", padx=(8, 0))
 
                 # Right-click status → context menu to change/revert it.
                 # Solves accidental "adjusted" via stray click in the
@@ -7229,60 +7443,57 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
                 stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
 
-                conf_hdr = res.get("confidence", 0)
-                if conf_hdr:
-                    tk.Label(hdr, text="{:.0%}".format(conf_hdr),
-                             font=FS, bg=SURF, fg=sc, cursor="hand2").pack(
-                                 side="left", padx=(0, 6))
+                # ── Detail line ────────────────────────────────────────────────────
+                # Sub-clip count, timecode drift and the recorded timecode
+                # range were three separate labels in three colours.  They are
+                # one grey line now: the amber on "N clips" and the orange on
+                # the deltas are the other colours this merge costs.  Every
+                # STATE signal — status colour, stripe, border — is untouched.
+                _detail_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB,
+                                       anchor="w", cursor="hand2")
+                _detail_lbl.pack(side="left", fill="x", expand=True,
+                                 padx=(6, 0))
 
+                def _refresh_clips_lbl(dl=_detail_lbl, r=res, af=None):
+                    """Rebuild the detail line from the row's current state.
 
-                # Sub-clip count (number of segments) — always created, shown when > 1
-                _clips_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=WARN,
-                                      cursor="hand2")
-
-                def _refresh_clips_lbl(cl=_clips_lbl, r=res):
+                    Named for what it used to be (the sub-clip badge) because
+                    _open_review's accept path calls it under that name.
+                    """
+                    bits = []
                     n = len(r.get("segments") or [(0, 0)])
                     if n > 1:
-                        cl.config(text="{} clips".format(n))
-                        cl.pack(side="left", padx=(0, 6))
-                    else:
-                        cl.pack_forget()
+                        bits.append("{} clips".format(n))
+                    _di, _do = r.get("delta_in", 0), r.get("delta_out", 0)
+                    if (r.get("status", "") == "ok"
+                            and (abs(_di) > 0.5 or abs(_do) > 0.5)):
+                        bits.append("Δ {:+.1f} / {:+.1f}s".format(_di, _do))
+                    if r.get("_s4_accepted"):
+                        _i = r.get("rec_in_tc",  r.get("in_tc",  ""))
+                        _o = r.get("rec_out_tc", r.get("out_tc", ""))
+                        if _i and _o:
+                            bits.append("{} → {}".format(_i, _o))
+                    dl.config(text="   ·   ".join(bits))
 
                 _refresh_clips_lbl()
-
-                # Timecode label — shown right after the status text when accepted
-                _tc_lbl = tk.Label(hdr, text="", font=FS, bg=SURF, fg=SUB)
-                # initially not packed
-
-                d_in  = res.get("delta_in",  0)
-                d_out = res.get("delta_out", 0)
-                delta_lbl = None
-                if st == "ok" and (abs(d_in) > 0.5 or abs(d_out) > 0.5):
-                    delta_lbl = tk.Label(hdr,
-                                text="Δin:{:+.1f}s  Δout:{:+.1f}s".format(d_in, d_out),
-                                font=FB, bg=SURF, fg=INFO, cursor="hand2")
-                    delta_lbl.pack(side="left", padx=4)
-                    self._tooltip(delta_lbl,
-                        "Δin = matched IN point differs from script timecode by this amount\n"
-                        "Δout = matched OUT point differs from script timecode by this amount\n"
-                        "Positive = later in file  ·  Negative = earlier in file")
+                self._tooltip(
+                    _detail_lbl,
+                    "Δ = how far the matched IN / OUT points moved from the "
+                    "script timecodes\n"
+                    "Positive = later in file  ·  Negative = earlier in file")
+                delta_lbl = None      # merged into the detail line above
 
                 skip_var = tk.BooleanVar(value=False)
 
                 # ── Header right — state container ─────────────────────────────────
                 # Normal: [ADJUST] [IGNORE]  |  Accepted: [✓ ACCEPTED]  |  Ignored: [⊘ IGNORED]
-                _hdr_right = tk.Frame(hdr, bg=SURF)
-                _hdr_right.pack(side="right")
-
-                _norm_frame    = tk.Frame(_hdr_right, bg=SURF)
-                _norm_frame.pack(side="left")
-
-                _acc_state_lbl = tk.Label(_hdr_right, text="\u2713 ACCEPTED",
-                                          font=FS, bg=SURF, fg=SUCCESS, cursor="hand2")
-                # initially not packed
-
-                _ign_state_lbl = tk.Label(_hdr_right, text="\u2298 IGNORED",
-                                          font=FS, bg=SURF, fg=ERR, cursor="hand2")
+                # ACCEPTED and IGNORED were two labels that were never shown
+                # at the same time — one label that swaps text and colour does
+                # the same job.  The two wrapper frames that grouped them and
+                # the action labels are gone with them; side="right" packing
+                # gives the same right-aligned order.
+                _state_lbl = tk.Label(hdr, text="", font=FS, bg=SURF,
+                                      fg=SUCCESS, cursor="hand2")
                 # initially not packed
 
                 # source_audio: prefer explicit audio path, fall back to video path
@@ -7291,7 +7502,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                               res.get("source_video", "") or "")
 
                 # IGNORE button (only interactive control besides clicking to review)
-                ignore_lbl = tk.Label(_norm_frame, text="IGNORE", font=FS,
+                ignore_lbl = tk.Label(hdr, text="IGNORE", font=FS,
                                       bg=SURF, fg=SUB, cursor="hand2")
                 ignore_lbl.pack(side="right", padx=(4, 0))
                 ignore_lbl.bind("<Enter>", lambda e, w=ignore_lbl: w.config(fg=ERR))
@@ -7303,7 +7514,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 # already-transcribed sidecar.  Interview and VO share the
                 # same entry point; the dialog adapts its layout + apply
                 # logic based on res["is_vo"].
-                reassign_lbl = tk.Label(_norm_frame, text="REASSIGN", font=FS,
+                reassign_lbl = tk.Label(hdr, text="REASSIGN", font=FS,
                                         bg=SURF, fg=SUB, cursor="hand2")
                 reassign_lbl.pack(side="right", padx=(4, 0))
                 reassign_lbl.bind("<Enter>", lambda e, w=reassign_lbl: w.config(fg=ACCENT))
@@ -7313,32 +7524,44 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     lambda e, r=res: self._s4_reassign_dialog(r))
 
                 # ── State management helpers ────────────────────────────────────────
-                def _set_normal(nf=_norm_frame, al=_acc_state_lbl,
-                                il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                    al.pack_forget(); il.pack_forget(); tl.pack_forget()
-                    nf.pack(side="left")
+                def _show_actions(ig=ignore_lbl, ra=reassign_lbl, show=True):
+                    """IGNORE / REASSIGN only make sense on an un-actioned row."""
+                    if show:
+                        ig.pack(side="right", padx=(6, 0))
+                        ra.pack(side="right", padx=(6, 0))
+                    else:
+                        ig.pack_forget(); ra.pack_forget()
+
+                def _set_normal(stl=_state_lbl, sw=_stripe, c=card,
+                                sa=_show_actions, rcl=None):
+                    stl.pack_forget()
+                    sa(show=True)
                     sw.config(bg=_STRIPE_DEF)
-                    c.config(highlightbackground=BORDER, highlightthickness=1)
+                    c.config(highlightbackground=BORDER,
+                             highlightthickness=_CARD_BORDER)
 
-                def _set_accepted(nf=_norm_frame, al=_acc_state_lbl,
-                                  il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe,
-                                  c=card, r=res):
-                    nf.pack_forget(); il.pack_forget()
-                    al.pack(side="left")
-                    in_tc  = r.get("rec_in_tc",  r.get("in_tc",  ""))
-                    out_tc = r.get("rec_out_tc", r.get("out_tc", ""))
-                    if in_tc and out_tc:
-                        tl.config(text="  {}  \u2192  {}".format(in_tc, out_tc))
-                        tl.pack(side="left", padx=(4, 0))
+                def _set_accepted(stl=_state_lbl, sw=_stripe, c=card, r=res,
+                                  sa=_show_actions):
+                    sa(show=False)
+                    stl.config(text="\u2713 ACCEPTED", fg=SUCCESS)
+                    stl.pack(side="right")
+                    # The recorded timecode range lives in the detail line now.
+                    r["_s4_accepted"] = True
+                    _refresh_clips_lbl()
                     sw.config(bg=_STRIPE_ACC)
-                    c.config(highlightbackground=SUCCESS, highlightthickness=2)
+                    c.config(highlightbackground=SUCCESS,
+                             highlightthickness=_CARD_BORDER)
 
-                def _set_ignored(nf=_norm_frame, al=_acc_state_lbl,
-                                 il=_ign_state_lbl, tl=_tc_lbl, sw=_stripe, c=card):
-                    nf.pack_forget(); al.pack_forget(); tl.pack_forget()
-                    il.pack(side="left")
+                def _set_ignored(stl=_state_lbl, sw=_stripe, c=card,
+                                 sa=_show_actions):
+                    sa(show=False)
+                    stl.config(text="\u2298 IGNORED", fg=ERR)
+                    stl.pack(side="right")
                     sw.config(bg=_STRIPE_IGN)
-                    c.config(highlightbackground=ERR, highlightthickness=2)
+                    c.config(highlightbackground=ERR,
+                             highlightthickness=_CARD_BORDER)
+
+                _show_actions(show=True)
 
                 def _un_accept(af=_accepted_flag, r=res, ss_n=_set_normal):
                     self._s4_push_undo()
@@ -7547,10 +7770,15 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 # ── Bind labels ────────────────────────────────────────────────────
                 ignore_lbl.bind("<Button-1>",
                                 lambda e, f=_toggle_ignore: f())
-                _acc_state_lbl.bind("<Button-1>",
-                                    lambda e, f=_un_accept: f())
-                _ign_state_lbl.bind("<Button-1>",
-                                    lambda e, f=_toggle_ignore: f())
+                # One state label, so which action it triggers depends on
+                # which state it is showing.
+                def _state_click(e=None, af=_accepted_flag, sv=skip_var,
+                                 ua=_un_accept, ti=_toggle_ignore):
+                    if sv.get():
+                        ti()
+                    elif af[0]:
+                        ua()
+                _state_lbl.bind("<Button-1>", _state_click)
 
                 # ── Card click → open waveform editor ──────────────────────────────
                 def _hdr_click(event=None, sv=skip_var, fn=_open_review,
@@ -7559,10 +7787,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     if not sv.get():   # ignored cards do nothing on click
                         fn()
 
-                for _w in [hdr, card, _inner, ord_lbl, tok_lbl, stat_lbl]:
+                for _w in [hdr, card, id_lbl, stat_lbl, _detail_lbl]:
                     _w.bind("<Button-1>", _hdr_click)
-                if delta_lbl:
-                    delta_lbl.bind("<Button-1>", _hdr_click)
 
                 self._rv.append({
                     "skip_var": skip_var, "res": res, "card": card,
@@ -7599,6 +7825,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # ...and the refresh, so a bulk apply can suppress the per-row
             # storm and re-sync exactly once when it is done.
             self._s4_sync_unconfirmed    = _sync_unconfirmed_btn
+            # Section folding, published on self for the same reason as the
+            # tally callbacks above: they're closures over _step4's scope and
+            # anything outside it (keyboard handlers, tests) needs a handle.
+            self._s4_toggle_part  = _toggle_part
+            self._s4_set_all_parts = _set_all_parts
+            self._s4_apply_filter  = _apply_filter
 
             # Recompute the UNCONFIRMED count from the live _rv state now that
             # card restoration has run (accepted_flag / skip_var are authoritative).
@@ -7790,6 +8022,404 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                              relief="flat", bd=6, cursor="hand2",
                              command=win.destroy)
         close_btn.pack(side="left")
+
+    # ── Transcript coverage pre-flight (Step 2 → CHECK TRANSCRIPTS) ───────────
+    # Answers "will reconcile reuse the transcripts I already have, or spend
+    # 20 minutes rediscovering them?" BEFORE the run starts, and gives the
+    # user a way to point PostBridge at a transcript it isn't finding.
+    # The forecast rules live in transcript_check.py, shared with the
+    # check_transcripts.py CLI.
+
+    def _tc_collect_inputs(self):
+        """Snapshot everything the report needs, ON THE MAIN THREAD.
+
+        MediaPool.get_assignments() reads StringVars, and Tk variable access
+        from a worker thread deadlocks on Python 3.14+ (same reason
+        _start_reconcile snapshots assignments before spawning its thread).
+        So the worker only ever sees this plain dict.
+        """
+        asgn = self._pool.get_assignments() if self._pool else {}
+        vo   = self._pool.get_vo_assets()   if self._pool else {}
+        pulls_per_token = {}
+        for p in (self.pulls or []):
+            pulls_per_token[p["token"]] = pulls_per_token.get(p["token"], 0) + 1
+        return {
+            "tokens":    list(self.tokens or []),
+            "assign":    {t: list(v) for t, v in asgn.items()},
+            "vo":        {pi: {"audios": list(d.get("audios", [])),
+                               "videos": list(d.get("videos", []))}
+                          for pi, d in vo.items()},
+            "part_name": {p["index"]: p["name"] for p in (self.parts or [])},
+            "pulls":     pulls_per_token,
+            "script":    getattr(self, "_script_path", "") or "",
+        }
+
+    def _tc_build_report(self, inp, quick, progress=None):
+        """Compute the coverage report.  Worker-thread safe: pure file I/O."""
+        import transcript_check as tc
+        try:
+            from parsers import discover_pq_sessions
+        except Exception:
+            discover_pq_sessions = lambda *a, **k: {}
+
+        def _prog(msg):
+            if progress:
+                try: progress(msg)
+                except Exception: pass
+
+        # ── Pull Quotes sessions ──────────────────────────────────────────
+        _prog("Looking for Pull Quotes sessions…")
+        pq_rows, pq_ok = [], set()
+        try:
+            pq = discover_pq_sessions(inp["script"]) or {}
+        except Exception:
+            pq = {}
+        pq.pop("__warnings__", None)
+        for tok in sorted(pq):
+            _prog("Verifying Pull Quotes session for {}…".format(tok))
+            ok, nw, detail = tc.pq_session_status(pq[tok], quick=quick)
+            if ok:
+                pq_ok.add(tok)
+            pq_rows.append({"token": tok, "ok": ok, "detail": detail,
+                            "path": pq[tok],
+                            "unused": tok not in inp["pulls"]})
+
+        # ── Interview tokens ──────────────────────────────────────────────
+        rows = []
+        for tok in inp["tokens"]:
+            n      = inp["pulls"].get(tok, 0)
+            if not n:
+                continue                      # token declared but never pulled
+            audios = [p for p in inp["assign"].get(tok, []) if not is_video(p)]
+            media  = []
+            covered = []
+            for ap in audios:
+                _prog("Checking {}…".format(os.path.basename(ap)))
+                ok, detail = tc.sidecar_status(ap, quick=quick)
+                if ok:
+                    covered.append(ap)
+                media.append({"path": ap, "ok": ok, "detail": detail})
+            # Does the mix have a transcript to inherit?  Same check
+            # reconcile makes, so the forecast can't disagree with it.
+            pooled_ok = False
+            if len(audios) > 1 and len(covered) == len(audios):
+                pooled_ok = engines.pooled_transcript_load(audios)[0] is not None
+            free, verdict = tc.token_forecast(
+                n, audios, tok in pq_ok, covered, AUTO_FULL_TRANSCRIBE_THRESHOLD,
+                pooled_ok=pooled_ok)
+            rows.append({"kind": "token", "label": tok,
+                         "sub": "{} pull{}".format(n, "s" if n != 1 else ""),
+                         "free": free, "verdict": verdict, "media": media})
+
+        # ── VO parts ──────────────────────────────────────────────────────
+        for pi in sorted(inp["vo"]):
+            d     = inp["vo"][pi]
+            takes = engines.pair_takes(d["videos"] + d["audios"])
+            for ti, (_vp, ap) in enumerate(takes):
+                label = "VO Part {} — {}".format(pi, inp["part_name"].get(pi, "?"))
+                sub   = "take {}".format(ti + 1) if len(takes) > 1 else ""
+                if not ap:
+                    rows.append({"kind": "vo", "label": label, "sub": sub,
+                                 "free": True, "media": [],
+                                 "verdict": "no audio in this take - skipped"})
+                    continue
+                _prog("Checking {}…".format(os.path.basename(ap)))
+                # Mirror reconcile's VO order: .pb_cache first, then sidecar.
+                if engines.cache_load(ap) is not None:
+                    rows.append({"kind": "vo", "label": label, "sub": sub,
+                                 "free": True,
+                                 "verdict": "instant - cached in .pb_cache",
+                                 "media": [{"path": ap, "ok": True,
+                                            "detail": "cached in .pb_cache"}]})
+                    continue
+                ok, detail = tc.sidecar_status(ap, quick=quick)
+                rows.append({
+                    "kind": "vo", "label": label, "sub": sub, "free": ok,
+                    "verdict": ("instant - sidecar on {}".format(
+                        os.path.basename(ap)) if ok
+                        else "will transcribe this take"),
+                    "media": [{"path": ap, "ok": ok, "detail": detail}]})
+
+        return {"pq": pq_rows, "rows": rows, "quick": quick}
+
+    def _check_transcripts(self):
+        """Open the transcript-coverage window (Step 2 → CHECK TRANSCRIPTS)."""
+        if not getattr(self, "_pool", None):
+            messagebox.showinfo("No media", "Assign media first.", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Transcript coverage")
+        win.configure(bg=BG, cursor="arrow")
+        win.minsize(720, 460)
+        win.geometry("880x620")
+
+        head = tk.Frame(win, bg=BG)
+        head.pack(fill="x", padx=14, pady=(14, 4))
+        tk.Label(head, text="Will reconcile reuse what you already have?",
+                 font=FL, bg=BG, fg=TEXT).pack(anchor="w")
+        status = tk.Label(head, text="", font=FS, bg=BG, fg=SUB,
+                          wraplength=820, justify="left")
+        status.pack(anchor="w", pady=(2, 0))
+
+        body_outer = tk.Frame(win, bg=BG)
+        body_outer.pack(fill="both", expand=True, padx=14, pady=(6, 0))
+        canvas = tk.Canvas(body_outer, bg=BG, bd=0, highlightthickness=0)
+        sb     = _SlimScrollbar(body_outer, command=canvas.yview)
+        inner  = tk.Frame(canvas, bg=BG)
+        _win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win_id, width=e.width))
+        # Bind the wheel to the DIALOG, not bind_all: the app installs a
+        # global "all"-tag handler in _scroll_frame, and a bind_all here
+        # would replace it app-wide and leave Step 2 unscrollable after
+        # this window closed.  A Toplevel sits in its children's bindtag
+        # chain, so this catches the wheel anywhere inside the dialog.
+        def _on_wheel(e):
+            units = (int(-1 * e.delta) if sys.platform == "darwin"
+                     else int(-1 * (e.delta / 120)))
+            canvas.yview_scroll(units, "units")
+        win.bind("<MouseWheel>", _on_wheel)
+
+        foot = tk.Frame(win, bg=BG)
+        foot.pack(fill="x", padx=14, pady=12)
+
+        quick_var = tk.BooleanVar(value=False)
+        state = {"report": None, "busy": False}
+
+        # ── Rendering ─────────────────────────────────────────────────────
+        def _clear_inner():
+            for w in inner.winfo_children():
+                w.destroy()
+
+        def _sub_header(txt):
+            tk.Label(inner, text=txt, font=FL, bg=BG, fg=SUB
+                     ).pack(anchor="w", pady=(12, 4))
+
+        def _media_row(parent, m):
+            r = tk.Frame(parent, bg=SURF2)
+            r.pack(fill="x", pady=(2, 0))
+            tk.Label(r, text="   {}".format(os.path.basename(m["path"])),
+                     font=FB, bg=SURF2, fg=TEXT, anchor="w"
+                     ).pack(side="left", padx=(6, 8))
+            tk.Label(r, text=m["detail"], font=FS, bg=SURF2,
+                     fg=SUCCESS if m["ok"] else WARN, anchor="w"
+                     ).pack(side="left", fill="x", expand=True)
+            if not m["ok"]:
+                self._btn(r, "Locate transcript…",
+                          lambda p=m["path"]: _locate_one(p),
+                          small=True).pack(side="right", padx=6, pady=3)
+
+        def _render():
+            _clear_inner()
+            rep = state["report"]
+            if rep is None:
+                return
+            if rep["pq"]:
+                _sub_header("PULL QUOTES SESSIONS")
+                for p in rep["pq"]:
+                    r = tk.Frame(inner, bg=SURF)
+                    r.pack(fill="x", pady=(2, 0))
+                    tk.Label(r, text="{}  {}".format(
+                        "OK" if p["ok"] else "REJECTED", p["token"]),
+                        font=FL, bg=SURF, fg=SUCCESS if p["ok"] else ERR,
+                        width=22, anchor="w").pack(side="left", padx=6, pady=4)
+                    note = p["detail"] + ("   (no pulls use this token)"
+                                          if p["unused"] else "")
+                    tk.Label(r, text=note, font=FB, bg=SURF, fg=SUB, anchor="w",
+                             wraplength=560, justify="left"
+                             ).pack(side="left", fill="x", expand=True)
+
+            _sub_header("PER TOKEN / VO PART")
+            for row in rep["rows"]:
+                box = tk.Frame(inner, bg=SURF)
+                box.pack(fill="x", pady=(4, 0))
+                hdr = tk.Frame(box, bg=SURF)
+                hdr.pack(fill="x")
+                tk.Label(hdr, text="✓" if row["free"] else "✗",
+                         font=FL, bg=SURF,
+                         fg=SUCCESS if row["free"] else WARN, width=3
+                         ).pack(side="left", padx=(6, 0), pady=4)
+                tk.Label(hdr, text=row["label"], font=FL, bg=SURF, fg=TEXT,
+                         width=20, anchor="w").pack(side="left")
+                tk.Label(hdr, text=row["sub"], font=FS, bg=SURF, fg=SUB,
+                         width=10, anchor="w").pack(side="left")
+                tk.Label(hdr, text=row["verdict"], font=FB, bg=SURF,
+                         fg=SUB if row["free"] else WARN, anchor="w",
+                         wraplength=460, justify="left"
+                         ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+                for m in row["media"]:
+                    _media_row(box, m)
+
+            cost = sum(1 for r in rep["rows"] if not r["free"])
+            tot  = len(rep["rows"])
+            if cost:
+                status.config(
+                    text="{} of {} will reuse an existing transcript.  {} will "
+                         "spend Whisper time — use “Locate transcript…” or "
+                         "“Adopt from folder…” to point PostBridge at the "
+                         "files it's missing.".format(tot - cost, tot, cost),
+                    fg=WARN)
+            else:
+                status.config(
+                    text="All {} will reuse an existing transcript. "
+                         "Reconcile should be near-instant.".format(tot),
+                    fg=SUCCESS)
+
+        # ── Running the check ─────────────────────────────────────────────
+        def _run():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            _clear_inner()
+            status.config(text="Checking…", fg=SUB)
+            inp   = self._tc_collect_inputs()      # main thread — Tk vars
+            quick = quick_var.get()
+
+            def _worker():
+                # Marshal every widget touch through self._ui (the main-thread
+                # queue drained by _pump_ui).  self.after() from a worker
+                # thread calls Tcl's createcommand off-thread -- the same
+                # latent crash _log_line documents.
+                def _status(text, fg):
+                    def _do(text=text, fg=fg):
+                        try:
+                            if status.winfo_exists():
+                                status.config(text=text, fg=fg)
+                        except tk.TclError:
+                            pass
+                    self._ui(_do)
+                try:
+                    rep = self._tc_build_report(
+                        inp, quick, progress=lambda m: _status(m, SUB))
+                except Exception as e:
+                    rep = None
+                    _status("Check failed: {}".format(e), ERR)
+                def _done():
+                    state["busy"] = False
+                    try:
+                        if not win.winfo_exists():
+                            return          # user closed it mid-check
+                    except tk.TclError:
+                        return
+                    if rep is not None:
+                        state["report"] = rep
+                        _render()
+                self._ui(_done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ── Adoption ──────────────────────────────────────────────────────
+        def _adopt(media_path, src_path, silent=False):
+            """Returns True when the transcript was adopted."""
+            import transcript_check as tc
+            words, blobs, err = tc.load_transcript_words(src_path)
+            if err:
+                if not silent:
+                    messagebox.showerror(
+                        "Can't use that file",
+                        "{}\n\n{}".format(os.path.basename(src_path), err),
+                        parent=win)
+                return False
+            warn = tc.adopt_warning(media_path, words)
+            if warn and not messagebox.askyesno(
+                    "Transcript may not match",
+                    "{}\n\n{}\n\nAdopt it anyway?".format(warn, os.path.basename(
+                        src_path)),
+                    icon="warning", parent=win):
+                return False
+            ok, msg = tc.adopt_transcript(media_path, words, blobs)
+            if not ok and not silent:
+                messagebox.showerror("Adoption failed", msg, parent=win)
+            return ok
+
+        def _locate_one(media_path):
+            src = filedialog.askopenfilename(
+                parent=win,
+                title="Transcript for {}".format(os.path.basename(media_path)),
+                filetypes=[("PostBridge transcript",
+                            "*.pb_transcript.json *.pb_session.json"),
+                           ("JSON", "*.json"), ("All", "*.*")])
+            if not src:
+                return
+            if _adopt(media_path, src):
+                _run()
+
+        def _adopt_folder():
+            import transcript_check as tc
+            rep = state["report"]
+            if not rep:
+                return
+            missing = [m["path"] for r in rep["rows"] for m in r["media"]
+                       if not m["ok"]]
+            if not missing:
+                messagebox.showinfo(
+                    "Nothing missing",
+                    "Every assigned file already has a usable transcript.",
+                    parent=win)
+                return
+            folder = filedialog.askdirectory(
+                parent=win, title="Folder containing the transcript files")
+            if not folder:
+                return
+            cand = tc.find_candidates_in_folder(folder, missing)
+            if not cand:
+                messagebox.showinfo(
+                    "No matches",
+                    "No .pb_transcript.json or .pb_session.json in that folder "
+                    "matches the filenames of the media still missing a "
+                    "transcript.\n\nMatching is by filename stem — "
+                    "INT_JORDAN.wav needs INT_JORDAN.pb_transcript.json.",
+                    parent=win)
+                return
+            preview = "\n".join(
+                "  {}  ←  {}".format(os.path.basename(k), os.path.basename(v))
+                for k, v in list(cand.items())[:12])
+            if len(cand) > 12:
+                preview += "\n  …and {} more".format(len(cand) - 12)
+            if not messagebox.askyesno(
+                    "Adopt {} transcript{}?".format(
+                        len(cand), "s" if len(cand) != 1 else ""),
+                    "These transcripts will be stamped onto the matching "
+                    "media so reconcile reuses them:\n\n{}\n\n"
+                    "The original files are not moved or changed.".format(preview),
+                    parent=win):
+                return
+            n = sum(1 for mp, sp in cand.items() if _adopt(mp, sp, silent=True))
+            messagebox.showinfo(
+                "Adopted",
+                "{} of {} transcript{} adopted.".format(
+                    n, len(cand), "s" if len(cand) != 1 else ""),
+                parent=win)
+            _run()
+
+        # ── Footer ────────────────────────────────────────────────────────
+        self._btn(foot, "ADOPT FROM FOLDER…", _adopt_folder,
+                  small=True).pack(side="left")
+        self._btn(foot, "RE-CHECK", _run, small=True).pack(side="left", padx=8)
+        self._btn(foot, "Close", win.destroy, small=True).pack(side="right")
+
+        qk = tk.Label(foot, text="☐", font=(_SANS, 15), bg=BG, fg=SUB,
+                      cursor="hand2", padx=4)
+        qk.pack(side="right", padx=(0, 6))
+        ql = tk.Label(foot, text="Quick (skip SHA-256)", font=FB, bg=BG, fg=SUB,
+                      cursor="hand2")
+        ql.pack(side="right", padx=(0, 2))
+
+        def _toggle_quick(_e=None):
+            quick_var.set(not quick_var.get())
+            on = quick_var.get()
+            qk.config(text="☑" if on else "☐", fg=ACCENT if on else SUB)
+            _run()
+        qk.bind("<Button-1>", _toggle_quick)
+        ql.bind("<Button-1>", _toggle_quick)
+
+        _run()
 
     def _step5(self):
         self._clear()

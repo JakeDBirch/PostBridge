@@ -155,6 +155,25 @@ PostBridge picks the fastest path per token:
 - **5+ pulls and no cache** → transcribes the full audio once and caches it, then looks up each pull
 - **Under 5 pulls** → traditional per-pull Whisper on padded windows
 
+When a token has **two or more audio files**, reconcile mixes them and transcribes the mix — so a sidecar on one individual track doesn't help, and the Pull Quotes session is dropped as possibly stale. What does help is every track carrying the *same* transcript, which is exactly how Pull Quotes mirrors one when you save a session: reconcile reuses it for the mix and stamps it onto the mix for next time. A partial set (only some tracks have a sidecar) or a disagreeing set is rejected, and the mix is transcribed.
+
+A sidecar is accepted when the media's mtime still matches it (±2 s). If the mtime drifted — copying media off a shared drive, restoring from backup, and re-saving all rewrite it — PostBridge falls back to the sidecar's baked `audio_signature` (size → duration → SHA-256) and reuses the transcript when the audio is provably identical. Sidecars written before signatures existed remain mtime-gated.
+
+**CHECK TRANSCRIPTS (Step 2):** shows which path each token will take *before* you commit to a run — a ✓/✗ per token and VO take, the reason behind every sidecar hit or miss, and every Pull Quotes session with its signature verification. Read-only; it decodes no audio.
+
+When something is missing, point PostBridge at it from the same window:
+
+- **Locate transcript…** — pick a `.pb_transcript.json` or `.pb_session.json` for one file. PostBridge re-stamps it onto that media with a current mtime and signature, so whatever was causing the rejection stops mattering.
+- **Adopt from folder…** — point at a folder of delivered transcripts and every file matching a media filename stem is adopted at once.
+
+Adoption warns first if the transcript's timings don't fit the audio's duration — the usual sign it belongs to a different recording. Originals are never moved or modified.
+
+The same report is available without opening the app, though it has to guess token→media assignments from filenames rather than reading your pool:
+
+```bash
+python check_transcripts.py "C:/path/to/script.txt"
+```
+
 A live progress log shows per-clip status. A **resource monitor** above the log shows GPU/RAM utilization. A **memory pre-flight check** warns before launch if Windows commit headroom is too tight (Whisper allocations can fail mid-run if the page file is near full).
 
 **Script-conform editing:** when a full transcript is available, PostBridge aligns the script's quote text against the transcript and generates internal cuts for any words on tape that aren't in the script — e.g. "you know" or "um" survivors get cut automatically. Safe by design: if alignment confidence is low, falls back to single-segment match.
@@ -170,6 +189,33 @@ Status badges:
 ### Step 4 — Review
 
 Review flagged clips. Adjust timecodes in the waveform editor. Manually accept or reject. All edits persist in the session JSON.
+
+**Collapsible sections:** each part header is a fold control — click it to collapse that part, and the header reports how many clips are hidden. **COLLAPSE ALL** / **EXPAND ALL** sit on the sort row. Folding is remembered across rebuilds, so finishing a part and folding it away survives the next reassign or status change. It applies in Script order, where the part dividers show; the other sorts interleave parts, so there is nothing coherent to fold.
+
+**Fixed row heights:** cards keep the same height in every state. Confirming or ignoring changes only the border and stripe colour — it does not resize the row and shift everything below it.
+
+**Compact card header:** each row is built from as few widgets as it can be, because scroll cost tracks the widget count. The order number and token share a label; status carries its confidence; sub-clip count, timecode drift and the recorded range share one grey detail line; and one state label swaps between ACCEPTED and IGNORED. Measured on a 240-card list: 3905 widgets → 2185, and a scroll step from 54ms to 36ms. The trade is two accent colours — the order number takes the token's orange, and the clips / Δ badges go grey. Every state signal (status colour, stripe, border) is unchanged.
+
+**FOCUS:** the toggle on the sort row keeps one part open at a time — opening a part folds the rest. Scroll cost tracks how many cards are laid out and nothing else, so this is the whole game: measured on a 184-card episode, **16.5 ms per scroll step with every part open, 0.8 ms with FOCUS on**. The setting is remembered between sessions. EXPAND ALL / COLLAPSE ALL sit beside it for manual control.
+
+To get the numbers for your own episode, point the profiler at a saved session:
+
+```bash
+python profile_step4.py "C:/path/to/your_session.json"
+```
+
+It reports card count, widget count, and milliseconds per scroll step both expanded and collapsed. Read-only.
+
+**Live playback:** the waveform editor streams its audio rather than rendering a file and playing it, so what you change is what you hear — immediately, with no gap and no restart:
+
+- **Drag a cut while it plays** and the edit is audible about 45 ms later. If the playhead is inside a region you just removed, it jumps to the next kept segment.
+- **Change speed while it plays** and it takes effect on the next buffer.
+
+The − / × / + stepper covers 0.75× to 3× (or `[` and `]`; the end stops dim when the range runs out), and the speed is pitch-preserved by a real-time WSOLA time-stretch, so speech stays intelligible instead of going chipmunk. Quality holds right to the top — spectral correlation against ffmpeg's `atempo` is 0.906 at 3× against 0.913 at 1.5×. The playhead is read from the engine's own cursor, so it stays correct across speed changes and cut jumps rather than being extrapolated. Your speed carries to the next card.
+
+This needs `sounddevice` (PortAudio). Without it PostBridge falls back to the old render-a-WAV-and-play-it path, which works on Windows only and has no live response.
+
+Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.
 
 ### Step 5 — Export
 
@@ -212,6 +258,12 @@ Sync results are cached to disk — re-running is fast.
 
 Click **Build XML** once all sources are synced. PostBridge generates an XMEML file with audio and video aligned.
 
+Picture can only land on whole frames; the audio it is matched to cannot. Some sub-frame residual is therefore unavoidable, but *which* frame a clip lands on is a choice. PostBridge rounds the sync offset once per source and applies that same whole-frame shift to every clip from it, so the residual stays under half a frame and clips from one camera never disagree with each other. Near-ties break toward picture-early, since sound arriving after the picture is the direction viewers tolerate (ATSC IS-191 allows audio to lag video by 45 ms but lead it by only 15 ms).
+
+After each build the console lists the leftover per source — how many milliseconds, and which way — so a source sitting close to half a frame can be nudged in Pro Tools instead of being found on the timeline. A residual near half a frame means the offset genuinely falls between two frames; it is not a sign the sync is wrong.
+
+Each source is declared with its own audio channel count, probed from the file. This matters when the media imports offline — a project opened on a different drive, or media moved after the build. Premiere creates offline clips with whatever layout the XML claims, and refuses to relink a file whose real layout differs ("the selected file cannot be linked because it has 1 audio channel(s) and the clip was created with 2"). Mono sources — isolated participant tracks, Riverside `raw-audio` exports — are the usual casualties. If a file cannot be probed at build time, the count is left out rather than guessed, and Premiere reads it off the media.
+
 ---
 
 ## Script Format
@@ -219,21 +271,23 @@ Click **Build XML** once all sources are synced. PostBridge generates an XMEML f
 PostBridge scripts use a bracketed markup:
 
 ```
+Episode Title
+
 [TOKENS]
 NATALIE
 DAN
-PART_0_NARRATOR
 [/TOKENS]
 
 [PART Cold Open]
 
+[VO PART_1_NARRATOR]
 When detectives stepped into the canvas tent, they thought the man on the
 ground had been attacked by a bear.
 
 [NATALIE 00:01:12-00:01:23]
 "I was on my way home, he met me on my doorstep with dinner."
 
-[VO PART_0_NARRATOR]
+[VO PART_1_NARRATOR]
 But the evidence inside pointed to someone else entirely.
 ```
 
@@ -245,6 +299,19 @@ But the evidence inside pointed to someone else entirely.
 
 Blank lines between blocks become a natural gap in the output timeline.
 
+### Easy mistakes
+
+- **The first line is the episode title.** It becomes `doc_title` (and the
+  sequence name). Without it, the first bare line in the file is used
+  instead — which, if `[TOKENS]` comes first, means your episode gets named
+  after a speaker.
+- **Every block of narration needs its own `[VO <id>]` header.** Prose sitting
+  under a `[PART …]` with no `[VO …]` above it belongs to no block and is
+  **silently dropped** — no error, no warning.
+- **`[TOKENS]` lists interview speakers only.** VO ids live in `[VO …]`
+  headers and must *not* be declared here; a VO id in `[TOKENS]` registers a
+  phantom speaker that will then ask you for media.
+
 ---
 
 ## Session Files
@@ -255,7 +322,7 @@ Two flavours, both human-readable JSON:
 |---|---|---|
 | `*_session.json` | Script→Session state: assignments, reconciliation results, Step 4 edits | Wherever you saved it |
 | `<TOKEN>.pb_session.json` | Pull Quotes session: media list, transcript, notes, speaker labels | `<project>/03_AUDIO/00_RAW AUDIO/` |
-| `<media>.pb_transcript.json` | Cached transcript word list | Next to the source audio |
+| `<media>.pb_transcript.json` | Cached transcript word list + audio signature | Next to the source audio |
 
 The `.pb_transcript.json` sidecars are shared between workflows: transcribing in Pull Quotes populates them; reconcile in Script→Session reads them.
 
