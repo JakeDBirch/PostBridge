@@ -2177,6 +2177,36 @@ def _snap_to_speech(words, clip_start, orig_in, orig_out, pad):
     snapped_out = min(out_candidates, key=lambda x: x[0])[1] if out_candidates else orig_out
     return round(snapped_in, 3), round(snapped_out, 3)
 
+# ── Host / guest file split (shared by the AAF and XML exporters) ─────────────
+_SPEAKER_N_RE = re.compile(r"speaker[-_ ]?\d+", re.IGNORECASE)
+
+
+def split_host_guest(paths):
+    """Split one token's source files into (host_paths, guest_paths).
+
+    A file is the host's when HOST_NAME appears in its basename — but
+    Riverside names anonymised multi-speaker exports after BOTH people
+    ("riversideI_Adam-Jordan_speaker-0", "..._speaker-1"), so a name with a
+    speaker-N tag says nothing about who is on it.  Those count as guests.
+
+    At most ONE file is the host: every host file lands on the shared host
+    track at the same timeline position, so a second one overlapped the
+    first and (in the AAF) pushed every later host clip out of place.
+    Extras are kept as guests, each on its own track, rather than dropped.
+    """
+    host_lc = HOST_NAME.lower()
+    host, guest = [], []
+    for p in paths:
+        if not p:
+            continue
+        b = os.path.basename(p).lower()
+        if host_lc in b and not _SPEAKER_N_RE.search(b) and not host:
+            host.append(p)
+        else:
+            guest.append(p)
+    return host, guest
+
+
 # ── Per-pull reconciler ────────────────────────────────────────────────────────
 def _base_result(pull):
     orig_in  = pull["in_seconds"]
@@ -4036,13 +4066,11 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     # count.  Slot 0 is reserved for the host across all tokens; subsequent
     # slots hold non-host files, one track per file.  Default is 2 (host +
     # 1 guest) for the typical Riverside duo.
-    def _is_host_file(p):
-        return HOST_LC in os.path.basename(p).lower()
     _max_guest_v = 1
     _max_guest_a = 1
     for _paths in (int_assets or {}).values():
-        _gvps = [p for p in _paths if p and is_video(p) and not _is_host_file(p)]
-        _gaps = [p for p in _paths if p and not is_video(p) and not _is_host_file(p)]
+        _gvps = split_host_guest([p for p in _paths if p and is_video(p)])[1]
+        _gaps = split_host_guest([p for p in _paths if p and not is_video(p)])[1]
         _max_guest_v = max(_max_guest_v, len(_gvps))
         _max_guest_a = max(_max_guest_a, len(_gaps))
     max_iv = 1 + _max_guest_v   # 1 host slot + N guest slots
@@ -4229,10 +4257,10 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             tok    = res["token"]
             paths  = int_assets.get(tok, [])
 
-            host_vpaths  = [p for p in paths if p and is_video(p)     and _is_host_file(p)]
-            guest_vpaths = [p for p in paths if p and is_video(p)     and not _is_host_file(p)]
-            host_apaths  = [p for p in paths if p and not is_video(p) and _is_host_file(p)]
-            guest_apaths = [p for p in paths if p and not is_video(p) and not _is_host_file(p)]
+            host_vpaths, guest_vpaths = split_host_guest(
+                [p for p in paths if p and is_video(p)])
+            host_apaths, guest_apaths = split_host_guest(
+                [p for p in paths if p and not is_video(p)])
 
             # Slot 0 holds the host (if any).  Each non-host file gets its own
             # slot (1, 2, 3, …) so multi-source tokens (3+ files, or anonymised
@@ -5236,10 +5264,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             # — important for setups where Riverside exports anonymised
             # "speaker-0" / "speaker-1" filenames or where a token has 3+
             # parallel sources.
-            host_paths  = [p for p in apaths
-                           if HOST_LC in os.path.basename(p).lower()]
-            guest_paths = [p for p in apaths
-                           if HOST_LC not in os.path.basename(p).lower()]
+            host_paths, guest_paths = split_host_guest(apaths)
 
             for si, (seg_in_s, seg_out_s) in enumerate(segments):
                 if seg_in_s >= seg_out_s: continue
@@ -5248,9 +5273,10 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 src_in  = s2sa(seg_in_s)
 
                 # Each non-host file → its own track.  Primary file uses the
-                # token name; additional files spill to TOKEN_2, TOKEN_3, …
+                # token name; additional files spill to "TOKEN (2)", … — not
+                # TOKEN_2, which collided with a real token named ADAM_2.
                 for gi, gp in enumerate(guest_paths):
-                    track_name = track if gi == 0 else "{}_{}".format(track, gi + 1)
+                    track_name = track if gi == 0 else "{} ({})".format(track, gi + 1)
                     slots.append((gp, cursor, dur_sa, src_in, track_name))
                 # All host-named files → shared JORDAN track
                 for hp in host_paths:
@@ -5259,6 +5285,26 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
                 _int_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
                 cursor += dur_sa + (_int_gap if (is_last and res.get("gap_after", True)) else 0)
+
+    # ── Overlap guard ─────────────────────────────────────────────────────────
+    # A track holds one clip at a time.  The writer below can only append,
+    # so an overlapping clip used to be silently pushed to the end of the
+    # track — and every later clip on that track drifted with it.  Route
+    # any overlap to an "(overlap)" track at its true position instead,
+    # and say so.
+    _track_end = {}
+    _rerouted  = {}
+    for _i, (_fp, _st, _du, _si, _tn) in enumerate(slots):
+        _name = _tn
+        while _track_end.get(_name, 0) > _st:
+            _name = _name + " (overlap)"
+        if _name != _tn:
+            _rerouted[_tn] = _rerouted.get(_tn, 0) + 1
+            slots[_i] = (_fp, _st, _du, _si, _name)
+        _track_end[_name] = _st + _du
+    for _tn, _n in _rerouted.items():
+        _prog("WARNING: {} clip(s) overlapped on track {} — moved to "
+              "\"{} (overlap)\" at their correct positions".format(_n, _tn, _tn))
 
     _prog("Analysing {} clips across {} tracks…".format(len(slots),
           len(set(s[4] for s in slots))))
