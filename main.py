@@ -2702,6 +2702,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         for r in targets:
             r["token"]         = new_tok
             r["source_audio"]  = new_file
+            # Export reads this, not source_audio (which may point at a
+            # transcript mix or a pool fallback) — see _collect_export_inputs.
+            r["export_source"] = new_file
             r.pop("source_video", None)
             if is_video(new_file):
                 r["source_video"] = new_file
@@ -7976,6 +7979,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                             r["token"] = new_token
                         if new_audio_path:
                             r["source_audio"] = new_audio_path
+                            r["export_source"] = new_audio_path
                             # source_video was a fallback for restored sessions;
                             # once we've reassigned, clear it so future opens
                             # use the new audio path.
@@ -8987,6 +8991,38 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             others   = [p for p in existing if p != _fp]
             int_assets[_tok] = [_fp] + others
 
+        # ── Per-pull source files ─────────────────────────────────────────
+        # A pull can be pointed at different audio than its token's files
+        # (REASSIGN "This pull only", cross-token ADOPT).  The builders
+        # otherwise export from int_assets[token] — the token's file at the
+        # pull's timecodes, i.e. the wrong audio.  Rows without the explicit
+        # export_source still count when their source_audio is a pool file
+        # assigned to a DIFFERENT token: nothing but a user reassign puts one
+        # there (reconcile uses the token's own file or a cache mix WAV).
+        # The chosen file leads; the rest of its owning token's files (the
+        # host side of the same recording) follow it onto their tracks.
+        def _norm(p):
+            return os.path.normcase(os.path.abspath(p)) if p else ""
+        _owner = {}
+        for _tok, _paths in int_assets.items():
+            for _p in _paths:
+                _owner.setdefault(_norm(_p), _tok)
+        for r in edited:
+            if r.get("is_vo"):
+                continue
+            src = r.get("export_source") or ""
+            if not src:
+                _sa = r.get("source_audio") or ""
+                _own = {_norm(p) for p in int_assets.get(r.get("token", ""), [])}
+                if _norm(_sa) in _owner and _norm(_sa) not in _own:
+                    src = _sa
+            if not src or os.path.basename(src).startswith("_pb_mix_"):
+                continue
+            _otok = _owner.get(_norm(src))
+            _rest = [p for p in int_assets.get(_otok, [])
+                     if _norm(p) != _norm(src)] if _otok else []
+            r["_export_paths"] = [src] + _rest
+
         try:
             vo_bin_data = {pi: vb for pi, vb in self.vo_bins.items()}
         except Exception:
@@ -9289,7 +9325,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             tk.Label(r, text=val, font=FB, bg=SURF, fg=TEXT).pack(side="left")
         tk.Frame(card, bg=BG, height=8).pack()
         tk.Frame(self.body, bg=BG, height=20).pack()
-        self._btn(self.body, "START NEW EPISODE", self._reset).pack()
+        nav = tk.Frame(self.body, bg=BG); nav.pack()
+        self._btn(nav, "← BACK", self._step5).pack(side="left", padx=(0, 10))
+        self._btn(nav, "START NEW EPISODE", self._reset).pack(side="left")
 
 
     # ── Script Formatter workflow ─────────────────────────────────────────────

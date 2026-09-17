@@ -4047,6 +4047,16 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     from collections import defaultdict
     clip_pos = defaultdict(int)
 
+    # One <file> definition per source path.  Ids used to be token+slot,
+    # which gave two different files the same id once a pull could export
+    # from a file other than its token's.
+    _file_ids = {}
+    def _file_id(kind, path):
+        key = (kind, os.path.normcase(os.path.abspath(path)))
+        if key not in _file_ids:
+            _file_ids[key] = "file-{}-{}".format(kind, len(_file_ids) + 1)
+        return _file_ids[key]
+
     max_vo_takes = 0
     vo_takes_by_part = {}
     if vo_takes_with_offset:
@@ -4255,7 +4265,8 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
         else:
             tok    = res["token"]
-            paths  = int_assets.get(tok, [])
+            paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok, []))
+                      if not _is_temp_mix_path(p)]
 
             host_vpaths, guest_vpaths = split_host_guest(
                 [p for p in paths if p and is_video(p)])
@@ -4298,7 +4309,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
                 for slot, vp, ap in participants:
                     if vp and slot < max_iv:
-                        fid   = "file-v-{}-{}".format(tok, slot)
+                        fid   = _file_id("v", vp)
                         cid   = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
                         if first: defined.add(fid)
@@ -4313,7 +4324,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                                       "clip_pos":clip_pos[("v",slot+1)]})
 
                     if ap and slot < max_ia:
-                        fid   = "file-a-{}-{}".format(tok, slot)
+                        fid   = _file_id("a", ap)
                         cid   = "clip-{}".format(ctr); ctr += 1
                         first = fid not in defined
                         if first: defined.add(fid)
@@ -5257,7 +5268,10 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             cursor += (_vo_gap if res.get("gap_after", True) else 0)
         else:
             tok    = res["token"]
-            paths  = int_assets.get(tok, [])
+            # _export_paths: this pull was pointed at other audio than its
+            # token's files (set by the app's export-input collection).
+            paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok, []))
+                      if not _is_temp_mix_path(p)]
             # Prefer pure-audio files; fall back to video files whose embedded
             # audio will be extracted by ffmpeg (-vn) during the WAV conversion.
             apaths = [p for p in paths if p and is_audio(p)]
