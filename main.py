@@ -1664,6 +1664,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 "rec_out_s":  r.get("rec_out_s",  0.0),
                 "status":     r.get("status",     ""),
                 "token":      r.get("token",      ""),
+                "source_audio": r.get("source_audio", ""),
                 "is_vo":      bool(r.get("is_vo", False)),
                 "confidence": r.get("confidence", None),
                 # Fresh reconcile output starts unflagged on both axes.
@@ -1746,6 +1747,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         "after":   cur.get(k),
                         "delta_s": round(delta_s, 3),
                     })
+            if cur.get("reassigned"):
+                deltas.append({
+                    "field":  "source",
+                    "before": {"token": base.get("token", ""),
+                               "source_audio": base.get("source_audio", "")},
+                    "after":  {"token": cur.get("token", ""),
+                               "source_audio": cur.get("source_audio", "")},
+                })
             for k in ("accepted", "ignored"):
                 if cur.get(k) != base.get(k):
                     deltas.append({
@@ -2220,7 +2229,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 "status":     r.get("status", ""),
                 "ignored":    e["skip_var"].get(),
                 "accepted":   e.get("accepted_flag", [False])[0],
+                "token":        r.get("token", ""),
+                "source_audio": r.get("source_audio", ""),
             }
+            if r.get("_s4_reassigned"):
+                entry["reassigned"]    = True
+                entry["export_source"] = r.get("export_source", "")
             if "gap_after_s" in r:
                 entry["gap_after_s"] = r["gap_after_s"]
             # Persist VO takes_data so edited segments survive save/load cycles
@@ -2705,6 +2719,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # Export reads this, not source_audio (which may point at a
             # transcript mix or a pool fallback) — see _collect_export_inputs.
             r["export_source"] = new_file
+            r["_s4_reassigned"] = True   # user-owned: never re-matched over
             r.pop("source_video", None)
             if is_video(new_file):
                 r["source_video"] = new_file
@@ -2958,6 +2973,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         res["rec_out_tc"]      = "00:00:00"
         res["matched_text"]    = ""
         res["confidence"]      = 0.0
+        res["_s4_reassigned"]  = True   # user-owned: never re-matched over
         res.pop("_s4_accepted",   None)
         res.pop("_s4_ignored",    None)
         res.pop("_original_status", None)
@@ -3049,10 +3065,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # previous run) or its status was set by hand.
             return None
 
-        # Reassigned while provisional: the fresh result is for the OLD
-        # token, so it is wrong for this row now.
-        if fresh.get("token") and cur.get("token") \
-                and fresh.get("token") != cur.get("token"):
+        # Reassigned while provisional: the fresh result was matched
+        # against the OLD audio, so it is wrong for this row now — even
+        # when the token stayed the same and only the file changed.
+        if cur.get("_s4_reassigned") or (
+                fresh.get("token") and cur.get("token")
+                and fresh.get("token") != cur.get("token")):
             cur["_bg_note"] = "reassigned before matching finished — kept"
             return "kept"
 
@@ -3362,7 +3380,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
     def _s4_redo_to_step2(self):
         """Go BACK to Step 2 while preserving user-approved Step 4 edits.
 
-        Rows the user confirmed OR ignored are stashed in
+        Rows the user confirmed, ignored OR reassigned are stashed in
         _confirmed_carryover so that _run_reconcile can pass them
         through untouched — both interview pulls (via
         process_token_pulls) and VO blocks (via process_vo_part).
@@ -3374,6 +3392,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             r["order"]: r
             for r in getattr(self, "results", [])
             if r.get("_s4_accepted") or r.get("_s4_ignored")
+                or r.get("_s4_reassigned")
         }
         self._confirmed_carryover = carryover
         self._step2()
@@ -6293,7 +6312,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 if pull.get("order") in _carryover:
                     r = _carryover[pull["order"]]
                     results.append(r)
-                    if r.get("rec_out_s", 0.0) > 0.0:
+                    # A reassigned row's times are in another file — they
+                    # say nothing about where this token's file is.
+                    if r.get("rec_out_s", 0.0) > 0.0 and not r.get("_s4_reassigned"):
                         cursor = max(cursor, r["rec_out_s"])
                     continue
 
@@ -7980,6 +8001,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         if new_audio_path:
                             r["source_audio"] = new_audio_path
                             r["export_source"] = new_audio_path
+                            r["_s4_reassigned"] = True
                             # source_video was a fallback for restored sessions;
                             # once we've reassigned, clear it so future opens
                             # use the new audio path.
