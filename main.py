@@ -9084,8 +9084,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
         seq_name = self.seq_name.get() or "roughcut"
         tok      = "VO" if res.get("is_vo") else (res.get("token") or "pull")
-        safe     = re.sub(r'[\\/:*?"<>|]+', "_",
-                          "{} - {} #{}".format(seq_name, tok, order)).strip()
+        # A fresh name per export.  Re-importing a re-exported AAF from the
+        # same path into Pro Tools gave the audio of the FIRST export there
+        # (a fixed pull kept coming in as its old source file).  No "#"
+        # either — it is the URL fragment character in AAF media locators.
+        safe     = re.sub(r'[\\/:*?"<>|#]+', "_",
+                          "{} - {} pull {} {}".format(
+                              seq_name, tok, order,
+                              time.strftime("%H%M%S"))).strip()
         init_dir = os.path.dirname(self.out_path.get()) if self.out_path.get() else None
         out_path = filedialog.asksaveasfilename(
             title="Export this pull as AAF",
