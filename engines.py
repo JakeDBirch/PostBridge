@@ -5055,7 +5055,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
 # ── AAF builder ────────────────────────────────────────────────────────────────
 def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
               seq_fps=24, seq_sr=48000, vo_takes_with_offset=None,
-              out_path="output.aaf", progress_cb=None, cancel_event=None):
+              out_path="output.aaf", progress_cb=None, cancel_event=None,
+              only_orders=None):
     """Build a multi-track AAF where:
       • Each guest token gets its own audio track.
       • All VO parts share a single "VO" track.
@@ -5063,6 +5064,11 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         how many interview segments they appear in.
     Clips are placed at absolute timeline positions so gaps appear correctly
     in Pro Tools when the session is opened.
+
+    only_orders: optional set of result "order" values.  The full timeline is
+    still laid out (so positions and track names match a full export), but
+    only clips from those results are written — used to re-export a single
+    pull and drop it into an existing session.  PARTS markers are omitted.
     """
     if not HAS_AAF:
         raise RuntimeError("pyaaf2 is not installed. Run: pip install pyaaf2")
@@ -5165,6 +5171,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     skipped     = []
     # slots: (filepath, start_sa, dur_sa, src_in_sa, track_name)
     slots       = []
+    slot_orders = []  # parallel to slots: the result "order" each slot came from
     part_starts = {}  # part_index → sample position of first content in that part
 
     for res in sorted(results, key=lambda r: r["order"]):
@@ -5244,6 +5251,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     if seg_in_s >= seg_out_s: continue
                     dur_sa = s2sa(seg_out_s - seg_in_s)
                     slots.append((ap, cursor, dur_sa, s2sa(seg_in_s), track))
+                    slot_orders.append(res["order"])
                     cursor += dur_sa
             _vo_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
             cursor += (_vo_gap if res.get("gap_after", True) else 0)
@@ -5278,10 +5286,12 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 for gi, gp in enumerate(guest_paths):
                     track_name = track if gi == 0 else "{} ({})".format(track, gi + 1)
                     slots.append((gp, cursor, dur_sa, src_in, track_name))
+                    slot_orders.append(res["order"])
                 # All host-named files → shared JORDAN track
                 for hp in host_paths:
                     slots.append((hp, cursor, dur_sa, src_in,
                                   HOST_NAME.upper()))
+                    slot_orders.append(res["order"])
 
                 _int_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
                 cursor += dur_sa + (_int_gap if (is_last and res.get("gap_after", True)) else 0)
@@ -5305,6 +5315,16 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     for _tn, _n in _rerouted.items():
         _prog("WARNING: {} clip(s) overlapped on track {} — moved to "
               "\"{} (overlap)\" at their correct positions".format(_n, _tn, _tn))
+
+    # ── Subset export ─────────────────────────────────────────────────────────
+    # Filter AFTER layout + overlap routing so the kept clips land exactly
+    # where (and on the track) they would in the full export.
+    if only_orders is not None:
+        _keep = set(only_orders)
+        slots = [sl for sl, o in zip(slots, slot_orders) if o in _keep]
+        part_starts = {}
+        if not slots:
+            raise RuntimeError("Nothing to export for the selected pull(s).")
 
     _prog("Analysing {} clips across {} tracks…".format(len(slots),
           len(set(s[4] for s in slots))))

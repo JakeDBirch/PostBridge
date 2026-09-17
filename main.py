@@ -7710,6 +7710,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                         m = tk.Menu(self, tearoff=0, bg=SURF, fg=TEXT,
                                     activebackground=ACCENT,
                                     activeforeground=BG, bd=0)
+                        m.add_command(label="Export this pull as AAF…",
+                                      command=lambda: self._export_single_pull(r))
+                        m.add_separator()
                         _orig = r.get("_original_status") or ""
                         _cur  = r.get("status", "")
                         if _orig and _orig != _cur:
@@ -7733,7 +7736,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                             m.grab_release()
                     return _popup
 
-                stat_lbl.bind("<Button-3>", _make_status_popup(res, stat_lbl))
+                _status_popup = _make_status_popup(res, stat_lbl)
+                stat_lbl.bind("<Button-3>", _status_popup)
 
                 # ── Detail line ────────────────────────────────────────────────────
                 # Sub-clip count, timecode drift and the recorded timecode
@@ -8100,6 +8104,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
                 for _w in [hdr, card, id_lbl, stat_lbl, _detail_lbl]:
                     _w.bind("<Button-1>", _hdr_click)
+                for _w in [hdr, card, id_lbl, _detail_lbl]:
+                    _w.bind("<Button-3>", _status_popup)
 
                 self._rv.append({
                     "skip_var": skip_var, "res": res, "card": card,
@@ -8914,12 +8920,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             initialfile="roughcut{}".format(ext))
         if p: self.out_path.set(p)
 
-    def _build(self):
-        if not self.out_path.get():
-            messagebox.showwarning("No Path", "Choose a save location first.")
-            return
-
-        # ── Snapshot all state on the main thread before handing off ─────────
+    def _collect_export_inputs(self):
+        """Snapshot the export inputs on the main thread: the edited result
+        list (IGNOREd / unusable rows dropped), interview assets with any
+        re-reconcile source overrides applied, VO bins, and every media path
+        for probing.  Shared by the full build and single-pull export so
+        both lay out the timeline identically."""
         # Build a lookup keyed by object id so we can match Step 4 row data
         # (skip_var, accepted_flag) back to their result dicts.
         rv_by_id = {id(r["res"]): r for r in getattr(self, "_rv", [])}
@@ -8998,6 +9004,95 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 all_paths.extend(vb._videos)
             elif hasattr(vb, "get_video") and vb.get_video():
                 all_paths.append(vb.get_video())
+
+        return edited, int_assets, vo_bin_data, all_paths
+
+    def _export_single_pull(self, res):
+        """Build an AAF holding just one Step 4 pull, placed at the timeline
+        position and on the track it gets in a full export — so a single
+        corrected pull can be dropped into an already-built session."""
+        if not engines.HAS_AAF:
+            messagebox.showerror("AAF unavailable",
+                                 "pyaaf2 is not installed. Run: pip install pyaaf2")
+            return
+        edited, int_assets, vo_bin_data, all_paths = self._collect_export_inputs()
+        order = res.get("order")
+        if not any(r.get("order") == order for r in edited):
+            messagebox.showwarning(
+                "Can't export this pull",
+                "This pull is IGNORED or has nothing to place "
+                "(no file / transcript / segments).")
+            return
+
+        seq_name = self.seq_name.get() or "roughcut"
+        tok      = "VO" if res.get("is_vo") else (res.get("token") or "pull")
+        safe     = re.sub(r'[\\/:*?"<>|]+', "_",
+                          "{} - {} #{}".format(seq_name, tok, order)).strip()
+        init_dir = os.path.dirname(self.out_path.get()) if self.out_path.get() else None
+        out_path = filedialog.asksaveasfilename(
+            title="Export this pull as AAF",
+            defaultextension=".aaf", initialfile=safe + ".aaf",
+            initialdir=init_dir or None,
+            filetypes=[("AAF", "*.aaf")])
+        if not out_path:
+            return
+
+        gap_secs = self.gap_var.get()
+        parts    = list(self.parts)
+        vo_takes = dict(getattr(self, "_vo_takes_by_part", {}))
+
+        win = tk.Toplevel(self)
+        win.title("Exporting pull")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        lbl = tk.Label(win, text="Starting…", font=FB, bg=BG, fg=SUB,
+                       wraplength=420, justify="center")
+        lbl.pack(padx=24, pady=20)
+
+        def _set_status(msg):
+            self._ui(lambda m=msg: lbl.winfo_exists() and lbl.config(text=m))
+
+        def _done(err=None):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            if err:
+                messagebox.showerror("Pull export failed", str(err))
+            else:
+                messagebox.showinfo(
+                    "Pull exported",
+                    "{} #{} exported to:\n{}\n\nIt sits at the same timeline "
+                    "position and track as in the full export (using the "
+                    "current gap setting of {:g}s).".format(
+                        tok, order, out_path, gap_secs))
+
+        def _worker():
+            try:
+                _set_status("Probing media settings…")
+                _w, _h, seq_fps, seq_sr = engines.probe_media_settings(
+                    [p for p in all_paths if p])
+                engines.build_aaf(
+                    edited, int_assets, vo_bin_data, parts,
+                    seq_name, gap_secs,
+                    seq_fps=seq_fps, seq_sr=seq_sr,
+                    vo_takes_with_offset=vo_takes,
+                    out_path=out_path,
+                    progress_cb=_set_status,
+                    only_orders={order})
+                self._ui(_done)
+            except Exception as e:
+                self._ui(lambda e=e: _done(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _build(self):
+        if not self.out_path.get():
+            messagebox.showwarning("No Path", "Choose a save location first.")
+            return
+
+        edited, int_assets, vo_bin_data, all_paths = self._collect_export_inputs()
 
         seq_name = self.seq_name.get()
         gap_secs = self.gap_var.get()
