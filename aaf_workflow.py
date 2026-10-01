@@ -2049,6 +2049,24 @@ class AafWorkflowMixin:
             self._aaf_set_sync_state(base, "")
         self._rebuild_aaf_source_rows()
 
+    def _aaf_ffmpeg_ready(self):
+        """True when ffmpeg/ffprobe can run; otherwise say why and return False.
+
+        Every waveform sync and probe shells out to them.  Without this
+        check a missing ffmpeg surfaced as "This file has no audio track"
+        on every source.  Success is remembered for the session; failure
+        is not, so installing ffmpeg and retrying works without a restart."""
+        if getattr(self, "_aaf_ffmpeg_ok", False):
+            return True
+        ok, err = engines.check_ffmpeg()
+        if not ok:
+            messagebox.showerror("ffmpeg unavailable",
+                (err or "Could not use or install ffmpeg.") +
+                "\n\nAudio sync and alignment need ffmpeg to read waveforms.")
+            return False
+        self._aaf_ffmpeg_ok = True
+        return True
+
     def _aaf_sync_all(self):
         """Run sync detection for every source marked 'needs sync' that has video + audio."""
         sources_to_sync = [
@@ -2061,6 +2079,8 @@ class AafWorkflowMixin:
             messagebox.showwarning("Nothing to sync",
                 "Tick the 'sync' checkbox on at least one source that has both a video "
                 "and a reference audio file assigned.")
+            return
+        if not self._aaf_ffmpeg_ready():
             return
         # Gate concurrency: cpu_count-1 syncs running simultaneously (same
         # scheme as reconcile), so we don't saturate disk I/O or CPU.
@@ -2677,6 +2697,8 @@ class AafWorkflowMixin:
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
             return
+        if not self._aaf_ffmpeg_ready():
+            return
         self._aaf_push_undo(base)
         btn = self._aaf_sync_btns.get(base)
 
@@ -3018,6 +3040,8 @@ class AafWorkflowMixin:
     def _aaf_open_align(self, base):
         """Open the waveform alignment dialog for manual verification/adjustment."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        if not self._aaf_ffmpeg_ready():
             return
         fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
         if fn == "— no video —":
@@ -3498,6 +3522,8 @@ class AafWorkflowMixin:
     def _aaf_reset_sync(self, base):
         """Reset sync state for *base* back to zero."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        if not self._aaf_ffmpeg_ready():
             return
         self._aaf_push_undo(base)
         ov = self._aaf_source_offset_vars.get(base)

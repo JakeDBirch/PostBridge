@@ -45,6 +45,21 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller PostBridge.spec --noconfirm
 
+      - name: Self-test the built app (bundled ffmpeg only)
+        # Runs the real app in --self-test mode: finds ffmpeg/ffprobe
+        # inside the bundle (PATH is ignored, so the runner's own ffmpeg
+        # can't mask a broken bundle), probes a clip with audio and one
+        # without, and extracts a waveform.  Fails the build otherwise.
+        # Windowed exe: wait on the process for its exit code.
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $p = Start-Process -FilePath "dist\PostBridge\PostBridge.exe" `
+                 -ArgumentList "--self-test", "`"$report`"" -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report }
+          else { Write-Host "::error::self-test wrote no report" }
+          exit $p.ExitCode
+
       - name: Zip output folder
         shell: pwsh
         run: Compress-Archive -Path dist\PostBridge -DestinationPath PostBridge-windows.zip

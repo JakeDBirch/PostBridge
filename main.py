@@ -9775,6 +9775,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         self._home()
 
 if __name__ == "__main__":
+    # Build verification: `PostBridge --self-test REPORT.txt` checks the
+    # bundle's own ffmpeg end to end and exits without opening a window.
+    # The build workflows fail the build when this does not pass.
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        sys.exit(engines.run_self_test(
+            sys.argv[2] if len(sys.argv) > 2 else None))
+
     if sys.platform == "win32":
         try:
             import ctypes

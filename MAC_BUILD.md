@@ -36,6 +36,21 @@ venv, installs deps, downloads static ffmpeg/ffprobe for the detected arch,
 pre-downloads the `tiny` Whisper model into `models/`, and runs PyInstaller
 against `PostBridge.spec`.
 
+The build ends by verifying itself: `codesign --verify` on the bundle, then
+`PostBridge.app/Contents/MacOS/PostBridge --self-test build/selftest.txt`,
+which makes the app find its **own** ffmpeg/ffprobe (PATH and Homebrew are
+ignored), probe a clip with audio and one without, and extract a waveform.
+If that fails the script exits non-zero — don't ship that build. CI runs the
+same self-test on the built app and again on the unzipped artifact, and fails
+the run on any miss. Run it by hand against any copy of the app to check it.
+
+ffmpeg/ffprobe are saved into `ffmpeg-bin/` as plain `ffmpeg` / `ffprobe` and
+ad-hoc signed *before* PyInstaller runs; the spec refuses to build without
+them. (Earlier builds shipped them as `ffmpeg-osx-arm64` etc., which the app
+never looked for — every sync then failed with "This file has no audio track".)
+
+The build is Apple Silicon only; it will not launch on an Intel Mac.
+
 To ship it:
 
 ```bash

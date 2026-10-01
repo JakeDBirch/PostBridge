@@ -34,23 +34,23 @@ echo "Architecture: $ARCH  →  using $FFMPEG_ASSET"
 echo ""
 
 # ── Download ffmpeg static binaries ──────────────────────────────────────────
+# Saved as plain ffmpeg / ffprobe — the names the app looks for inside the
+# bundle — and ad-hoc signed before PyInstaller runs (Apple Silicon kills
+# unsigned executables; signing inside a finished .app breaks its seal).
 mkdir -p "$FFBIN"
 
-if [[ ! -f "$FFBIN/$FFMPEG_ASSET" ]]; then
-    echo "Downloading $FFMPEG_ASSET ..."
-    curl -fL -o "$FFBIN/$FFMPEG_ASSET" "$FFMPEG_BASE/$FFMPEG_ASSET"
-    chmod +x "$FFBIN/$FFMPEG_ASSET"
-else
-    echo "  $FFMPEG_ASSET already present — skipping."
-fi
-
-if [[ ! -f "$FFBIN/$FFPROBE_ASSET" ]]; then
-    echo "Downloading $FFPROBE_ASSET ..."
-    curl -fL -o "$FFBIN/$FFPROBE_ASSET" "$FFMPEG_BASE/$FFPROBE_ASSET"
-    chmod +x "$FFBIN/$FFPROBE_ASSET"
-else
-    echo "  $FFPROBE_ASSET already present — skipping."
-fi
+for pair in "ffmpeg:$FFMPEG_ASSET" "ffprobe:$FFPROBE_ASSET"; do
+    name="${pair%%:*}"; asset="${pair#*:}"
+    if [[ ! -f "$FFBIN/$name" ]]; then
+        echo "Downloading $asset ..."
+        curl -fL --retry 3 -o "$FFBIN/$name" "$FFMPEG_BASE/$asset"
+    else
+        echo "  $name already present — skipping."
+    fi
+    chmod +x "$FFBIN/$name"
+    codesign --force --sign - "$FFBIN/$name"
+    "$FFBIN/$name" -version | head -1
+done
 
 echo ""
 
@@ -104,6 +104,20 @@ rm -rf build/PostBridge dist/PostBridge dist/PostBridge.app
 echo ""
 echo "Running PyInstaller ..."
 "$PY" -m PyInstaller PostBridge.spec --noconfirm
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+# Same checks as CI: the bundle's signature is intact, and the built app can
+# find and use its OWN ffmpeg (PATH / Homebrew ignored) to probe audio and
+# extract a waveform.  A failure here means the .app would fail on a clean Mac.
+echo ""
+echo "Verifying bundle ..."
+codesign --verify --deep --strict dist/PostBridge.app
+if ! dist/PostBridge.app/Contents/MacOS/PostBridge --self-test build/selftest.txt; then
+    cat build/selftest.txt 2>/dev/null
+    echo ""
+    echo "ERROR: self-test failed — do not ship this build."
+    exit 1
+fi
 
 echo ""
 echo "============================================================"

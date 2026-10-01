@@ -5,9 +5,9 @@ name: Build PostBridge — macOS (Apple Silicon)
 # artifact (.app bundle, ~1.2 GB with bundled tiny/base/small Whisper
 # models).
 #
-# Intel Macs (pre-2020) run the ARM build via Rosetta 2 — no separate
-# job needed.  macos-13 Intel runners were deprecated by GitHub in
-# early 2025.
+# Apple Silicon (M-series) Macs only.  Rosetta 2 runs Intel code on
+# Apple Silicon, not the other way round, so this build will NOT launch
+# on an Intel Mac; one would need an x64 build (build.sh on that Mac).
 
 on:
   workflow_dispatch:
@@ -37,18 +37,62 @@ jobs:
         run: python _download_bundled_models.py
 
       - name: Download ffmpeg (macOS ARM64)
+        # Saved as plain ffmpeg / ffprobe — the names the app looks for
+        # inside the bundle.  Then ad-hoc signed: Apple Silicon kills any
+        # unsigned executable on launch, and signing BEFORE PyInstaller
+        # keeps the finished .app's seal intact (signing a file inside an
+        # already-built bundle breaks it, and Gatekeeper then reports the
+        # app as damaged).
         run: |
           mkdir -p ffmpeg-bin
           base="https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
-          curl -fL -o ffmpeg-bin/ffmpeg-osx-arm64  "$base/ffmpeg-osx-arm64"
-          curl -fL -o ffmpeg-bin/ffprobe-osx-arm64 "$base/ffprobe-osx-arm64"
-          chmod +x ffmpeg-bin/ffmpeg-osx-arm64 ffmpeg-bin/ffprobe-osx-arm64
+          curl -fL --retry 3 -o ffmpeg-bin/ffmpeg  "$base/ffmpeg-osx-arm64"
+          curl -fL --retry 3 -o ffmpeg-bin/ffprobe "$base/ffprobe-osx-arm64"
+          chmod +x ffmpeg-bin/ffmpeg ffmpeg-bin/ffprobe
+          for b in ffmpeg-bin/ffmpeg ffmpeg-bin/ffprobe; do
+            lipo -archs "$b" | grep -qw arm64 || { echo "::error::$b is not arm64"; exit 1; }
+            codesign --force --sign - "$b"
+            "$b" -version | head -1
+          done
 
       - name: Build with PyInstaller
         run: pyinstaller PostBridge.spec --noconfirm
 
+      - name: Verify bundle signature
+        run: codesign --verify --deep --strict --verbose=2 dist/PostBridge.app
+
+      - name: Self-test the built app (bundled ffmpeg only)
+        # Runs the real app binary in --self-test mode: finds ffmpeg and
+        # ffprobe inside the bundle (PATH and Homebrew are ignored, so the
+        # runner's own ffmpeg can't mask a broken bundle), probes a clip
+        # with audio and one without, and extracts a waveform.  Fails the
+        # build if any of that doesn't work.
+        run: |
+          set +e
+          dist/PostBridge.app/Contents/MacOS/PostBridge --self-test "$RUNNER_TEMP/selftest.txt"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/selftest.txt" || true
+          exit $rc
+
       - name: Zip .app (preserving macOS metadata)
         run: ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac-arm64.zip
+
+      - name: Self-test the zipped app as a user would get it
+        # Unzip with ditto into a fresh folder and test again, so anything
+        # the zip round-trip loses (exec bits, symlinks, the signature)
+        # fails here instead of on a user's Mac.
+        run: |
+          rm -rf "$RUNNER_TEMP/unzipped"
+          ditto -x -k PostBridge-mac-arm64.zip "$RUNNER_TEMP/unzipped"
+          app="$RUNNER_TEMP/unzipped/PostBridge.app"
+          codesign --verify --deep --strict "$app"
+          set +e
+          "$app/Contents/MacOS/PostBridge" --self-test "$RUNNER_TEMP/selftest-zip.txt"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/selftest-zip.txt" || true
+          exit $rc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

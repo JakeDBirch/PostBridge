@@ -45,39 +45,38 @@ except ImportError:
     print("PostBridge build: torch not installed — CPU-only bundle.")
 
 # ── Bundle platform-specific ffmpeg/ffprobe static binaries ──────────────────
-# build.bat / build.sh download these before PyInstaller runs.
+# The build scripts and CI workflows download these into ffmpeg-bin/ before
+# PyInstaller runs, saved as plain ffmpeg / ffprobe (.exe on Windows) — the
+# names ffmpeg_bundled._package_ffmpeg_paths() looks for first.  The release
+# asset names (ffmpeg-osx-arm64, ...) are still accepted here and at runtime
+# for older checkouts.  A missing binary is a hard error: a bundle without
+# its own ffmpeg works on the build machine (ffmpeg on PATH) and then fails
+# on every clean Mac with "This file has no audio track".
 _ffbin = os.path.join(src_dir, "ffmpeg-bin")
 
-def _add_ff(src_name):
-    fp = os.path.join(_ffbin, src_name)
-    if os.path.isfile(fp):
-        added_files.append((fp, "ffmpeg"))
-    else:
-        import sys as _s
-        print(
-            "WARNING: ffmpeg-bin/{} not found — run the build script first.".format(src_name),
-            file=_s.stderr,
-        )
+def _add_ff(*names):
+    for src_name in names:
+        fp = os.path.join(_ffbin, src_name)
+        if os.path.isfile(fp):
+            added_files.append((fp, "ffmpeg"))
+            return
+    raise SystemExit(
+        "PostBridge build: none of ffmpeg-bin/{} found — run the build "
+        "script (build.sh / build.bat) first.".format(" / ".join(names)))
 
 if _sys.platform == "win32":
     _add_ff("ffmpeg.exe")
     _add_ff("ffprobe.exe")
 elif _sys.platform == "darwin":
     _machine = _platform.machine().lower()
-    if _machine in ("arm64", "aarch64"):
-        _add_ff("ffmpeg-osx-arm64")
-        _add_ff("ffprobe-osx-arm64")
-    else:
-        _add_ff("ffmpeg-osx-x64")
-        _add_ff("ffprobe-osx-x64")
+    _arch = "arm64" if _machine in ("arm64", "aarch64") else "x64"
+    _add_ff("ffmpeg",  "ffmpeg-osx-"  + _arch)
+    _add_ff("ffprobe", "ffprobe-osx-" + _arch)
 else:  # Linux
     _machine = _platform.machine().lower()
-    if _machine in ("aarch64", "arm64"):
-        _add_ff("ffmpeg-linux-arm64")
-        _add_ff("ffprobe-linux-arm64")
-    else:
-        _add_ff("ffmpeg-linux-x64")
-        _add_ff("ffprobe-linux-x64")
+    _arch = "arm64" if _machine in ("aarch64", "arm64") else "x64"
+    _add_ff("ffmpeg",  "ffmpeg-linux-"  + _arch)
+    _add_ff("ffprobe", "ffprobe-linux-" + _arch)
 
 # ── Include HTML helper files ─────────────────────────────────────────────────
 for _fn in ("blood_trails_formatter.html",):
