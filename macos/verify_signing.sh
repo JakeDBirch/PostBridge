@@ -39,6 +39,16 @@ echo "checked $n Mach-O files"
 echo "--- main executable ---"
 codesign -dvv "$APP/Contents/MacOS/PostBridge" 2>&1 | grep -E "^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier)=" || true
 
+# Layout evidence for notarization failures: the main executable's
+# __LINKEDIT / symbol table / signature placement, and its size.
+exe="$APP/Contents/MacOS/PostBridge"
+echo "--- main executable layout ($(stat -f %z "$exe" 2>/dev/null || wc -c <"$exe") bytes) ---"
+otool -l "$exe" 2>/dev/null | awk '
+    /cmd LC_SEGMENT_64/ {seg=1} /segname __LINKEDIT/ && seg {p=1}
+    /cmd LC_SYMTAB/ || /cmd LC_CODE_SIGNATURE/ {p=1; print; next}
+    p && /fileoff|filesize|stroff|strsize|dataoff|datasize/ {print}
+    /^Load command/ {p=0; seg=0}' || true
+
 if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
     echo "::error::bundle seal is invalid"; bad=1
 fi

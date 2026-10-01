@@ -181,6 +181,13 @@ exe = EXE(   # noqa: F821
     target_arch=None,
     codesign_identity=_codesign_identity,
     entitlements_file=_entitlements,
+    # macOS: ship the Python archive (PKG) as a separate file in the bundle
+    # instead of embedding it in the executable.  Embedding stretches the
+    # executable's Mach-O string table over the archive; Apple's notary
+    # rejected that executable as "The signature of the binary is invalid"
+    # even though it signed and verified cleanly.  Side-loaded, the
+    # executable is essentially PyInstaller's stock bootloader.
+    append_pkg=(_sys.platform != "darwin"),
     icon=_icon_win if _sys.platform == "win32" else None,
 )
 
