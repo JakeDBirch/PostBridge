@@ -1787,7 +1787,8 @@ class AafWorkflowMixin:
             for vp in paths:
                 try:
                     result = run_hidden(
-                        ["ffprobe", "-v", "quiet", "-print_format", "json",
+                        engines._ffprobe_cmd() + [
+                         "-v", "quiet", "-print_format", "json",
                          "-show_streams", vp],
                         capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
                     info = _json.loads(result.stdout)

@@ -6,6 +6,17 @@ import tempfile
 import json
 from utils import tc_secs, basename, run_hidden
 
+
+def _ffmpeg_cmd():
+    """The bundled ffmpeg (or system / Homebrew / downloaded copy), never a
+    bare "ffmpeg": a Mac without ffmpeg on PATH has only the bundled one,
+    and a bare spawn there fails on every call."""
+    try:
+        from ffmpeg_bundled import get_ffmpeg_cmd
+        return get_ffmpeg_cmd()
+    except Exception:
+        return ["ffmpeg"]
+
 # ── Script parser ───────────────────────────────────────────────────────────────────────────
 #
 # Bracketed syntax (the only supported form):
@@ -610,7 +621,7 @@ def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as _fh:
             tmp = _fh.name
         try:
-            cmd = ["ffmpeg", "-y", "-v", "quiet"]
+            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
             if start_offset > 0.5:
                 cmd += ["-ss", "{:.3f}".format(start_offset)]
             cmd += ["-t", "{:.3f}".format(max(probe_duration, 0.1)),
@@ -939,7 +950,7 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
             tmp = tf.name
         try:
-            cmd = ["ffmpeg", "-y", "-v", "quiet"]
+            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
             if t_start > 0.5:
                 cmd += ["-ss", "{:.3f}".format(t_start)]
             cmd += ["-t",  "{:.3f}".format(max(t_dur, 0.1)),
@@ -1655,7 +1666,7 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
             tmp = tf.name
         try:
-            cmd = ["ffmpeg", "-y", "-v", "quiet"]
+            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
             if t_start > 0.5:
                 cmd += ["-ss", "{:.3f}".format(t_start)]
             cmd += ["-t", "{:.3f}".format(max(t_dur, 0.1)),
@@ -1777,7 +1788,7 @@ def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=80
 
     def _extract(src, dst):
         r = run_hidden(
-            ["ffmpeg", "-y",
+            _ffmpeg_cmd() + ["-y",
              "-t", str(search_secs),
              "-i", src,
              "-ac", "1", "-ar", str(sample_rate),
