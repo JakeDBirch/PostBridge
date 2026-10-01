@@ -784,8 +784,46 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
             alts.insert(0, (round(T_ev, 4), round(min(0.6, 0.4 * margin), 4)))
         return T, conf, alts[:6]
 
+    def _rerank(T, conf, alts):
+        """Re-rank the pick against its runner-up candidates with the
+        Stage-3 precision verifier (2 ms envelope, ±0.5 s).
+
+        The 0.1 s envelope stages can't tell apart offsets that differ by
+        a whole period of a repeating loudness pattern (steady music,
+        a metronomic delivery): each alias scores about the same, and the
+        true offset can end up as a runner-up.  The 2 ms fine structure
+        only lines up at the true offset, so a candidate the verifier
+        clearly prefers takes over and the old pick becomes a candidate.
+        """
+        alts = list(alts or [])
+        if not alts:
+            return T, conf, alts
+        try:
+            _t0, v0 = verify_sync_at_offset(video_path, audio_path, T)
+        except Exception:
+            return T, conf, alts
+        best = None
+        for t_alt, _c in alts[:4]:
+            if abs(t_alt - T) <= 0.5:
+                continue
+            try:
+                tv, vc = verify_sync_at_offset(video_path, audio_path, t_alt)
+            except Exception:
+                continue
+            if abs(tv - t_alt) > 0.5:
+                continue
+            if best is None or vc > best[1]:
+                best = (tv, vc, t_alt)
+        if best is None or best[1] < 0.6 or best[1] - v0 < 0.3:
+            return T, conf, alts
+        tv, vc, t_alt = best
+        alts = [x for x in alts if abs(x[0] - t_alt) > 0.5]
+        alts.insert(0, (round(T, 4), round(min(1.0, conf), 4)))
+        return round(tv, 6), round(max(conf, min(0.97, vc)), 4), alts[:6]
+
     def _emit(T, conf, alts):
         T, conf, alts = _augment(T, conf, alts)
+        T, conf, alts = _rerank(T, conf, alts)
         if return_candidates:
             return T, conf, alts
         return T, conf
