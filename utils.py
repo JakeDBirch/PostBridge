@@ -8,6 +8,37 @@ import os, re, ntpath, sys, subprocess
 # go through this wrapper.
 _CREATE_NO_WINDOW = 0x08000000
 
+def app_state_dir():
+    """Writable home for PostBridge's own logs and caches.
+
+    A packaged app must never write inside its install location: on macOS
+    any file added to a signed .app breaks its code-signature seal (Apple's
+    notary rejected the build for exactly this — the sync-preview log landed
+    in Contents/Frameworks), and a downloaded app launched from Downloads
+    runs from a read-only translocated copy.  Frozen builds therefore use the
+    per-user app-data folder; running from source keeps the old behaviour
+    (next to the scripts), which the dev tools such as inspect_cache.py
+    read from."""
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            d = os.path.join(os.path.expanduser("~"), "Library",
+                             "Application Support", "PostBridge")
+        elif sys.platform == "win32":
+            d = os.path.join(os.environ.get("APPDATA")
+                             or os.path.expanduser("~"), "PostBridge")
+        else:
+            d = os.path.join(os.environ.get("XDG_DATA_HOME")
+                             or os.path.join(os.path.expanduser("~"),
+                                             ".local", "share"), "PostBridge")
+    else:
+        d = os.path.dirname(os.path.abspath(__file__))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
 def _hidden_startupinfo():
     """STARTUPINFO that hides the child window — belt-and-suspenders
     alongside CREATE_NO_WINDOW.  CREATE_NO_WINDOW alone is normally

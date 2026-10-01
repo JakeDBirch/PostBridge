@@ -1,4 +1,5 @@
 import os
+from utils import app_state_dir as _app_state_dir
 import sys
 import re
 import json
@@ -5179,7 +5180,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         return "{:.1f}s".format(secs)
 
     # Fixed-path debug mirror — readable by the dev without knowing the script location.
-    _DEBUG_LOG      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_debug_run.log")
+    _DEBUG_LOG      = os.path.join(_app_state_dir(), "_debug_run.log")
     _DEBUG_LOG_LOCK = threading.Lock()   # serialise concurrent thread writes to the log file
 
     # ── Step 3 transcription-tasks routing ────────────────────────────

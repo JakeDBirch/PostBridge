@@ -136,9 +136,12 @@ jobs:
         # runner's own ffmpeg can't mask a broken bundle), probes a clip
         # with audio and one without, and extracts a waveform.  Runs after
         # signing, so a hardened-runtime problem fails here too.
-        # On a COPY: the bundle that ships is never launched, so nothing
-        # the app does at runtime can alter it after signing.  The copy's
-        # seal is checked afterwards to show whether a launch modifies it.
+        # On a COPY: the bundle that ships is never launched.  The copy's
+        # seal is then checked, and the build FAILS if launching the app
+        # changed anything inside its own bundle: that breaks the code
+        # signature (Apple rejects it as "The signature of the binary is
+        # invalid") and fails outright from a read-only location.  Logs
+        # and caches belong in utils.app_state_dir().
         run: |
           rm -rf "$RUNNER_TEMP/selftest-copy"
           mkdir -p "$RUNNER_TEMP/selftest-copy"
@@ -149,8 +152,10 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/selftest.txt" || true
           echo "--- seal of the copy after launching it ---"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/selftest-copy/PostBridge.app" \
-            || echo "::warning::Launching the app modified its bundle (see above)."
+          if ! codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/selftest-copy/PostBridge.app"; then
+            echo "::error::Launching the app wrote inside its own bundle (file named above). Write logs/caches to utils.app_state_dir()."
+            exit 1
+          fi
           exit $rc
 
       - name: Re-verify the bundle that ships

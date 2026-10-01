@@ -8,6 +8,7 @@ inheritance.  App is declared ``class App(AafWorkflowMixin, ...)``.
 Pure code-move from main.py: every method body is identical to its original.
 """
 import os
+from utils import app_state_dir as _app_state_dir
 import re
 import json
 import tempfile
@@ -3080,8 +3081,7 @@ class AafWorkflowMixin:
             # ── Log correction for feedback analysis ──────────────────────
             try:
                 import json as _json, datetime as _dt, os as _os
-                _cache_dir = _os.path.join(
-                    _os.path.dirname(_os.path.abspath(__file__)), ".pb_cache")
+                _cache_dir = _os.path.join(_app_state_dir(), ".pb_cache")
                 _os.makedirs(_cache_dir, exist_ok=True)
                 _correction_ms = round(abs(accepted_offset - offset) * 1000, 1)
                 _verdict = ("exact"  if _correction_ms < 50  else
@@ -3126,8 +3126,7 @@ class AafWorkflowMixin:
                 try:
                     import json as _jv, datetime as _dv, os as _ov
                     _v_T, _v_conf = verify_sync_at_offset(vp, ap, acc)
-                    _cache = _ov.path.join(
-                        _ov.path.dirname(_ov.path.abspath(__file__)), ".pb_cache")
+                    _cache = _ov.path.join(_app_state_dir(), ".pb_cache")
                     _ve = {
                         "ts":            _dv.datetime.now().isoformat(timespec="seconds"),
                         "source":        src,
@@ -3463,8 +3462,7 @@ class AafWorkflowMixin:
             _offset = float(_ov.get()) if _ov else 0.0
             _vp = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
             _ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
-            _cache_dir = _os.path.join(
-                _os.path.dirname(_os.path.abspath(__file__)), ".pb_cache")
+            _cache_dir = _os.path.join(_app_state_dir(), ".pb_cache")
             _os.makedirs(_cache_dir, exist_ok=True)
             _entry = {
                 "ts":      _dt.datetime.now().isoformat(timespec="seconds"),

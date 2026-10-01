@@ -8,12 +8,13 @@ audio recording.
 
 import logging
 import os
+from utils import app_state_dir as _app_state_dir
 import tempfile
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 
 # ── Crash log ─────────────────────────────────────────────────────────────────
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_LOG_PATH = os.path.join(_app_state_dir(),
                          "sync_preview_log.txt")
 logging.basicConfig(
     filename=_LOG_PATH,

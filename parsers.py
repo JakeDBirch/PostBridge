@@ -1,4 +1,5 @@
 import os
+from utils import app_state_dir as _app_state_dir
 import re
 import subprocess
 import tempfile
@@ -1512,8 +1513,7 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
     # "wrong" / "verified" verdicts are skipped so a mis-found file never
     # corrupts the cache.
     try:
-        _cal_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  ".pb_cache")
+        _cal_cache = os.path.join(_app_state_dir(), ".pb_cache")
         _corr_path = os.path.join(_cal_cache, "sync_corrections.jsonl")
         if os.path.exists(_corr_path):
             _audio_name = os.path.basename(audio_path)
@@ -1556,8 +1556,7 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
     # At session start these can be read to understand algorithm behaviour.
     try:
         import datetime as _dt
-        _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   ".pb_cache")
+        _cache_dir = os.path.join(_app_state_dir(), ".pb_cache")
         os.makedirs(_cache_dir, exist_ok=True)
         _entry = {
             "ts":            _dt.datetime.now().isoformat(timespec="seconds"),

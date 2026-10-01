@@ -11,6 +11,7 @@ with the sole exception that the three staticmethod self-calls that used
 in scope inside this module (importing it would be a circular import).
 """
 import os
+from utils import app_state_dir as _app_state_dir
 import re
 import sys
 import json
@@ -4241,8 +4242,7 @@ class PqWorkflowMixin:
                     # the streaming merge is doing.
                     if _PQ_STREAM_DIAG:
                         _pq_stream_log_path = os.path.join(
-                            os.path.dirname(os.path.abspath(__file__)),
-                            "_pq_stream.log")
+                            _app_state_dir(), "_pq_stream.log")
                         try:
                             with open(_pq_stream_log_path, "w",
                                       encoding="utf-8") as _f0:

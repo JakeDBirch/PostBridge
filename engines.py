@@ -1,4 +1,5 @@
 import os, sys, re, io, json, math, tempfile, subprocess, wave, hashlib, threading
+from utils import app_state_dir as _app_state_dir
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -2798,8 +2799,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             # Also write directly to the debug log so it appears regardless
             # of how the result dict is handled upstream.
             try:
-                _dlog = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "_debug_run.log")
+                _dlog = os.path.join(_app_state_dir(), "_debug_run.log")
                 with open(_dlog, "a", encoding="utf-8") as _f:
                     _f.write(diag_str + "\n")
             except Exception:
