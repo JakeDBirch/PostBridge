@@ -59,14 +59,20 @@ ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac.zip
 
 Use `ditto`, not `zip` — plain zip flattens the symlinks inside the bundle.
 
-**Signing.** `macos/sign_app.sh` signs every Mach-O in the bundle
-(ffmpeg/ffprobe included) inside-out, then the bundle. `build.sh` ad-hoc
-signs unless `PB_SIGN_ID="Developer ID Application: … (TEAMID)"` is set.
-CI signs with the Developer ID, notarizes and staples when the repository
-secrets listed at the top of `.github/workflows/build-macos-arm.yml` are
-set; without them it ad-hoc signs and a downloaded copy needs right-click →
-**Open** (or `xattr -cr PostBridge.app`) on first launch. Hardened-runtime
-entitlements are in `macos/entitlements.plist`.
+**Signing.** PyInstaller signs the bundle itself (`PostBridge.spec`):
+with `PB_CODESIGN_IDENTITY="Developer ID Application: … (TEAMID)"` in the
+environment it uses the hardened runtime, a secure timestamp and
+`macos/entitlements.plist`; unset, it ad-hoc signs. **Never re-sign the
+built bundle** — PyInstaller rewrites its main executable's Mach-O headers to
+carry the Python archive, and a second codesign pass over it produced a binary
+Apple's notary rejects as "The signature of the binary is invalid" although
+local `codesign --verify` passes. `macos/verify_signing.sh` only checks: every
+Mach-O verifies, and with `--developer-id` each has the Developer ID
+authority, a timestamp and the hardened runtime. CI notarizes and staples
+when the repository secrets listed at the top of
+`.github/workflows/build-macos-arm.yml` are set; without them a downloaded
+copy needs right-click → **Open** (or `xattr -cr PostBridge.app`) on first
+launch.
 
 **Which build is this?** CI stamps `CFBundleVersion` with run number +
 commit (Finder → Get Info → Version, e.g. `1.0.0 (4.65b4772)`), and the

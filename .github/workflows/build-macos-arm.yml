@@ -89,18 +89,17 @@ jobs:
             exit 1
           fi
           echo "Signing as: $id"
-          echo "SIGN_ID=$id" >> "$GITHUB_ENV"
+          echo "PB_CODESIGN_IDENTITY=$id" >> "$GITHUB_ENV"
 
       - name: Ad-hoc signing (no certificate configured)
         if: env.HAVE_CERT != 'true'
         run: |
           echo "::warning::MACOS_CERT_P12_BASE64 not set — ad-hoc signing. Downloaded copies will need right-click → Open."
-          echo "SIGN_ID=-" >> "$GITHUB_ENV"
 
       - name: Download ffmpeg (macOS ARM64)
         # Saved as plain ffmpeg / ffprobe — the names the app looks for
-        # inside the bundle.  Checked to be arm64 and to run; signing
-        # happens with the rest of the bundle below.
+        # inside the bundle.  Checked to be arm64 and to run; PyInstaller
+        # signs them along with the rest of the bundle.
         run: |
           mkdir -p ffmpeg-bin
           base="https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/n7.1-2"
@@ -112,13 +111,24 @@ jobs:
             "$b" -version | head -1
           done
 
-      - name: Build with PyInstaller
+      - name: Build and sign with PyInstaller
+        # PyInstaller signs every binary and the bundle with
+        # PB_CODESIGN_IDENTITY (hardened runtime + timestamp +
+        # macos/entitlements.plist), or ad-hoc when it is unset.  Nothing
+        # may re-sign the bundle after this: re-signing PyInstaller's main
+        # executable is what made Apple reject it as "invalid".
         run: pyinstaller PostBridge.spec --noconfirm
 
-      - name: Sign the app
-        # Signs every Mach-O in the bundle (ffmpeg/ffprobe included),
-        # inside-out, then the bundle, and verifies the seal.
-        run: macos/sign_app.sh "$SIGN_ID" dist/PostBridge.app
+      - name: Verify signatures
+        # Check only.  With a Developer ID, every Mach-O must also carry
+        # the Developer ID authority, a timestamp and the hardened runtime
+        # — notarization's requirements — so a gap is named here.
+        run: |
+          if [[ -n "${PB_CODESIGN_IDENTITY:-}" ]]; then
+            macos/verify_signing.sh dist/PostBridge.app --developer-id
+          else
+            macos/verify_signing.sh dist/PostBridge.app
+          fi
 
       - name: Self-test the built app (bundled ffmpeg only)
         # Runs the real app binary in --self-test mode: finds ffmpeg and

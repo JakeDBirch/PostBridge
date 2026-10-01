@@ -86,6 +86,20 @@ for _fn in ("ME_HortLogo_OrgWht.png", os.path.join("icon", "PostBridge.png")):
     if os.path.isfile(_fp):
         added_files.append((_fp, os.path.dirname(os.path.join("assets", _fn))))
 
+# ── macOS code signing ────────────────────────────────────────────────────────
+# PyInstaller signs everything itself: it has to, because it rewrites the main
+# executable's Mach-O headers to carry the embedded Python archive and then
+# signs it on the spot.  Re-signing that executable afterwards with a separate
+# codesign pass produced a binary Apple's notary rejects ("The signature of the
+# binary is invalid") even though local codesign --verify accepts it.
+# PB_CODESIGN_IDENTITY="Developer ID Application: …" → hardened runtime +
+# timestamp + entitlements, ready for notarization; unset → ad-hoc.
+_codesign_identity = (os.environ.get("PB_CODESIGN_IDENTITY") or "").strip() or None
+if _codesign_identity == "-":
+    _codesign_identity = None
+_entitlements = (os.path.join(src_dir, "macos", "entitlements.plist")
+                 if _codesign_identity else None)
+
 # App icon — regenerate with  python assets/icon/make_icons.py
 _icon_dir = os.path.join(src_dir, "assets", "icon")
 _icon_win = os.path.join(_icon_dir, "PostBridge.ico")
@@ -165,8 +179,8 @@ exe = EXE(   # noqa: F821
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    codesign_identity=_codesign_identity,
+    entitlements_file=_entitlements,
     icon=_icon_win if _sys.platform == "win32" else None,
 )
 

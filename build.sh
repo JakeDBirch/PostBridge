@@ -35,8 +35,7 @@ echo ""
 
 # ── Download ffmpeg static binaries ──────────────────────────────────────────
 # Saved as plain ffmpeg / ffprobe — the names the app looks for inside the
-# bundle.  They are signed along with the rest of the bundle after
-# PyInstaller (macos/sign_app.sh).
+# bundle.  PyInstaller signs them along with the rest of the bundle.
 mkdir -p "$FFBIN"
 
 for pair in "ffmpeg:$FFMPEG_ASSET" "ffprobe:$FFPROBE_ASSET"; do
@@ -109,10 +108,14 @@ echo "Running PyInstaller ..."
 # find and use its OWN ffmpeg (PATH / Homebrew ignored) to probe audio and
 # extract a waveform.  A failure here means the .app would fail on a clean Mac.
 echo ""
-# PB_SIGN_ID="Developer ID Application: Name (TEAMID)" signs for distribution
-# (hardened runtime + timestamp); unset, the bundle is ad-hoc signed.
-echo "Signing bundle as ${PB_SIGN_ID:-ad-hoc} ..."
-macos/sign_app.sh "${PB_SIGN_ID:--}" dist/PostBridge.app
+# PyInstaller signed the bundle: with PB_CODESIGN_IDENTITY="Developer ID
+# Application: Name (TEAMID)" exported before running this script it is ready
+# for notarization; unset, it is ad-hoc signed.  Check, never re-sign.
+if [[ -n "${PB_CODESIGN_IDENTITY:-}" ]]; then
+    macos/verify_signing.sh dist/PostBridge.app --developer-id
+else
+    macos/verify_signing.sh dist/PostBridge.app
+fi
 if ! dist/PostBridge.app/Contents/MacOS/PostBridge --self-test build/selftest.txt; then
     cat build/selftest.txt 2>/dev/null
     echo ""
