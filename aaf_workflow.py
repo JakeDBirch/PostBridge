@@ -8,6 +8,7 @@ inheritance.  App is declared ``class App(AafWorkflowMixin, ...)``.
 Pure code-move from main.py: every method body is identical to its original.
 """
 import os
+from utils import app_state_dir as _app_state_dir
 import re
 import json
 import tempfile
@@ -2049,6 +2050,24 @@ class AafWorkflowMixin:
             self._aaf_set_sync_state(base, "")
         self._rebuild_aaf_source_rows()
 
+    def _aaf_ffmpeg_ready(self):
+        """True when ffmpeg/ffprobe can run; otherwise say why and return False.
+
+        Every waveform sync and probe shells out to them.  Without this
+        check a missing ffmpeg surfaced as "This file has no audio track"
+        on every source.  Success is remembered for the session; failure
+        is not, so installing ffmpeg and retrying works without a restart."""
+        if getattr(self, "_aaf_ffmpeg_ok", False):
+            return True
+        ok, err = engines.check_ffmpeg()
+        if not ok:
+            messagebox.showerror("ffmpeg unavailable",
+                (err or "Could not use or install ffmpeg.") +
+                "\n\nAudio sync and alignment need ffmpeg to read waveforms.")
+            return False
+        self._aaf_ffmpeg_ok = True
+        return True
+
     def _aaf_sync_all(self):
         """Run sync detection for every source marked 'needs sync' that has video + audio."""
         sources_to_sync = [
@@ -2061,6 +2080,8 @@ class AafWorkflowMixin:
             messagebox.showwarning("Nothing to sync",
                 "Tick the 'sync' checkbox on at least one source that has both a video "
                 "and a reference audio file assigned.")
+            return
+        if not self._aaf_ffmpeg_ready():
             return
         # Gate concurrency: cpu_count-1 syncs running simultaneously (same
         # scheme as reconcile), so we don't saturate disk I/O or CPU.
@@ -2677,6 +2698,8 @@ class AafWorkflowMixin:
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
             return
+        if not self._aaf_ffmpeg_ready():
+            return
         self._aaf_push_undo(base)
         btn = self._aaf_sync_btns.get(base)
 
@@ -3019,6 +3042,8 @@ class AafWorkflowMixin:
         """Open the waveform alignment dialog for manual verification/adjustment."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
             return
+        if not self._aaf_ffmpeg_ready():
+            return
         fn = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
         if fn == "— no video —":
             messagebox.showwarning("No Video",
@@ -3056,8 +3081,7 @@ class AafWorkflowMixin:
             # ── Log correction for feedback analysis ──────────────────────
             try:
                 import json as _json, datetime as _dt, os as _os
-                _cache_dir = _os.path.join(
-                    _os.path.dirname(_os.path.abspath(__file__)), ".pb_cache")
+                _cache_dir = _os.path.join(_app_state_dir(), ".pb_cache")
                 _os.makedirs(_cache_dir, exist_ok=True)
                 _correction_ms = round(abs(accepted_offset - offset) * 1000, 1)
                 _verdict = ("exact"  if _correction_ms < 50  else
@@ -3102,8 +3126,7 @@ class AafWorkflowMixin:
                 try:
                     import json as _jv, datetime as _dv, os as _ov
                     _v_T, _v_conf = verify_sync_at_offset(vp, ap, acc)
-                    _cache = _ov.path.join(
-                        _ov.path.dirname(_ov.path.abspath(__file__)), ".pb_cache")
+                    _cache = _ov.path.join(_app_state_dir(), ".pb_cache")
                     _ve = {
                         "ts":            _dv.datetime.now().isoformat(timespec="seconds"),
                         "source":        src,
@@ -3439,8 +3462,7 @@ class AafWorkflowMixin:
             _offset = float(_ov.get()) if _ov else 0.0
             _vp = self._aaf_source_file_vars.get(base, tk.StringVar()).get()
             _ap = self._aaf_source_syncaudio_vars.get(base, tk.StringVar()).get()
-            _cache_dir = _os.path.join(
-                _os.path.dirname(_os.path.abspath(__file__)), ".pb_cache")
+            _cache_dir = _os.path.join(_app_state_dir(), ".pb_cache")
             _os.makedirs(_cache_dir, exist_ok=True)
             _entry = {
                 "ts":      _dt.datetime.now().isoformat(timespec="seconds"),
@@ -3498,6 +3520,8 @@ class AafWorkflowMixin:
     def _aaf_reset_sync(self, base):
         """Reset sync state for *base* back to zero."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
+            return
+        if not self._aaf_ffmpeg_ready():
             return
         self._aaf_push_undo(base)
         ov = self._aaf_source_offset_vars.get(base)

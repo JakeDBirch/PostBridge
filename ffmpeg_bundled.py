@@ -25,7 +25,22 @@ _ASSETS = {
 _ffmpeg_path = None
 _ffprobe_path = None
 _ensured = False
+_ensure_failed_at = None
 _last_ensure_error = None
+
+# A failed auto-download is retried after this long rather than never:
+# one blip in connectivity at launch used to disable ffmpeg for the
+# whole session.  Not retried on every call, because a probe asks for
+# the ffprobe path every time it runs and each attempt can block 120 s.
+_ENSURE_RETRY_S = 300
+
+# Set by the build's self-test so a runner with ffmpeg on PATH or in
+# Homebrew cannot mask a bundle that is missing its own copy.
+_BUNDLED_ONLY_ENV = "PB_FFMPEG_BUNDLED_ONLY"
+
+
+def _bundled_only():
+    return os.environ.get(_BUNDLED_ONLY_ENV) == "1"
 
 
 def _app_ffmpeg_dir():
@@ -135,6 +150,11 @@ def _package_ffmpeg_paths():
         os.path.join(exe_dir, "ffmpeg"),                        # Windows / Linux flat folder
         os.path.join(exe_dir, "_internal", "ffmpeg"),           # PyInstaller ≥ 6 _internal layout
     ]
+    # Wherever PyInstaller actually unpacked to (Contents/Frameworks inside
+    # a PyInstaller ≥ 6 .app) — the authoritative root, whatever the layout.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.insert(0, os.path.join(meipass, "ffmpeg"))
     if sys.platform == "darwin":
         # Inside a .app bundle sys.executable is Contents/MacOS/PostBridge
         contents_dir = os.path.dirname(exe_dir)                 # → Contents/
@@ -143,12 +163,35 @@ def _package_ffmpeg_paths():
             os.path.join(contents_dir, "Resources", "ffmpeg"),  # Contents/Resources/ffmpeg/
         ]
 
+    # build.bat renames the Windows binaries to ffmpeg.exe / ffprobe.exe, but
+    # build.sh and PostBridge.spec ship the macOS / Linux ones under their
+    # release asset names (ffmpeg-osx-arm64, ...).  Accept both, or the
+    # bundled copy is never found and every probe silently fails.
+    names = [("ffmpeg" + ext, "ffprobe" + ext)]
+    assets = _ASSETS.get(_platform_key())
+    if assets:
+        names.append(assets)
     for d in candidates:
-        ff  = os.path.join(d, "ffmpeg"  + ext)
-        ffp = os.path.join(d, "ffprobe" + ext)
-        if os.path.isfile(ff) and os.path.isfile(ffp):
-            return ff, ffp
+        for ff_name, ffp_name in names:
+            ff  = os.path.join(d, ff_name)
+            ffp = os.path.join(d, ffp_name)
+            if os.path.isfile(ff) and os.path.isfile(ffp):
+                _ensure_executable(ff)
+                _ensure_executable(ffp)
+                return ff, ffp
     return None, None
+
+
+def _ensure_executable(path):
+    """Restore the exec bit if packaging dropped it (a no-op on Windows)."""
+    if sys.platform == "win32":
+        return
+    try:
+        if not os.access(path, os.X_OK):
+            os.chmod(path, os.stat(path).st_mode
+                     | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        pass
 
 
 def _bundled_exists():
@@ -193,13 +236,18 @@ def _download_binary(url, dest_path):
 
 def _ensure_bundled():
     """Download ffmpeg and ffprobe to app dir if not present. Returns True if usable."""
-    global _ensured, _last_ensure_error
-    _last_ensure_error = None
+    global _ensured, _ensure_failed_at, _last_ensure_error
+    import time
     if _ensured:
         return _bundled_exists()
-    _ensured = True
     if _bundled_exists():
+        _ensured = True
         return True
+    if (_ensure_failed_at is not None
+            and time.monotonic() - _ensure_failed_at < _ENSURE_RETRY_S):
+        return False
+    _last_ensure_error = None
+    _ensure_failed_at = time.monotonic()     # cleared below on success
     key = _platform_key()
     machine = key[1]
     # Normalise macOS/Linux machine strings; Windows uses "AMD64" directly in _ASSETS
@@ -218,7 +266,11 @@ def _ensure_bundled():
     try:
         _download_binary("{}/{}".format(_BASE, ffmpeg_asset), dest_ffmpeg)
         _download_binary("{}/{}".format(_BASE, ffprobe_asset), dest_ffprobe)
-        return os.path.isfile(dest_ffmpeg) and os.path.isfile(dest_ffprobe)
+        ok = os.path.isfile(dest_ffmpeg) and os.path.isfile(dest_ffprobe)
+        if ok:
+            _ensured = True
+            _ensure_failed_at = None
+        return ok
     except Exception as e:
         _last_ensure_error = str(e)
         try:
@@ -241,6 +293,8 @@ def get_ffmpeg_cmd():
     if pkg_ff:
         _ffmpeg_path = pkg_ff
         return [pkg_ff]
+    if _bundled_only():
+        return ["ffmpeg"]
     # 2. System PATH
     if _system_ffmpeg_ok():
         _ffmpeg_path = "ffmpeg"
@@ -267,6 +321,8 @@ def get_ffprobe_cmd():
     if pkg_ffp:
         _ffprobe_path = pkg_ffp
         return [pkg_ffp]
+    if _bundled_only():
+        return ["ffprobe"]
     # 2. System PATH
     if _system_ffprobe_ok():
         _ffprobe_path = "ffprobe"

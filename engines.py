@@ -1,4 +1,5 @@
 import os, sys, re, io, json, math, tempfile, subprocess, wave, hashlib, threading
+from utils import app_state_dir as _app_state_dir
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
 # console window is suppressed on Windows (see utils.run_hidden — the
@@ -220,7 +221,7 @@ def extract_mono_pcm(media_path, sample_rate=8000):
         # so ffmpeg exits with "does not contain any stream".  Say that in
         # plain English instead of handing the caller 400 characters of
         # stream banner with the one useful line off the end.
-        if not has_audio_track(media_path):
+        if has_audio_track(media_path) is False:
             raise RuntimeError(
                 "{} has no audio track — there is nothing to read a "
                 "waveform from.".format(os.path.basename(media_path)))
@@ -327,9 +328,15 @@ def _ffprobe_csv(path, entries, select=None, timeout=10):
     try:
         r = _run(cmd, capture_output=True, text=True,
                  encoding="utf-8", errors="replace", timeout=timeout)
-        return (r.stdout or "").strip()
     except Exception:
         return None
+    # A non-zero exit means ffprobe itself failed (binary blocked or
+    # killed by the OS, wrong architecture, unreadable file) — it is not
+    # an answer about the file.  Returning "" here used to read as "no
+    # such stream", which _probe_codec then cached for the session.
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip()
 
 
 def get_media_duration(path):
@@ -370,14 +377,20 @@ def get_audio_channels(path):
 
 
 def has_audio_track(path):
-    """True when *path* carries at least one audio stream.
+    """True when *path* carries at least one audio stream, False when it
+    definitely carries none, and None when ffprobe could not answer.
 
     Video-only files are common enough in this pipeline to be worth naming:
     Riverside "raw-video" exports ship the audio as a separate WAV, and most
     camera proxies drop audio entirely.  Anything that wants a waveform out
     of a file needs to know this before it tries.  Memoised via _probe_codec,
-    so repeat calls across the UI cost nothing."""
-    return bool(_probe_codec(path, "a:0"))
+    so repeat calls across the UI cost nothing.
+
+    Callers must test `is False`: a probe failure is not proof of a
+    silent file, and calling it one sends the user off to re-assign
+    media that is fine."""
+    codec = _probe_codec(path, "a:0", unknown=None)
+    return None if codec is None else bool(codec)
 
 # ── Split-clip join (gapless file-size splits → one continuous file) ─────────
 def _concat_stream_sig(path):
@@ -430,16 +443,18 @@ def probe_concat_compat(paths):
 
 _codec_cache = {}   # (path, stream) → codec name; codecs never change mid-session
 
-def _probe_codec(path, stream):
+def _probe_codec(path, stream, unknown=""):
     """Codec name of the given stream, memoised per (path, stream).
     The memo collapses the duplicate spawn between join_output_ext
-    (the dialog's default-name probe) and concat_video_files."""
+    (the dialog's default-name probe) and concat_video_files.
+    Returns *unknown* when ffprobe fails, so callers that care can tell
+    a failed probe apart from a missing stream ("")."""
     key = (path, stream)
     if key in _codec_cache:
         return _codec_cache[key]
     out = _ffprobe_csv(path, "stream=codec_name", select=stream, timeout=15)
     if out is None:
-        return ""    # transient failure — do NOT cache, retry next call
+        return unknown    # transient failure — do NOT cache, retry next call
     out = out.lower()
     _codec_cache[key] = out
     return out
@@ -2784,8 +2799,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             # Also write directly to the debug log so it appears regardless
             # of how the result dict is handled upstream.
             try:
-                _dlog = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "_debug_run.log")
+                _dlog = os.path.join(_app_state_dir(), "_debug_run.log")
                 with open(_dlog, "a", encoding="utf-8") as _f:
                     _f.write(diag_str + "\n")
             except Exception:
@@ -5786,3 +5800,102 @@ def generate_report(results, skipped, parts, seq_name, xml_path):
         report_path = None
 
     return text, report_path
+
+# ── Build self-test (`PostBridge --self-test REPORT`) ────────────────────────
+def run_self_test(report_path=None):
+    """Check that a packaged build can find, run and use its own ffmpeg.
+
+    The build workflows run this against the finished app and fail the
+    build on a non-zero exit, so a bundle that ships without working
+    ffmpeg/ffprobe never reaches anyone.  Discovery is restricted to the
+    copy inside the bundle: a build runner with ffmpeg on PATH or in
+    Homebrew would otherwise pass a bundle that is broken on a clean Mac.
+
+    Exercises the same code paths sync uses — has_audio_track() on a file
+    with audio and one without, then extract_mono_pcm() for a waveform —
+    on two clips generated by the bundled ffmpeg itself.  Returns the
+    process exit code (0 = pass) and writes a plain-text report to
+    *report_path* (stdout is not reliable in a windowed build)."""
+    import tempfile as _tf
+    import traceback
+    os.environ["PB_FFMPEG_BUNDLED_ONLY"] = "1"
+    lines, failed = [], []
+
+    def check(name, ok, detail=""):
+        lines.append("{}  {}{}".format("PASS" if ok else "FAIL", name,
+                                       "  -- " + detail if detail else ""))
+        if not ok:
+            failed.append(name)
+        return ok
+
+    try:
+        import ffmpeg_bundled as fb
+        lines.append("platform: {} {}".format(sys.platform, fb._platform_key()))
+        lines.append("frozen:   {}  executable: {}".format(
+            getattr(sys, "frozen", False), sys.executable))
+        ff, fp = _ffmpeg_cmd()[0], _ffprobe_cmd()[0]
+        lines.append("ffmpeg:   " + ff)
+        lines.append("ffprobe:  " + fp)
+        found = (os.path.isabs(ff) and os.path.isfile(ff)
+                 and os.path.isabs(fp) and os.path.isfile(fp))
+        check("bundled ffmpeg/ffprobe found", found,
+              "" if found else "the bundle has no ffmpeg/ffprobe the app can locate")
+        if found:
+            for tool in (ff, fp):
+                try:
+                    r = _run([tool, "-version"], capture_output=True, timeout=30)
+                    first = (r.stdout or b"").decode(errors="replace").splitlines()
+                    check(os.path.basename(tool) + " runs", r.returncode == 0,
+                          first[0] if first and r.returncode == 0
+                          else "exit {} {}".format(
+                              r.returncode,
+                              (r.stderr or b"").decode(errors="replace")[-300:]))
+                except Exception as e:
+                    check(os.path.basename(tool) + " runs", False, repr(e))
+
+        if not failed:
+            with _tf.TemporaryDirectory() as td:
+                av = os.path.join(td, "with_audio.mp4")
+                vo = os.path.join(td, "video_only.mp4")
+                gen = [ff, "-v", "error", "-y",
+                       "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24:duration=2"]
+                r1 = _run(gen + ["-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                                 "-shortest", "-c:v", "mpeg4", "-c:a", "aac", av],
+                          capture_output=True, timeout=60)
+                r2 = _run(gen + ["-c:v", "mpeg4", vo],
+                          capture_output=True, timeout=60)
+                gen_ok = r1.returncode == 0 and r2.returncode == 0
+                check("generate test clips", gen_ok, "" if gen_ok else
+                      (r1.stderr or r2.stderr or b"").decode(errors="replace")[-300:])
+                if not failed:
+                    has = has_audio_track(av)
+                    check("has_audio_track(clip with audio) is True", has is True,
+                          "got {!r}".format(has))
+                    has = has_audio_track(vo)
+                    check("has_audio_track(video-only clip) is False", has is False,
+                          "got {!r}".format(has))
+                    try:
+                        pcm = extract_mono_pcm(av)
+                        peak = float(abs(pcm).max()) if len(pcm) else 0.0
+                        check("waveform extraction", len(pcm) > 8000 and peak > 0.01,
+                              "{} samples, peak {:.3f}".format(len(pcm), peak))
+                    except Exception as e:
+                        check("waveform extraction", False, str(e))
+    except Exception:
+        check("self-test ran", False, traceback.format_exc())
+
+    lines.append("RESULT: " + ("FAIL ({})".format(", ".join(failed))
+                               if failed else "PASS"))
+    report = "\n".join(lines) + "\n"
+    if report_path:
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report)
+        except OSError:
+            pass
+    try:
+        sys.stdout.write(report)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    return 1 if failed else 0

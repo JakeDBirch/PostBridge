@@ -45,39 +45,65 @@ except ImportError:
     print("PostBridge build: torch not installed — CPU-only bundle.")
 
 # ── Bundle platform-specific ffmpeg/ffprobe static binaries ──────────────────
-# build.bat / build.sh download these before PyInstaller runs.
+# The build scripts and CI workflows download these into ffmpeg-bin/ before
+# PyInstaller runs, saved as plain ffmpeg / ffprobe (.exe on Windows) — the
+# names ffmpeg_bundled._package_ffmpeg_paths() looks for first.  The release
+# asset names (ffmpeg-osx-arm64, ...) are still accepted here and at runtime
+# for older checkouts.  A missing binary is a hard error: a bundle without
+# its own ffmpeg works on the build machine (ffmpeg on PATH) and then fails
+# on every clean Mac with "This file has no audio track".
 _ffbin = os.path.join(src_dir, "ffmpeg-bin")
 
-def _add_ff(src_name):
-    fp = os.path.join(_ffbin, src_name)
-    if os.path.isfile(fp):
-        added_files.append((fp, "ffmpeg"))
-    else:
-        import sys as _s
-        print(
-            "WARNING: ffmpeg-bin/{} not found — run the build script first.".format(src_name),
-            file=_s.stderr,
-        )
+def _add_ff(*names):
+    for src_name in names:
+        fp = os.path.join(_ffbin, src_name)
+        if os.path.isfile(fp):
+            added_files.append((fp, "ffmpeg"))
+            return
+    raise SystemExit(
+        "PostBridge build: none of ffmpeg-bin/{} found — run the build "
+        "script (build.sh / build.bat) first.".format(" / ".join(names)))
 
 if _sys.platform == "win32":
     _add_ff("ffmpeg.exe")
     _add_ff("ffprobe.exe")
 elif _sys.platform == "darwin":
     _machine = _platform.machine().lower()
-    if _machine in ("arm64", "aarch64"):
-        _add_ff("ffmpeg-osx-arm64")
-        _add_ff("ffprobe-osx-arm64")
-    else:
-        _add_ff("ffmpeg-osx-x64")
-        _add_ff("ffprobe-osx-x64")
+    _arch = "arm64" if _machine in ("arm64", "aarch64") else "x64"
+    _add_ff("ffmpeg",  "ffmpeg-osx-"  + _arch)
+    _add_ff("ffprobe", "ffprobe-osx-" + _arch)
 else:  # Linux
     _machine = _platform.machine().lower()
-    if _machine in ("aarch64", "arm64"):
-        _add_ff("ffmpeg-linux-arm64")
-        _add_ff("ffprobe-linux-arm64")
-    else:
-        _add_ff("ffmpeg-linux-x64")
-        _add_ff("ffprobe-linux-x64")
+    _arch = "arm64" if _machine in ("aarch64", "arm64") else "x64"
+    _add_ff("ffmpeg",  "ffmpeg-linux-"  + _arch)
+    _add_ff("ffprobe", "ffprobe-linux-" + _arch)
+
+# ── App assets: header logo + window icon ─────────────────────────────────────
+# main.py loads these from <bundle>/assets at runtime.  They were never
+# bundled before, so packaged builds silently showed no header logo.
+for _fn in ("ME_HortLogo_OrgWht.png", os.path.join("icon", "PostBridge.png")):
+    _fp = os.path.join(src_dir, "assets", _fn)
+    if os.path.isfile(_fp):
+        added_files.append((_fp, os.path.dirname(os.path.join("assets", _fn))))
+
+# ── macOS code signing ────────────────────────────────────────────────────────
+# PyInstaller signs everything itself: it has to, because it rewrites the main
+# executable's Mach-O headers to carry the embedded Python archive and then
+# signs it on the spot.  Re-signing that executable afterwards with a separate
+# codesign pass produced a binary Apple's notary rejects ("The signature of the
+# binary is invalid") even though local codesign --verify accepts it.
+# PB_CODESIGN_IDENTITY="Developer ID Application: …" → hardened runtime +
+# timestamp + entitlements, ready for notarization; unset → ad-hoc.
+_codesign_identity = (os.environ.get("PB_CODESIGN_IDENTITY") or "").strip() or None
+if _codesign_identity == "-":
+    _codesign_identity = None
+_entitlements = (os.path.join(src_dir, "macos", "entitlements.plist")
+                 if _codesign_identity else None)
+
+# App icon — regenerate with  python assets/icon/make_icons.py
+_icon_dir = os.path.join(src_dir, "assets", "icon")
+_icon_win = os.path.join(_icon_dir, "PostBridge.ico")
+_icon_mac = os.path.join(_icon_dir, "PostBridge.icns")
 
 # ── Include HTML helper files ─────────────────────────────────────────────────
 for _fn in ("blood_trails_formatter.html",):
@@ -153,10 +179,16 @@ exe = EXE(   # noqa: F821
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    # icon="postbridge.ico",   # Windows — supply a .ico to set taskbar icon
-    # icon="postbridge.icns",  # macOS   — supply a .icns for the Dock icon
+    codesign_identity=_codesign_identity,
+    entitlements_file=_entitlements,
+    # macOS: ship the Python archive (PKG) as a separate file in the bundle
+    # instead of embedding it in the executable.  Embedding stretches the
+    # executable's Mach-O string table over the archive; Apple's notary
+    # rejected that executable as "The signature of the binary is invalid"
+    # even though it signed and verified cleanly.  Side-loaded, the
+    # executable is essentially PyInstaller's stock bootloader.
+    append_pkg=(_sys.platform != "darwin"),
+    icon=_icon_win if _sys.platform == "win32" else None,
 )
 
 coll = COLLECT(   # noqa: F821
@@ -176,12 +208,15 @@ if _sys.platform == "darwin":
     app = BUNDLE(   # noqa: F821
         coll,
         name="PostBridge.app",
-        # icon="postbridge.icns",
+        icon=_icon_mac,
         bundle_identifier="com.meateater.postbridge",
         info_plist={
             "NSPrincipalClass":          "NSApplication",
             "NSHighResolutionCapable":   True,
             "CFBundleShortVersionString": "1.0.0",
+            # Run number + commit from CI (Finder → Get Info shows it), so
+            # a copy of the app can be traced to the code it was built from.
+            "CFBundleVersion": os.environ.get("PB_BUILD_VERSION", "local"),
             "CFBundleName":              "PostBridge",
             "LSMinimumSystemVersion":    "11.0",
         },

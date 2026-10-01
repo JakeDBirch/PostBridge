@@ -34,23 +34,21 @@ echo "Architecture: $ARCH  →  using $FFMPEG_ASSET"
 echo ""
 
 # ── Download ffmpeg static binaries ──────────────────────────────────────────
+# Saved as plain ffmpeg / ffprobe — the names the app looks for inside the
+# bundle.  PyInstaller signs them along with the rest of the bundle.
 mkdir -p "$FFBIN"
 
-if [[ ! -f "$FFBIN/$FFMPEG_ASSET" ]]; then
-    echo "Downloading $FFMPEG_ASSET ..."
-    curl -fL -o "$FFBIN/$FFMPEG_ASSET" "$FFMPEG_BASE/$FFMPEG_ASSET"
-    chmod +x "$FFBIN/$FFMPEG_ASSET"
-else
-    echo "  $FFMPEG_ASSET already present — skipping."
-fi
-
-if [[ ! -f "$FFBIN/$FFPROBE_ASSET" ]]; then
-    echo "Downloading $FFPROBE_ASSET ..."
-    curl -fL -o "$FFBIN/$FFPROBE_ASSET" "$FFMPEG_BASE/$FFPROBE_ASSET"
-    chmod +x "$FFBIN/$FFPROBE_ASSET"
-else
-    echo "  $FFPROBE_ASSET already present — skipping."
-fi
+for pair in "ffmpeg:$FFMPEG_ASSET" "ffprobe:$FFPROBE_ASSET"; do
+    name="${pair%%:*}"; asset="${pair#*:}"
+    if [[ ! -f "$FFBIN/$name" ]]; then
+        echo "Downloading $asset ..."
+        curl -fL --retry 3 -o "$FFBIN/$name" "$FFMPEG_BASE/$asset"
+    else
+        echo "  $name already present — skipping."
+    fi
+    chmod +x "$FFBIN/$name"
+    "$FFBIN/$name" -version | head -1
+done
 
 echo ""
 
@@ -104,6 +102,26 @@ rm -rf build/PostBridge dist/PostBridge dist/PostBridge.app
 echo ""
 echo "Running PyInstaller ..."
 "$PY" -m PyInstaller PostBridge.spec --noconfirm
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+# Same checks as CI: the bundle's signature is intact, and the built app can
+# find and use its OWN ffmpeg (PATH / Homebrew ignored) to probe audio and
+# extract a waveform.  A failure here means the .app would fail on a clean Mac.
+echo ""
+# PyInstaller signed the bundle: with PB_CODESIGN_IDENTITY="Developer ID
+# Application: Name (TEAMID)" exported before running this script it is ready
+# for notarization; unset, it is ad-hoc signed.  Check, never re-sign.
+if [[ -n "${PB_CODESIGN_IDENTITY:-}" ]]; then
+    macos/verify_signing.sh dist/PostBridge.app --developer-id
+else
+    macos/verify_signing.sh dist/PostBridge.app
+fi
+if ! dist/PostBridge.app/Contents/MacOS/PostBridge --self-test build/selftest.txt; then
+    cat build/selftest.txt 2>/dev/null
+    echo ""
+    echo "ERROR: self-test failed — do not ship this build."
+    exit 1
+fi
 
 echo ""
 echo "============================================================"

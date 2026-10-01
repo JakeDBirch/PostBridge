@@ -36,6 +36,21 @@ venv, installs deps, downloads static ffmpeg/ffprobe for the detected arch,
 pre-downloads the `tiny` Whisper model into `models/`, and runs PyInstaller
 against `PostBridge.spec`.
 
+The build ends by verifying itself: `codesign --verify` on the bundle, then
+`PostBridge.app/Contents/MacOS/PostBridge --self-test build/selftest.txt`,
+which makes the app find its **own** ffmpeg/ffprobe (PATH and Homebrew are
+ignored), probe a clip with audio and one without, and extract a waveform.
+If that fails the script exits non-zero — don't ship that build. CI runs the
+same self-test on the built app and again on the unzipped artifact, and fails
+the run on any miss. Run it by hand against any copy of the app to check it.
+
+ffmpeg/ffprobe are saved into `ffmpeg-bin/` as plain `ffmpeg` / `ffprobe` and
+ad-hoc signed *before* PyInstaller runs; the spec refuses to build without
+them. (Earlier builds shipped them as `ffmpeg-osx-arm64` etc., which the app
+never looked for — every sync then failed with "This file has no audio track".)
+
+The build is Apple Silicon only; it will not launch on an Intel Mac.
+
 To ship it:
 
 ```bash
@@ -44,8 +59,27 @@ ditto -c -k --keepParent dist/PostBridge.app PostBridge-mac.zip
 
 Use `ditto`, not `zip` — plain zip flattens the symlinks inside the bundle.
 
-First launch of an unsigned app: right-click → **Open**, or `xattr -cr
-dist/PostBridge.app`.
+**Signing.** PyInstaller signs the bundle itself (`PostBridge.spec`):
+with `PB_CODESIGN_IDENTITY="Developer ID Application: … (TEAMID)"` in the
+environment it uses the hardened runtime, a secure timestamp and
+`macos/entitlements.plist`; unset, it ad-hoc signs. **Never re-sign the
+built bundle** — PyInstaller rewrites its main executable's Mach-O headers to
+carry the Python archive, and a second codesign pass over it produced a binary
+Apple's notary rejects as "The signature of the binary is invalid" although
+local `codesign --verify` passes. `macos/verify_signing.sh` only checks: every
+Mach-O verifies, and with `--developer-id` each has the Developer ID
+authority, a timestamp and the hardened runtime. CI notarizes and staples
+when the repository secrets listed at the top of
+`.github/workflows/build-macos-arm.yml` are set; without them a downloaded
+copy needs right-click → **Open** (or `xattr -cr PostBridge.app`) on first
+launch.
+
+**Which build is this?** CI stamps `CFBundleVersion` with run number +
+commit (Finder → Get Info → Version, e.g. `1.0.0 (4.65b4772)`), and the
+artifact name carries the same label.
+
+**Icon.** `assets/icon/` — regenerate from `assets/meateater_mark.png` with
+`python assets/icon/make_icons.py` (needs Pillow; outputs are committed).
 
 **CI equivalent:** `.github/workflows/build-macos-arm.yml` does the same thing
 on a GitHub `macos-14` runner (manual `workflow_dispatch`). `build.sh` was

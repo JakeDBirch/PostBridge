@@ -10,11 +10,12 @@ import bisect
 import hashlib
 import logging
 import os
+from utils import app_state_dir as _app_state_dir
 import tempfile
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_LOG_PATH = os.path.join(_app_state_dir(),
                          "match_review_log.txt")
 logging.basicConfig(
     filename=_LOG_PATH,
@@ -36,7 +37,7 @@ from engines import (extract_audio_segment, extract_mono_pcm,
 # Keyed on file path + mtime + size so stale entries are automatically ignored.
 # Stores 8 kHz float32 display samples (normalized to 0.85 peak) + raw src peak.
 
-_WAVE_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_WAVE_CACHE_DIR = os.path.join(_app_state_dir(),
                                 "waveform_cache")
 
 def _wave_cache_key(audio_path):

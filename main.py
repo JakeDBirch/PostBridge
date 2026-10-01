@@ -1,4 +1,5 @@
 import os
+from utils import app_state_dir as _app_state_dir
 import sys
 import re
 import json
@@ -157,6 +158,16 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         super().__init__()
         self.title("PostBridge")
         self.configure(bg=BG)
+        # Window / taskbar icon.  The packaged .app and .exe carry their own
+        # (PostBridge.spec); this covers dialogs and runs from source.
+        try:
+            _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "assets", "icon", "PostBridge.png")
+            if os.path.isfile(_icon):
+                self._app_icon = tk.PhotoImage(file=_icon)
+                self.iconphoto(True, self._app_icon)
+        except tk.TclError:
+            pass
         self.resizable(True, True)
         self.minsize(960, 700)
         # Windows starts maximised, which throws away whatever geometry
@@ -5169,7 +5180,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         return "{:.1f}s".format(secs)
 
     # Fixed-path debug mirror — readable by the dev without knowing the script location.
-    _DEBUG_LOG      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_debug_run.log")
+    _DEBUG_LOG      = os.path.join(_app_state_dir(), "_debug_run.log")
     _DEBUG_LOG_LOCK = threading.Lock()   # serialise concurrent thread writes to the log file
 
     # ── Step 3 transcription-tasks routing ────────────────────────────
@@ -9775,6 +9786,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         self._home()
 
 if __name__ == "__main__":
+    # Build verification: `PostBridge --self-test REPORT.txt` checks the
+    # bundle's own ffmpeg end to end and exits without opening a window.
+    # The build workflows fail the build when this does not pass.
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        sys.exit(engines.run_self_test(
+            sys.argv[2] if len(sys.argv) > 2 else None))
+
     if sys.platform == "win32":
         try:
             import ctypes
