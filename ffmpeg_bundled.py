@@ -143,12 +143,35 @@ def _package_ffmpeg_paths():
             os.path.join(contents_dir, "Resources", "ffmpeg"),  # Contents/Resources/ffmpeg/
         ]
 
+    # build.bat renames the Windows binaries to ffmpeg.exe / ffprobe.exe, but
+    # build.sh and PostBridge.spec ship the macOS / Linux ones under their
+    # release asset names (ffmpeg-osx-arm64, ...).  Accept both, or the
+    # bundled copy is never found and every probe silently fails.
+    names = [("ffmpeg" + ext, "ffprobe" + ext)]
+    assets = _ASSETS.get(_platform_key())
+    if assets:
+        names.append(assets)
     for d in candidates:
-        ff  = os.path.join(d, "ffmpeg"  + ext)
-        ffp = os.path.join(d, "ffprobe" + ext)
-        if os.path.isfile(ff) and os.path.isfile(ffp):
-            return ff, ffp
+        for ff_name, ffp_name in names:
+            ff  = os.path.join(d, ff_name)
+            ffp = os.path.join(d, ffp_name)
+            if os.path.isfile(ff) and os.path.isfile(ffp):
+                _ensure_executable(ff)
+                _ensure_executable(ffp)
+                return ff, ffp
     return None, None
+
+
+def _ensure_executable(path):
+    """Restore the exec bit if packaging dropped it (a no-op on Windows)."""
+    if sys.platform == "win32":
+        return
+    try:
+        if not os.access(path, os.X_OK):
+            os.chmod(path, os.stat(path).st_mode
+                     | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        pass
 
 
 def _bundled_exists():
