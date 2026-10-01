@@ -5819,6 +5819,11 @@ def run_self_test(report_path=None):
     import tempfile as _tf
     import traceback
     os.environ["PB_FFMPEG_BUNDLED_ONLY"] = "1"
+    # A Finder-launched Mac app sees only the system PATH.  Match it, so a
+    # code path that spawns a bare "ffmpeg" fails here exactly as it does
+    # on a user's Mac, instead of quietly using the build machine's copy.
+    if sys.platform != "win32":
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
     lines, failed = [], []
 
     def check(name, ok, detail=""):
@@ -5881,6 +5886,38 @@ def run_self_test(report_path=None):
                               "{} samples, peak {:.3f}".format(len(pcm), peak))
                     except Exception as e:
                         check("waveform extraction", False, str(e))
+
+                # Auto-sync end to end: a camera clip whose audio is the
+                # reference recording starting 3.5 s in.  The detector must
+                # find that offset — a failed extraction anywhere in it
+                # comes back as 0.000 s, which this catches.
+                ref = os.path.join(td, "ref.wav")
+                cam = os.path.join(td, "cam.mp4")
+                TRUE_OFF = 3.5
+                r3 = _run([ff, "-v", "error", "-y", "-f", "lavfi", "-i",
+                           "anoisesrc=d=60:c=pink:r=48000:a=0.3,"
+                           "volume='if(lt(mod(t,2.3),1.1),1,0.15)':eval=frame",
+                           "-ac", "1", ref], capture_output=True, timeout=60)
+                r4 = _run([ff, "-v", "error", "-y",
+                           "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24:duration=50",
+                           "-ss", str(TRUE_OFF), "-i", ref, "-t", "50",
+                           "-map", "0:v", "-map", "1:a",
+                           "-c:v", "mpeg4", "-c:a", "aac", cam],
+                          capture_output=True, timeout=120)
+                if r3.returncode == 0 and r4.returncode == 0:
+                    try:
+                        from parsers import detect_sync_offset
+                        T, conf, _alts = detect_sync_offset(
+                            cam, ref, probe_duration=300.0, start_offset=0.0,
+                            return_candidates=True, has_slate=False)
+                        check("auto-sync finds a known {:.1f} s offset".format(TRUE_OFF),
+                              abs(abs(T) - TRUE_OFF) < 0.05 and conf > 0.5,
+                              "got {:.3f} s at {:.0f}%".format(T, conf * 100))
+                    except Exception as e:
+                        check("auto-sync finds a known offset", False, repr(e))
+                else:
+                    check("generate sync test clips", False,
+                          (r3.stderr or r4.stderr or b"").decode(errors="replace")[-300:])
     except Exception:
         check("self-test ran", False, traceback.format_exc())
 
