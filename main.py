@@ -157,6 +157,16 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         super().__init__()
         self.title("PostBridge")
         self.configure(bg=BG)
+        # Window / taskbar icon.  The packaged .app and .exe carry their own
+        # (PostBridge.spec); this covers dialogs and runs from source.
+        try:
+            _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "assets", "icon", "PostBridge.png")
+            if os.path.isfile(_icon):
+                self._app_icon = tk.PhotoImage(file=_icon)
+                self.iconphoto(True, self._app_icon)
+        except tk.TclError:
+            pass
         self.resizable(True, True)
         self.minsize(960, 700)
         # Windows starts maximised, which throws away whatever geometry

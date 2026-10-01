@@ -78,6 +78,19 @@ else:  # Linux
     _add_ff("ffmpeg",  "ffmpeg-linux-"  + _arch)
     _add_ff("ffprobe", "ffprobe-linux-" + _arch)
 
+# ── App assets: header logo + window icon ─────────────────────────────────────
+# main.py loads these from <bundle>/assets at runtime.  They were never
+# bundled before, so packaged builds silently showed no header logo.
+for _fn in ("ME_HortLogo_OrgWht.png", os.path.join("icon", "PostBridge.png")):
+    _fp = os.path.join(src_dir, "assets", _fn)
+    if os.path.isfile(_fp):
+        added_files.append((_fp, os.path.dirname(os.path.join("assets", _fn))))
+
+# App icon — regenerate with  python assets/icon/make_icons.py
+_icon_dir = os.path.join(src_dir, "assets", "icon")
+_icon_win = os.path.join(_icon_dir, "PostBridge.ico")
+_icon_mac = os.path.join(_icon_dir, "PostBridge.icns")
+
 # ── Include HTML helper files ─────────────────────────────────────────────────
 for _fn in ("blood_trails_formatter.html",):
     _fp = os.path.join(src_dir, _fn)
@@ -154,8 +167,7 @@ exe = EXE(   # noqa: F821
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="postbridge.ico",   # Windows — supply a .ico to set taskbar icon
-    # icon="postbridge.icns",  # macOS   — supply a .icns for the Dock icon
+    icon=_icon_win if _sys.platform == "win32" else None,
 )
 
 coll = COLLECT(   # noqa: F821
@@ -175,12 +187,15 @@ if _sys.platform == "darwin":
     app = BUNDLE(   # noqa: F821
         coll,
         name="PostBridge.app",
-        # icon="postbridge.icns",
+        icon=_icon_mac,
         bundle_identifier="com.meateater.postbridge",
         info_plist={
             "NSPrincipalClass":          "NSApplication",
             "NSHighResolutionCapable":   True,
             "CFBundleShortVersionString": "1.0.0",
+            # Run number + commit from CI (Finder → Get Info shows it), so
+            # a copy of the app can be traced to the code it was built from.
+            "CFBundleVersion": os.environ.get("PB_BUILD_VERSION", "local"),
             "CFBundleName":              "PostBridge",
             "LSMinimumSystemVersion":    "11.0",
         },
