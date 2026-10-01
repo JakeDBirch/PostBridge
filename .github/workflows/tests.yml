@@ -1,0 +1,27 @@
+name: Tests
+
+# Fast checks on every PR and every push to main.  Detector quality
+# (auto-sync accuracy) is tested here, so a regression shows up on the PR
+# that caused it.  The release builds only check that the packaged app
+# works (bundled ffmpeg, signing); they don't judge the detector.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install Python packages
+        run: python -m pip install numpy pytest
+      - name: Run tests
+        run: python -m pytest -v tests
