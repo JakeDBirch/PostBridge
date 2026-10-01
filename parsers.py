@@ -856,6 +856,13 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
         except Exception:
             pass
 
+    # A probe that measured nothing (unreadable audio, failed extraction)
+    # comes back as (0.0, conf 0.0).  It must not vote: three failed
+    # probes all "agree" on 0.000 s, and the agreement floor below then
+    # promoted that to 100 % confidence — every source on a Mac whose
+    # ffmpeg could not be found read "✓ 0.000s (100%)".
+    results = [r for r in results if r[1] > 0.0]
+
     if not results:
         return _emit(0.0, 0.0, [])
     if len(results) == 1:
