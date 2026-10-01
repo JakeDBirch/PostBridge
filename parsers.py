@@ -872,6 +872,10 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     # probe lands inside the same cluster.  False peak → probes scatter
     # across the file's noisy regions.
     AGREE_S = 0.5
+    # Agreeing probes further apart than this = clock drift (see below).
+    # ~2 frames at 25 fps; on a drift-free test clip the probes landed
+    # within 5 ms of each other.
+    DRIFT_SPREAD_S = 0.08
     best_cluster = []
     for i, ri in enumerate(results):
         cluster = [ri]
@@ -892,6 +896,16 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
         max_inner = max(r[1] for r in best_cluster)
         agree_floor = 0.92 if len(best_cluster) == 2 else 1.0
         final_conf = min(1.0, max(max_inner, agree_floor))
+        # Agreement within ±0.5 s is not agreement on one offset.  When the
+        # probes that agree still differ by more than a couple of frames,
+        # the camera and recorder clocks run at different rates (e.g. a
+        # 0.1 % drift moves the offset ~0.12 s every 2 minutes).  One
+        # constant offset — the average — is then only right mid-file and
+        # off at the head and tail, so it must not read as a green ✓.
+        # Capped below the 0.95 tier → "verify recommended".
+        spread = max(r[0] for r in best_cluster) - min(r[0] for r in best_cluster)
+        if spread > DRIFT_SPREAD_S:
+            final_conf = min(final_conf, 0.90)
         final_T = round(avg_T, 6)
         final_conf = round(final_conf, 4)
     else:
