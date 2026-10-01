@@ -220,7 +220,7 @@ def extract_mono_pcm(media_path, sample_rate=8000):
         # so ffmpeg exits with "does not contain any stream".  Say that in
         # plain English instead of handing the caller 400 characters of
         # stream banner with the one useful line off the end.
-        if not has_audio_track(media_path):
+        if has_audio_track(media_path) is False:
             raise RuntimeError(
                 "{} has no audio track — there is nothing to read a "
                 "waveform from.".format(os.path.basename(media_path)))
@@ -327,9 +327,15 @@ def _ffprobe_csv(path, entries, select=None, timeout=10):
     try:
         r = _run(cmd, capture_output=True, text=True,
                  encoding="utf-8", errors="replace", timeout=timeout)
-        return (r.stdout or "").strip()
     except Exception:
         return None
+    # A non-zero exit means ffprobe itself failed (binary blocked or
+    # killed by the OS, wrong architecture, unreadable file) — it is not
+    # an answer about the file.  Returning "" here used to read as "no
+    # such stream", which _probe_codec then cached for the session.
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip()
 
 
 def get_media_duration(path):
@@ -370,14 +376,20 @@ def get_audio_channels(path):
 
 
 def has_audio_track(path):
-    """True when *path* carries at least one audio stream.
+    """True when *path* carries at least one audio stream, False when it
+    definitely carries none, and None when ffprobe could not answer.
 
     Video-only files are common enough in this pipeline to be worth naming:
     Riverside "raw-video" exports ship the audio as a separate WAV, and most
     camera proxies drop audio entirely.  Anything that wants a waveform out
     of a file needs to know this before it tries.  Memoised via _probe_codec,
-    so repeat calls across the UI cost nothing."""
-    return bool(_probe_codec(path, "a:0"))
+    so repeat calls across the UI cost nothing.
+
+    Callers must test `is False`: a probe failure is not proof of a
+    silent file, and calling it one sends the user off to re-assign
+    media that is fine."""
+    codec = _probe_codec(path, "a:0", unknown=None)
+    return None if codec is None else bool(codec)
 
 # ── Split-clip join (gapless file-size splits → one continuous file) ─────────
 def _concat_stream_sig(path):
@@ -430,16 +442,18 @@ def probe_concat_compat(paths):
 
 _codec_cache = {}   # (path, stream) → codec name; codecs never change mid-session
 
-def _probe_codec(path, stream):
+def _probe_codec(path, stream, unknown=""):
     """Codec name of the given stream, memoised per (path, stream).
     The memo collapses the duplicate spawn between join_output_ext
-    (the dialog's default-name probe) and concat_video_files."""
+    (the dialog's default-name probe) and concat_video_files.
+    Returns *unknown* when ffprobe fails, so callers that care can tell
+    a failed probe apart from a missing stream ("")."""
     key = (path, stream)
     if key in _codec_cache:
         return _codec_cache[key]
     out = _ffprobe_csv(path, "stream=codec_name", select=stream, timeout=15)
     if out is None:
-        return ""    # transient failure — do NOT cache, retry next call
+        return unknown    # transient failure — do NOT cache, retry next call
     out = out.lower()
     _codec_cache[key] = out
     return out
