@@ -651,9 +651,9 @@ class MediaPool(tk.Frame):
             filetypes=[("Media",
                         "*.mp4 *.mov *.mxf *.avi *.mkv *.m4v *.webm "
                         "*.wmv *.mpg *.mpeg *.ts *.mts *.m2ts "
-                        "*.flv *.ogv *.3gp *.dv *.r3d *.braw *.ari "
+                        "*.flv *.ogv *.3gp *.dv *.r3d *.braw *.ari *.vob "
                         "*.wav *.aif *.aiff *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.wma *.caf "
-                        "*.MP4 *.MOV *.MXF *.M4V *.WMV *.WAV *.MP3 *.M4A *.FLAC *.WMA"),
+                        "*.MP4 *.MOV *.MXF *.M4V *.WMV *.VOB *.WAV *.MP3 *.M4A *.FLAC *.WMA"),
                        ("All","*.*")])
         for p in paths: self._add(p)
 
@@ -665,7 +665,7 @@ class MediaPool(tk.Frame):
             # Professional / camera formats
             ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v", ".webm",
             ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts",
-            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari",
+            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari", ".vob",
             # Broadcast / studio audio
             ".wav", ".aif", ".aiff",
             # Consumer / archival audio

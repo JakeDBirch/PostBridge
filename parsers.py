@@ -17,6 +17,103 @@ def _ffmpeg_cmd():
     except Exception:
         return ["ffmpeg"]
 
+
+def _ffprobe_cmd():
+    try:
+        from ffmpeg_bundled import get_ffprobe_cmd
+        return get_ffprobe_cmd()
+    except Exception:
+        return ["ffprobe"]
+
+
+_vob_starts_cache = {}
+
+def _vob_starts(path):
+    """(video_start, audio_start) program-clock seconds of a .VOB's first
+    video and audio stream, or None when ffprobe can't say.  Memoised."""
+    key = os.path.normcase(os.path.abspath(path))
+    if key in _vob_starts_cache:
+        return _vob_starts_cache[key]
+    starts = []
+    for sel in ("v:0", "a:0"):
+        try:
+            r = run_hidden(
+                _ffprobe_cmd() + ["-v", "quiet", "-select_streams", sel,
+                                  "-show_entries", "stream=start_time",
+                                  "-of", "csv=p=0", path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=15)
+            # csv rows can carry a trailing comma (side-data section).
+            first = (r.stdout or "").strip().splitlines()[0]
+            starts.append(float(first.split(",")[0]))
+        except Exception:
+            return None    # unknown — don't cache, the file may be mid-copy
+    _vob_starts_cache[key] = tuple(starts)
+    return _vob_starts_cache[key]
+
+
+def vob_av_skew(path):
+    """Seconds the first audio packet of a DVD .VOB starts after its first
+    video frame (negative = audio first); 0.0 for anything else or when
+    ffprobe can't say.
+
+    A VOB is an MPEG program stream: audio and video carry their own
+    timestamps and needn't start together.  ffmpeg decodes the audio from
+    its own first packet, but the NLE puts frame 0 of the picture at the
+    head of the clip, so a sync offset measured on the raw audio would be
+    off by exactly this much."""
+    from utils import is_vob
+    starts = _vob_starts(path) if is_vob(path) else None
+    if not starts:
+        return 0.0
+    skew = starts[1] - starts[0]
+    # Anything past a few seconds is a timestamp reset, not a real lead.
+    return skew if abs(skew) <= 5.0 else 0.0
+
+
+def audio_read_args(path, t_start=0.0, t_dur=None, min_seek=0.5):
+    """ffmpeg arguments that open *path* and read its audio from *t_start*
+    for *t_dur* seconds, everything up to (not including) the output's own
+    options such as -ac / -ar / -f.
+
+    Ordinary media: fast input seek (only past *min_seek*, as before).
+
+    DVD .VOB: time is measured from the first video frame — see
+    vob_av_skew — so every window agrees with the picture the NLE shows.
+    And an input seek in an MPEG program stream lands somewhere that
+    depends on how the streams' start times line up, so the same -ss
+    reads different audio from one VOB to the next.  So the input seek
+    only gets close (10 s short), timestamps are kept on the disc's own
+    program clock (-copyts), and the output seek cuts at the exact
+    program-clock time of the frame wanted."""
+    from utils import is_vob
+    if not is_vob(path):
+        args = []
+        if t_start > min_seek:
+            args += ["-ss", "{:.3f}".format(t_start)]
+        if t_dur is not None:
+            args += ["-t", "{:.3f}".format(max(t_dur, 0.1))]
+        return args + ["-i", path]
+    t_start = max(0.0, t_start)
+    skew    = vob_av_skew(path)
+    starts  = _vob_starts(path)
+    _NEAR_S = 10.0
+    if starts and t_start > _NEAR_S:
+        args = ["-ss", "{:.3f}".format(t_start - _NEAR_S), "-copyts",
+                "-i", path, "-ss", "{:.4f}".format(starts[0] + t_start)]
+    else:
+        # Near the top: decode from the start and seek on the output.
+        args = ["-i", path]
+        aud_t = t_start - skew
+        if aud_t > 0.0005:
+            args += ["-ss", "{:.4f}".format(aud_t)]
+        elif aud_t < -0.0005:
+            # The window opens before the audio does: pad with silence.
+            args += ["-af", "adelay={:.2f}:all=1".format(-aud_t * 1000.0)]
+    if t_dur is not None:
+        args += ["-t", "{:.3f}".format(max(t_dur, 0.1))]
+    return args
+
 # ── Script parser ───────────────────────────────────────────────────────────────────────────
 #
 # Bracketed syntax (the only supported form):
@@ -621,12 +718,9 @@ def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as _fh:
             tmp = _fh.name
         try:
-            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
-            if start_offset > 0.5:
-                cmd += ["-ss", "{:.3f}".format(start_offset)]
-            cmd += ["-t", "{:.3f}".format(max(probe_duration, 0.1)),
-                    "-i", path, "-ac", "1", "-ar", str(SR),
-                    "-f", "f32le", tmp]
+            cmd = (_ffmpeg_cmd() + ["-y", "-v", "quiet"]
+                   + audio_read_args(path, start_offset, probe_duration)
+                   + ["-ac", "1", "-ar", str(SR), "-f", "f32le", tmp])
             r = run_hidden(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
@@ -995,15 +1089,12 @@ def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
             tmp = tf.name
         try:
-            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
-            if t_start > 0.5:
-                cmd += ["-ss", "{:.3f}".format(t_start)]
-            cmd += ["-t",  "{:.3f}".format(max(t_dur, 0.1)),
-                    "-i",  path,
-                    "-ac", "1",
-                    "-ar", str(int(out_sr)),
-                    "-f",  "f32le",
-                    tmp]
+            cmd = (_ffmpeg_cmd() + ["-y", "-v", "quiet"]
+                   + audio_read_args(path, t_start, t_dur)
+                   + ["-ac", "1",
+                      "-ar", str(int(out_sr)),
+                      "-f",  "f32le",
+                      tmp])
             r = run_hidden(cmd, capture_output=True, timeout=120)
             if r.returncode != 0:
                 return None
@@ -1711,12 +1802,10 @@ def verify_sync_at_offset(video_path, audio_path, offset, start_offset=0.0):
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
             tmp = tf.name
         try:
-            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet"]
-            if t_start > 0.5:
-                cmd += ["-ss", "{:.3f}".format(t_start)]
-            cmd += ["-t", "{:.3f}".format(max(t_dur, 0.1)),
-                    "-i", path, "-ac", "1", "-ar", str(int(out_sr)),
-                    "-f", "f32le", tmp]
+            cmd = (_ffmpeg_cmd() + ["-y", "-v", "quiet"]
+                   + audio_read_args(path, t_start, t_dur)
+                   + ["-ac", "1", "-ar", str(int(out_sr)),
+                      "-f", "f32le", tmp])
             r = run_hidden(cmd, capture_output=True, timeout=60)
             if r.returncode != 0:
                 return None
@@ -1833,10 +1922,9 @@ def detect_slate_offset(video_path, audio_path, search_secs=10.0, sample_rate=80
 
     def _extract(src, dst):
         r = run_hidden(
-            _ffmpeg_cmd() + ["-y",
-             "-t", str(search_secs),
-             "-i", src,
-             "-ac", "1", "-ar", str(sample_rate),
+            _ffmpeg_cmd() + ["-y"]
+            + audio_read_args(src, 0.0, search_secs)
+            + ["-ac", "1", "-ar", str(sample_rate),
              "-acodec", "pcm_s16le", "-vn", dst],
             capture_output=True, timeout=30)
         if r.returncode != 0:

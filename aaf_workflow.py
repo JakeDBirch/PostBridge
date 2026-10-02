@@ -29,7 +29,7 @@ except ImportError:
 
 from config import *
 from config import _SANS
-from utils import (basename, is_video, is_audio, is_media,
+from utils import (basename, is_video, is_audio, is_media, is_dvd_menu_vob,
                    MEDIA_EXTS, VIDEO_EXTS, run_hidden,
                    offline_media, offline_media_message)
 from parsers import (get_clip_base_name, parse_aaf_session,
@@ -3929,7 +3929,8 @@ class AafWorkflowMixin:
         paths = []
         for root, _, files in os.walk(folder):
             for fn in sorted(files):
-                if os.path.splitext(fn)[1].lower() in MEDIA_EXTS:
+                if (os.path.splitext(fn)[1].lower() in MEDIA_EXTS
+                        and not is_dvd_menu_vob(fn)):
                     paths.append(os.path.join(root, fn))
         self._aaf_add_audio_batch(paths)
 
@@ -4340,7 +4341,8 @@ class AafWorkflowMixin:
         paths = []
         for root, _, files in os.walk(folder):
             for fn in sorted(files):
-                if os.path.splitext(fn)[1].lower() in VIDEO_EXTS:
+                if (os.path.splitext(fn)[1].lower() in VIDEO_EXTS
+                        and not is_dvd_menu_vob(fn)):
                     paths.append(os.path.join(root, fn))
         self._aaf_add_video_batch(paths)
 

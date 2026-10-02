@@ -208,8 +208,8 @@ def extract_mono_pcm(media_path, sample_rate=8000):
     Returns a 1-D numpy float32 array, or raises RuntimeError on failure.
     """
     import numpy as _np
-    cmd = _ffmpeg_cmd() + [
-        "-i", media_path,
+    from parsers import audio_read_args   # VOB: time from frame 0
+    cmd = _ffmpeg_cmd() + audio_read_args(media_path) + [
         "-ac", "1", "-ar", str(sample_rate),
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-vn", "pipe:1",
@@ -249,7 +249,11 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     """
     start_s = max(0.0, start_s)
     _PRE_BUFFER_S = 2.0    # fast-seek land this far before the target
-    if start_s > _PRE_BUFFER_S:
+    if is_vob(media_path):
+        # Input seeking in a VOB is unreliable — see audio_read_args.
+        from parsers import audio_read_args
+        seek_args = audio_read_args(media_path, start_s)
+    elif start_s > _PRE_BUFFER_S:
         pre_seek  = start_s - _PRE_BUFFER_S
         post_seek = _PRE_BUFFER_S
         seek_args = (["-ss", "{:.3f}".format(pre_seek), "-i", media_path,
@@ -480,6 +484,15 @@ def _probe_start_tc_secs(path, fps):
     return None
 
 
+def _probe_start_time(path):
+    """Container start timestamp in seconds, or None."""
+    out = _ffprobe_csv(path, "format=start_time", timeout=15)
+    try:
+        return float((out or "").split(",")[0])
+    except (TypeError, ValueError):
+        return None
+
+
 def _probe_creation_epoch(path):
     """File's creation_time as a unix epoch (seconds), or None."""
     try:
@@ -544,11 +557,18 @@ def probe_join_continuity(paths):
             "dur": dur,
             "tc":  _probe_start_tc_secs(p, fps),
             "cr":  _probe_creation_epoch(p),
+            # DVD VOBs carry neither, but the pieces of one title share a
+            # running program clock, so each one's first timestamp shows
+            # whether it picks up where the last left off.
+            "pts": _probe_start_time(p) if is_vob(p) else None,
         })
 
-    use_tc = all(i["tc"] is not None for i in info)
-    use_cr = (not use_tc) and all(i["cr"] is not None for i in info)
-    key    = "tc" if use_tc else ("cr" if use_cr else None)
+    use_tc  = all(i["tc"] is not None for i in info)
+    use_cr  = (not use_tc) and all(i["cr"] is not None for i in info)
+    use_pts = (not use_tc and not use_cr
+               and all(i["pts"] is not None for i in info))
+    key     = ("tc" if use_tc else "cr" if use_cr
+               else "pts" if use_pts else None)
 
     total_dur = sum(i["dur"] for i in info)
     if use_tc:
@@ -586,6 +606,8 @@ def join_output_ext(paths):
     container has no tag for PCM — remuxing it to .mp4 yields a broken
     file.  .MOV holds h264/hevc + PCM cleanly, so PCM sources must join
     to .mov.  Anything else keeps the source's own extension."""
+    if paths and all(is_vob(p) for p in paths):
+        return ".vob"      # DVD LPCM (pcm_dvd) has no .mov tag either
     a = _probe_codec(paths[0], "a:0") if paths else ""
     if a.startswith("pcm"):
         return ".mov"
@@ -620,7 +642,10 @@ def concat_video_files(paths, out_path, progress_cb=None):
     # an audio stream gets mapped at all.
     acodec    = _probe_codec(paths[0], "a:0")
     has_audio = bool(acodec)
-    if acodec.startswith("pcm"):
+    vob_set   = all(is_vob(p) for p in paths)
+    if vob_set:
+        want_ext = ".vob"
+    elif acodec.startswith("pcm"):
         want_ext = ".mov"
     else:
         want_ext = os.path.splitext(paths[0])[1].lower() or ".mp4"
@@ -643,8 +668,20 @@ def concat_video_files(paths, out_path, progress_cb=None):
         # Map only video + audio (drop the camera's timecode/data track,
         # which otherwise corrupts the output).  '?' = optional so a
         # missing stream doesn't abort the join.
-        cmd = _ffmpeg_cmd() + ["-y", "-f", "concat", "-safe", "0",
-                               "-i", listf, "-map", "0:v:0?"]
+        if vob_set:
+            # VTS_nn_1.VOB, _2, … are byte splits of ONE program stream,
+            # cut mid-GOP with timestamps that simply carry on.  The concat
+            # demuxer treats each as a separate file and breaks the stream
+            # at every seam (the joined file stops decoding after the first
+            # piece); the concat protocol glues the bytes back together,
+            # which is what they are.  The DVD navigation packets are
+            # dropped along with any other data track.
+            src = "concat:" + "|".join(os.path.abspath(p) for p in paths)
+        else:
+            src = None
+        cmd = _ffmpeg_cmd() + ["-y"] + (
+            ["-i", src] if src else
+            ["-f", "concat", "-safe", "0", "-i", listf]) + ["-map", "0:v:0?"]
         if has_audio:
             cmd += ["-map", "0:a:0?"]
         cmd += ["-c", "copy", out_path]

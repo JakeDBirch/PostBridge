@@ -4169,7 +4169,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             # Professional / camera formats
             ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v", ".webm",
             ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts",
-            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari",
+            ".flv", ".ogv", ".3gp", ".dv", ".r3d", ".braw", ".ari", ".vob",
             # Broadcast / studio audio
             ".wav", ".aif", ".aiff",
             # Consumer / archival audio

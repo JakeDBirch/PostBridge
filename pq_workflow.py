@@ -803,7 +803,7 @@ class PqWorkflowMixin:
                 title="Pick interview media",
                 filetypes=[("Media",
                             "*.wav *.aif *.aiff *.bwf *.mp3 *.m4a *.flac "
-                            "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v"),
+                            "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v *.vob"),
                            ("All", "*.*")])
             if files:
                 _add_paths(files)
@@ -3516,7 +3516,7 @@ class PqWorkflowMixin:
             title="Add media to session",
             filetypes=[("Media",
                         "*.wav *.aif *.aiff *.bwf *.mp3 *.m4a *.flac "
-                        "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v"),
+                        "*.mp4 *.mov *.mxf *.mkv *.avi *.m4v *.vob"),
                        ("All", "*.*")])
         added_paths = []
         media = list(session.get("media", []))
