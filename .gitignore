@@ -20,3 +20,4 @@ waveform_cache/
 
 # macOS build venv (created by build.sh)
 .venv-build/
+installer-out/
