@@ -385,6 +385,182 @@ def _check_sessions(script_path, tokens, pulls, out):
                 "A transcribed session exists but no pull references it."))
 
     _check_session_media(found, out)
+    _check_transcript_quality(found, pulls, out)
+    _check_against_transcripts(found, pulls, out)
+
+
+# Whisper models small enough that they drop words outright.  A transcript
+# built from one of these resolves pulls badly and is cheap to redo.
+_WEAK_MODELS = ("tiny", "base")
+
+# A silence this long between consecutive words is not a pause — it is speech
+# the transcriber missed.
+_HOLE_SECS = 8.0
+
+
+def _check_transcript_quality(found, pulls, out):
+    """Flag sessions that will resolve badly because the transcript itself is
+    thin: built with a weak model, or missing chunks of speech outright.
+
+    A hole matters when a pull is written across it — the matcher then reaches
+    far outside the span hunting for words that were never transcribed."""
+    for tok, path in sorted(found.items()):
+        data = _load_session(path)
+        if not data:
+            continue
+        words = data.get("transcript") or []
+        if not words:
+            continue
+
+        srcs = {}
+        for w in words:
+            s = (w.get("_src") or "").lower()
+            srcs[s] = srcs.get(s, 0) + 1
+        weak = sum(n for s, n in srcs.items() if s in _WEAK_MODELS)
+        if weak and weak >= len(words) * 0.5:
+            worst = sorted((s for s in srcs if s in _WEAK_MODELS))
+            out.append(Finding(
+                WARN, "Transcript",
+                "%s was transcribed with the %s model" % (tok, "/".join(worst)),
+                "%d of %d words came from a model that drops speech.  Pulls over "
+                "those regions resolve to the wrong span, and re-transcribing the "
+                "session at a higher quality is far cheaper than fixing the clips "
+                "by hand." % (weak, len(words))))
+
+        holes, prev = [], None
+        for w in words:
+            s = float(w.get("start", 0.0))
+            if prev is not None and s - prev > _HOLE_SECS:
+                holes.append((prev, s))
+            prev = float(w.get("end", s))
+
+        for h_start, h_end in holes:
+            hit = [p for p in pulls
+                   if p["token"] == tok
+                   and p["in_seconds"] < h_end and p["out_seconds"] > h_start]
+            if not hit:
+                continue
+            out.append(Finding(
+                WARN, "Transcript",
+                "%s transcript has a %ds hole at %s"
+                % (tok, round(h_end - h_start), _tc(int(h_start))),
+                "No words were transcribed between %s and %s, so speech there is "
+                "missing entirely.  %d pull%s written across it:\n%s\n"
+                "Re-transcribe this session before reconciling."
+                % (_tc(int(h_start)), _tc(int(h_end)), len(hit),
+                   "" if len(hit) == 1 else "s",
+                   "\n".join("  [%s %s-%s]" % (p["token"], p["in_tc"], p["out_tc"])
+                             for p in hit[:6]))))
+
+
+def _load_session(path):
+    import json
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _check_against_transcripts(found, pulls, out):
+    """Resolve every pull against its already-transcribed session.
+
+    This runs the production resolver (`reconcile_pull_from_session`) rather
+    than a lookalike, so what it reports is exactly what the pipeline will do
+    later — including the mis-pointed-timecode guard, which is what catches a
+    span copy-pasted from a neighbouring pull.  No media and no Whisper: the
+    word timings already live in the session JSON.
+    """
+    import engines                      # imported lazily: heavy, and only needed here
+
+    cache = {}
+    checked = 0
+    for p in pulls:
+        path = found.get(p["token"])
+        if not path:
+            continue
+        if path not in cache:
+            cache[path] = _load_session(path)
+        data = cache[path]
+        if not data:
+            continue
+
+        try:
+            res = engines.reconcile_pull_from_session(dict(p), data)
+        except Exception as exc:
+            out.append(Finding(
+                INFO, "Transcript", "Could not cross-check [%s %s-%s]"
+                % (p["token"], p["in_tc"], p["out_tc"]), str(exc)))
+            continue
+        checked += 1
+
+        status = res.get("status")
+        where = "[%s %s-%s]" % (p["token"], p["in_tc"], p["out_tc"])
+        quote = (p.get("quote_text") or "").strip()
+        quote = (quote[:120] + "…") if len(quote) > 120 else quote
+
+        if status == "no_transcript":
+            continue                     # already reported by the asset checks
+
+        if status == "no_match":
+            out.append(Finding(
+                ERROR, "Transcript", "Quote not found in the %s transcript" % p["token"],
+                "%s\n“%s”\nNeither the written timecodes nor a search of the "
+                "whole transcript located this quote.  Either the timecodes point at "
+                "the wrong session, or the quote was rewritten past recognition.\n%s"
+                % (where, quote, res.get("_diag", "")),
+                None))
+            continue
+
+        # The resolver snaps every pull to word boundaries and sets
+        # _text_fallback freely — including when it snaps straight back to the
+        # same place.  So the flag on its own proves nothing; compare the spans.
+        # Likewise, a loose out-point is something reconcile silently fixes, so
+        # it is not worth a warning.  Only report what a human must act on.
+        rec_in = float(res.get("rec_in_s") or 0.0)
+        rec_out = float(res.get("rec_out_s") or 0.0)
+        dec_in, dec_out = p["in_seconds"], p["out_seconds"]
+        overlap = min(rec_out, dec_out) - max(rec_in, dec_in)
+        rec_dur = max(0.0, rec_out - rec_in)
+        dec_dur = max(0.001, dec_out - dec_in)
+
+        if overlap <= 0:
+            out.append(Finding(
+                ERROR, "Transcript", "Timecodes point at the wrong audio",
+                "%s\n“%s”\nThese words are not spoken anywhere in that span — "
+                "they are at %s-%s.  A span copied from a neighbouring pull looks "
+                "exactly like this.\nLeft as written, the clip is cut from the wrong "
+                "place.\n%s"
+                % (where, quote, res.get("rec_in_tc"), res.get("rec_out_tc"),
+                   res.get("_diag", "")),
+                None))
+            continue
+
+        if rec_dur > dec_dur * 3 and rec_dur - dec_dur > 30:
+            out.append(Finding(
+                WARN, "Transcript", "Quote resolves to a far longer span than written",
+                "%s is %ds, but matching the quote stretches it to %s-%s (%ds).\n"
+                "“%s”\nUsually the transcript is missing words in this region, so "
+                "the matcher reaches further to find them.  Check this clip by ear."
+                % (where, round(dec_dur), res.get("rec_in_tc"), res.get("rec_out_tc"),
+                   round(rec_dur), quote),
+                None))
+            continue
+
+        if abs(rec_in - dec_in) >= 10:
+            out.append(Finding(
+                WARN, "Transcript", "In-point is well before the first spoken word",
+                "%s\n“%s”\nThe quote does not start until %s (%+.0fs).  The clip "
+                "would open on %.0fs of unrelated audio."
+                % (where, quote, res.get("rec_in_tc"), rec_in - dec_in, rec_in - dec_in),
+                None))
+
+    if checked:
+        out.append(Finding(
+            INFO, "Transcript",
+            "%d pull%s cross-checked against transcripts"
+            % (checked, "" if checked == 1 else "s"),
+            "Resolved from the session JSONs with no media and no transcription run."))
 
 
 def _check_session_media(found, out):
