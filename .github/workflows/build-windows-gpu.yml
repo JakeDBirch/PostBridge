@@ -70,6 +70,49 @@ jobs:
           else { Write-Host "::error::self-test wrote no report" }
           exit $p.ExitCode
 
+      - name: Build the installer (Inno Setup)
+        # Wraps dist\PostBridge into PostBridge-GPU-Setup.exe (see installer\PostBridge.iss).
+        # Inno Setup is on some runner images and not others — install it
+        # when it's missing.
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & $iscc "/DAppVersion=1.0.0.${{ github.run_number }}" `
+                  "/DOutputName=PostBridge-GPU-Setup" "/DSpan=1" installer\PostBridge.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer-out | Format-Table Name, Length
+
+      - name: Self-test the installed app
+        # Silent per-user install into a temp folder, then the same
+        # --self-test as above against the installed copy — proves the
+        # installer carries a complete, launchable app.
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "pb-install"
+          $setup = Start-Process -FilePath "installer-out\PostBridge-GPU-Setup.exe" `
+                     -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`"" `
+                     -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { Write-Host "::error::installer exited $($setup.ExitCode)"; exit $setup.ExitCode }
+          $report = Join-Path $env:RUNNER_TEMP "selftest-installed.txt"
+          $p = Start-Process -FilePath "$dir\PostBridge.exe" `
+                 -ArgumentList "--self-test", "`"$report`"" -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report }
+          else { Write-Host "::error::self-test wrote no report" }
+          exit $p.ExitCode
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostBridge-windows-gpu-installer
+          path: installer-out/
+          # Already compressed by the installer; don't spend time re-zipping.
+          compression-level: 0
+          retention-days: 5
+
       - name: Zip output folder
         shell: pwsh
         run: Compress-Archive -Path dist\PostBridge -DestinationPath PostBridge-windows-gpu.zip

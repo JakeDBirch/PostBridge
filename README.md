@@ -27,6 +27,8 @@ No Python installation required — everything is bundled. Each workflow ships i
 | AMD / Intel GPU, integrated graphics, or no GPU | `PostBridge-windows` — works fine on CPU |
 | Not sure | Start with `PostBridge-windows`; switch to the GPU build later if reconcile feels slow |
 
+**Installing on Windows:** each Windows run also produces an installer artifact (`PostBridge-windows-installer` / `PostBridge-windows-gpu-installer`). Unzip the download, run `PostBridge-Setup.exe` (GPU: `PostBridge-GPU-Setup.exe`, keeping the `.bin` files next to it), and PostBridge installs like any other app, with a Start menu entry, an optional desktop icon and an uninstaller. No admin rights are needed. The plain zip artifact is still there; if you use it, run `PostBridge.exe` from where you unzipped it, because copying the extracted folder elsewhere can silently drop files.
+
 The GPU build is a drop-in replacement — same data files, same session JSONs, same UI. The only difference is what hardware it uses for inference. PostBridge auto-detects CUDA at startup; if torch fails to load, it silently falls back to CPU.
 
 > **macOS first launch:** Right-click the app → **Open** → click **Open** in the dialog. This bypasses Gatekeeper for unsigned apps and only needs to be done once.
