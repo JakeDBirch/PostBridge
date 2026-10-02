@@ -204,7 +204,7 @@ VIDEO_EXTS = {
     ".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v",
     ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".wmv",
     ".flv", ".webm", ".ogv", ".3gp", ".dv", ".r3d",
-    ".braw", ".ari",
+    ".braw", ".ari", ".vob",
 }
 
 AUDIO_EXTS = {
@@ -224,6 +224,18 @@ def is_audio(p):
 
 def is_media(p):
     return os.path.splitext(p)[1].lower() in MEDIA_EXTS
+
+# DVD-Video.  A title's programme is VTS_nn_1.VOB … VTS_nn_9.VOB: byte
+# splits (1 GB each) of ONE MPEG program stream.  VIDEO_TS.VOB and
+# VTS_nn_0.VOB are the disc's menus — never footage, so folder scans skip
+# them (picking one by hand still works).
+_DVD_MENU_VOB_RE = re.compile(r"^(video_ts|vts_\d\d_0)\.vob$", re.I)
+
+def is_vob(p):
+    return os.path.splitext(p)[1].lower() == ".vob"
+
+def is_dvd_menu_vob(p):
+    return bool(_DVD_MENU_VOB_RE.match(os.path.basename(p)))
 
 def clean_words(text):
     """Lowercase, strip punctuation, return list of words.
