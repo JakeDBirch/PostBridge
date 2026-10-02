@@ -10,7 +10,7 @@ writes: it re-stamps an existing transcript onto a media file so a
 sidecar that reconcile was rejecting (or that never sat beside the
 media at all) starts being reused.
 """
-import os, json
+import os, json, re
 
 import engines
 from utils import is_video
@@ -280,4 +280,172 @@ def find_candidates_in_folder(folder, media_paths):
                         if s.startswith(mstem) or mstem.startswith(s)), None)
         if hit:
             out[mp] = hit
+
+    # Filenames are not reliable: the same recording routinely arrives as a
+    # re-encode under a different name (Riverside's "Alex.mp3" exported as
+    # "riverside_alex_raw-audio_….wav"), and no stem rule bridges that.  For
+    # whatever is still unmatched, pair on CONTENT instead — a transcript
+    # belongs to the audio whose duration its last word lands against.
+    unmatched = [mp for mp in media_paths if mp not in out]
+    if unmatched:
+        out.update(_pair_by_duration(pool, unmatched, taken=set(out.values())))
     return out
+
+
+def transcript_end(path):
+    """Last word end-time in a transcript file, or None if unreadable."""
+    words, _blobs, err = load_transcript_words(path)
+    if err or not words:
+        return None
+    try:
+        return max(float(w.get("end") or 0.0) for w in words)
+    except (TypeError, ValueError):
+        return None
+
+
+# A transcript's last word lands at or just before the end of its audio.
+_DUR_TOL   = 2.0    # how close "lands against the end" has to be
+_DUR_CLEAR = 10.0   # how much worse the runner-up must be to call it unambiguous
+
+
+def _pair_by_duration(pool, media_paths, taken=()):
+    """Pair transcripts to media by where the transcript ends vs how long the
+    audio runs.  Deliberately refuses to guess: a transcript is only claimed
+    when it fits one file closely AND fits every other candidate far worse, so
+    two similar-length interviews are left for the user to pair by hand rather
+    than silently crossed over."""
+    ends = {}
+    for _stem, p in pool:
+        if p in taken:
+            continue
+        e = transcript_end(p)
+        if e is not None:
+            ends[p] = e
+    if not ends:
+        return {}
+
+    out, used = {}, set(taken)
+    for mp in media_paths:
+        try:
+            dur = float(engines.get_media_duration(mp) or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0:
+            continue
+        scored = []
+        for p, e in ends.items():
+            if p in used:
+                continue
+            # Same sanity envelope adopt_warning uses, so anything this pairs
+            # would not then be challenged on adoption.
+            if e > dur + 30.0:
+                continue
+            if dur > 120.0 and e < dur * 0.5:
+                continue
+            scored.append((abs(dur - e), p))
+        if not scored:
+            continue
+        scored.sort()
+        close = [(d, p) for d, p in scored if d <= _DUR_TOL]
+
+        if not close:
+            continue
+        if len(close) == 1:
+            # Unambiguous on duration alone.
+            runner_up = scored[1][0] if len(scored) > 1 else None
+            if runner_up is None or runner_up >= close[0][0] + _DUR_CLEAR:
+                out[mp] = close[0][1]
+                used.add(close[0][1])
+            continue
+
+        # Several transcripts fit the duration — the normal case for a
+        # Riverside session, where the guest track and the "Jordan (Guest)"
+        # track are the same length.  Break the tie on the names: a stem whose
+        # words all appear in the media's name is a better claim than one that
+        # only half matches.
+        best = _best_by_name(mp, [p for _d, p in close])
+        if best is not None:
+            out[mp] = best
+            used.add(best)
+    return out
+
+
+def _name_tokens(path):
+    stem = os.path.basename(path)
+    for sfx in TRANSCRIPT_SUFFIXES:
+        if stem.lower().endswith(sfx):
+            stem = stem[:-len(sfx)]
+            break
+    else:
+        stem = os.path.splitext(stem)[0]
+    return set(t for t in re.split(r"[^a-z0-9]+", stem.lower()) if t)
+
+
+def _best_by_name(media_path, candidates):
+    """Pick the candidate whose name is most specifically about this media.
+
+    Scored as the share of the candidate's own words that appear in the media
+    filename, so "Eddleman" (1/1) beats "Jordan (Eddleman)" (1/2) for the
+    guest track, while the interviewer's file still prefers the latter.
+    Returns None when nothing wins outright.
+    """
+    mtok = _name_tokens(media_path)
+    if not mtok:
+        return None
+    ranked = []
+    for p in candidates:
+        ctok = _name_tokens(p)
+        if not ctok:
+            continue
+        hits = len(ctok & mtok)
+        if not hits:
+            continue
+        ranked.append((hits / float(len(ctok)), hits, p))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    top = [r for r in ranked if r[:2] == ranked[0][:2]]
+    if len(top) == 1:
+        return top[0][2]
+
+    # Equal names usually means the SAME transcript in two forms — a session
+    # and its exported sidecar, or a "… (1)" re-transcribe.  When the contents
+    # match there is nothing to choose between them, so pick deterministically
+    # (session first: it carries the token) rather than bailing out.
+    sigs = {p: _transcript_sig(p) for _r, _h, p in top}
+    first = sigs[top[0][2]]
+    if first is not None and all(s == first for s in sigs.values()):
+        return sorted((p for _r, _h, p in top),
+                      key=lambda p: (not p.lower().endswith(".pb_session.json"),
+                                     len(os.path.basename(p)),
+                                     os.path.basename(p).lower()))[0]
+    return None                          # genuinely different — user chooses
+
+
+def _transcript_sig(path):
+    """(last word end, word count) — enough to tell two files apart."""
+    words, _blobs, err = load_transcript_words(path)
+    if err or not words:
+        return None
+    try:
+        return (round(max(float(w.get("end") or 0.0) for w in words), 2), len(words))
+    except (TypeError, ValueError):
+        return None
+
+
+def remove_transcript(media_path):
+    """Delete the sidecar beside `media_path`, undoing an adoption.
+
+    Adoption is a manual override and manual overrides go wrong, so there has
+    to be a way back.  Only the sidecar is removed — the media and whatever
+    file the transcript was adopted from are untouched.
+    Returns (ok, message).
+    """
+    p = engines.pb_transcript_path(media_path)
+    if not p or not os.path.isfile(p):
+        return False, "no transcript is assigned to this file"
+    try:
+        os.remove(p)
+    except OSError as e:
+        return False, "could not remove sidecar ({})".format(e)
+    return True, "removed {}".format(os.path.basename(p))

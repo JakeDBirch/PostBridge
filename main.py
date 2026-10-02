@@ -8574,7 +8574,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 ok, detail = tc.sidecar_status(ap, quick=quick)
                 if ok:
                     covered.append(ap)
-                media.append({"path": ap, "ok": ok, "detail": detail})
+                try:
+                    _side = engines.pb_transcript_path(ap)
+                    _side = _side if _side and os.path.isfile(_side) else None
+                except Exception:
+                    _side = None
+                media.append({"path": ap, "ok": ok, "detail": detail,
+                              "sidecar": _side})
             # Does the mix have a transcript to inherit?  Same check
             # reconcile makes, so the forecast can't disagree with it.
             pooled_ok = False
@@ -8628,7 +8634,14 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         win.title("Transcript coverage")
         win.configure(bg=BG, cursor="arrow")
         win.minsize(720, 460)
-        win.geometry("880x620")
+        # Size against the screen rather than a fixed pixel count: on a
+        # high-DPI display a hard-coded 880x620 comes up physically tiny and
+        # the footer controls end up crammed together.
+        _sw, _sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        _w = max(880, min(1180, int(_sw * 0.62)))
+        _h = max(620, min(900, int(_sh * 0.78)))
+        win.geometry("{}x{}+{}+{}".format(
+            _w, _h, max(0, (_sw - _w) // 2), max(0, (_sh - _h) // 2)))
 
         head = tk.Frame(win, bg=BG)
         head.pack(fill="x", padx=14, pady=(14, 4))
@@ -8690,6 +8703,13 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 self._btn(r, "Locate transcript…",
                           lambda p=m["path"]: _locate_one(p),
                           small=True).pack(side="right", padx=6, pady=3)
+            # A wrongly adopted transcript has to be undoable, so the button
+            # is offered whenever a sidecar exists — including when it reads
+            # as OK, which is exactly when a mis-pairing hides.
+            if m.get("sidecar"):
+                self._btn(r, "Un-assign",
+                          lambda p=m["path"]: _unassign_one(p),
+                          small=True).pack(side="right", padx=(0, 4), pady=3)
 
         def _render():
             _clear_inner()
@@ -8813,6 +8833,23 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             if not ok and not silent:
                 messagebox.showerror("Adoption failed", msg, parent=win)
             return ok
+
+        def _unassign_one(media_path):
+            import transcript_check as tc
+            if not messagebox.askyesno(
+                    "Un-assign transcript?",
+                    "Remove the transcript assigned to:\n\n{}\n\n"
+                    "Only the sidecar is deleted — the media file and the "
+                    "transcript it was adopted from are left alone.  Reconcile "
+                    "will transcribe this file again unless you assign another "
+                    "one.".format(os.path.basename(media_path)),
+                    parent=win):
+                return
+            ok, msg = tc.remove_transcript(media_path)
+            if not ok:
+                messagebox.showerror("Could not un-assign", msg, parent=win)
+                return
+            _run()
 
         def _locate_one(media_path):
             src = filedialog.askopenfilename(

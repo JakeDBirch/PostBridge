@@ -367,6 +367,12 @@ def _check_sessions(script_path, tokens, pulls, out):
         return
 
     for w in (found.pop("__warnings__", None) or []):
+        # "Episode session not found" just means a session file referenced from
+        # another machine is not here, which the per-token note below already
+        # covers.  A duplicate token is the one that genuinely needs deciding:
+        # two transcripts claim the same speaker and only one will be used.
+        if "not found" in str(w):
+            continue
         out.append(Finding(WARN, "Assets", "Session discovery warning", str(w)))
 
     if not found:
@@ -376,19 +382,21 @@ def _check_sessions(script_path, tokens, pulls, out):
             "interviews have not been transcribed yet."))
         return
 
-    used = {p["token"] for p in pulls}
+    # A pull with no quote text (a music sting, a gunshot insert) has nothing
+    # to match against a transcript, so it needs no session.
+    used = {p["token"] for p in pulls if (p.get("quote_text") or "").strip()}
     for tok in sorted(used):
         if tok not in found:
             out.append(Finding(
                 INFO, "Assets", "No session found for token %s" % tok,
-                "Pulls reference it, but no %s.pb_session.json was discovered." % tok))
+                "Pulls reference it, but no %s.pb_session.json was discovered. "
+                "Those pulls will be transcribed at reconcile time." % tok))
     for tok in sorted(found):
         if tok not in used:
             out.append(Finding(
                 INFO, "Assets", "Session %s is not used by the script" % tok,
                 "A transcribed session exists but no pull references it."))
 
-    _check_session_media(found, out)
     _check_transcript_quality(found, pulls, out)
     _check_against_transcripts(found, pulls, out)
 
@@ -565,29 +573,6 @@ def _check_against_transcripts(found, pulls, out):
             "%d pull%s cross-checked against transcripts"
             % (checked, "" if checked == 1 else "s"),
             "Resolved from the session JSONs with no media and no transcription run."))
-
-
-def _check_session_media(found, out):
-    import json
-    dead = []
-    for tok, path in sorted(found.items()):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            continue
-        for m in (data.get("media") or []):
-            if not os.path.exists(m):
-                dead.append((tok, m))
-    if dead:
-        out.append(Finding(
-            ERROR, "Assets",
-            "%d session media file%s cannot be found on disk"
-            % (len(dead), "" if len(dead) == 1 else "s"),
-            "The session files point at paths that do not exist here — typically "
-            "because the project moved between machines.  Re-point them before "
-            "reconciling.\n"
-            + "\n".join("  %s → %s" % (t, p) for t, p in dead[:10])))
 
 
 # ── entry point ─────────────────────────────────────────────────────────────
