@@ -1,6 +1,6 @@
 """Search across every .pb_transcript.json sidecar under a folder for a phrase.
 
-Use when a script's @PULL points to the wrong token / audio file and you
+Use when a script's pull points to the wrong token / audio file and you
 need to find where the quoted text actually appears in your other
 transcripts.
 

@@ -828,11 +828,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             ("Pull Quotes",
              "pull_quotes",
              "Transcribe interview sessions, browse the transcripts, and "
-             "copy passages as ready-to-paste @PULL blocks for your script.",
+             "copy passages as ready-to-paste [TOKEN in-out] blocks for your script.",
              HAS_WHISPER),
             ("Format Script",
              "script_formatter",
-             "Build @PART, @VO, and @PULL blocks and copy them into your script.",
+             "Build [PART], [VO] and [TOKEN in-out] blocks and copy them "
+             "into your script.",
              True),
             ("Reconcile Script \u2192 Session",
              "script_session",
@@ -9455,7 +9456,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
     # ── Script Formatter workflow ─────────────────────────────────────────────
 
     def _script_formatter(self):
-        """Standalone script builder: token chips, @PART/@VO/@PULL block copiers,
+        """Standalone script builder: token chips, [PART]/[VO]/[TOKEN] block copiers,
         format reference cheat sheet, and AI prompt copier."""
         self._clear()
         self._sf_tokens = []
@@ -9498,7 +9499,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 fb.after(2000, lambda: fb.config(text=""))
             self._btn(row, label, _do, small=True).pack(side="left")
 
-        # Shared @PULL state
+        # Shared pull state
         _pull_text    = [""]
         _pull_tok_var = tk.StringVar()
 

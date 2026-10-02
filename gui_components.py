@@ -458,7 +458,7 @@ class _FlatDropdown(tk.Frame):
     config = configure
 
 
-# ── VO Bin (one per @PART) ────────────────────────────────────────────────────
+# ── VO Bin (one per [PART]) ────────────────────────────────────────────────────
 class VoBin(tk.Frame):
     """
     Holds any number of video+audio files for a part's VO narration.
