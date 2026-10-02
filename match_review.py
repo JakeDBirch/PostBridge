@@ -176,7 +176,7 @@ class MatchReviewDialog:
         self._context_before  = context_before or ""
         self._context_after   = context_after  or ""
         self._scripted_tc     = scripted_tc or ""
-        # Retained for the "copy corrected @PULL header" action in the
+        # Retained for the "copy corrected pull header" action in the
         # cross-token search: the current pull's token label and the
         # scripted quote text.
         self._current_token   = title or ""
@@ -642,7 +642,7 @@ class MatchReviewDialog:
         # sidecars.  When the phrase is nowhere in THIS file (or the
         # user suspects the assigned token was wrong to begin with),
         # the cross-token panel below surfaces hits with their file /
-        # token / timecode + a one-click "copy corrected @PULL header"
+        # token / timecode + a one-click "copy corrected pull header"
         # so the user can paste the fix into the script and re-reconcile.
         self._search_all_var = tk.BooleanVar(value=False)
         _all_cb = tk.Checkbutton(srow, text="🌐 all pulls",

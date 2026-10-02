@@ -467,7 +467,7 @@ class PqWorkflowMixin:
                      anchor="w", padx=20).pack(side="top", anchor="w")
             tk.Label(list_outer,
                      text="  Drop interview media into a session, transcribe it,\n"
-                          "  and copy quotes as ready-to-paste @PULL blocks.\n",
+                          "  and copy quotes as ready-to-paste pull blocks.\n",
                      font=FB, bg=SURF, fg=SUB,
                      anchor="w", padx=20, justify="left",
                      pady=(4)).pack(side="top", anchor="w")
@@ -1364,7 +1364,7 @@ class PqWorkflowMixin:
 
         self._pq_render_transcript_text(session)
 
-        # Bind copy → @PULL
+        # Bind copy → pull
         for keyspec in ("<Control-c>", "<Control-C>",
                         "<Command-c>", "<Command-C>"):
             tx_text.bind(keyspec, self._pq_copy_as_pull)
@@ -1475,7 +1475,7 @@ class PqWorkflowMixin:
                             activeforeground=TEXT,
                             bd=0)
             menu.add_command(
-                label="Copy as @PULL",
+                label="Copy as Pull",
                 command=self._pq_copy_as_pull,
                 state="normal" if has_sel else "disabled")
             menu.add_command(
@@ -1584,7 +1584,7 @@ class PqWorkflowMixin:
         # Primary actions live on the same bottom row as BACK TO PROJECT.
         # Right-anchored so they hug the right edge regardless of how much
         # the hint text on the left consumes.
-        self._btn(nav, "COPY SELECTION AS @PULL",
+        self._btn(nav, "COPY SELECTION AS PULL",
                   self._pq_copy_as_pull,
                   color=ACCENT).pack(side="right")
         self._pq_play_btn = self._btn(
@@ -1887,7 +1887,7 @@ class PqWorkflowMixin:
             #    the speaker changes, emit a visible "<SPEAKER>:\n"
             #    label tagged with the "speaker_lbl" style.  Speaker
             #    labels are excluded from word_index so they don't
-            #    appear in @PULL clipboard output.
+            #    appear in pull clipboard output.
             # 2. Within each speaker run, concatenate words into a
             #    continuous string and run the syntactic paragraph
             #    detector — same logic that handled the single-speaker
@@ -2581,7 +2581,7 @@ class PqWorkflowMixin:
         """Margin-mode action: prompt for a note tied to the current
         selection (or to the cursor word if no selection).  Notes are
         persisted on session["notes"] and rendered as small inline
-        markers — they never appear in @PULL clipboard output."""
+        markers — they never appear in pull clipboard output."""
         tx      = getattr(self, "_pq_tx_text", None)
         session = getattr(self, "_pq_current_session", None)
         if tx is None or session is None:
@@ -5176,7 +5176,7 @@ class PqWorkflowMixin:
                 pass
 
     def _pq_copy_as_pull(self, event=None):
-        """Convert the current transcript selection into a @PULL block."""
+        """Convert the current transcript selection into a pull block."""
         tx      = getattr(self, "_pq_tx_text", None)
         session = getattr(self, "_pq_current_session", None)
         if tx is None or session is None:
@@ -5260,7 +5260,7 @@ class PqWorkflowMixin:
             prev_text = lbl.cget("text")
             prev_fg   = lbl.cget("fg")
             lbl.config(
-                text="✓ @PULL copied  [{}–{}]".format(in_tc, out_tc),
+                text="✓ Pull copied  [{}–{}]".format(in_tc, out_tc),
                 fg=SUCCESS)
             self.after(2000,
                        lambda: lbl.config(text=prev_text, fg=prev_fg))

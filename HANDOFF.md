@@ -34,7 +34,7 @@ designed to remove friction from Jordan's quote-pulling step.
   TRANSCRIBE button.  Auto-suggests token from filenames via
   `_pq_suggest_token()`.
 - `_pq_open_session_view()` — Session view: token (read-only), media list,
-  re-transcribe button, transcript Text widget, "COPY SELECTION AS @PULL"
+  re-transcribe button, transcript Text widget, "COPY SELECTION AS PULL"
   action button.  Bottom nav: `← BACK TO PROJECT`, `REMOVE FROM PROJECT`.
 - `_pq_run_transcription()` — uses existing `engines.mix_for_transcript()`
   (multi-file) or `engines.extract_window()` (single file) → 16 kHz mono

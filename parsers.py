@@ -229,8 +229,11 @@ def parse_script(text):
         while j < n:
             raw      = lines[j]
             stripped = _strip_comment(raw).strip()
-            # Header at column 0 ends the block
-            if raw and not raw[:1].isspace() and _HEADER_RE.match(stripped):
+            # A header ends the block.  Leading whitespace is tolerated: the
+            # header grammar is specific enough that a body line cannot match
+            # it by accident, and silently swallowing an indented header loses
+            # the whole pull.
+            if _HEADER_RE.match(stripped):
                 break
             if not stripped:
                 if cur_lines:
@@ -250,8 +253,9 @@ def parse_script(text):
         raw = lines[i]
         ln  = _strip_comment(raw).strip()
 
-        # Headers must be at column 0
-        if not ln or (raw and raw[:1].isspace()):
+        # Indentation is not significant: a line whose text matches the header
+        # grammar is a header wherever it starts.
+        if not ln:
             i += 1
             continue
 

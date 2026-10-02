@@ -2771,7 +2771,7 @@ def reconcile_pull_from_session(pull, session_data):
 
 def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.0):
     """
-    Reconcile a single @PULL against its source transcript.
+    Reconcile a single pull against its source transcript.
 
     Always transcribes the padded window so the audio conforms to the script
     regardless of whether the script contains quote text:
@@ -5249,7 +5249,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
         # ── Guard: cap clips whose source range is unreasonably long ──────────
         # A segment spanning > 30 minutes almost always means a typo in the
-        # script @PULL timecodes.  Instead of skipping the clip entirely,
+        # script pull timecodes.  Instead of skipping the clip entirely,
         # cap each over-long segment to _CAP_SECS from its declared start so
         # the clip still appears at the right spot in the timeline.
         _MAX_SEG_SECS = 1800   # 30 minutes

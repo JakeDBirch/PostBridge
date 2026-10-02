@@ -1,4 +1,5 @@
 import os
+import script_check
 from utils import app_state_dir as _app_state_dir
 import sys
 import re
@@ -827,11 +828,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             ("Pull Quotes",
              "pull_quotes",
              "Transcribe interview sessions, browse the transcripts, and "
-             "copy passages as ready-to-paste @PULL blocks for your script.",
+             "copy passages as ready-to-paste [TOKEN in-out] blocks for your script.",
              HAS_WHISPER),
             ("Format Script",
              "script_formatter",
-             "Build @PART, @VO, and @PULL blocks and copy them into your script.",
+             "Build [PART], [VO] and [TOKEN in-out] blocks and copy them "
+             "into your script.",
              True),
             ("Reconcile Script \u2192 Session",
              "script_session",
@@ -923,12 +925,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             "  • VO ids: PART_N_NARRATOR (e.g. PART_0_NARRATOR, "
             "PART_1_NARRATOR).\n\n"
             "BODY RULES:\n\n"
-            "  • Header lines (anything in `[…]`) MUST be at column 0.\n"
+            "  • Header lines (anything in `[…]`) sit on a line of their own.\n"
             "  • The text under each header is the block's content.\n"
             "  • BLANK LINES inside a block ARE preserved as paragraph "
             "breaks — feel free to use them.\n"
             "  • The next block starts only when another `[…]` header "
-            "appears at column 0.  Indented or non-header text is body.\n"
+            "appears.  Any other text is body.\n"
             "  • Timecodes must be HH:MM:SS (zero-padded).  Use a "
             "single hyphen between in/out (no space).\n"
             "  • Comments: `// comment` from a whitespace-prefixed "
@@ -1304,7 +1306,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         self._step1_next_added   = False
         wf_label = ("Session" if self.workflow == "script_session"
                     else ("AAF" if self.workflow == "script_aaf" else "XML"))
-        self._section("STEP 1 — LOAD SCRIPT  (Script → {})".format(wf_label))
+        self._section("LOAD SCRIPT  (Script → {})".format(wf_label))
 
         # ── Nav pinned to bottom first so it's always visible ─────────────────
         nav = tk.Frame(self.body, bg=BG)
@@ -1354,7 +1356,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         except Exception:
             pass
 
-    def _load_script(self, path):
+    def _load_script(self, path, navigate=True):
         def _clear_pending_restore():
             # _open_session arms these for THIS load.  Every early-return
             # path below MUST clear them, or they survive into the next
@@ -1388,7 +1390,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             _clear_pending_restore()
             messagebox.showerror("Nothing Found",
                 "No interview pulls found.\n\n"
-                "PostBridge expects bracketed headers at column 0:\n"
+                "PostBridge expects bracketed headers, each on its own line:\n"
                 "    [PART <name>]\n"
                 "    [VO <vo_id>]\n"
                 "    [<TOKEN> HH:MM:SS-HH:MM:SS]\n\n"
@@ -1401,7 +1403,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         self.parts     = parts
         self.pulls     = pulls
         self.vo_blocks = vo_blocks
-        self.doc_title = doc_title
+        self.doc_title  = doc_title
+        self._script_text = text
 
         # Set cache dir next to the script file inside the engines module
         engines._cache_dir = os.path.join(os.path.dirname(os.path.abspath(path)), ".pb_cache")
@@ -1421,34 +1424,115 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                     "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
                 fg=SUCCESS if not no_quote else WARN)
 
-        # A script in the obsolete @PULL/@VO/@PART syntax still yields valid
-        # pulls (pull headers were always bracketed), but every narration
-        # block and section marker is dropped without error.  Surface that
-        # instead of loading a silently gutted script.
-        _shape = []
-        if not vo_blocks:
-            _shape.append("\u2022  0 VO blocks \u2014 no narration was parsed.")
-        if not parts:
-            _shape.append("\u2022  0 parts \u2014 no [PART \u2026] headers were found.")
-        if _shape:
-            messagebox.showwarning(
-                "Check Script Format",
-                "This script parsed {} pulls but:\n\n{}\n\n"
-                "Most often the script still uses the old @VO / @PART "
-                "markers, or narration is missing its [VO <id>] headers "
-                "\u2014 that text is dropped silently.\n\n"
-                "Script Formatter \u2192 Copy AI Prompt will convert it.".format(
-                    len(pulls), "\n".join(_shape)))
-
         if warnings:
             messagebox.showwarning("Warnings", "\n".join(warnings[:10]))
+        if not navigate:
+            return
+
         # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
         if hasattr(self, "_step1_nav") and not getattr(self, "_step1_next_added", False):
-            self._btn(self._step1_nav, "NEXT  →  ASSIGN MEDIA",
-                      self._step2, color=ACCENT).pack(side="right")
+            self._btn(self._step1_nav, "NEXT  →  SCRIPT CHECK",
+                      self._step_check, color=ACCENT).pack(side="right")
             self._step1_next_added = True
         else:
             self._ui(self._step2)
+
+    def _step_check(self):
+        """STEP 1 — Script Check.
+
+        Deterministic pre-flight on the script alone: structure, tokens and
+        assets.  Runs before any media is loaded, because every defect it
+        reports is one the later pipeline either cannot see or only surfaces
+        after a full transcribe-and-reconcile.
+        """
+        self._clear()
+        self._section("STEP 1 — SCRIPT CHECK")
+
+        findings = script_check.run_checks(
+            getattr(self, "_script_text", "") or "",
+            script_path=getattr(self, "_script_path", None))
+        n_err, n_warn, n_info = script_check.summarize(findings)
+
+        # ── Nav pinned to the bottom so it survives a long report ────────────
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8, 0))
+        self._btn(nav, "← BACK", self._step1).pack(side="left")
+
+        def _recheck():
+            path = getattr(self, "_script_path", None)
+            if path and os.path.isfile(path):
+                # Re-read from disk so an external edit is picked up, but do
+                # not let the loader navigate out from under us.
+                self._load_script(path, navigate=False)
+            self._ui(self._step_check)
+
+        self._btn(nav, "RE-CHECK", _recheck, small=True).pack(side="left", padx=(8, 0))
+        self._btn(nav, "NEXT  →  ASSIGN MEDIA",
+                  self._step2, color=ACCENT).pack(side="right")
+
+        # ── Headline ────────────────────────────────────────────────────────
+        if n_err:
+            head, head_fg = "%d blocking issue%s found" % (n_err, "" if n_err == 1 else "s"), ERR
+        elif n_warn:
+            head, head_fg = "%d thing%s worth checking" % (n_warn, "" if n_warn == 1 else "s"), WARN
+        else:
+            head, head_fg = "No structural or asset problems found", SUCCESS
+
+        bar = tk.Frame(self.body, bg=SURF, highlightbackground=BORDER,
+                       highlightthickness=1)
+        bar.pack(fill="x", pady=(0, 10))
+        tk.Label(bar, text=head, font=FBT, bg=SURF, fg=head_fg).pack(
+            anchor="w", padx=12, pady=(10, 2))
+        tk.Label(bar,
+                 text="{}  ·  {} pulls  ·  {} VO  ·  {} parts"
+                      "        {} error / {} warning / {} note".format(
+                          self.doc_title, len(self.pulls), len(self.vo_blocks),
+                          len(self.parts), n_err, n_warn, n_info),
+                 font=FB, bg=SURF, fg=SUB).pack(anchor="w", padx=12, pady=(0, 10))
+
+        if n_err:
+            tk.Label(self.body,
+                     text="Blocking issues mean content is dropped or mis-timed. "
+                          "You can continue, but the timeline will be wrong — "
+                          "fix the script, then press RE-CHECK.",
+                     font=FB, bg=BG, fg=SUB, wraplength=860,
+                     justify="left").pack(anchor="w", pady=(0, 8))
+
+        # ── Findings ────────────────────────────────────────────────────────
+        sf = self._scroll_frame(self.body)
+        if not findings:
+            tk.Label(sf, text="Nothing to report.", font=FB, bg=BG, fg=SUB).pack(
+                anchor="w", pady=8)
+            return
+
+        chip = {script_check.ERROR: ("ERROR", ERR),
+                script_check.WARN:  ("WARN",  WARN),
+                script_check.INFO:  ("NOTE",  SUB)}
+        for f in findings:
+            label, colour = chip[f.severity]
+            card = tk.Frame(sf, bg=SURF, highlightbackground=BORDER,
+                            highlightthickness=1)
+            card.pack(fill="x", pady=(0, 6))
+
+            head_row = tk.Frame(card, bg=SURF)
+            head_row.pack(fill="x", padx=10, pady=(8, 0))
+            tk.Label(head_row, text=label, font=FBT, bg=SURF, fg=colour,
+                     width=6, anchor="w").pack(side="left")
+            tk.Label(head_row, text=f.category, font=FB, bg=SURF, fg=SUB,
+                     width=10, anchor="w").pack(side="left")
+            tk.Label(head_row, text=f.title, font=FBT, bg=SURF, fg=TEXT,
+                     anchor="w", justify="left", wraplength=640).pack(
+                         side="left", fill="x", expand=True)
+            if f.line:
+                tk.Label(head_row, text="line %d" % f.line, font=FB,
+                         bg=SURF, fg=SUB).pack(side="right")
+
+            if f.detail:
+                tk.Label(card, text=f.detail, font=FB, bg=SURF, fg=SUB,
+                         anchor="w", justify="left", wraplength=820).pack(
+                             anchor="w", padx=10, pady=(2, 8))
+            else:
+                tk.Frame(card, bg=SURF, height=6).pack()
 
     def _step2(self):
         self._clear()
@@ -9372,7 +9456,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
     # ── Script Formatter workflow ─────────────────────────────────────────────
 
     def _script_formatter(self):
-        """Standalone script builder: token chips, @PART/@VO/@PULL block copiers,
+        """Standalone script builder: token chips, [PART]/[VO]/[TOKEN] block copiers,
         format reference cheat sheet, and AI prompt copier."""
         self._clear()
         self._sf_tokens = []
@@ -9415,7 +9499,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 fb.after(2000, lambda: fb.config(text=""))
             self._btn(row, label, _do, small=True).pack(side="left")
 
-        # Shared @PULL state
+        # Shared pull state
         _pull_text    = [""]
         _pull_tok_var = tk.StringVar()
 

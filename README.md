@@ -94,7 +94,7 @@ The transcript renders as paragraphs with speaker headers and supports inline ed
 
 Select text in the transcript and right-click to:
 
-- **Copy as @PULL** — clipboard gets a script-ready block: `[TOKEN HH:MM:SS-HH:MM:SS]\n"<quote>"`
+- **Copy as Pull** — clipboard gets a script-ready block: `[TOKEN HH:MM:SS-HH:MM:SS]\n"<quote>"`
 - **Play selection** (Space) — auditions the audio; a warm orange highlight follows the playhead word-by-word and auto-scrolls to keep it in view
 - **Add margin note** (Ctrl+M) — annotate a passage without affecting the script output
 - **Edit selected text…** — fix Whisper transcription errors in place. Edited words are marked with a thin underline as a tracked-changes indicator
@@ -120,7 +120,7 @@ Generates a paste-ready instruction block for ChatGPT / Claude / any LLM. Paste 
 
 ### Episode Tokens
 
-A multi-line text input where you list every speaker/asset token used in the episode. As you type, the cards below register chips for each token so the @PULL builder knows what to offer. Clicking **Copy [TOKENS] block** copies the full `[TOKENS]…[/TOKENS]` header for pasting into the top of your script.
+A multi-line text input where you list every speaker/asset token used in the episode. As you type, the cards below register chips for each token so the pull builder knows what to offer. Clicking **Copy [TOKENS] block** copies the full `[TOKENS]…[/TOKENS]` header for pasting into the top of your script.
 
 ### Block builders
 
@@ -128,7 +128,7 @@ Three composers for the three header types:
 
 - **[PART name]** — type a part name, hit copy, paste at a section boundary in your script
 - **[VO id]** — pick from your registered tokens, optionally paste the body text, copy the block
-- **[<TOKEN> in-out]** — pick a token, enter in/out timecodes, paste the quote text, copy a complete @PULL block
+- **[<TOKEN> in-out]** — pick a token, enter in/out timecodes, paste the quote text, copy a complete pull block
 
 Every "copy" button confirms with a brief ✓ Copied! marker so you can move quickly between PostBridge and your script editor.
 
