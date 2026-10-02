@@ -96,15 +96,19 @@ def _check_shape(parts, pulls, vo_blocks, out, legacy=False):
 
 
 def _check_indented_headers(lines, out):
-    for i, raw in enumerate(lines, 1):
-        if not raw[:1].isspace():
-            continue
-        if _HEADER_RE.match(raw.strip()):
-            out.append(Finding(
-                ERROR, "Structure", "Header is indented and will be ignored",
-                "%s\nHeaders must start at column 0.  As written, this line is "
-                "treated as body text and its pull/VO block is lost." % raw.strip(),
-                i))
+    """Indented headers are parsed normally — this is a tidiness note, not a
+    defect.  Aggregated so a uniformly indented script reports once."""
+    hits = [(i, raw.strip()) for i, raw in enumerate(lines, 1)
+            if raw[:1].isspace() and _HEADER_RE.match(raw.strip())]
+    if not hits:
+        return
+    out.append(Finding(
+        INFO, "Structure",
+        "%d header%s indented" % (len(hits), " is" if len(hits) == 1 else "s are"),
+        "Parsed normally — indentation is not significant.  Listed only so the "
+        "formatting can be tidied if you want it:\n"
+        + "\n".join("  line %d:  %s" % (i, s) for i, s in hits[:6]),
+        hits[0][0]))
 
 
 def _check_unparsed_brackets(lines, out):

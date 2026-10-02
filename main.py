@@ -925,12 +925,12 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             "  • VO ids: PART_N_NARRATOR (e.g. PART_0_NARRATOR, "
             "PART_1_NARRATOR).\n\n"
             "BODY RULES:\n\n"
-            "  • Header lines (anything in `[…]`) MUST be at column 0.\n"
+            "  • Header lines (anything in `[…]`) sit on a line of their own.\n"
             "  • The text under each header is the block's content.\n"
             "  • BLANK LINES inside a block ARE preserved as paragraph "
             "breaks — feel free to use them.\n"
             "  • The next block starts only when another `[…]` header "
-            "appears at column 0.  Indented or non-header text is body.\n"
+            "appears.  Any other text is body.\n"
             "  • Timecodes must be HH:MM:SS (zero-padded).  Use a "
             "single hyphen between in/out (no space).\n"
             "  • Comments: `// comment` from a whitespace-prefixed "
@@ -1390,7 +1390,7 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             _clear_pending_restore()
             messagebox.showerror("Nothing Found",
                 "No interview pulls found.\n\n"
-                "PostBridge expects bracketed headers at column 0:\n"
+                "PostBridge expects bracketed headers, each on its own line:\n"
                 "    [PART <name>]\n"
                 "    [VO <vo_id>]\n"
                 "    [<TOKEN> HH:MM:SS-HH:MM:SS]\n\n"
