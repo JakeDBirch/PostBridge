@@ -1112,8 +1112,13 @@ class PqWorkflowMixin:
             tx_hdr, textvariable=self._pq_cursor_tc_var, font=FBT,
             bg=SURF3, fg=ACCENT, cursor="hand2", padx=12, pady=6)
         self._pq_cursor_tc_lbl.pack(side="right")
+        # padx must be ONE distance on the widget itself — a (left, right)
+        # pair is only valid in pack()/grid().  Older Tk let "0 0" slide;
+        # Tk 8.6.14+ (current Python builds) raises "bad screen
+        # distance", which aborted the whole session view and left every
+        # transcript blank.
         tk.Label(tx_hdr, text="AT", font=FB, bg=SURF3, fg=SUB,
-                 padx=(0, 0), pady=6).pack(side="right")
+                 padx=0, pady=6).pack(side="right")
 
         def _copy_cursor_tc(_e=None):
             v = self._pq_cursor_tc_var.get()
