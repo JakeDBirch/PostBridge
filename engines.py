@@ -5924,6 +5924,31 @@ def run_self_test(report_path=None):
                     except Exception as e:
                         check("waveform extraction", False, str(e))
 
+                    # Transcription's audio loader.  faster-whisper decodes
+                    # media itself through PyAV, not through our ffmpeg, so
+                    # none of the checks above touch it.  PyAV 19 dropped an
+                    # argument faster-whisper 1.2.1 passes, and every
+                    # TRANSCRIBE then failed with "open() got an unexpected
+                    # keyword argument 'metadata_errors'" while this
+                    # self-test passed.  Decode the clip the same way.
+                    try:
+                        from faster_whisper.audio import decode_audio
+                        import av as _av
+                        samples = decode_audio(av)
+                        check("transcription audio decode (faster-whisper + PyAV {})"
+                              .format(getattr(_av, "__version__", "?")),
+                              len(samples) > 16000,
+                              "{} samples".format(len(samples)))
+                    except ImportError as e:
+                        # Running from source without faster-whisper installed
+                        # is fine; a packaged build without it is not.
+                        check("transcription audio decode",
+                              not getattr(sys, "frozen", False),
+                              "faster-whisper not importable: {}".format(e))
+                    except Exception as e:
+                        check("transcription audio decode", False,
+                              "{}: {}".format(type(e).__name__, e))
+
                 # Auto-sync plumbing: a camera clip whose audio is the
                 # reference recording starting 3.5 s in.  This only checks
                 # that the detector gets a real measurement with the bundled
