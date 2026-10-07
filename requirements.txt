@@ -9,6 +9,13 @@ tkinterdnd2>=0.3.0
 
 # ── Whisper transcription backend
 faster-whisper>=1.0.0
+# PyAV is faster-whisper's audio decoder.  faster-whisper (1.2.1 and earlier)
+# calls av.open(..., metadata_errors=...), which PyAV 19 removed, so every
+# transcription failed with "open() got an unexpected keyword argument
+# 'metadata_errors'".  faster-whisper itself only asks for av>=11, so pin the
+# ceiling here.  Lift it once a faster-whisper release supports PyAV 19 —
+# the build self-test decodes audio through faster-whisper and fails if not.
+av>=11,<19
 
 # ── AAF parsing (required for Script→AAF and AAF→XML workflows)
 pyaaf2>=1.7.0
