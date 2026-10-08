@@ -1,5 +1,7 @@
 # PostBridge
 
+> **Portfolio note:** PostBridge was built as internal tooling at MeatEater and remains their property. It's shared here publicly as a portfolio piece — not licensed for reuse or redistribution.
+
 PostBridge is a desktop tool for post-production teams that reconciles interview transcripts against recordings and exports editor-ready timelines — either as Pro Tools AAF sessions or Premiere/FCP-compatible XML.
 
 Built for **Windows** and **macOS** (Apple Silicon + Intel via Rosetta 2).
