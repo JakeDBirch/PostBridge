@@ -258,6 +258,12 @@ Click **ALIGN** to open the waveform dialog for manual work: nudge the offset vi
 
 Sync results are cached to disk — re-running is fast.
 
+**Camera-clock drift.** The three probes also measure how the camera's clock runs against the recorder's — typically single to double digits of parts per million, which is a frame or more across a long interview. When the probes agree on a straight line, the drift is kept with the offset (the SYNC button shows `· drift +8 ppm`) and applied per clip at build time, so one measured offset holds from the first clip to the last.
+
+#### How picture is placed
+
+Picture can only sit on sequence frames; the stereo mix is continuous. Every clip is rounded **once**, against the session clock: the frame rounding its timeline position received is folded into its source in-point, so the picture is never more than half a frame from where the mix has the sound, and the leftover is centred on zero rather than biased. (Rounding the two separately, the obvious way, let the errors add — measured on a real export as 0 to 1.8 frames early, "one frame early" most often.) When a stereo mix is set, the build also measures where that bounce sits against the session clock from a handful of clips and places picture and clip audio against the mix; a bounce can carry a constant offset of a dozen milliseconds, enough to tip the rounding. The console lists, per source, the worst and mean leftover in frames.
+
 ### Saving the setup, and re-exported AAFs
 
 **Ctrl+S** saves everything on this screen — pool files, assignments, every sync offset and lock, hide selections, sequence settings, mix file — to a setup JSON (the first save asks where; it suggests `<aaf name>_setup.json` next to the AAF). **Open Session** on the home screen takes you straight back to Step 2 with all of it restored.

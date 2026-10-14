@@ -795,8 +795,19 @@ def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
 def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
                         sample_rate=8000, start_offset=0.0,
                         n_probes=3, return_candidates=False,
-                        has_slate=False):
+                        has_slate=False, drift_out=None):
     """Multi-window sync detection wrapper.
+
+    ``drift_out``: pass a dict to receive the camera-clock drift the probes
+    measured, when they could: ``{"ppm", "t_ref", "n_probes", "span_s"}``.
+    The offset then holds at reference-audio time ``t_ref`` and changes by
+    ``ppm`` parts per million per second away from it (positive: the camera
+    runs fast, so the offset grows through the file).  Camera and recorder
+    crystals differ by tens of ppm, which is a frame or more over a long
+    interview; the three probes already measure it, so it is reported
+    rather than averaged away.  Left untouched when fewer than three probes
+    agreed, when the line through them does not fit, or when the final
+    pick was overridden by the histogram cross-check.
 
     Real-world video/audio files have setup/teardown noise at the head
     and tail (mic checks, slating, room handling, gear bumps).  Probing
@@ -1054,7 +1065,35 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
         if len(merged) >= 5:
             break
 
-    return _emit(final_T, final_conf, merged)
+    # Camera-clock drift: a weighted line through the agreeing probes'
+    # (centre time, offset) points.  final_T is the confidence-weighted
+    # mean of their offsets, so it is the line's value at the weighted
+    # mean centre, t_ref.  Three points are needed so the fit can be
+    # checked against itself: each probe is good to a few ms, and a
+    # middle point more than 15 ms off the line means a probe locked
+    # onto something else rather than the clocks drifting.
+    _drift = None
+    if len(best_cluster) >= 3:
+        pts = [(s + probe_duration / 2.0, T, (conf or 1.0))
+               for (T, conf, s, _alts) in best_cluster]
+        W   = sum(w for _x, _y, w in pts)
+        xm  = sum(w * x for x, _y, w in pts) / W
+        ym  = sum(w * y for _x, y, w in pts) / W
+        sxx = sum(w * (x - xm) ** 2 for x, _y, w in pts)
+        if sxx > 0 and (max(x for x, _y, _w in pts) - min(x for x, _y, _w in pts)) >= 60.0:
+            k = sum(w * (x - xm) * (y - ym) for x, y, w in pts) / sxx
+            resid = max(abs(y - (ym + k * (x - xm))) for x, y, _w in pts)
+            if abs(k) <= 2000e-6 and resid <= 0.015:
+                _drift = {"ppm":      round(k * 1e6, 2),
+                          "t_ref":    round(xm, 3),
+                          "n_probes": len(pts),
+                          "span_s":   round(max(x for x, _y, _w in pts)
+                                            - min(x for x, _y, _w in pts), 1)}
+
+    res = _emit(final_T, final_conf, merged)
+    if drift_out is not None and _drift is not None and abs(res[0] - final_T) <= 0.1:
+        drift_out.update(_drift)
+    return res
 
 
 def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,

@@ -229,7 +229,10 @@ class AafWorkflowMixin:
                 "_aaf_source_sync_extra_vars",
                 "_aaf_source_syncaudio_extra_vars",
                 "_aaf_source_offset_extra_vars",
-                "_aaf_source_multi_mode_vars"):
+                "_aaf_source_multi_mode_vars",
+                # Camera-clock drift measured by the sync probes (plain
+                # dicts, not Tk vars) -- same prune rules.
+                "_aaf_source_drift", "_aaf_source_drift_auto"):
             _d = getattr(self, _dname, None)
             if isinstance(_d, dict):
                 for _stale in [k for k in _d if k not in _live]:
@@ -1487,6 +1490,7 @@ class AafWorkflowMixin:
                         lv = self._aaf_source_sync_label_vars.get(b)
                         if lv: lv.set("")
                         self._aaf_set_sync_state(b, "")
+                        self._aaf_set_drift(b, None)
                         # Drop the now-stale candidate list too — they
                         # were measured against the previous video.
                         # Without this, TRY NEXT remains visible and
@@ -1726,6 +1730,7 @@ class AafWorkflowMixin:
                         if sv2: sv2.set(False)
                         if lv: lv.set("")
                         self._aaf_set_sync_state(b, "")
+                        self._aaf_set_drift(b, None)
                         self._aaf_clear_sync_candidates(b)
                         btn_ = self._aaf_sync_btns.get(b)
                         if btn_:
@@ -2113,6 +2118,7 @@ class AafWorkflowMixin:
             lv = self._aaf_source_sync_label_vars.get(base)
             if lv: lv.set("")
             self._aaf_set_sync_state(base, "")
+            self._aaf_set_drift(base, None)
         self._rebuild_aaf_source_rows()
 
     def _aaf_ffmpeg_ready(self):
@@ -2706,6 +2712,10 @@ class AafWorkflowMixin:
         idx_new = (idx_cur + 1) % len(cands)
         self._aaf_source_sync_cand_idx[base] = idx_new
         offset, conf = cands[idx_new]
+        # The measured drift goes with the primary pick only.
+        self._aaf_set_drift(
+            base, getattr(self, "_aaf_source_drift_auto", {}).get(base)
+            if idx_new == 0 else None)
 
         # Push to offset column
         ov = self._aaf_source_offset_vars.get(base)
@@ -2859,28 +2869,29 @@ class AafWorkflowMixin:
             if _sem is not None:
                 _sem.acquire()
             try:
-                if _n_vps == 1:
+                def _one(_vp):
+                    # drift_out receives the camera-clock drift the three
+                    # probes measured (ppm around t_ref); empty when they
+                    # could not agree on a line.
+                    _dr = {}
                     off, conf, alts = detect_sync_offset(
-                        _all_vps[0], ap,
+                        _vp, ap,
                         probe_duration=300.0,
                         start_offset=start_offset,
                         return_candidates=True,
-                        has_slate=_has_slate_flag)
-                    return off, conf, _all_vps[0], alts
+                        has_slate=_has_slate_flag,
+                        drift_out=_dr)
+                    return off, conf, _vp, alts, (_dr or None)
+                if _n_vps == 1:
+                    return _one(_all_vps[0])
                 # Multi-file: probe all candidates in parallel, pick best confidence
                 from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
                 results = []
                 with _TPE(max_workers=_n_vps) as _ex:
-                    _fmap = {_ex.submit(detect_sync_offset, _vp, ap,
-                                        probe_duration=300.0,
-                                        start_offset=start_offset,
-                                        return_candidates=True,
-                                        has_slate=_has_slate_flag): _vp
-                             for _vp in _all_vps}
-                    for _f in _asc(_fmap):
+                    _futs = [_ex.submit(_one, _vp) for _vp in _all_vps]
+                    for _f in _asc(_futs):
                         try:
-                            _off, _conf, _alts = _f.result()
-                            results.append((_off, _conf, _fmap[_f], _alts))
+                            results.append(_f.result())
                         except Exception:
                             pass
                 if not results:
@@ -2894,7 +2905,7 @@ class AafWorkflowMixin:
         def _done(fut):
             _animating[0] = False
             try:
-                offset, confidence, best_vp, alt_candidates = fut.result()
+                offset, confidence, best_vp, alt_candidates, drift = fut.result()
             except Exception as exc:
                 def _err():
                     lv = self._aaf_source_sync_label_vars.get(base)
@@ -2967,6 +2978,12 @@ class AafWorkflowMixin:
                        for (t, c) in (alt_candidates or [])
                        if abs(float(t) - float(offset)) > 0.01])
                 self._aaf_source_sync_cand_idx[base] = 0
+                # Drift belongs to the primary pick; cycling to an
+                # alternate drops it, cycling back restores it.
+                if not hasattr(self, "_aaf_source_drift_auto"):
+                    self._aaf_source_drift_auto = {}
+                self._aaf_source_drift_auto[base] = drift
+                self._aaf_set_drift(base, drift)
 
                 pct = int(confidence * 100)
                 # Confidence tiers calibrated from real-world false-positive
@@ -2987,6 +3004,7 @@ class AafWorkflowMixin:
                     lbl = "\u26a0 {:.3f}s ({:d}%)  — verify required".format(offset, pct)
                 else:
                     lbl = "\u26a0 {:.3f}s ({:d}%)  — low conf, must verify".format(offset, pct)
+                lbl += self._aaf_drift_suffix(drift)
 
                 lv = self._aaf_source_sync_label_vars.get(base)
                 if lv: lv.set(lbl)
@@ -3219,7 +3237,8 @@ class AafWorkflowMixin:
                 sv.set(True)
             lv = self._aaf_source_sync_label_vars.get(base)
             if lv:
-                lv.set("\u2713 {:.3f}s (manual)".format(accepted_offset))
+                lv.set("\u2713 {:.3f}s (manual)".format(accepted_offset)
+                       + self._aaf_drift_suffix(self._aaf_get_drift(base)))
             btn = self._aaf_sync_btns.get(base)
             if btn:
                 self._aaf_refresh_sync_btn(base, btn)
@@ -3269,6 +3288,7 @@ class AafWorkflowMixin:
             "locked":  self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get(),
             "enabled": self._aaf_source_sync_vars.get(base, tk.BooleanVar()).get(),
             "label":   self._aaf_source_sync_label_vars.get(base, tk.StringVar()).get(),
+            "drift":   self._aaf_get_drift(base),
         }
 
     def _aaf_push_undo(self, base):
@@ -3303,6 +3323,7 @@ class AafWorkflowMixin:
                 "state":      self._aaf_sync_state_vars.get(b, tk.StringVar()).get(),
                 "needs_sync": self._aaf_needs_sync_vars.get(b, tk.BooleanVar()).get(),
                 "locked":     self._aaf_sync_locked_vars.get(b, tk.BooleanVar()).get(),
+                "drift":      self._aaf_get_drift(b),
                 # Per-extra-slot values (Slice A) so undo restores per-slot
                 # edits, not just slot 1.
                 "extra_enabled":    [bv.get() for bv in
@@ -3398,6 +3419,7 @@ class AafWorkflowMixin:
             self._aaf_sync_state_vars[b].set(sd.get("state", ""))
             self._aaf_needs_sync_vars[b].set(sd.get("needs_sync", False))
             self._aaf_sync_locked_vars[b].set(sd.get("locked", False))
+            self._aaf_set_drift(b, sd.get("drift"))
 
             # Restore slot count, extra file assignments, per-slot
             # sync/syncaudio/offset extras, and multi_mode.  Extras are
@@ -3447,6 +3469,7 @@ class AafWorkflowMixin:
         lkv = self._aaf_sync_locked_vars.get(base)
         if lkv: lkv.set(snap.get("locked", False))
         self._aaf_set_sync_state(base, snap.get("state", ""))
+        self._aaf_set_drift(base, snap.get("drift"))
         btn = self._aaf_sync_btns.get(base)
         if btn:
             self._aaf_refresh_sync_btn(base, btn)
@@ -3563,6 +3586,33 @@ class AafWorkflowMixin:
         current = self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get()
         self._aaf_push_undo(base)
         self._aaf_apply_lock(base, not current)
+
+    def _aaf_get_drift(self, base):
+        """Camera-clock drift for *base* as {"ppm", "t_ref", ...} or None."""
+        d = getattr(self, "_aaf_source_drift", {}).get(base)
+        return dict(d) if d else None
+
+    def _aaf_set_drift(self, base, drift):
+        """Store (or clear, with None) the drift the sync probes measured.
+        Lives beside the offset: saved in the setup, carried by undo,
+        cleared with the rest of the sync state when the video or the
+        reference audio changes."""
+        if not hasattr(self, "_aaf_source_drift"):
+            self._aaf_source_drift = {}
+        if drift:
+            self._aaf_source_drift[base] = dict(drift)
+        else:
+            self._aaf_source_drift.pop(base, None)
+
+    @staticmethod
+    def _aaf_drift_suffix(drift):
+        """Label tail for a measured drift; empty below 1 ppm."""
+        try:
+            ppm = float((drift or {}).get("ppm", 0.0) or 0.0)
+        except Exception:
+            return ""
+        return ("  \u00b7 drift {:+.0f} ppm".format(ppm)
+                if abs(ppm) >= 1.0 else "")
 
     def _aaf_clear_sync_candidates(self, base):
         """Drop the per-source sync candidate list + cycle index and
@@ -4540,6 +4590,9 @@ class AafWorkflowMixin:
                                       base, tk.BooleanVar()).get(),
                     "locked":     self._aaf_sync_locked_vars.get(
                                       base, tk.BooleanVar()).get(),
+                    # Camera-clock drift from the sync probes (ppm, t_ref)
+                    # or None.  Applied per clip at build time.
+                    "drift":      self._aaf_get_drift(base),
                     # Per-extra-slot values (index 0 = slot 2, ...).  Only
                     # written when N > 1 so single-slot sources don't
                     # bloat the save file.  Slot 1's values live in the
@@ -4727,6 +4780,7 @@ class AafWorkflowMixin:
                 self._aaf_needs_sync_vars[base].set(sd.get("needs_sync", False))
             if base in self._aaf_sync_locked_vars:
                 self._aaf_sync_locked_vars[base].set(sd.get("locked", False))
+            self._aaf_set_drift(base, sd.get("drift"))
 
             # Per-extra-slot restore.  Legacy saves have no "extra_*"
             # keys — they get empty lists (default) which _aaf_update_
@@ -5083,6 +5137,7 @@ class AafWorkflowMixin:
                     "audio_path":        (source_syncaudio.get(base)
                                           if _angle_i == 0 else None),
                     "video_offset_secs": source_offset.get(base, 0.0),
+                    "video_drift":       self._aaf_get_drift(base),
                 })
 
         # Interval scheduling for "consolidate" mode — assign minimum tracks
@@ -5242,6 +5297,29 @@ class AafWorkflowMixin:
                     except Exception:
                         pass
 
+                # Where does the stereo mix sit against the session clock?
+                # A bounce can start before the session start or carry a
+                # constant delay; the editor cuts to the mix, so picture
+                # and clip audio are placed against it, not the clock.
+                _mix_lag = 0.0
+                if mix_path and os.path.isfile(mix_path):
+                    self._aaf_build_progress(
+                        75, "Measuring the mix against the session clock\u2026")
+                    _mli = None
+                    try:
+                        _mli = engines.measure_mix_lag(clips_with_media, mix_path)
+                    except Exception as _e:
+                        print("Mix position: measurement failed ({})".format(_e))
+                    if _mli:
+                        _mix_lag = _mli[0]
+                        print("Stereo mix sits {:+.1f} ms from the session clock "
+                              "({} clips agree within {:.1f} ms); picture and "
+                              "clip audio are placed against the mix.".format(
+                                  _mix_lag * 1000.0, _mli[1], _mli[2]))
+                    else:
+                        print("Stereo mix: could not measure its position against "
+                              "the session clock; placing against the clock (0 ms).")
+
                 self._aaf_build_progress(80, "Building XML\u2026")
                 print("Sequence start timecode: {} ({}) - from AAF".format(
                     engines.secs_to_tc(start_tc, fps, drop_fr)[0],
@@ -5254,6 +5332,7 @@ class AafWorkflowMixin:
                     seq_name,
                     seq_w=_seq_w, seq_h=_seq_h, seq_fps=fps, seq_sr=sr,
                     mix_path=mix_path or None,
+                    mix_lag_secs=_mix_lag,
                     include_camera_audio=cam_audio_v,
                     warnings_out=_oor_warnings,
                     close_gaps_max_secs=close_gaps_secs,
@@ -5273,18 +5352,17 @@ class AafWorkflowMixin:
                 # in Pro Tools rather than discovered on the timeline.
                 _resid = _build_stats.get("sync_residuals") or []
                 if _resid:
-                    print("Sub-frame sync residual "
-                          "(picture is on the frame grid, sound is not):")
+                    print("Picture placement (picture sits on frames, sound does "
+                          "not; each clip is rounded once, so half a frame is "
+                          "the worst case):")
                     for _r in _resid:
-                        _dir = ("sound leads picture" if _r["residual_fr"] > 0
-                                else "sound lags picture")
-                        _mark = ("   <-- within a hair of half a frame"
-                                 if abs(_r["residual_fr"]) > 0.45 else "")
-                        print("  {:<30} offset {:+.3f}s -> {:+d} frames, "
-                              "{:.1f}ms {}{}".format(
-                                  _r["source"][:30], _r["offset_secs"],
-                                  _r["shift_fr"], abs(_r["residual_ms"]),
-                                  _dir, _mark))
+                        _dr = ("  drift {:+.0f} ppm".format(_r["drift_ppm"])
+                               if abs(_r["drift_ppm"]) >= 1.0 else "")
+                        print("  {:<30} offset {:+.3f}s{}  {} clips, worst "
+                              "{:.2f} fr ({:.1f} ms), mean {:+.2f} fr".format(
+                                  _r["source"][:30], _r["offset_secs"], _dr,
+                                  _r["n_clips"], _r["max_err_fr"],
+                                  _r["max_err_ms"], _r["mean_err_fr"]))
 
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)

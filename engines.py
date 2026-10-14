@@ -3545,13 +3545,14 @@ def video_shift_frames(offset_secs, fps):
     choice, and making it badly is what leaves one clip a frame out of step
     with its neighbours.
 
-    Rounding `src_in + offset` and `src_in` separately (the obvious way to
-    write it) makes the shift depend on where each clip happens to fall
-    against the frame grid, so two clips from the same camera with the same
-    offset can land a full frame apart — worst near a half-frame offset,
-    where the choice is close to a coin flip per clip.  Rounding the offset
-    once gives every clip from a source the same shift and bounds the
-    residual at half a frame instead of a whole one.
+    build_xml_from_pt feeds this the offset with the audio in-point's own
+    rounding error already taken out, so the frame it returns is the one
+    nearest the TRUE picture target for that clip: a single rounding per
+    clip against the session clock, at most half a frame out, with this
+    function's tie rule deciding the coin flips.  (An earlier version kept
+    one shift per source instead; that made picture consistent with the
+    frame-quantised clip audio but let it scatter up to a full frame
+    against the continuous mix the editor actually hears.)
 
     Ties break toward the later source frame, which puts picture early and
     sound late.  Sound arriving after the picture is the direction viewers
@@ -4585,13 +4586,135 @@ def write_build_diagnostic(clips_with_media, seq_fps, seq_w, seq_h, seq_sr,
     return out_path
 
 
+def measure_mix_lag(clips_with_media, mix_path, max_clips=6, pad_s=1.0,
+                    sr=8000, env_hz=1000, min_dur_s=6.0):
+    """Where the stereo mix sits against the AAF's session clock, in seconds.
+
+    Positive: the mix's content arrives LATER than the AAF places the same
+    audio -- the bounce started before the session start, or carries a
+    constant delay.  One real session measured +14 ms (a third of a frame
+    at 23.976), enough to tip the rounding of every clip.
+
+    Takes up to ``max_clips`` clips spread through the timeline whose AAF
+    source file is on disk, extracts that file at the clip's source
+    in-point and the mix around the clip's timeline position, and
+    cross-correlates 1 ms loudness envelopes.  Returns ``(lag_secs,
+    n_clips, spread_ms)`` from the median of the clips that locked, or
+    None when fewer than two did or they disagree by more than 12 ms
+    (then the caller should assume 0 and say so)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if not mix_path or not os.path.isfile(mix_path):
+        return None
+    mix_dur = get_media_duration(mix_path) or 0.0
+    if mix_dur <= 0:
+        return None
+
+    usable = []
+    seen = set()
+    for c in sorted(clips_with_media, key=lambda c: c["start_secs"]):
+        sf  = c.get("source_file") or ""
+        if not (sf and os.path.isfile(sf)):
+            # The AAF's path is often stale (session moved, other machine).
+            # The source's chosen reference audio is the same recording when
+            # it carries the same file name -- a copy of the Pro Tools
+            # source -- and then shares its time base, so it can stand in.
+            ap = c.get("audio_path") or ""
+            if (sf and ap and os.path.isfile(ap)
+                    and os.path.basename(ap).lower() == os.path.basename(sf).lower()):
+                sf = ap
+            else:
+                continue
+        dur = c["end_secs"] - c["start_secs"]
+        key = (round(c["start_secs"], 2), sf)
+        if (dur < min_dur_s or key in seen
+                or c["start_secs"] - pad_s < 0
+                or c["start_secs"] + dur + pad_s > mix_dur):
+            continue
+        seen.add(key)
+        usable.append(dict(c, source_file=sf))
+    if len(usable) < 2:
+        return None
+    if len(usable) > max_clips:
+        step = len(usable) / float(max_clips)
+        usable = [usable[int(i * step)] for i in range(max_clips)]
+
+    def _extract(path, t0, dur):
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
+            tmp = tf.name
+        try:
+            cmd = _ffmpeg_cmd() + ["-y", "-v", "quiet",
+                                   "-ss", "{:.6f}".format(max(0.0, t0)),
+                                   "-t",  "{:.6f}".format(dur),
+                                   "-i", path, "-vn", "-ac", "1",
+                                   "-ar", str(sr), "-f", "f32le", tmp]
+            r = _run(cmd, capture_output=True, timeout=120)
+            if r.returncode != 0:
+                return None
+            with open(tmp, "rb") as fh:
+                raw = fh.read()
+            return np.frombuffer(raw, dtype=np.float32).copy() if raw else None
+        except Exception:
+            return None
+        finally:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+    def _env(x):
+        k = max(1, sr // 250)                       # 4 ms smoothing
+        e = np.convolve(np.abs(x), np.ones(k) / k, mode="same")
+        dec = max(1, sr // env_hz)
+        e = e[: (len(e) // dec) * dec].reshape(-1, dec).mean(axis=1)
+        e = e - e.mean()
+        n = np.linalg.norm(e)
+        return e / n if n > 0 else e
+
+    lags = []
+    L = int(pad_s * env_hz)
+    for c in usable:
+        dur = c["end_secs"] - c["start_secs"]
+        mix = _extract(mix_path, c["start_secs"] - pad_s, dur + 2 * pad_s)
+        ref = _extract(c["source_file"], c["src_in_secs"], dur)
+        if mix is None or ref is None or len(ref) < sr or len(mix) < len(ref) + sr:
+            continue
+        em, er = _env(mix), _env(ref)
+        scores = []
+        for l in range(0, 2 * L + 1):
+            seg = em[l: l + len(er)]
+            if len(seg) < len(er):
+                break
+            scores.append(float(np.dot(seg, er)) / (float(np.linalg.norm(seg)) + 1e-12))
+        # ffmpeg's -t can come up a few samples short, so the last lags
+        # may be missing; the search is still centred on L.
+        if len(scores) < L + 1:
+            continue
+        scores = np.array(scores)
+        best = int(scores.argmax())
+        prom = (scores[best] - np.median(scores)) / (scores.std() + 1e-12)
+        if prom < 4.0:
+            continue
+        lags.append((best - L) / float(env_hz))
+    if len(lags) < 2:
+        return None
+    lags.sort()
+    spread_ms = (lags[-1] - lags[0]) * 1000.0
+    if spread_ms > 12.0:
+        return None
+    med = lags[len(lags) // 2] if len(lags) % 2 else 0.5 * (lags[len(lags) // 2 - 1] + lags[len(lags) // 2])
+    return round(med, 4), len(lags), round(spread_ms, 1)
+
+
 def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       seq_w=1280, seq_h=720, seq_fps=30.0, seq_sr=48000,
                       mix_path=None, include_camera_audio=False,
                       warnings_out=None, close_gaps_max_secs=0.0,
                       close_gaps_across_sources=False, stats_out=None,
-                      seq_start_secs=0.0, seq_drop_frame=False):
+                      seq_start_secs=0.0, seq_drop_frame=False,
+                      mix_lag_secs=0.0):
     fps        = seq_fps
+    mix_lag_secs = float(mix_lag_secs or 0.0)
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
     ctr     = 0
@@ -4609,10 +4732,10 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         _vfc_cache[vp] = fr
         return fr
     _oor_seen = set()   # source bases already warned (dedupe per source)
-    # base -> (offset_secs, shift_fr): what picture was actually moved by,
-    # against what the measured offset asked for.  Reported after the build
-    # so the sub-frame leftover on every synced source is visible rather
-    # than something you have to notice in the timeline.
+    # base -> {"offset_secs", "drift_ppm", "errs": [signed picture error per
+    # clip, frames]}.  Reported after the build so the sub-frame leftover on
+    # every source is visible rather than something you have to notice in
+    # the timeline.
     _sync_applied = {}
 
     v_tracks   = {tn: [] for tn in track_names}
@@ -4677,29 +4800,56 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         if dur_fr <= 0:
             continue
 
-        # Audio uses the reference-audio src position directly (no camera offset).
-        # Video ADDS v_offset: positive offset = camera started before DAW (common),
-        # negative offset = audio started before camera (both are valid).
-        # Picture is the audio's own source window shifted by ONE rounded
-        # offset, not a second independent rounding of (src_in + offset).
-        # That keeps every clip from a source on the same shift, and keeps
-        # the video window exactly as long as the audio window.
-        v_shift   = video_shift_frames(v_offset, fps)
-        a_src_in  = max(0, f2fr(src_in_s,  fps) - head_ext)
-        a_src_out = f2fr(src_out_s, fps) + fo_fr
-        v_src_in  = max(0, f2fr(src_in_s,  fps) + v_shift - head_ext)
-        v_src_out = max(0, f2fr(src_out_s, fps) + v_shift) + fo_fr
-        # If clamping collapsed the video window, push out by clip duration
-        if v_src_out <= v_src_in:
-            v_src_out = v_src_in + (end_fr - start_fr)
+        # ── Source in-points: ONE rounding per clip, against the session clock ──
+        # Picture can only sit on sequence frames, but what the editor hears
+        # is continuous: the stereo mix, laid at frame 0.  Timeline frame
+        # `orig_start` stands for session time orig_start/fps, which is
+        # `delta_fr` frames away from where Pro Tools really had this clip
+        # start.  Rounding the timeline position and the source in-point
+        # separately (the obvious way) added those two errors: up to a full
+        # frame, and a different frame per clip -- measured on a real export
+        # as 0 to 1.8 frames of picture-early scatter, with "a frame early"
+        # the most common outcome.  Folding delta_fr into the in-point
+        # target makes each clip's error a single rounding: half a frame at
+        # worst, centred on zero.
+        #
+        # Three things set the target:
+        #   delta_fr      the timeline rounding this clip received;
+        #   mix_lag_secs  where the mix sits against the session clock
+        #                 (measured by measure_mix_lag; a bounce can carry
+        #                 a constant offset -- 14 ms on one real session);
+        #   drift         camera clock vs recorder clock, from the sync
+        #                 probes, so one offset holds across a long file.
+        # Audio ADDS nothing; video ADDS the offset: positive = camera
+        # started before the DAW (common), negative = the other way round.
+        drift     = clip.get("video_drift") or {}
+        k_drift   = float(drift.get("ppm", 0.0) or 0.0) * 1e-6
+        eff_off   = v_offset + k_drift * (
+            src_in_s - float(drift.get("t_ref", 0.0) or 0.0))
+        delta_fr  = orig_start - clip["start_secs"] * fps
+        target_a  = src_in_s * fps + delta_fr - mix_lag_secs * fps
+        a_in_core = int(math.floor(target_a + 0.5))
+        # Picture = the audio in-point plus the offset, rounded ONCE against
+        # the true target: the audio's own rounding error is taken out
+        # before video_shift_frames applies its tie rule (picture early,
+        # sound late).
+        v_in_core = a_in_core + video_shift_frames(
+            eff_off - (a_in_core - target_a) / fps, fps)
+        pic_err_fr = v_in_core - (target_a + eff_off * fps)   # |.| <= 0.5
+        span_fr   = end_fr - start_fr      # content + fade room, as placed
+        a_src_in  = max(0, a_in_core - head_ext)
+        a_src_out = a_src_in + span_fr
+        v_src_in  = max(0, v_in_core - head_ext)
+        v_src_out = v_src_in + span_fr
 
         vp = clip.get("video_path")
         ap = clip.get("audio_path")
 
-        if vp and v_offset:
+        if vp:
             _sync_applied.setdefault(
                 clip.get("source_base") or os.path.basename(vp),
-                (v_offset, v_shift))
+                {"offset_secs": v_offset, "drift_ppm": k_drift * 1e6,
+                 "errs": []})["errs"].append(pic_err_fr)
 
         # ── Out-of-range guard ────────────────────────────────────────
         # When the sync offset is badly wrong (e.g. the joined footage is
@@ -4727,8 +4877,8 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
             _vfc = _video_frame_count(vp)
             if _vfc and _vfc > 0 and (v_src_in < 0 or v_src_out > _vfc):
                 # Content-only bounds (strip the fade extensions back off).
-                _content_in  = f2fr(src_in_s,  fps) + v_shift
-                _content_out = f2fr(src_out_s, fps) + v_shift
+                _content_in  = v_in_core
+                _content_out = v_in_core + dur_fr
                 _content_overshoot = max(
                     -_content_in,                  # head before video frame 0
                     _content_out - _vfc,           # tail past video end
@@ -4865,12 +5015,16 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         # Sorted worst-first so a marginal source is the first thing read.
         stats_out["sync_residuals"] = sorted(
             ({"source":      base,
-              "offset_secs": off,
-              "shift_fr":    shift,
-              "residual_fr": off * fps - shift,
-              "residual_ms": (off * fps - shift) / fps * 1000.0 if fps else 0.0}
-             for base, (off, shift) in _sync_applied.items()),
-            key=lambda r: -abs(r["residual_fr"]))
+              "offset_secs": d["offset_secs"],
+              "drift_ppm":   d["drift_ppm"],
+              "n_clips":     len(d["errs"]),
+              "max_err_fr":  max(abs(e) for e in d["errs"]),
+              "max_err_ms":  (max(abs(e) for e in d["errs"]) / fps * 1000.0
+                              if fps else 0.0),
+              "mean_err_fr": sum(d["errs"]) / len(d["errs"])}
+             for base, d in _sync_applied.items() if d["errs"]),
+            key=lambda r: -r["max_err_fr"])
+        stats_out["mix_lag_secs"] = mix_lag_secs
 
     # ── Emit clipitems ─────────────────────────────────────────────────
     for p in placements:

@@ -4,6 +4,15 @@
 
 ## October 14, 2026
 
+### AAF → XML: picture lands within half a frame of the mix
+On a real 23.976 export every clip's picture sat 0 to 1.8 frames early against the stereo mix, most often one frame, with no drift. Two causes.
+
+- **One rounding per clip.** The timeline position and the source in-point were rounded to frames separately, so their errors added: up to a frame, and a different frame per clip. The timeline rounding is now folded into each clip's in-point target, so the picture is at most half a frame from where the mix has the sound and the spread is centred on zero. Measured on the same export: 0.26 late to 0.67 early, mean 0.13.
+- **The mix's own position.** A bounce can sit a constant few milliseconds off the session clock (14 ms on this one). With a stereo mix set, the build measures that from a handful of clips and places picture and clip audio against the mix. The console reports the figure.
+- **Camera-clock drift.** The three sync probes measured the camera running against the recorder (8 ppm here) and then averaged it away. The drift is now kept with the offset, shown on the SYNC button, saved in the setup, and applied per clip at build time.
+- Source windows are now exactly as long as their timeline span, so Premiere has no one-frame mismatch to read as a speed change.
+- The post-build console report now gives, per source, the worst and mean picture leftover in frames instead of a single per-source residual.
+
 ### AAF → XML: sync survives REIMPORT AAF and Back
 Returning to Step 2 — by pressing Back then Next, or by REIMPORT AAF, which rebuilds the page — cleared every source's sync offset, state and lock while leaving the video assignments in place. The page emptied its media pool while rebuilding and refilled it last, so the first row rebuild saw no videos, reset every assignment, and the assignment-change rule wiped the sync behind it; auto-match then re-assigned the videos by name, which is why only the sync looked lost. A manual assignment auto-match wouldn't make was lost outright. The pool is now restored before the rows are built, and re-setting an assignment to the video it already has no longer counts as a change.
 
