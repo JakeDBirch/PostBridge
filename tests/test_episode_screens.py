@@ -163,6 +163,21 @@ def test_pull_quotes_session_registers_a_source(app, monkeypatch, project):
     assert saved["workflow"] == "episode" and len(saved["sources"]) == 4
     assert not app._errors, "\n".join(app._errors)
 
+    # Sessions straight from the episode's sources: Ep 7 pt 1 is covered
+    # already; pt 2 and the Butler interview (token known) are offered.
+    app._pq_render_project_view(); _pump(app, 3)
+    offered = {n: tok for n, tok, _m in app._pq_episode_sources_without_session()}
+    assert set(offered) == {"Ep 7 pt 2", "Butler Interview"}
+    assert offered["Butler Interview"] == "BUTLER"
+    made = app._pq_create_session_from_source("Ep 7 pt 2", "narr 2", open_view=False)
+    assert made and made["token"] == "NARR_2"
+    assert [os.path.basename(m) for m in made["media"]] == ["Ep 7 pt 2.wav"]
+    assert os.path.isfile(made["_file_path"])
+    saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
+    assert saved["sources"]["Ep 7 pt 2"]["token"] == "NARR_2"
+    assert "Ep 7 pt 2" not in {n for n, _t, _m in app._pq_episode_sources_without_session()}
+    assert not app._errors, "\n".join(app._errors)
+
 
 def test_launch_script_session_prefills_the_pool(app, monkeypatch, project):
     _open_fresh(app, monkeypatch, project)
@@ -170,7 +185,8 @@ def test_launch_script_session_prefills_the_pool(app, monkeypatch, project):
     script = os.path.join(project, "05_SCRIPT", "Ep 7.txt")
     os.makedirs(os.path.dirname(script), exist_ok=True)
     with open(script, "w", encoding="utf-8") as f:
-        f.write("[PART Open]\n[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n")
+        f.write("[PART Open]\n[VO PART_0_NARRATOR]\nA quiet morning.\n"
+                "[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n")
     ep["links"]["script"] = EP.rel(ep, script)
     app._ep_save()
     app._ep_launch_s2s()

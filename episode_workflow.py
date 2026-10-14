@@ -234,6 +234,12 @@ class EpisodeWorkflowMixin:
                 t = "".join(ch for ch in v.get().upper() if ch.isalnum() or ch == "_")
                 ep["sources"][n]["token"] = t or None
             tv.trace_add("write", _tok)
+            if src.get("vo_part"):
+                tk.Label(top, text="   narrator \u00b7 VO: {}".format(src["vo_part"]),
+                         font=FB, bg=SURF2, fg=SUB).pack(side="left")
+            if src.get("session"):
+                tk.Label(top, text="   transcribed", font=FB, bg=SURF2, fg=SUCCESS
+                         ).pack(side="left")
             self._btn(top, "REMOVE SOURCE", lambda n=name: self._ep_remove_source(n),
                       small=True).pack(side="right")
             # Recordings
@@ -539,10 +545,34 @@ class EpisodeWorkflowMixin:
         rows = [(r["path"], r["var"].get()) for r in getattr(pool, "_rows", [])]
         from utils import is_video
         for path, tok in rows:
-            if not tok or tok.startswith("\u2014") or tok.startswith("VO:"):
+            if not tok or tok.startswith("\u2014"):
                 continue
             r = EP.rel(ep, path)
             kind = "video" if is_video(path) else "audio"
+            if tok.startswith("VO:"):
+                # A narrator take: the source owning the file remembers the
+                # part, so the next script version opens assigned.  A
+                # camera for a part goes to the source narrating that part.
+                part = tok[3:].strip()
+                name = self._ep_source_for(ep, [r], kind)
+                if name is None and kind == "video":
+                    name = next((n for n, s in ep["sources"].items()
+                                 if s.get("vo_part") == part), None)
+                if name is None:
+                    if kind == "video":
+                        continue
+                    name, i = EP._stem(r), 2
+                    while name in ep["sources"]:
+                        name = "{} ({})".format(EP._stem(r), i); i += 1
+                    ep["sources"][name] = {"token": None, "audio": [], "video": [],
+                                           "session": None, "user_made": True}
+                src = ep["sources"][name]
+                src["vo_part"] = part
+                self._ep_ensure_media(ep, r, kind)
+                if r not in src.setdefault(kind, []):
+                    src[kind].append(r)
+                    src[kind].sort()
+                continue
             name = None
             for n, src in ep["sources"].items():
                 if src.get("token") == tok:
@@ -666,16 +696,33 @@ class EpisodeWorkflowMixin:
             EP.save(ep)
         # Pre-fill Step 2: every source's recordings and cameras, assigned to
         # the source's token when the script knows it.
+        known, part_names, vo_parts = set(), set(), set()
         try:
             from parsers import parse_script
             with open(script, encoding="utf-8", errors="replace") as f:
-                known = set(parse_script(f.read())[0] or [])
+                tokens, parts, _pulls, vo_blocks, _t, _w = parse_script(f.read())
+            known = set(tokens or [])
+            by_index = {p["index"]: p["name"] for p in parts}
+            part_names = set(by_index.values())
+            vo_parts = {by_index[v["part_index"]] for v in vo_blocks
+                        if v.get("part_index") in by_index}
         except Exception:
-            known = set()
+            pass
         assignments = {}
         for src in ep["sources"].values():
             tok = src.get("token")
-            val = tok if tok and tok in known else "— unassigned —"
+            vo = src.get("vo_part")
+            if tok and tok in known:
+                val = tok
+            elif vo and vo in part_names:
+                # The part this narrator recording was assigned to last time.
+                val = "VO: " + vo
+            elif not tok and not src.get("session") and len(vo_parts) == 1:
+                # No interview token, no transcript session: a narrator
+                # recording.  With one narrated part there is no choice.
+                val = "VO: " + next(iter(vo_parts))
+            else:
+                val = "— unassigned —"
             for r in src.get("audio", []) + src.get("video", []):
                 assignments[EP.absp(ep, r)] = val
         self._pending_setup = {"assignments": assignments}

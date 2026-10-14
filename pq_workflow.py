@@ -366,6 +366,9 @@ class PqWorkflowMixin:
         nav = tk.Frame(self.body, bg=BG)
         nav.pack(side="bottom", fill="x", pady=(8, 0))
         self._btn(nav, "← HOME", self._home).pack(side="left")
+        ep_file = project.get("episode_file")
+        if ep_file:
+            self._btn(nav, "← EPISODE", self._ep_enter).pack(side="left", padx=(8, 0))
 
         self._section("PULL QUOTES — EPISODE PROJECT")
 
@@ -387,9 +390,13 @@ class PqWorkflowMixin:
         fp_row.pack(fill="x", pady=(0, 12))
         tk.Label(fp_row, text="PROJECT FILE", font=FL,
                  bg=BG, fg=SUB, width=18, anchor="w").pack(side="left")
-        fp = project.get("file_path") or "— unsaved (use SAVE in the header) —"
+        if ep_file:
+            fp = "Episode  \u2014  {}   (sessions are saved into it)".format(
+                os.path.basename(ep_file))
+        else:
+            fp = project.get("file_path") or "— unsaved (use SAVE in the header) —"
         tk.Label(fp_row, text=fp, font=FB, bg=BG,
-                 fg=SUCCESS if project.get("file_path") else SUB,
+                 fg=SUCCESS if (project.get("file_path") or ep_file) else SUB,
                  anchor="w").pack(side="left", fill="x", expand=True)
 
         # Project-level controls row: bg-mode + manage-speakers
@@ -467,6 +474,11 @@ class PqWorkflowMixin:
                   "+ ADD INTERVIEW SESSION",
                   self._pq_add_session_dialog,
                   color=ACCENT).pack(side="left")
+        if ep_file and self._pq_episode_sources_without_session():
+            # The episode already knows the recordings: offer them as
+            # sessions without a file dialog.
+            self._btn(add_inner, "+ FROM EPISODE SOURCE",
+                      self._pq_add_from_episode_dialog).pack(side="left", padx=(8, 0))
         if is_empty:
             tk.Label(add_inner,
                      text="    ← start here",
@@ -867,21 +879,9 @@ class PqWorkflowMixin:
                         parent=win)
                     return
 
-            session_path = self._pq_default_session_path(token, media_paths)
-            if not session_path:
-                messagebox.showerror("Save path",
-                    "Could not derive a session save path.", parent=win)
+            session = self._pq_create_session(token, media_paths, parent=win)
+            if session is None:
                 return
-            session = {
-                "version":    1,
-                "workflow":   "interview_session",
-                "token":      token,
-                "media":      list(media_paths),
-                "transcript": [],
-                "_file_path": session_path,
-            }
-            self._pq_project["sessions"].append(session)
-            self._pq_save_session_file(session)   # write empty-transcript shell
             win.destroy()
             self._pq_open_session_view(session, transcribe_now=True)
 
@@ -894,6 +894,111 @@ class PqWorkflowMixin:
         _refresh_list()
         tok_entry.focus_set()
         self.wait_window(win)
+
+    def _pq_create_session(self, token, media_paths, parent=None):
+        """Make a new interview session for *token* over *media_paths*,
+        write its empty shell, add it to the project.  None on failure
+        (a dialog says why)."""
+        session_path = self._pq_default_session_path(token, media_paths)
+        if not session_path:
+            messagebox.showerror("Save path",
+                "Could not derive a session save path.", parent=parent)
+            return None
+        session = {
+            "version":    1,
+            "workflow":   "interview_session",
+            "token":      token,
+            "media":      list(media_paths),
+            "transcript": [],
+            "_file_path": session_path,
+        }
+        self._pq_project["sessions"].append(session)
+        self._pq_save_session_file(session)   # write empty-transcript shell
+        return session
+
+    # ── Sessions from episode sources ────────────────────────────────────
+
+    def _pq_episode_sources_without_session(self):
+        """[(name, token_suggestion, [abs media])] for the episode's sources
+        with recordings that no project session covers yet."""
+        proj = getattr(self, "_pq_project", None) or {}
+        ep = self._ep_bound(proj.get("episode_file")) if proj.get("episode_file") else None
+        if not ep:
+            return []
+        import episode as _EP
+        covered = set()
+        for s in proj.get("sessions", []):
+            covered.update(os.path.normcase(os.path.abspath(m)) for m in s.get("media", []))
+        out = []
+        for name in sorted(ep.get("sources", {})):
+            src = ep["sources"][name]
+            media = [_EP.absp(ep, r) for r in src.get("audio", [])]
+            media = [m for m in media if m and os.path.isfile(m)]
+            if not media or any(os.path.normcase(m) in covered for m in media):
+                continue
+            tok = src.get("token") or self._pq_suggest_token(media) or \
+                re.sub(r"[^A-Z0-9_]+", "_", name.upper()).strip("_")
+            out.append((name, tok, media))
+        return out
+
+    def _pq_create_session_from_source(self, name, token, open_view=True):
+        """A session for the episode source *name* with *token*."""
+        token = re.sub(r"[^A-Z0-9_]+", "_", (token or "").strip().upper()).strip("_")
+        if not token:
+            messagebox.showwarning("Token required", "Enter a session token name.")
+            return None
+        for s in self._pq_project["sessions"]:
+            if s.get("token") == token:
+                messagebox.showwarning("Token already in use",
+                    "This project already has a session with token '{}'.".format(token))
+                return None
+        match = [m for m in self._pq_episode_sources_without_session() if m[0] == name]
+        if not match:
+            return None
+        session = self._pq_create_session(token, match[0][2])
+        if session is not None and open_view:
+            self._pq_open_session_view(session, transcribe_now=True)
+        return session
+
+    def _pq_add_from_episode_dialog(self):
+        rows = self._pq_episode_sources_without_session()
+        if not rows:
+            messagebox.showinfo("Episode sources",
+                "Every recording the episode knows already has a session.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Sessions from episode sources")
+        win.configure(bg=BG)
+        win.transient(self); win.grab_set()
+        tk.Label(win, text="Sessions from episode sources", font=FH, bg=BG, fg=TEXT,
+                 padx=20).pack(anchor="w", pady=(14, 2))
+        tk.Label(win, text="Each row is a source the episode found. Pick a token and "
+                           "transcribe; the recordings are already chosen.",
+                 font=FB, bg=BG, fg=SUB, padx=20, wraplength=560, justify="left"
+                 ).pack(anchor="w", pady=(0, 10))
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=20)
+        for name, tok, media in rows:
+            r = tk.Frame(body, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
+            r.pack(fill="x", pady=3)
+            left = tk.Frame(r, bg=SURF)
+            left.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+            tk.Label(left, text=name, font=FBT, bg=SURF, fg=TEXT, anchor="w").pack(anchor="w")
+            tk.Label(left, text="  ".join(os.path.basename(m) for m in media),
+                     font=FB, bg=SURF, fg=SUB, anchor="w", wraplength=420,
+                     justify="left").pack(anchor="w")
+            tv = tk.StringVar(value=tok)
+            tk.Entry(r, textvariable=tv, font=FB, bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                     relief="flat", width=14).pack(side="left", padx=6)
+            def _go(n=name, v=tv, w=win):
+                if self._pq_create_session_from_source(n, v.get()) is not None:
+                    w.destroy()
+            self._btn(r, "TRANSCRIBE  \u2192", _go, small=True, color=ACCENT
+                      ).pack(side="right", padx=10)
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(10, 14))
+        self._btn(nav, "CLOSE", win.destroy).pack(side="right")
+        self._center_dialog(win, min_w=640, min_h=300)
 
     def _pq_suggest_token(self, paths):
         """Suggest a token name from filename common content."""
