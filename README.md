@@ -258,6 +258,18 @@ Click **ALIGN** to open the waveform dialog for manual work: nudge the offset vi
 
 Sync results are cached to disk — re-running is fast.
 
+### Saving the setup, and re-exported AAFs
+
+**Ctrl+S** saves everything on this screen — pool files, assignments, every sync offset and lock, hide selections, sequence settings, mix file — to a setup JSON (the first save asks where; it suggests `<aaf name>_setup.json` next to the AAF). **Open Session** on the home screen takes you straight back to Step 2 with all of it restored.
+
+When the Pro Tools session changes after you've done this work — a notes pass, a re-cut — export a fresh AAF and press **REIMPORT AAF…** in the Step 2 header (next to UNDO / REDO / CLEAN UP). PostBridge swaps the new AAF in underneath the existing setup rather than starting over:
+
+- Sources are matched by name. A source present in both AAFs keeps its video assignment, reference audio, sync offset, state and lock exactly as they were — nothing is re-measured.
+- A source that only exists in the new AAF appears unassigned; a source the new AAF no longer has drops out, and its state goes with it.
+- A summary lists what was kept, added and removed, naming the new sources that need assignment.
+
+Quick-saves keep writing to the same setup file, now pointing at the new AAF; the window shows unsaved changes until you do. Clip names and source files must still be the ones the first AAF used — rename a clip in Pro Tools and it shows up as one source removed plus one added, not kept.
+
 ### Build XML
 
 Click **Build XML** once all sources are synced. PostBridge generates an XMEML file with audio and video aligned.
@@ -320,11 +332,12 @@ Blank lines between blocks become a natural gap in the output timeline.
 
 ## Session Files
 
-Two flavours, both human-readable JSON:
+All human-readable JSON:
 
 | File | Contents | Lives in |
 |---|---|---|
 | `*_session.json` | Script→Session state: assignments, reconciliation results, Step 4 edits | Wherever you saved it |
+| `*_setup.json` | AAF → XML setup: AAF path, pool files, assignments, sync offsets and locks, sequence settings | Wherever you saved it (suggested: next to the AAF) |
 | `<TOKEN>.pb_session.json` | Pull Quotes session: media list, transcript, notes, speaker labels | `<project>/03_AUDIO/00_RAW AUDIO/` |
 | `<media>.pb_transcript.json` | Cached transcript word list + audio signature | Next to the source audio |
 

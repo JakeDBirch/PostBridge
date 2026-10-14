@@ -2,6 +2,18 @@
 
 ---
 
+## October 14, 2026
+
+### AAF → XML: sync survives REIMPORT AAF and Back
+Returning to Step 2 — by pressing Back then Next, or by REIMPORT AAF, which rebuilds the page — cleared every source's sync offset, state and lock while leaving the video assignments in place. The page emptied its media pool while rebuilding and refilled it last, so the first row rebuild saw no videos, reset every assignment, and the assignment-change rule wiped the sync behind it; auto-match then re-assigned the videos by name, which is why only the sync looked lost. A manual assignment auto-match wouldn't make was lost outright. The pool is now restored before the rows are built, and re-setting an assignment to the video it already has no longer counts as a change.
+
+- **REIMPORT AAF restores onto the rebuilt page**, through the same deferred path Open Session uses, instead of onto the page about to be torn down.
+- **Quick-save still targets the setup file** after a reimport. The reimport used to drop the chosen file, so Ctrl+S asked where to save again.
+- **No more silent failure from a Step 1 visit.** REIMPORT after reaching Step 2 from Step 1 raised an error on the old Step 1 status label and did nothing.
+- README now documents saving the setup and REIMPORT AAF.
+
+---
+
 ## October 2, 2026
 
 ### DVD .VOB files in the AAF workflow

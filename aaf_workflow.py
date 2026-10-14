@@ -119,6 +119,21 @@ class AafWorkflowMixin:
                       self._aaf_step2, color=ACCENT).pack(side="right")
             self._aaf_step1_next_added = True
 
+    def _aaf_s1_status(self, text, fg):
+        """Update the Step 1 status label if that screen is still showing.
+
+        The label outlives its screen as an attribute: once the user is on
+        Step 2 (and presses REIMPORT AAF there) it is a destroyed widget,
+        and configuring it raised TclError out of the button callback."""
+        lbl = getattr(self, "_aaf_s1", None)
+        if lbl is None:
+            return
+        try:
+            if lbl.winfo_exists():
+                lbl.config(text=text, fg=fg)
+        except tk.TclError:
+            pass
+
     def _aaf_load(self, path):
         def _clear_pending_restore():
             # _open_session arms these for THIS load.  If the load fails
@@ -129,13 +144,13 @@ class AafWorkflowMixin:
             self._pending_aaf_setup      = None
             self._pending_aaf_saved_path = None
             self._pending_mark_saved     = False
+            self._pending_aaf_after_restore = None
 
         if not path or not os.path.isfile(path):
             _clear_pending_restore()
             return
-        if hasattr(self, "_aaf_s1"):
-            self._aaf_s1.config(text="Parsing AAF\u2026", fg=SUB)
-            self.update_idletasks()
+        self._aaf_s1_status("Parsing AAF\u2026", SUB)
+        self.update_idletasks()
         try:
             parsed = parse_aaf_session(path)
         except Exception as e:
@@ -228,12 +243,11 @@ class AafWorkflowMixin:
         self._aaf_sort_col = "name"   # default: source clip A→Z (▲ visible from start)
         self._aaf_sort_dir = "asc"
 
-        if hasattr(self, "_aaf_s1"):
-            self._aaf_s1.config(
-                text="\u2713  {}  \u00b7  {} tracks  \u00b7  {} clips  \u00b7  {} sources".format(
-                    parsed["session_name"], len(parsed["tracks"]),
-                    total_clips, len(self._aaf_sources)),
-                fg=SUCCESS)
+        self._aaf_s1_status(
+            "\u2713  {}  \u00b7  {} tracks  \u00b7  {} clips  \u00b7  {} sources".format(
+                parsed["session_name"], len(parsed["tracks"]),
+                total_clips, len(self._aaf_sources)),
+            SUCCESS)
 
         self.seq_name.set(parsed["session_name"])
         # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
@@ -275,24 +289,30 @@ class AafWorkflowMixin:
                                  "Could not capture current setup:\n{}".format(e))
             return
 
-        # Override the AAF path in the snapshot so _aaf_restore_setup's
-        # "aaf" key (if consulted) points at the new file, not the old.
+        # Override the AAF path in the snapshot so the restored setup (and
+        # the next save) point at the new file, not the old.
         saved["aaf"] = os.path.abspath(new_path)
 
+        # Apply the snapshot AFTER Step 2 has been rebuilt for the new AAF
+        # -- the same deferred path Open Session uses -- not synchronously
+        # onto the page that _aaf_load is about to tear down.  Quick-saves
+        # keep going to the project's setup file: _aaf_load clears
+        # _aaf_saved_path for a fresh AAF, and the pending path re-arms it
+        # once the restore has run.  The baseline is NOT marked clean: the
+        # setup on disk still names the old AAF.
+        self._pending_aaf_setup         = saved
+        self._pending_aaf_saved_path    = getattr(self, "_aaf_saved_path", None)
+        self._pending_mark_saved        = False
+        self._pending_aaf_after_restore = (
+            lambda old=old_sources: self._aaf_reimport_report(old))
+
         self._aaf_load(new_path)
-        if not getattr(self, "_aaf_data", None):
-            # _aaf_load already surfaced an error dialog; nothing more to do.
-            return
+        # On failure _aaf_load surfaced the error and cleared the pending
+        # state; the current setup is untouched.
 
-        try:
-            self._aaf_restore_setup(saved)
-        except Exception as e:
-            messagebox.showerror("Reimport error",
-                                 "Loaded new AAF but couldn't restore setup:\n{}\n\n"
-                                 "Your saved setup file is untouched — reopen it "
-                                 "to recover.".format(e))
-            return
-
+    def _aaf_reimport_report(self, old_sources):
+        """Summarise a completed reimport: which sources kept their state,
+        which are new (need assignment), which dropped out."""
         new_sources = set(getattr(self, "_aaf_sources", []) or [])
         common  = old_sources & new_sources
         added   = new_sources - old_sources
@@ -309,16 +329,16 @@ class AafWorkflowMixin:
             _lines.append("")
             _lines.append("  New (needs assignment):")
             for _b in sorted(added)[:8]:
-                _lines.append("    • " + _b)
+                _lines.append("    \u2022 " + _b)
             if len(added) > 8:
-                _lines.append("    … and {} more".format(len(added) - 8))
+                _lines.append("    \u2026 and {} more".format(len(added) - 8))
         if removed:
             _lines.append("")
             _lines.append("  Removed (state dropped):")
             for _b in sorted(removed)[:8]:
-                _lines.append("    • " + _b)
+                _lines.append("    \u2022 " + _b)
             if len(removed) > 8:
-                _lines.append("    … and {} more".format(len(removed) - 8))
+                _lines.append("    \u2026 and {} more".format(len(removed) - 8))
         messagebox.showinfo("Reimport complete", "\n".join(_lines))
 
     def _aaf_step2(self):
@@ -486,6 +506,34 @@ class AafWorkflowMixin:
 
         self._aaf_audio_file_list = tk.Frame(a_body, bg=SURF)
         self._aaf_audio_file_list.pack(fill="x", padx=12)
+
+        # -- Restore the pool BEFORE the first row rebuild below -----------
+        # The lists were emptied above (their row widgets went with the old
+        # page).  _rebuild_aaf_source_rows resets any assignment whose
+        # video is not in the pool, and the assignment-change trace then
+        # wipes that source's sync (offset, state, lock).  Rebuilding
+        # against the transiently-empty pool therefore cleared every sync
+        # on each revisit -- Back from Step 1, and REIMPORT AAF -- while
+        # auto-match re-assigned the videos by name afterwards, so only
+        # the sync appeared to be lost.  Back-navigation takes priority
+        # over prefetch.  Batch adds only; the fps probe and preset scan
+        # run once the settings widgets exist (end of this method).
+        _restore_v, _restore_a = _saved_vpaths, _saved_apaths
+        if not (_restore_v or _restore_a):
+            prefetch   = getattr(self, "_prefetch_aaf_media", [])
+            _restore_v = [p for p in prefetch if is_video(p)]
+            _restore_a = [p for p in prefetch if is_audio(p)]
+        for _p in _restore_v:
+            self._aaf_add_video(_p, _batch=True)
+        for _p in _restore_a:
+            self._aaf_add_audio(_p, _batch=True)
+        _pool_restored = bool(_restore_v or _restore_a)
+        _nv = len(self._aaf_video_paths)
+        self._aaf_count_lbl.config(
+            text="{} file{}".format(_nv, "s" if _nv != 1 else ""))
+        _na = len(self._aaf_audio_paths)
+        self._aaf_audio_count_lbl.config(
+            text="{} file{}".format(_na, "s" if _na != 1 else ""))
 
         # -- Seed the pool with the AAF's own source media ------------------
         # Every clip's src_in is measured against a specific file, named in
@@ -822,17 +870,12 @@ class AafWorkflowMixin:
         self._aaf_close_gaps_var.trace_add("write", _sync_gap_sub)
         _sync_gap_sub()
 
-        # Restore pool contents: back-navigation takes priority over prefetch
-        if _saved_vpaths or _saved_apaths:
-            if _saved_vpaths: self._aaf_add_video_batch(_saved_vpaths)
-            if _saved_apaths: self._aaf_add_audio_batch(_saved_apaths)
-        else:
-            prefetch = getattr(self, "_prefetch_aaf_media", [])
-            if prefetch:
-                vp = [p for p in prefetch if is_video(p)]
-                ap = [p for p in prefetch if is_audio(p)]
-                if vp: self._aaf_add_video_batch(vp)
-                if ap: self._aaf_add_audio_batch(ap)
+        # The pool was restored before the row rebuild (see above); these
+        # are the follow-ups _aaf_add_video_batch would have run, deferred
+        # until the preset dropdown and fps field they write to exist.
+        if _pool_restored:
+            self._aaf_schedule_detect_fps()
+            self._aaf_update_seq_presets()
 
     # Palette of subtle background tints — one per assigned video file.
     # Unassigned rows use a warm amber tint so they stand out immediately.
@@ -1412,8 +1455,10 @@ class AafWorkflowMixin:
                     if _tr[0] == "write":
                         try: sv.trace_remove("write", _tr[1])
                         except Exception: pass
-                def _on_vid_change(*args, c=container, s=sv, b=base):
-                    _apply_color(c, _row_bg(s.get()))
+                def _on_vid_change(*args, c=container, s=sv, b=base,
+                                   _last=[sv.get()]):
+                    _new = s.get()
+                    _apply_color(c, _row_bg(_new))
                     # Keep the button label in sync with the StringVar too —
                     # the trace previously only refreshed the background,
                     # so _aaf_auto_match (which writes sv directly) and any
@@ -1421,6 +1466,13 @@ class AafWorkflowMixin:
                     # its row-construction value (reported: bg updated,
                     # label still "— no video —" until picker round-trip).
                     self._aaf_refresh_vid_btn_label(b)
+                    # A write of the SAME video is not a change.  Tk fires
+                    # write traces on every set(); a setup restore re-sets
+                    # each assignment to its current value, and that must
+                    # not invalidate a sync measured against that video.
+                    if _new == _last[0]:
+                        return
+                    _last[0] = _new
                     # If this source had a locked/completed sync, invalidate it —
                     # the assignment changed so the old sync result is stale.
                     lkv = self._aaf_sync_locked_vars.get(b)
@@ -1651,10 +1703,16 @@ class AafWorkflowMixin:
                 # sync label, leaving offset / sync_var / state dot /
                 # lock / candidates stale — TRY NEXT would still cycle
                 # offsets measured against the previous reference audio.
-                def _on_aud_change(*args, b=base, dv=aud_disp):
+                def _on_aud_change(*args, b=base, dv=aud_disp,
+                                   _last=[aud_disp.get()]):
                     fn   = dv.get()
                     full = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}.get(fn, "")
                     self._aaf_source_syncaudio_vars[b].set(full)
+                    # Same reference audio re-set (setup restore): not a
+                    # change; the offset measured against it still holds.
+                    if fn == _last[0]:
+                        return
+                    _last[0] = fn
                     lkv = self._aaf_sync_locked_vars.get(b)
                     was_locked = lkv and lkv.get()
                     ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
@@ -1755,7 +1813,13 @@ class AafWorkflowMixin:
         pending = getattr(self, "_pending_aaf_setup", None)
         if pending is not None:
             self._pending_aaf_setup = None
-            self._ui(lambda d=pending: self._aaf_restore_setup(d))
+            after = getattr(self, "_pending_aaf_after_restore", None)
+            self._pending_aaf_after_restore = None
+            def _apply(d=pending, after=after):
+                self._aaf_restore_setup(d)
+                if after is not None:
+                    after()
+            self._ui(_apply)
 
     # FPS priority order: higher quality / higher frame rate wins
     _FPS_PRIORITY = [
