@@ -5435,7 +5435,14 @@ class AafWorkflowMixin:
         tk.Frame(card, bg=BG, height=8).pack()
 
         tk.Frame(self.body, bg=BG, height=10).pack()
-        self._btn(self.body, "START NEW EPISODE", self._reset).pack()
+        # Back returns to Step 2 with the whole setup intact (pool,
+        # assignments, syncs) -- the usual next move after reading the
+        # report is to adjust something and build again, not start over.
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack()
+        self._btn(nav, "← BACK TO SETUP", self._aaf_step2).pack(
+            side="left", padx=(0, 10))
+        self._btn(nav, "START NEW EPISODE", self._reset).pack(side="left")
 
         # ── Per-clip colored log (same scheme as Script→AAF reconcile view) ──
         if clip_results:
