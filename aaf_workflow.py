@@ -237,6 +237,10 @@ class AafWorkflowMixin:
             if isinstance(_d, dict):
                 for _stale in [k for k in _d if k not in _live]:
                     _d.pop(_stale, None)
+        _tm = getattr(self, "_aaf_track_map_vars", None)
+        if isinstance(_tm, dict):
+            for _k in [k for k in _tm if k[0] not in _live]:
+                _tm.pop(_k, None)
         # Reset column widths so they recompute from new content on next visit
         if hasattr(self, "_aaf_col_widths"):
             del self._aaf_col_widths
@@ -701,13 +705,46 @@ class AafWorkflowMixin:
         row_grp.pack(anchor="w", padx=12, pady=(0,4))
         tk.Label(row_grp, text="Video tracks:", font=FB, bg=SURF, fg=TEXT,
                  width=18, anchor="w").pack(side="left")
-        self._aaf_group_var = tk.StringVar(value="single")
+        # Persist across revisits (Back / Next) like the other settings.
+        if not hasattr(self, "_aaf_group_var"):
+            self._aaf_group_var = tk.StringVar(value="single")
         for val, lbl in [("single",    "Consolidate to one video track"),
                          ("by_source", "Group by source video file"),
-                         ("by_track",  "Group by audio track")]:
+                         ("by_track",  "Group by audio track"),
+                         ("custom",    "Custom track map")]:
             tk.Radiobutton(row_grp, text=lbl, variable=self._aaf_group_var, value=val,
                            font=FB, bg=SURF, fg=TEXT, activebackground=SURF,
                            selectcolor=BG).pack(side="left", padx=(0,14))
+
+        # ── Custom track map: one row per camera (source x slot) ──────────
+        # One narrator shot on the same three cameras over two days is two
+        # AAF sources, and "group by source video file" gives each day its
+        # own stack: 6 video and 8 audio tracks where the editor wants 3
+        # and 4.  Here each camera is pointed at a track by name; cameras
+        # that share a video track share its clip-audio and camera-audio
+        # tracks too, because the build keys all three by that name.
+        self._aaf_track_map_frame = tk.Frame(settings_frame, bg=SURF)
+        if not hasattr(self, "_aaf_track_map_vars"):
+            self._aaf_track_map_vars = {}   # (base, slot) -> StringVar "Video N"
+
+        def _show_track_map(*_):
+            try:
+                if self._aaf_group_var.get() == "custom":
+                    self._aaf_build_track_map_panel()
+                    if not self._aaf_track_map_frame.winfo_ismapped():
+                        self._aaf_track_map_frame.pack(
+                            anchor="w", padx=12, pady=(0, 6), fill="x",
+                            after=row_grp)
+                else:
+                    self._aaf_track_map_frame.pack_forget()
+            except tk.TclError:
+                pass
+        for _tr in list(self._aaf_group_var.trace_info()):
+            if _tr[0] == "write":
+                try: self._aaf_group_var.trace_remove("write", _tr[1])
+                except Exception: pass
+        self._aaf_group_var.trace_add("write", _show_track_map)
+        _show_track_map()
 
         # ── Sequence settings (preset + editable resolution/fps) ──────────────
         if not hasattr(self, "_aaf_preset_var"):
@@ -1812,6 +1849,15 @@ class AafWorkflowMixin:
                     _ch.bind("<Button-1>", _toggle_hidden)
 
         self._aaf_auto_match()
+
+        # The custom track map lists cameras by assignment and slot count,
+        # both of which may just have changed.
+        if getattr(self, "_aaf_group_var", None) is not None and \
+                self._aaf_group_var.get() == "custom":
+            try:
+                self._aaf_build_track_map_panel()
+            except tk.TclError:
+                pass
 
         # If opened via the generic Open Session from the home screen, restore
         # any saved setup state that was stashed before navigating here.
@@ -3587,6 +3633,83 @@ class AafWorkflowMixin:
         self._aaf_push_undo(base)
         self._aaf_apply_lock(base, not current)
 
+    # ── Custom track map ─────────────────────────────────────────────────
+    _TRACK_MAP_CHOICES = ["Video {}".format(i) for i in range(1, 9)]
+
+    def _aaf_track_map_var(self, base, slot):
+        """StringVar naming the video track for camera (*base*, *slot*).
+        Default "Video {slot+1}": the same rig over several sessions lands
+        each camera on one track with no setup at all."""
+        if not hasattr(self, "_aaf_track_map_vars"):
+            self._aaf_track_map_vars = {}
+        v = self._aaf_track_map_vars.get((base, slot))
+        if v is None:
+            v = tk.StringVar(value="Video {}".format(slot + 1))
+            self._aaf_track_map_vars[(base, slot)] = v
+        return v
+
+    def _aaf_track_name_for(self, group_mode, base, vp, angle_i, clip_track_name):
+        """Video track name for one camera of one clip under *group_mode*.
+        Audio tracks (clip audio on angle 0, camera audio per angle) take
+        the same name, so cameras sharing a video track share those too.
+        "_consolidate_" is the placeholder the interval scheduler replaces."""
+        if group_mode == "custom":
+            return self._aaf_track_map_var(base, angle_i).get().strip() or \
+                "Video {}".format(angle_i + 1)
+        if group_mode == "by_source":
+            base_tn = self._aaf_vid_label(vp) if vp else "No Video"
+        elif group_mode == "by_track":
+            base_tn = clip_track_name or "Unknown Track"
+        else:
+            return "_consolidate_"
+        if angle_i == 0:
+            return base_tn
+        return "{}  \u00b7  ANGLE {}".format(base_tn, angle_i + 1)
+
+    @staticmethod
+    def _aaf_sort_track_names(names):
+        """"Video 1", "Video 2", ... in numeric order (Video 1 is V1, the
+        bottom track); anything else after, in the order given."""
+        def _key(n):
+            m = re.match(r"^\s*Video\s+(\d+)\s*$", n, re.IGNORECASE)
+            return (0, int(m.group(1)), "") if m else (1, 0, "")
+        order = {n: i for i, n in enumerate(names)}
+        return sorted(names, key=lambda n: _key(n) + (order[n],))
+
+    def _aaf_build_track_map_panel(self):
+        """(Re)populate the custom track map: one row per camera."""
+        frame = getattr(self, "_aaf_track_map_frame", None)
+        if frame is None:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        tk.Label(frame,
+                 text="Each camera goes to the track named here.  Cameras on "
+                      "the same video track also share its clip-audio and "
+                      "camera-audio tracks.",
+                 font=FB, bg=SURF, fg=SUB, anchor="w", justify="left"
+                 ).pack(anchor="w", pady=(2, 4))
+        hidden = getattr(self, "_aaf_hidden_sources", set())
+        for base in getattr(self, "_aaf_sources", []):
+            if base in hidden:
+                continue
+            labels = [self._aaf_source_file_vars.get(base, tk.StringVar(
+                value="\u2014 no video \u2014")).get()]
+            labels += [ev.get() for ev in
+                       getattr(self, "_aaf_source_extra_vars", {}).get(base, [])]
+            n = max(1, getattr(self, "_aaf_source_slot_counts", {}).get(base, 1))
+            for slot in range(n):
+                lbl = labels[slot] if slot < len(labels) else "\u2014 no video \u2014"
+                r = tk.Frame(frame, bg=SURF)
+                r.pack(anchor="w", pady=1)
+                tk.Label(r, text="{}  \u00b7  {}".format(base, lbl), font=FB,
+                         bg=SURF, fg=TEXT, width=52, anchor="w").pack(side="left")
+                tk.Label(r, text="\u2192", font=FB, bg=SURF, fg=SUB).pack(
+                    side="left", padx=6)
+                _FlatDropdown(r, self._aaf_track_map_var(base, slot),
+                              self._TRACK_MAP_CHOICES, font=FB, width=10
+                              ).pack(side="left")
+
     def _aaf_get_drift(self, base):
         """Camera-clock drift for *base* as {"ppm", "t_ref", ...} or None."""
         d = getattr(self, "_aaf_source_drift", {}).get(base)
@@ -4616,6 +4739,13 @@ class AafWorkflowMixin:
             },
             "hidden_sources": sorted(getattr(self, "_aaf_hidden_sources", set())),
             "grouping":      self._aaf_group_var.get(),
+            # Custom track map: base -> ["Video 1", "Video 2", ...] per slot.
+            "track_map": {
+                base: [self._aaf_track_map_var(base, s).get()
+                       for s in range(max(1, getattr(
+                           self, "_aaf_source_slot_counts", {}).get(base, 1)))]
+                for base in self._aaf_sources
+            },
             "fps":           self._aaf_fps_var.get(),
             "seq_preset":    getattr(self, "_aaf_preset_var",  tk.StringVar(value="Detect from media")).get(),
             "seq_w":         getattr(self, "_aaf_seq_w_var",   tk.StringVar()).get(),
@@ -4830,6 +4960,11 @@ class AafWorkflowMixin:
         self._aaf_schedule_detect_fps()
 
         # Restore other settings
+        for base, names in (data.get("track_map") or {}).items():
+            if base in self._aaf_sources:
+                for s, name in enumerate(names or []):
+                    if name:
+                        self._aaf_track_map_var(base, s).set(name)
         if "grouping" in data:  self._aaf_group_var.set(data["grouping"])
         if "fps"      in data:  self._aaf_fps_var.set(data["fps"])
         if "seq_preset" in data:
@@ -5100,21 +5235,12 @@ class AafWorkflowMixin:
             # get one per angle — the first keeps the source's normal
             # label so its audio track lines up with the visual, then
             # ANGLE 2/3/... land on their own tracks above it.
+            # Consolidate mode returns the "_consolidate_" placeholder so
+            # the interval scheduler below distributes each angle to the
+            # first free track by overlap; custom mode reads the track map.
             def _tn_for(_vp, _angle_i):
-                if group_mode == "by_source":
-                    _base_tn = self._aaf_vid_label(_vp) if _vp else "No Video"
-                elif group_mode == "by_track":
-                    _base_tn = clip.get("track_name") or "Unknown Track"
-                else:
-                    # Consolidate mode: keep the placeholder verbatim
-                    # so the interval scheduler below distributes each
-                    # angle to the first free track by overlap.  Stacked
-                    # angles share start_secs so they naturally land on
-                    # distinct tracks.
-                    return "_consolidate_"
-                if _angle_i == 0:
-                    return _base_tn
-                return "{}  ·  ANGLE {}".format(_base_tn, _angle_i + 1)
+                return self._aaf_track_name_for(
+                    group_mode, base, _vp, _angle_i, clip.get("track_name"))
 
             if _stack:
                 _angle_paths = list(_paths)
@@ -5139,6 +5265,10 @@ class AafWorkflowMixin:
                     "video_offset_secs": source_offset.get(base, 0.0),
                     "video_drift":       self._aaf_get_drift(base),
                 })
+
+        if group_mode == "custom":
+            # Video 1 is the bottom track whatever order the clips named it.
+            track_names_ordered = self._aaf_sort_track_names(track_names_ordered)
 
         # Interval scheduling for "consolidate" mode — assign minimum tracks
         if group_mode == "single":

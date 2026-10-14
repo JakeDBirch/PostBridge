@@ -4,6 +4,9 @@
 
 ## October 14, 2026
 
+### AAF → XML: custom track map
+A fourth **Video tracks** choice. Each camera (source × slot) names the video track it goes to; cameras on the same video track share its clip-audio and camera-audio tracks. The default sends slot 1 of every source to Video 1, slot 2 to Video 2, and so on, so one narrator shot on the same three cameras over two days collapses from 6 video and 8 audio tracks to 3 and 4 without touching the map. Saved with the setup. The export-complete screen also gained **BACK TO SETUP**, and the Video tracks choice now survives Back / Next.
+
 ### AAF → XML: picture lands within half a frame of the mix
 On a real 23.976 export every clip's picture sat 0 to 1.8 frames early against the stereo mix, most often one frame, with no drift. Two causes.
 
