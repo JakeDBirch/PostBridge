@@ -3715,8 +3715,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._current_session_file = path
             self._mark_saved()
-            self._ep_note_link("s2s_session", path,
-                               owner=("script", getattr(self, "_script_path", None)))
+            self._ep_absorb_s2s(path)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -3774,6 +3773,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 json.dump(self._build_full_session_data(), f,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._mark_saved()
+            self._ep_absorb_s2s(self._current_session_file)
             b = btn_ref[0] if btn_ref else None
             if b:
                 try:

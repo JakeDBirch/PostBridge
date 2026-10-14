@@ -92,9 +92,9 @@ Every decision is shown for review. Each source has its token, its recordings an
 
 The **STAGES** card opens each workflow already linked:
 
-- **Pull Quotes** opens the episode's interview sessions; saving writes the session list back into the episode file.
-- **Script → Session** asks for the script the first time, then opens Step 2 with every source's recordings and cameras in the pool, assigned to the source's token where the script uses it. Once a session is saved it is remembered, and the stage reopens it.
-- **AAF → XML** asks for the AAF the first time, then opens Step 2 with the video pool, the per-source camera assignments and slot counts, each source's reference audio and the stereo mix already in place — only SYNC remains. A saved setup is remembered and reopened, syncs and all.
+- **Pull Quotes** opens the episode's interview sessions. Saving a session registers its token and recordings as a source (or updates the source that already owns those recordings); saving the project writes the session list back into the episode file.
+- **Script → Session** asks for the script the first time, then opens Step 2 with every source's recordings and cameras in the pool, assigned to the source's token where the script uses it. Saving writes the pool's assignments back: a camera assigned to a token joins that token's source, a recording assigned to a token gives its source the token. The session file is remembered and reopened next time.
+- **AAF → XML** asks for the AAF the first time, then opens Step 2 with the video pool, the per-source camera assignments and slot counts, each source's reference audio and the stereo mix already in place — only SYNC remains. Saving the setup writes each source's cameras, sync (offset, state, lock, drift) and track row into the episode as well as remembering the setup file. A later AAF export of the same session — a re-cut, or a fresh file on another machine with no setup file — opens with those syncs in place, as long as the same camera and recording are still in play.
 
 Existing per-workflow files (`*_session.json`, `*_setup.json`, the old Pull Quotes `.pb_episode.json`) keep working exactly as before; episodes are for new work.
 

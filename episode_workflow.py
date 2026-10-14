@@ -446,6 +446,185 @@ class EpisodeWorkflowMixin:
         rec["status"] = "source"; rec["reason"] = ""
         self._ep_view()
 
+    # ── Write-backs from the stages ───────────────────────────────────────
+
+    def _ep_bound(self, ep_file):
+        """The episode a stage was launched from: the open one when it is
+        that file, else loaded fresh (and not made current)."""
+        ep = getattr(self, "_ep", None)
+        if ep and ep.get("file_path") and ep_file and \
+                os.path.normcase(ep["file_path"]) == os.path.normcase(ep_file):
+            return ep
+        if ep_file and os.path.isfile(ep_file):
+            try:
+                return EP.load(ep_file)
+            except Exception:
+                return None
+        return None
+
+    def _ep_owns(self, ep, key, path):
+        return bool(path) and ep.get("links", {}).get(key) == EP.rel(ep, path)
+
+    @staticmethod
+    def _ep_ensure_media(ep, r, kind):
+        """A media record for a file a stage linked that the scan never saw
+        (outside the root, or added since)."""
+        if r in ep["media"]:
+            return
+        full = EP.absp(ep, r)
+        try:
+            size = os.path.getsize(full)
+        except OSError:
+            size = 0
+        ep["media"][r] = {"kind": kind, "size": size, "duration_s": None,
+                          "status": "source", "reason": "", "dup_of": None}
+
+    @staticmethod
+    def _ep_source_for(ep, rel_paths, kind="audio"):
+        for name, src in ep["sources"].items():
+            if set(src.get(kind, [])) & set(rel_paths):
+                return name
+        return None
+
+    def _ep_register_session(self, session):
+        """Pull Quotes saved an interview session while opened from an
+        episode: its token and media become (or update) a source."""
+        proj = getattr(self, "_pq_project", None) or {}
+        ep = self._ep_bound(proj.get("episode_file"))
+        if not ep or not session.get("token"):
+            return
+        token = session["token"]
+        media = [EP.rel(ep, m) for m in session.get("media", []) if m]
+        sess  = EP.rel(ep, session.get("_file_path"))
+        name  = self._ep_source_for(ep, media)
+        if name is None:
+            for n, src in ep["sources"].items():
+                if src.get("token") == token:
+                    name = n
+                    break
+        if name is None:
+            name, i = token, 2
+            while name in ep["sources"]:
+                name = "{} ({})".format(token, i); i += 1
+            ep["sources"][name] = {"token": token, "audio": [], "video": [],
+                                   "session": None, "user_made": True}
+        src = ep["sources"][name]
+        src["token"] = token
+        src["session"] = sess
+        for m in media:
+            self._ep_ensure_media(ep, m, "audio")
+            if m not in src["audio"]:
+                src["audio"].append(m)
+        src["audio"].sort()
+        if session.get("_file_path"):
+            ap = os.path.abspath(session["_file_path"])
+            if ap not in ep.setdefault("sessions", []):
+                ep["sessions"].append(ap)
+        try:
+            EP.save(ep)
+        except Exception:
+            pass
+
+    def _ep_absorb_s2s(self, session_path):
+        """Script -> Session saved: remember the session, and take the pool's
+        token assignments into the sources -- a camera assigned to a token
+        joins that token's source (leaving any other), a recording assigned
+        to a token gives its source that token."""
+        ep = getattr(self, "_ep", None)
+        script = getattr(self, "_script_path", None)
+        if not ep or not self._ep_owns(ep, "script", script):
+            return
+        ep.setdefault("links", {})["s2s_session"] = EP.rel(ep, session_path)
+        pool = getattr(self, "_pool", None)
+        rows = [(r["path"], r["var"].get()) for r in getattr(pool, "_rows", [])]
+        from utils import is_video
+        for path, tok in rows:
+            if not tok or tok.startswith("\u2014") or tok.startswith("VO:"):
+                continue
+            r = EP.rel(ep, path)
+            kind = "video" if is_video(path) else "audio"
+            name = None
+            for n, src in ep["sources"].items():
+                if src.get("token") == tok:
+                    name = n
+                    break
+            if name is None:
+                # No source carries this token yet: the recording's own
+                # source takes it, or a new source is made for the file.
+                name = self._ep_source_for(ep, [r], kind)
+                if name is None:
+                    name, i = tok, 2
+                    while name in ep["sources"]:
+                        name = "{} ({})".format(tok, i); i += 1
+                    ep["sources"][name] = {"token": tok, "audio": [], "video": [],
+                                           "session": None, "user_made": True}
+                ep["sources"][name]["token"] = tok
+            src = ep["sources"][name]
+            self._ep_ensure_media(ep, r, kind)
+            if r not in src.setdefault(kind, []):
+                for other_name, other in ep["sources"].items():
+                    if other_name != name and r in other.get(kind, []):
+                        other[kind].remove(r)
+                src[kind].append(r)
+                src[kind].sort()
+        try:
+            EP.save(ep)
+        except Exception:
+            pass
+
+    def _ep_absorb_aaf(self, setup_path):
+        """AAF setup saved: remember it, and keep each source's cameras,
+        sync and track row in the episode so a fresh AAF export of the
+        same session opens synced even without the setup file."""
+        ep = getattr(self, "_ep", None)
+        aaf = getattr(self, "_aaf_path", None)
+        if not ep or not self._ep_owns(ep, "aaf", aaf):
+            return
+        ep.setdefault("links", {})["aaf_setup"] = EP.rel(ep, setup_path)
+        try:
+            data = self._aaf_build_setup_data()
+        except Exception:
+            data = None
+        if data:
+            by_label = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
+            by_stem = {}
+            for name, src in ep["sources"].items():
+                for a in src.get("audio", []):
+                    by_stem[EP._stem_key(a)] = name
+            for base in getattr(self, "_aaf_sources", []):
+                name = by_stem.get(EP._stem_key(base + ".x"))
+                if name is None:
+                    continue
+                src = ep["sources"][name]
+                labels = [data["assignments"].get(base)] + list(
+                    data.get("extra_assignments", {}).get(base, []))
+                vids = [EP.rel(ep, by_label[l]) for l in labels if l in by_label]
+                if vids:
+                    for v in vids:
+                        self._ep_ensure_media(ep, v, "video")
+                    src["video"] = vids
+                sd = data.get("sync", {}).get(base, {})
+                src["aaf_sync"] = {
+                    "video":      vids[0] if vids else None,
+                    "audio":      EP.rel(ep, sd.get("audio_path")) if sd.get("audio_path") else None,
+                    "offset":     sd.get("offset", "0.000"),
+                    "enabled":    sd.get("enabled", False),
+                    "state":      sd.get("state", ""),
+                    "locked":     sd.get("locked", False),
+                    "label":      sd.get("label", ""),
+                    "needs_sync": sd.get("needs_sync", False),
+                    "drift":      sd.get("drift"),
+                }
+                tm = data.get("track_map", {}).get(base)
+                if tm:
+                    src["track_map"] = tm
+            if data.get("mix_path"):
+                ep["links"]["mix"] = EP.rel(ep, data["mix_path"])
+        try:
+            EP.save(ep)
+        except Exception:
+            pass
+
     # ── Stage launchers ───────────────────────────────────────────────────
 
     def _ep_ready(self):
@@ -548,7 +727,7 @@ class EpisodeWorkflowMixin:
             for a in src.get("audio", []):
                 by_stem[EP._stem_key(a)] = (name, src, a)
         video_paths, audio_paths = [], []
-        assignments, slot_counts, extra, sync = {}, {}, {}, {}
+        assignments, slot_counts, extra, sync, track_map = {}, {}, {}, {}, {}
         for b in bases:
             hit = by_stem.get(EP._stem_key(b + ".x"))
             if not hit:
@@ -568,6 +747,18 @@ class EpisodeWorkflowMixin:
                     extra[b] = [os.path.basename(v) for v in vids[1:]]
             sync[b] = {"enabled": False, "audio_path": ref, "offset": "0.000",
                        "label": "", "state": "", "needs_sync": True, "locked": False}
+            # A sync measured on an earlier AAF of the same session still
+            # holds when the same camera and the same recording are in
+            # play: the offset is between those two files.
+            st = src.get("aaf_sync") or {}
+            same_cam = bool(vids) and st.get("video") == src.get("video", [None])[0]
+            same_ref = st.get("audio") == rec
+            if st and same_cam and same_ref and (st.get("state") or st.get("enabled")):
+                sync[b].update({k: st.get(k, sync[b].get(k)) for k in
+                                ("offset", "enabled", "state", "locked", "label",
+                                 "needs_sync", "drift")})
+            if src.get("track_map"):
+                track_map[b] = list(src["track_map"])
         mix = EP.absp(ep, ep.get("links", {}).get("mix"))
         if mix and os.path.isfile(mix) and mix not in audio_paths:
             audio_paths.append(mix)
@@ -576,4 +767,5 @@ class EpisodeWorkflowMixin:
                 "assignments": assignments, "slot_counts": slot_counts,
                 "extra_assignments": extra, "sync": sync,
                 "mix_path": mix if mix and os.path.isfile(mix) else "",
+                "track_map": track_map,
                 "grouping": "custom" if any(n > 1 for n in slot_counts.values()) else "by_source"}

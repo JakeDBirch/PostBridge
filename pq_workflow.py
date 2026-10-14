@@ -213,6 +213,12 @@ class PqWorkflowMixin:
                             engines.pb_transcript_save(media_path, words)
                     except Exception:
                         pass
+            # Opened from an episode: the token and its recordings become
+            # (or update) one of the episode's sources.
+            try:
+                self._ep_register_session(session)
+            except Exception:
+                pass
             return True
         except Exception as e:
             messagebox.showerror("Save Session failed", str(e))
