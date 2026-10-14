@@ -1,0 +1,502 @@
+# -*- coding: utf-8 -*-
+"""Episode: one project file shared by every workflow.
+
+An episode lives at the root of a show's project folder as
+``<Title>.pb_episode.json`` and holds what the three workflows used to each
+keep for themselves: which files are the interview recordings and the
+camera footage, which recordings belong together as one *source* (a
+speaker, a narrator session), which footage covers each source, and where
+the script, the reconcile state and the AAF setup live.  Every path is
+stored relative to the root, so the folder can move between machines.
+
+Discovery (``scan``) looks through the chosen folder once and sorts what it
+finds.  Project folders are noisy: Pro Tools keeps its own copies of every
+imported recording under ``Audio Files``, music and effects libraries sit
+beside the interviews, and renders, bounces, caches and backups all look
+like media.  The scan folds duplicates onto one canonical file, puts music,
+effects and short clips aside with a reason, and proposes sources with
+their footage from file names and running times.  Everything it decides is
+shown for review; nothing it excludes is deleted or hidden for good.
+
+No Tk in this module: it is used by the screens in episode_workflow.py and
+by tests.
+"""
+import hashlib
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+from utils import is_audio, is_video, is_media
+
+EPISODE_EXT     = ".pb_episode.json"
+EPISODE_VERSION = 2
+WORKFLOW        = "episode"
+
+# Recordings and footage shorter than this are effects, stings, idents or
+# test clips, not sources.  Reviewable: a short file can be included by hand.
+MIN_SOURCE_SECS = 60.0
+
+# Folder names (any component of the relative path) that hold things an
+# episode never cuts from: libraries, renders, caches, Pro Tools housekeeping.
+_NOISE_DIR_RE = re.compile(
+    r"^(?:\d+[_\s-]*)?(?:"
+    r"music|mx|score|sfx|fx|sound[\s_-]*effects|stings?|beds?|library|"
+    r"foley|ambien(?:ce|t)|atmos|stems?|bounces?|bounced[\s_-]*files|"
+    r"renders?|rendered[\s_-]*files|exports?|deliverables?|"
+    r"final[\s_-]*assets?|approval|z?[\s_-]*temp(?:orary)?[\s_-]*.*|tmp|"
+    r"cache|\.pb_cache|backups?|session[\s_-]*file[\s_-]*backups?|"
+    r"fade[\s_-]*files|clip[\s_-]*groups|waveform[\s_-]*cache|"
+    r"trash|proxies|proxy|graphics|gfx|motion|titles?"
+    r")$", re.IGNORECASE)
+
+# Pro Tools' own copy of every imported recording.
+_PT_AUDIO_DIR_RE = re.compile(r"^audio[\s_-]*files$", re.IGNORECASE)
+
+# Library music and effects by name, wherever they sit: APM-style catalogue
+# codes (CEZ_CEZ_4163_01701_...), stems, "_APM", "_60_" edits, SFX_ and
+# Freesound prefixes.  A Pro Tools session folder is full of these.
+_LIBRARY_NAME_RE = re.compile(
+    r"(?:^[A-Z]{2,6}_[A-Z0-9]{2,8}_\d{3,5}_\d{4,6}_)|_STEM_\(|_APM\b|__\d{2,3}__|"
+    r"^SFX[\s_-]|^Freesound\b|^FX[\s_-]|^MX[\s_-]", re.IGNORECASE)
+
+# A full-programme mix: the file the editor cuts to.
+_MIX_NAME_RE = re.compile(r"for[\s_-]*vid|mix|bounce|master", re.IGNORECASE)
+_MIX_DIR_RE  = re.compile(r"mix", re.IGNORECASE)
+
+
+# ── Episode model ─────────────────────────────────────────────────────────
+
+def new_episode(root, title=None):
+    root = os.path.abspath(root)
+    return {
+        "version":  EPISODE_VERSION,
+        "workflow": WORKFLOW,
+        "title":    title or os.path.basename(root.rstrip("\\/")) or "Episode",
+        "root":     root,
+        # rel path -> media record (see scan)
+        "media":    {},
+        # name -> {"token", "audio": [rel], "video": [rel], "session": rel|None}
+        "sources":  {},
+        # rel paths the user put aside by hand (survives a rescan)
+        "excluded": [],
+        "links":    {"script": None, "s2s_session": None,
+                     "aaf": None, "aaf_setup": None, "mix": None},
+        # Pull Quotes reads this list of absolute session paths.
+        "sessions": [],
+    }
+
+
+def episode_file_for(root, title=None):
+    ep_title = title or os.path.basename(os.path.abspath(root).rstrip("\\/"))
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", ep_title).strip() or "Episode"
+    return os.path.join(os.path.abspath(root), safe + EPISODE_EXT)
+
+
+def find_episode_file(root):
+    """The episode file in *root*, or None."""
+    try:
+        names = sorted(n for n in os.listdir(root) if n.endswith(EPISODE_EXT))
+    except OSError:
+        return None
+    for n in names:
+        p = os.path.join(root, n)
+        try:
+            with open(p, encoding="utf-8") as f:
+                if json.load(f).get("workflow") == WORKFLOW:
+                    return p
+        except Exception:
+            continue
+    return None
+
+
+def rel(ep, path):
+    """Path relative to the episode root, forward slashes."""
+    if not path:
+        return None
+    try:
+        r = os.path.relpath(os.path.abspath(path), ep["root"])
+    except ValueError:            # different drive
+        return os.path.abspath(path).replace("\\", "/")
+    return r.replace("\\", "/")
+
+
+def absp(ep, r):
+    if not r:
+        return None
+    if os.path.isabs(r):
+        return os.path.normpath(r)
+    return os.path.normpath(os.path.join(ep["root"], r))
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        ep = json.load(f)
+    if ep.get("workflow") != WORKFLOW:
+        raise ValueError("not an episode file: {}".format(path))
+    # The root is wherever the file is now: the folder may have moved.
+    ep["root"] = os.path.dirname(os.path.abspath(path))
+    ep["file_path"] = os.path.abspath(path)
+    ep.setdefault("media", {}); ep.setdefault("sources", {})
+    ep.setdefault("excluded", []); ep.setdefault("links", {})
+    ep["sessions"] = [absp(ep, s) for s in ep.get("sessions", []) if s]
+    return ep
+
+
+def save(ep, path=None):
+    path = path or ep.get("file_path") or episode_file_for(ep["root"], ep.get("title"))
+    out = {k: v for k, v in ep.items() if k != "file_path"}
+    # Sessions are kept relative on disk like everything else; load()
+    # makes them absolute for Pull Quotes.
+    out["sessions"] = [rel(ep, s) for s in sorted(
+        {absp(ep, src.get("session")) for src in ep["sources"].values()
+         if src.get("session")} | {absp(ep, s) for s in ep.get("sessions", []) if s})]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    ep["file_path"] = os.path.abspath(path)
+    return ep["file_path"]
+
+
+# ── Discovery ─────────────────────────────────────────────────────────────
+
+def _quick_hash(path, size):
+    """Head + tail hash: tells identical copies apart from different files
+    of the same length without reading gigabytes."""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(1 << 20))
+            if size > (2 << 20):
+                f.seek(size - (1 << 20))
+                h.update(f.read(1 << 20))
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _duration(path):
+    try:
+        from engines import get_media_duration
+        return float(get_media_duration(path) or 0.0)
+    except Exception:
+        return 0.0
+
+
+_ROMAN = frozenset({"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix",
+                    "x", "xi", "xii"})
+
+
+def _sig_words(text):
+    """Words that carry identity in a file name: 4+ letters, numbers
+    (leading zeros dropped so CAM 01 and CAM 1 agree), roman numerals."""
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", text.lower()):
+        if w.isdigit():
+            out.add(str(int(w)))
+        elif len(w) >= 4 or w in _ROMAN:
+            out.add(w)
+    return out
+
+
+def _name_score(src_stem, video_stem):
+    s, v = _sig_words(src_stem), _sig_words(video_stem)
+    if not s or not v:
+        return 0.0
+    return len(s & v) / float(len(s))
+
+
+def _stem(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _stem_key(path):
+    """Stem with the copy suffixes an app adds to a re-import stripped:
+    "Take (1).wav", "Take.1.wav", "Take-01.wav" all key as "take"."""
+    s = _stem(path).lower()
+    s = re.sub(r"\s*\(\d+\)$", "", s)
+    s = re.sub(r"(\.\d+|-\d{2,})$", "", s)
+    return s.strip()
+
+
+def _components(relpath):
+    return [c for c in relpath.replace("\\", "/").split("/") if c]
+
+
+def classify_path(relpath):
+    """Folder-based verdict for one relative path: ("noise", reason),
+    ("pt_copy", reason), ("mix", reason) or (None, "")."""
+    comps = _components(relpath)
+    dirs = comps[:-1]
+    for d in dirs:
+        if d.startswith("."):
+            return "noise", "hidden folder"
+        if _NOISE_DIR_RE.match(d):
+            return "noise", "in '{}'".format(d)
+    name = comps[-1] if comps else ""
+    if name.lower().endswith(".pb_audio.wav"):
+        return "noise", "playback cache"
+    if _LIBRARY_NAME_RE.search(_stem(name)):
+        return "noise", "library music / effects"
+    for d in dirs:
+        if _PT_AUDIO_DIR_RE.match(d):
+            return "pt_copy", "Pro Tools 'Audio Files' copy"
+    if is_audio(name) and (_MIX_NAME_RE.search(_stem(name))
+                           or any(_MIX_DIR_RE.search(d) for d in dirs)):
+        return "mix", "full-programme mix"
+    return None, ""
+
+
+def scan(root, progress=None, excluded=None, workers=4):
+    """Find the media under *root* and sort it.
+
+    Returns {"files": {rel: record}, "sources": {name: {...}},
+             "mix": rel|None, "sessions": {token: rel}}.
+
+    A record: {"kind", "size", "duration_s", "status", "reason", "dup_of"}
+    with status one of  source | mix | duplicate | pt_copy | noise | short |
+    excluded.  *excluded* is the user's own put-aside list; it wins over
+    everything.  *progress(done, total, text)* is called as durations are
+    probed.
+    """
+    root = os.path.abspath(root)
+    excluded = set(excluded or [])
+    files = {}
+    sessions = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune hidden folders early; everything else is looked at so the
+        # review can show why it was put aside.
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for fn in filenames:
+            if fn.startswith("._"):
+                continue
+            full = os.path.join(dirpath, fn)
+            r = os.path.relpath(full, root).replace("\\", "/")
+            if fn.endswith(".pb_session.json"):
+                try:
+                    with open(full, encoding="utf-8") as f:
+                        d = json.load(f)
+                    if d.get("workflow") == "interview_session" and d.get("token"):
+                        sessions[d["token"]] = {
+                            "path": r,
+                            "media": [os.path.basename(m) for m in d.get("media", [])]}
+                except Exception:
+                    pass
+                continue
+            if not is_media(fn):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            kind = "video" if is_video(fn) else "audio"
+            status, reason = classify_path(r)
+            if r in excluded:
+                status, reason = "excluded", "put aside"
+            files[r] = {"kind": kind, "size": size, "duration_s": None,
+                        "status": status, "reason": reason, "dup_of": None}
+
+    # Durations for everything that might matter (noise is never probed:
+    # a music library can be thousands of files).
+    probe = [r for r, rec in files.items() if rec["status"] in (None, "pt_copy", "mix")]
+    total = len(probe)
+    done = [0]
+
+    def _one(r):
+        full = os.path.join(root, r)
+        d = _duration(full)
+        h = _quick_hash(full, files[r]["size"])
+        return r, d, h
+
+    hashes = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for r, d, h in ex.map(_one, probe):
+            files[r]["duration_s"] = round(d, 3)
+            hashes[r] = h
+            done[0] += 1
+            if progress:
+                progress(done[0], total, os.path.basename(r))
+
+    # Short clips are not sources.
+    for r in probe:
+        rec = files[r]
+        if rec["status"] is None and rec["duration_s"] is not None \
+                and rec["duration_s"] < MIN_SOURCE_SECS:
+            rec["status"] = "short"
+            rec["reason"] = "{:.0f} s".format(rec["duration_s"])
+
+    # Duplicates: identical bytes first, then the same stem and length
+    # (Pro Tools converts on import, so a copy can differ in bytes).
+    def _rank(r):
+        rec = files[r]
+        return (rec["status"] == "pt_copy", len(_components(r)), len(r))
+    groups = {}
+    for r in probe:
+        rec = files[r]
+        if rec["status"] not in (None, "pt_copy", "mix"):
+            continue
+        key = ("h", rec["kind"], rec["size"], hashes.get(r))
+        groups.setdefault(key, []).append(r)
+    for r in probe:
+        rec = files[r]
+        if rec["status"] not in (None, "pt_copy", "mix"):
+            continue
+        key = ("s", rec["kind"], _stem_key(r), round(rec["duration_s"] or 0.0, 0))
+        groups.setdefault(key, []).append(r)
+    for key, members in groups.items():
+        members = [m for m in members if files[m]["dup_of"] is None]
+        if len(members) < 2:
+            continue
+        members.sort(key=_rank)
+        canon = members[0]
+        for m in members[1:]:
+            if m == canon:
+                continue
+            files[m]["dup_of"] = canon
+            files[m]["status"] = "duplicate"
+            files[m]["reason"] = "copy of {}".format(os.path.basename(canon))
+    # Whatever is left in the Pro Tools folder with no original elsewhere
+    # stays listed as a Pro Tools copy: a session folder holds every music
+    # cue and effect ever auditioned alongside any recording that only ever
+    # lived there, and only a person can tell them apart.  The review shows
+    # these with their running time for a one-click include.
+    for r in probe:
+        rec = files[r]
+        if rec["status"] is None:
+            rec["status"] = "source"
+
+    mix = _pick_mix(files)
+    sources = propose_sources(files, sessions)
+    return {"files": files, "sources": sources, "mix": mix, "sessions": sessions}
+
+
+def _pick_mix(files):
+    cands = [(files[r]["duration_s"] or 0.0, r) for r, rec in files.items()
+             if rec["status"] == "mix"]
+    if not cands:
+        return None
+    # The longest full-programme mix; "FOR VID" in the name wins ties.
+    cands.sort(key=lambda t: (-t[0], 0 if re.search(r"for[\s_-]*vid", t[1], re.I) else 1, t[1]))
+    return cands[0][1]
+
+
+def propose_sources(files, sessions=None):
+    """Group the source recordings into sources and attach footage.
+
+    Recordings with the same running time (within a second) that share a
+    name are one multi-track session (a mic per speaker).  Footage goes to
+    the source whose running time it matches (a camera rolled on the same
+    session runs within a few percent of the recorder) and whose name it
+    shares; several cameras match one source.  A Pull Quotes session whose
+    media names match gives the source its token."""
+    sessions = sessions or {}
+    audio = sorted((r for r, rec in files.items()
+                    if rec["kind"] == "audio" and rec["status"] == "source"),
+                   key=lambda r: (-(files[r]["duration_s"] or 0.0), r))
+    video = [r for r, rec in files.items()
+             if rec["kind"] == "video" and rec["status"] == "source"]
+
+    # 1. Group audio into sources.
+    sources = []          # list of {"name", "audio": [rel]}
+    for r in audio:
+        d = files[r]["duration_s"] or 0.0
+        placed = False
+        for s in sources:
+            d0 = files[s["audio"][0]]["duration_s"] or 0.0
+            if abs(d - d0) <= 1.0 and len(_sig_words(_stem(r)) & _sig_words(_stem(s["audio"][0]))) >= 2:
+                s["audio"].append(r)
+                placed = True
+                break
+        if not placed:
+            sources.append({"name": _stem(r), "audio": [r]})
+    for s in sources:
+        if len(s["audio"]) > 1:
+            s["name"] = _common_name(s["audio"])
+            s["audio"].sort()
+
+    # 2. Footage: by running time first, then by name.
+    claimed = set()
+    for s in sources:
+        d0 = files[s["audio"][0]]["duration_s"] or 0.0
+        scored = []
+        for v in video:
+            if v in claimed:
+                continue
+            dv = files[v]["duration_s"] or 0.0
+            dur_ok = d0 > 0 and dv > 0 and abs(dv - d0) / max(d0, dv) <= 0.08
+            ns = max(_name_score(s["name"], _stem(v)),
+                     max(_name_score(_stem(a), _stem(v)) for a in s["audio"]))
+            if dur_ok and ns >= 0.25:
+                scored.append((2 + ns, v))
+            elif ns >= 0.6:
+                scored.append((ns, v))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        if not scored:
+            s["video"] = []
+            continue
+        best = scored[0][0]
+        # Everything close to the best is another angle of the same shoot.
+        s["video"] = sorted(v for sc, v in scored if sc >= best - 0.5 and sc >= 1.0 or sc == best)
+        claimed.update(s["video"])
+
+    # 3. Tokens from Pull Quotes sessions.
+    out = {}
+    for s in sources:
+        names = {os.path.basename(a).lower() for a in s["audio"]}
+        token, sess = None, None
+        for tok, info in sessions.items():
+            if names & {m.lower() for m in info.get("media", [])}:
+                token, sess = tok, info["path"]
+                break
+        out[s["name"]] = {"token": token, "audio": s["audio"],
+                          "video": s.get("video", []), "session": sess}
+    return out
+
+
+def _common_name(paths):
+    stems = [_stem(p) for p in paths]
+    pre = os.path.commonprefix(stems).rstrip(" _-.")
+    return pre or stems[0]
+
+
+def apply_scan(ep, result):
+    """Write a scan result into the episode: media records (keeping the
+    user's exclusions), proposed sources (keeping tokens and edits for
+    names that already exist), the mix link and the Pull Quotes sessions."""
+    ep["media"] = {r: dict(rec) for r, rec in result["files"].items()}
+    old = ep.get("sources", {})
+    new = {}
+    for name, src in result["sources"].items():
+        prev = old.get(name)
+        if prev:
+            src = dict(src, token=prev.get("token") or src.get("token"),
+                       session=prev.get("session") or src.get("session"))
+            if prev.get("video"):
+                src["video"] = prev["video"]
+        new[name] = src
+    # Sources the user made by hand (not re-proposed) stay.
+    for name, src in old.items():
+        if name not in new and src.get("user_made"):
+            new[name] = src
+    ep["sources"] = new
+    ep.setdefault("links", {})
+    if result.get("mix") and not ep["links"].get("mix"):
+        ep["links"]["mix"] = result["mix"]
+    ep["sessions"] = sorted({absp(ep, s["path"]) for s in result["sessions"].values()}
+                            | {absp(ep, s) for s in ep.get("sessions", []) if s})
+    return ep
+
+
+def summary(ep):
+    """Counts for the review header."""
+    st = {}
+    for rec in ep.get("media", {}).values():
+        st[rec["status"]] = st.get(rec["status"], 0) + 1
+    return {
+        "sources":  len(ep.get("sources", {})),
+        "audio":    sum(1 for r in ep.get("media", {}).values()
+                        if r["kind"] == "audio" and r["status"] == "source"),
+        "video":    sum(1 for r in ep.get("media", {}).values()
+                        if r["kind"] == "video" and r["status"] == "source"),
+        "aside":    sum(n for s, n in st.items() if s not in ("source", "mix")),
+        "by_status": st,
+    }
