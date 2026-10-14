@@ -3545,14 +3545,10 @@ def video_shift_frames(offset_secs, fps):
     choice, and making it badly is what leaves one clip a frame out of step
     with its neighbours.
 
-    build_xml_from_pt feeds this the offset with the audio in-point's own
-    rounding error already taken out, so the frame it returns is the one
-    nearest the TRUE picture target for that clip: a single rounding per
-    clip against the session clock, at most half a frame out, with this
-    function's tie rule deciding the coin flips.  (An earlier version kept
-    one shift per source instead; that made picture consistent with the
-    frame-quantised clip audio but let it scatter up to a full frame
-    against the continuous mix the editor actually hears.)
+    build_xml_from_pt no longer uses this for placement: it rounds each
+    clip's picture target with the asymmetric window set by
+    PICTURE_LATE_LIMIT_MS (see there).  This stays for the diagnostic
+    report and sync_residual_frames.
 
     Ties break toward the later source frame, which puts picture early and
     sound late.  Sound arriving after the picture is the direction viewers
@@ -3564,6 +3560,52 @@ def video_shift_frames(offset_secs, fps):
     if abs(frac - 0.5) <= _SYNC_TIE_BAND_FR:
         return int(math.ceil(d))
     return int(math.floor(d + 0.5))
+
+
+# Picture rounding window.  Picture sits on frames, the mix does not, so a
+# clip's picture is always somewhere inside a window exactly one frame wide
+# around its true moment; the only choice is where that window sits.
+# Perception is not symmetric: sound arriving after the picture goes
+# unnoticed far longer than sound arriving before it (nothing in nature
+# arrives before its light), and ATSC IS-191 allows audio to lag by 45 ms
+# but lead by only 15 ms.  So the window is placed to keep picture LATE
+# (sound leading) within this many ms and spend the rest of the frame on
+# picture early.  At 23.976 that is late <= 0.36 frame, early < 0.64; at
+# 29.97, 0.45 / 0.55; from 50 fps up a frame is shorter than twice the
+# limit and the window is plain nearest-frame.
+PICTURE_LATE_LIMIT_MS = 15.0
+
+
+def exact_fps(fps):
+    """The rate the NLE really plays for a rounded UI rate: 23.976 is
+    24000/1001, 29.97 is 30000/1001, and so on (make_rate writes exactly
+    these as timebase + NTSC).  Placement arithmetic has to use the exact
+    value: at the rounded one a frame count is one part in a million off,
+    which is 0.12 frame by the 80th minute of a source file -- a quarter of
+    the picture window."""
+    try:
+        f = float(fps)
+    except (TypeError, ValueError):
+        return fps
+    for approx, integer in ((23.976, 24), (29.97, 30), (47.952, 48), (59.94, 60)):
+        if abs(f - approx) < 0.01:
+            return integer * 1000.0 / 1001.0
+    return f
+
+
+def picture_late_limit_frames(fps):
+    """How far behind its true moment a picture frame may land, in frames:
+    PICTURE_LATE_LIMIT_MS at this rate, never more than half a frame."""
+    if not fps:
+        return 0.5
+    return min(0.5, PICTURE_LATE_LIMIT_MS / 1000.0 * fps)
+
+
+def round_picture_frame(target_fr, fps):
+    """The frame for a real-valued picture target such that
+    frame - target lies in [-late, 1 - late), late = picture_late_limit_frames."""
+    late = picture_late_limit_frames(fps)
+    return int(math.ceil(target_fr - late - 1e-9))
 
 
 def sync_residual_frames(offset_secs, fps):
@@ -4713,7 +4755,9 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       close_gaps_across_sources=False, stats_out=None,
                       seq_start_secs=0.0, seq_drop_frame=False,
                       mix_lag_secs=0.0):
-    fps        = seq_fps
+    # make_rate() writes the NTSC rational for 23.976 / 29.97 / 59.94; do
+    # the frame arithmetic at that exact rate too (see exact_fps).
+    fps        = exact_fps(seq_fps)
     mix_lag_secs = float(mix_lag_secs or 0.0)
     defined    = set()
     link_pairs = []      # (video_element, cam_audio_element, track_name)
@@ -4822,6 +4866,9 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         #                 probes, so one offset holds across a long file.
         # Audio ADDS nothing; video ADDS the offset: positive = camera
         # started before the DAW (common), negative = the other way round.
+        # The audio in-point is nearest-frame.  The picture frame is chosen
+        # with the asymmetric window of PICTURE_LATE_LIMIT_MS: at most that
+        # many ms late (sound leading), the rest of the frame early.
         drift     = clip.get("video_drift") or {}
         k_drift   = float(drift.get("ppm", 0.0) or 0.0) * 1e-6
         eff_off   = v_offset + k_drift * (
@@ -4829,13 +4876,12 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
         delta_fr  = orig_start - clip["start_secs"] * fps
         target_a  = src_in_s * fps + delta_fr - mix_lag_secs * fps
         a_in_core = int(math.floor(target_a + 0.5))
-        # Picture = the audio in-point plus the offset, rounded ONCE against
-        # the true target: the audio's own rounding error is taken out
-        # before video_shift_frames applies its tie rule (picture early,
-        # sound late).
-        v_in_core = a_in_core + video_shift_frames(
-            eff_off - (a_in_core - target_a) / fps, fps)
-        pic_err_fr = v_in_core - (target_a + eff_off * fps)   # |.| <= 0.5
+        # Picture: ONE rounding of the true target (audio target + offset),
+        # into the asymmetric window -- not the audio in-point plus a
+        # rounded offset, which would add the audio's own rounding error.
+        target_v  = target_a + eff_off * fps
+        v_in_core = round_picture_frame(target_v, fps)
+        pic_err_fr = v_in_core - target_v    # + = picture early; in [-late, 1-late)
         span_fr   = end_fr - start_fr      # content + fade room, as placed
         a_src_in  = max(0, a_in_core - head_ext)
         a_src_out = a_src_in + span_fr
@@ -5021,10 +5067,13 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
               "max_err_fr":  max(abs(e) for e in d["errs"]),
               "max_err_ms":  (max(abs(e) for e in d["errs"]) / fps * 1000.0
                               if fps else 0.0),
+              "late_max_fr":  max(0.0, -min(d["errs"])),
+              "early_max_fr": max(0.0, max(d["errs"])),
               "mean_err_fr": sum(d["errs"]) / len(d["errs"])}
              for base, d in _sync_applied.items() if d["errs"]),
             key=lambda r: -r["max_err_fr"])
         stats_out["mix_lag_secs"] = mix_lag_secs
+        stats_out["picture_late_limit_fr"] = picture_late_limit_frames(fps)
 
     # ── Emit clipitems ─────────────────────────────────────────────────
     for p in placements:

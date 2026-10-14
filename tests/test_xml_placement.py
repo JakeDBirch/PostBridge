@@ -31,9 +31,16 @@ sys.path.insert(0, ROOT)
 import engines  # noqa: E402
 import parsers  # noqa: E402
 
-FPS = 24000.0 / 1001.0
-# Exact half-frame ties break toward picture-early inside a small band.
-BOUND = 0.5 + engines._SYNC_TIE_BAND_FR + 1e-6
+FPS = 24000.0 / 1001.0          # what Premiere plays; the build snaps 23.976 to this
+# Picture window: at most PICTURE_LATE_LIMIT_MS late, the rest of the frame
+# early (perception tolerates sound late far better than sound early).
+LATE  = engines.picture_late_limit_frames(23.976)       # 0.36 fr at 23.976
+EARLY = 1.0 - LATE
+EPS   = 1e-6
+
+
+def _in_window(errs):
+    return min(errs) >= -LATE - EPS and max(errs) <= EARLY + EPS
 
 
 def _clip(start, dur, src_in, offset, drift=None, sf="ref.wav"):
@@ -80,11 +87,15 @@ def test_picture_within_half_a_frame_and_centred(seed):
     vids, auds, stats = _build(clips)
     assert len(vids) == len(clips) == len(auds)
     errs = [_picture_error_frames(ci, c, 0.740, 0.0) for ci, c in zip(vids, clips)]
-    assert max(abs(e) for e in errs) <= BOUND, errs
-    # Centred: nothing systematic left (the old build sat at ~+0.8 here).
-    assert abs(sum(errs) / len(errs)) < 0.15, sum(errs) / len(errs)
+    assert _in_window(errs), (min(errs), max(errs))
+    # Sits where the window says: mean at the window's centre (+0.14 at
+    # 23.976), not at the +0.8 the old build produced here.
+    centre = (EARLY - LATE) / 2.0
+    assert abs(sum(errs) / len(errs) - centre) < 0.15, sum(errs) / len(errs)
     r = stats["sync_residuals"][0]
-    assert r["n_clips"] == len(clips) and r["max_err_fr"] <= BOUND
+    assert r["n_clips"] == len(clips)
+    assert r["late_max_fr"] <= LATE + EPS and r["early_max_fr"] <= EARLY + EPS
+    assert abs(stats["picture_late_limit_fr"] - LATE) < EPS
     # The source window is exactly as long as the timeline span: no speed
     # change for Premiere to infer.
     for ci in vids + auds:
@@ -97,7 +108,7 @@ def test_mix_lag_moves_the_target():
     for lag in (0.014, -0.02):
         vids, _auds, stats = _build(clips, mix_lag=lag)
         errs = [_picture_error_frames(ci, c, 1.5, lag) for ci, c in zip(vids, clips)]
-        assert max(abs(e) for e in errs) <= BOUND
+        assert _in_window(errs), (min(errs), max(errs))
         assert stats["mix_lag_secs"] == lag
 
 
@@ -107,13 +118,30 @@ def test_drift_applied_per_clip():
     clips = [_clip(5.0 + i * 9.0, 6.0, src_in, 2.0, drift)
              for i, src_in in enumerate(range(0, 3600, 90))]
     vids, _auds, stats = _build(clips)
-    for ci, c in zip(vids, clips):
-        off = 2.0 + 60e-6 * (c["src_in_secs"] - 1800.0)
-        assert abs(_picture_error_frames(ci, c, off, 0.0)) <= BOUND
+    errs = [_picture_error_frames(ci, c, 2.0 + 60e-6 * (c["src_in_secs"] - 1800.0), 0.0)
+            for ci, c in zip(vids, clips)]
+    assert _in_window(errs), (min(errs), max(errs))
     # Against a constant offset the same clips would be off by frames.
     worst = max(abs(_picture_error_frames(ci, c, 2.0, 0.0)) for ci, c in zip(vids, clips))
     assert worst > 2.0
     assert abs(stats["sync_residuals"][0]["drift_ppm"] - 60.0) < 1e-9
+
+
+def test_picture_window_follows_the_frame_rate():
+    # 15 ms is 0.36 fr at 23.976 and 0.45 fr at 29.97; from 50 fps the
+    # frame is too short for the limit to matter and rounding is nearest.
+    assert abs(engines.picture_late_limit_frames(23.976) - 0.35964) < 1e-4
+    assert abs(engines.picture_late_limit_frames(29.97) - 0.44955) < 1e-4
+    assert engines.picture_late_limit_frames(59.94) == 0.5
+    # Window edges: a target exactly `late` above a frame still rounds down
+    # to it; a hair more and it goes up.
+    late = engines.picture_late_limit_frames(23.976)
+    assert engines.round_picture_frame(100.0 + late, 23.976) == 100          # late edge, inclusive
+    assert engines.round_picture_frame(100.0 + late + 1e-6, 23.976) == 101
+    assert engines.round_picture_frame(100.0 - (1 - late) + 1e-6, 23.976) == 100   # early edge
+    assert engines.round_picture_frame(100.0 - (1 - late) - 1e-6, 23.976) == 99
+    assert abs(engines.exact_fps(23.976) - FPS) < 1e-12
+    assert engines.exact_fps(25.0) == 25.0
 
 
 def test_detector_reports_drift_from_the_probes(monkeypatch):

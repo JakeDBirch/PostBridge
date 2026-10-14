@@ -5352,17 +5352,19 @@ class AafWorkflowMixin:
                 # in Pro Tools rather than discovered on the timeline.
                 _resid = _build_stats.get("sync_residuals") or []
                 if _resid:
+                    _lim = _build_stats.get("picture_late_limit_fr", 0.5)
                     print("Picture placement (picture sits on frames, sound does "
-                          "not; each clip is rounded once, so half a frame is "
-                          "the worst case):")
+                          "not; each clip is rounded once into a one-frame "
+                          "window: at most {:.2f} fr / {:.0f} ms late, the rest "
+                          "early):".format(_lim, engines.PICTURE_LATE_LIMIT_MS))
                     for _r in _resid:
                         _dr = ("  drift {:+.0f} ppm".format(_r["drift_ppm"])
                                if abs(_r["drift_ppm"]) >= 1.0 else "")
-                        print("  {:<30} offset {:+.3f}s{}  {} clips, worst "
-                              "{:.2f} fr ({:.1f} ms), mean {:+.2f} fr".format(
-                                  _r["source"][:30], _r["offset_secs"], _dr,
-                                  _r["n_clips"], _r["max_err_fr"],
-                                  _r["max_err_ms"], _r["mean_err_fr"]))
+                        print("  {:<30} offset {:+.3f}s{}  {} clips, late "
+                              "<= {:.2f} fr, early <= {:.2f} fr, mean {:+.2f} fr"
+                              .format(_r["source"][:30], _r["offset_secs"], _dr,
+                                      _r["n_clips"], _r["late_max_fr"],
+                                      _r["early_max_fr"], _r["mean_err_fr"]))
 
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
