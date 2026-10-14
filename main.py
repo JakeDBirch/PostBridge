@@ -62,6 +62,7 @@ from sync_preview import SyncPreviewDialog
 from match_review import MatchReviewDialog
 from aaf_workflow import AafWorkflowMixin
 from pq_workflow import PqWorkflowMixin
+from episode_workflow import EpisodeWorkflowMixin
 
 
 def _tx_count_chars(tx, a, b):
@@ -99,7 +100,8 @@ def _tx_count_displaylines(tx, a, b):
     return int(r)
 
 
-class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk):
+class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
+          TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     # ── Status display maps (single source of truth) ────────────────
     # Class-level so any code path that renders a status label uses
@@ -824,7 +826,17 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
         _ARR_FONT   = (_SANS, 20, "bold")
         hover_bg    = "#303030"
 
+        _ep = getattr(self, "_ep", None)
         workflows = [
+            ("Episode" if not _ep else "Episode  \u2014  {}".format(_ep.get("title", "")),
+             "episode",
+             ("Choose the project folder once. PostBridge finds the interview "
+              "recordings and camera footage, folds Pro Tools copies, sets "
+              "music and effects aside, and carries the links into every "
+              "stage below.") if not _ep else
+             ("Back to the open episode: its sources, cameras and stages. "
+              "Use CHANGE FOLDER there to start another."),
+             True),
             ("Pull Quotes",
              "pull_quotes",
              "Transcribe interview sessions, browse the transcripts, and "
@@ -992,6 +1004,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
             self._script_formatter()
         elif key == "pull_quotes":
             self._pq_open_home()
+        elif key == "episode":
+            self._ep_enter()
 
     def _tooltip(self, widget, text):
         """Attach a hover tooltip showing full text to any widget."""
@@ -3555,6 +3569,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 if getattr(self, "_aaf_data", None) is None:
                     return None
                 data = self._aaf_build_setup_data()
+            elif wf == "episode":
+                ep = getattr(self, "_ep", None)
+                if not ep:
+                    return None
+                data = {k: v for k, v in ep.items() if k != "file_path"}
             elif wf == "pull_quotes":
                 proj = getattr(self, "_pq_project", None)
                 if not proj:
@@ -3665,6 +3684,9 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
 
     def _save_as(self):
         """Prompt for a file path, write a complete session JSON, and remember the path."""
+        if getattr(self, 'workflow', None) == 'episode':
+            self._ep_save(prompt=True)
+            return
         if getattr(self, 'workflow', None) == 'aaf_xml':
             self._aaf_save_setup()
             return
@@ -3693,6 +3715,8 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                           cls=self._numpy_safe_encoder(), indent=2)
             self._current_session_file = path
             self._mark_saved()
+            self._ep_note_link("s2s_session", path,
+                               owner=("script", getattr(self, "_script_path", None)))
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -3709,6 +3733,10 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 except Exception:
                     pass
 
+        if getattr(self, 'workflow', None) == 'episode':
+            if self._ep_save():
+                _flash_saved()
+            return
         if getattr(self, 'workflow', None) == 'aaf_xml':
             if self._aaf_save_setup(prompt=False):
                 _flash_saved()
@@ -4034,6 +4062,11 @@ class App(AafWorkflowMixin, PqWorkflowMixin, TkinterDnD.Tk if HAS_DND else tk.Tk
                 data = json.load(f)
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
+            return
+
+        # ── Episode file — the hub for every workflow ─────────────────────
+        if data.get("workflow") == "episode":
+            self._ep_open_file(path)
             return
 
         # ── AAF→XML setup file — route to the AAF workflow ───────────────────

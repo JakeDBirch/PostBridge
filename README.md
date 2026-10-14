@@ -70,6 +70,34 @@ Step 3 (reconcile) shows a live resource monitor — GPU utilization, VRAM, and 
 
 ---
 
+## Episodes: one project for every workflow
+
+The three workflows below each used to keep their own file and their own media links, so every stage began by rebuilding what the last one already knew. An **episode** is the one file they share. It lives at the root of the show's project folder as `<Title>.pb_episode.json`, every path inside it is relative to that folder, and it can move between machines with the folder.
+
+### Choose the folder once
+
+From the home screen pick **Episode** and choose the project folder — any folder; the `02_MEDIA` / `03_AUDIO` layout is not required. If an episode file is already there it opens; otherwise PostBridge looks through the folder once and sorts what it finds:
+
+- **Recordings and footage** become candidate sources. Running times are measured; nothing is hashed in full.
+- **Pro Tools copies** — the session's `Audio Files` folder holds a copy of every recording ever imported, plus every music cue and effect auditioned. Copies of a recording that exists elsewhere are folded onto the original. Everything else in that folder is listed, with its length, for a one-click **USE AS SOURCE**; it is never assumed to be a recording.
+- **Music, effects, renders, caches** are put aside by folder name (`MUSIC`, `SFX`, `STEMS`, `Bounced Files`, `FINAL_ASSETS`, `.pb_cache`, backups, …) and by file name (library catalogue codes, `_STEM_(`, `_APM`, `SFX_`, Freesound). Clips under 60 s are put aside as too short. All of it stays visible under **PUT ASIDE** with the reason.
+- **The stereo mix** is found by name or folder (`FOR VID`, `MIXED AUDIO`).
+- **Sources** are proposed from the recordings: files with the same running time and a shared name are one multi-mic session; footage is attached to the source whose running time it matches (within 8 %) and whose name it shares, several cameras per source; a Pull Quotes session whose media match gives the source its token.
+
+### The episode screen
+
+Every decision is shown for review. Each source has its token, its recordings and its cameras; cameras can be attached or detached, recordings promoted to sources, anything put aside or restored. **RESCAN FOLDER** picks up new files while keeping your tokens, cameras and exclusions. **SAVE EPISODE** (or Ctrl+S) writes the file at the project root.
+
+### Stages
+
+The **STAGES** card opens each workflow already linked:
+
+- **Pull Quotes** opens the episode's interview sessions; saving writes the session list back into the episode file.
+- **Script → Session** asks for the script the first time, then opens Step 2 with every source's recordings and cameras in the pool, assigned to the source's token where the script uses it. Once a session is saved it is remembered, and the stage reopens it.
+- **AAF → XML** asks for the AAF the first time, then opens Step 2 with the video pool, the per-source camera assignments and slot counts, each source's reference audio and the stereo mix already in place — only SYNC remains. A saved setup is remembered and reopened, syncs and all.
+
+Existing per-workflow files (`*_session.json`, `*_setup.json`, the old Pull Quotes `.pb_episode.json`) keep working exactly as before; episodes are for new work.
+
 ## Workflow 1: Pull Quotes
 
 For browsing raw interview audio and lifting quotes straight into a script.

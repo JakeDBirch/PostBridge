@@ -261,6 +261,27 @@ class PqWorkflowMixin:
             messagebox.showinfo("Nothing to save",
                 "Add at least one Interview Session before saving the project.")
             return False
+        # Opened from an episode: the episode file is the project.  Write
+        # the title and session list into it and leave the rest -- sources,
+        # media, links -- exactly as the episode screens keep them.
+        ep_file = project.get("episode_file")
+        if ep_file and not prompt_path:
+            try:
+                import episode as _EP
+                ep = _EP.load(ep_file)
+                ep["title"] = project.get("title") or ep.get("title")
+                ep["sessions"] = sorted({os.path.abspath(s["_file_path"])
+                                         for s in project["sessions"] if s.get("_file_path")})
+                _EP.save(ep, ep_file)
+                if getattr(self, "_ep", None) and self._ep.get("file_path") == ep_file:
+                    self._ep["title"] = ep["title"]
+                    self._ep["sessions"] = ep["sessions"]
+                self._mark_saved()
+                self._pq_render_project_view()
+                return True
+            except Exception as e:
+                messagebox.showerror("Save episode failed", str(e))
+                return False
         path = project.get("file_path")
         if prompt_path or not path:
             suggested = re.sub(r"[^A-Za-z0-9_\- ]+", "_",

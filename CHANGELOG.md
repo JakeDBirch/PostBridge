@@ -4,6 +4,9 @@
 
 ## October 14, 2026
 
+### Episodes: one project file for every workflow
+Choose the project folder once. PostBridge looks through it, folds Pro Tools copies onto the originals, puts music, effects, renders and caches aside with the reason, finds the stereo mix, groups recordings into sources (multi-mic sessions by running time and name) and attaches the cameras that rolled on each one. Every decision is reviewable; tokens, cameras and exclusions survive a rescan. The episode file lives at the project root with relative paths, so the folder can move. From it, Pull Quotes, Script → Session and AAF → XML open already linked: the pool, the token assignments, the per-source cameras, reference audio and mix are in place, and each stage's own saved file is remembered and reopened. Existing per-workflow files are untouched.
+
 ### AAF → XML: custom track map
 A fourth **Video tracks** choice. Each camera (source × slot) names the video track it goes to; cameras on the same video track share its clip-audio and camera-audio tracks. The default sends slot 1 of every source to Video 1, slot 2 to Video 2, and so on, so one narrator shot on the same three cameras over two days collapses from 6 video and 8 audio tracks to 3 and 4 without touching the map. Saved with the setup. The export-complete screen also gained **BACK TO SETUP**, and the Video tracks choice now survives Back / Next.
 

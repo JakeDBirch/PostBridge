@@ -1,0 +1,202 @@
+"""Episode screens, headless: choose a folder, scan, review, save, reopen,
+and launch Script -> Session and AAF -> XML already linked.
+
+Builds the same small real-media project as test_episode.py.  Needs
+tkinter, a display and ffmpeg; skips otherwise.
+"""
+import json
+import os
+import shutil
+import sys
+import time
+import traceback
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+    pytest.skip("ffmpeg/ffprobe not on PATH", allow_module_level=True)
+
+from test_episode import project  # noqa: E402,F401  (module-scoped fixture)
+import episode as EP  # noqa: E402
+
+
+def _app_or_skip():
+    tk = pytest.importorskip("tkinter")
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        pytest.skip("no display")
+    try:
+        import main
+        app = main.App()
+    except tk.TclError as e:
+        pytest.skip("Tk unavailable: {}".format(e))
+    app.withdraw()
+    return app
+
+
+def _pump(app, n=20):
+    for _ in range(n):
+        app.update()
+        time.sleep(0.025)
+
+
+def _wait(app, cond, secs=60):
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        _pump(app, 4)
+        if cond():
+            return True
+    return False
+
+
+@pytest.fixture
+def app(monkeypatch):
+    import episode_workflow, aaf_workflow
+    a = _app_or_skip()
+    errors = []
+    a.report_callback_exception = (
+        lambda *x: errors.append("".join(traceback.format_exception(*x))))
+    a._errors = errors
+    import main as main_mod, pq_workflow
+    for mod in (episode_workflow, aaf_workflow, main_mod, pq_workflow):
+        for name in ("showinfo", "showwarning", "showerror"):
+            monkeypatch.setattr(mod.messagebox, name,
+                                lambda title, msg, *x, **k: errors.append("{}: {}".format(title, msg)))
+        # A native file dialog would hang a headless run; make any
+        # unexpected one a recorded failure instead.
+        for name in ("askopenfilename", "asksaveasfilename", "askdirectory"):
+            monkeypatch.setattr(mod.filedialog, name,
+                                lambda **k: (errors.append("unexpected dialog: " + repr(k)) or ""))
+    def _ask(title, msg, **k):
+        errors.append("unexpected question: " + title); return False
+    for mod in (main_mod, aaf_workflow, pq_workflow):
+        monkeypatch.setattr(mod.messagebox, "askyesno", _ask)
+        monkeypatch.setattr(mod.messagebox, "askyesnocancel", _ask)
+    try:
+        yield a
+    finally:
+        a.destroy()
+
+
+def _open_fresh(app, monkeypatch, project, reset=True):
+    """Choose the project folder.  The project fixture is shared across the
+    module, so an earlier test's episode file is removed first unless the
+    test wants to find it."""
+    import episode_workflow
+    if reset:
+        for n in os.listdir(project):
+            if n.endswith(EP.EPISODE_EXT):
+                os.remove(os.path.join(project, n))
+    monkeypatch.setattr(episode_workflow.filedialog, "askdirectory", lambda **k: project)
+    app._select_workflow("episode")
+    assert _wait(app, lambda: bool(getattr(app, "_ep", None) and app._ep.get("media"))), \
+        "scan never finished"
+    _pump(app, 10)
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_choose_folder_scan_save_reopen(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    assert set(ep["sources"]) == {"Ep 7 pt 1", "Ep 7 pt 2", "Butler Interview"}
+    assert ep["sources"]["Butler Interview"]["token"] == "BUTLER"
+    assert app.workflow == "episode" and app._is_dirty()
+
+    # Edit through the model the way the screen does, then save with the
+    # header SAVE (quick save), which must land at the project root.
+    ep["sources"]["Ep 7 pt 1"]["token"] = "NARR1"
+    app._quick_save()
+    path = os.path.join(project, "Ep 7" + EP.EPISODE_EXT)
+    assert os.path.isfile(path) and not app._is_dirty()
+
+    # Put a camera aside and rescan: it stays aside, the token survives.
+    app._ep_exclude("02_MEDIA/RAW/Ep 7 CAM 2 01.mp4")
+    app._ep_scan()
+    assert _wait(app, lambda: "02_MEDIA/RAW/Ep 7 CAM 2 01.mp4" in app._ep["media"]
+                 and app._ep["media"]["02_MEDIA/RAW/Ep 7 CAM 2 01.mp4"]["status"] == "excluded")
+    assert app._ep["sources"]["Ep 7 pt 1"]["token"] == "NARR1"
+    assert app._ep["sources"]["Ep 7 pt 1"]["video"] == ["02_MEDIA/RAW/Ep 7 CAM 1 01.mp4"]
+    app._ep_save()
+
+    # Reopen through the generic OPEN router.
+    app._ep = None
+    app._home(); _pump(app, 3)
+    app._open_session(path); _pump(app, 10)
+    assert app.workflow == "episode" and app._ep["title"] == "Ep 7"
+    assert app._ep["sources"]["Ep 7 pt 1"]["token"] == "NARR1"
+    # And the folder dialog finds the existing file next time.
+    app._ep = None
+    _open_fresh(app, monkeypatch, project, reset=False)
+    assert app._ep["sources"]["Ep 7 pt 1"]["token"] == "NARR1"
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_launch_script_session_prefills_the_pool(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    script = os.path.join(project, "05_SCRIPT", "Ep 7.txt")
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("[PART Open]\n[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n")
+    ep["links"]["script"] = EP.rel(ep, script)
+    app._ep_save()
+    app._ep_launch_s2s()
+    ok = _wait(app, lambda: getattr(app, "_pool", None) is not None
+               and len(app._pool._rows) >= 9, secs=30)
+    _pump(app, 10)
+    _rows = getattr(getattr(app, "_pool", None), "_rows", None)
+    assert ok, "workflow={} rows={} errors={}".format(
+        app.workflow, None if _rows is None else [os.path.basename(r["path"]) for r in _rows],
+        app._errors)
+    rows = {os.path.basename(r["path"]): r["var"].get() for r in app._pool._rows}
+    assert rows["Butler Interview_JORDAN.wav"] == "BUTLER"
+    assert rows["Butler Interview_CARY.wav"] == "BUTLER"
+    assert rows["Butler Interview.MP4"] == "BUTLER"
+    assert rows["Ep 7 pt 1.wav"] == "— unassigned —"      # no such token in the script
+    assert "Ep 7 CAM 1 01.mp4" in rows and "bed.wav" not in rows
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_launch_aaf_prefills_setup(app, monkeypatch, project):
+    import parsers, aaf_workflow
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    aaf = os.path.join(project, "01_PROJECT FILES", "Ep 7.aaf")
+    open(aaf, "wb").close()
+
+    def clip(name, sf, t0):
+        return {"clip_name": name, "start_secs": t0, "end_secs": t0 + 5,
+                "src_in_secs": 10.0, "src_out_secs": 15.0, "state": "Unmuted",
+                "source_file": sf, "fade_in_secs": 0.0, "fade_out_secs": 0.0}
+    pt1 = os.path.join(project, "03_AUDIO", "01_VO", "Ep 7 pt 1.wav")
+    bj = os.path.join(project, "03_AUDIO", "00_RAW AUDIO", "Butler Interview_JORDAN.wav")
+    def fake_parse(path):
+        return {"session_name": "Ep 7", "fps": 23.976, "sample_rate": 48000, "markers": [],
+                "start_tc_secs": 0.0, "start_tc_frames": 0, "tc_fps": 23.976,
+                "tracks": [{"name": "VO", "clips": [clip("Ep 7 pt 1.wav-01", pt1, 0)]},
+                           {"name": "INT", "clips": [clip("Butler Interview_JORDAN.wav-03", bj, 10)]}]}
+    monkeypatch.setattr(parsers, "parse_aaf_session", fake_parse)
+    monkeypatch.setattr(aaf_workflow, "parse_aaf_session", fake_parse)
+    ep["links"]["aaf"] = EP.rel(ep, aaf)
+    app._ep_save()
+    app._ep_launch_aaf()
+    assert _wait(app, lambda: app.workflow == "aaf_xml"
+                 and "Ep 7 pt 1" in getattr(app, "_aaf_source_file_vars", {})
+                 and app._aaf_source_file_vars["Ep 7 pt 1"].get() == "Ep 7 CAM 1 01.mp4", secs=30)
+    _pump(app, 10)
+    assert app._aaf_source_slot_counts["Ep 7 pt 1"] == 2
+    assert [v.get() for v in app._aaf_source_extra_vars["Ep 7 pt 1"]] == ["Ep 7 CAM 2 01.mp4"]
+    assert app._aaf_source_syncaudio_vars["Ep 7 pt 1"].get() == pt1
+    assert app._aaf_source_file_vars["Butler Interview_JORDAN"].get() == "Butler Interview.MP4"
+    assert app._aaf_source_syncaudio_vars["Butler Interview_JORDAN"].get() == bj
+    assert app._aaf_mix_var.get().endswith("Ep 7_FOR VID.wav")
+    assert app._aaf_group_var.get() == "custom"
+    assert not app._errors, "\n".join(app._errors)
+
+    # Saving the AAF setup is remembered by the episode (same AAF).
+    app._aaf_saved_path = os.path.join(project, "01_PROJECT FILES", "Ep 7_setup.json")
+    assert app._aaf_save_setup(prompt=False)
+    saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
+    assert saved["links"]["aaf_setup"] == "01_PROJECT FILES/Ep 7_setup.json"

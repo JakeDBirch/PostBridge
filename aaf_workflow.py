@@ -4782,6 +4782,8 @@ class AafWorkflowMixin:
                 with open(saved, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 self._mark_saved()
+                self._ep_note_link("aaf_setup", saved,
+                                   owner=("aaf", getattr(self, "_aaf_path", None)))
                 return True
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
@@ -4808,6 +4810,8 @@ class AafWorkflowMixin:
                 json.dump(data, f, indent=2)
             self._aaf_saved_path = path   # future quick-saves go here
             self._mark_saved()
+            self._ep_note_link("aaf_setup", path,
+                               owner=("aaf", getattr(self, "_aaf_path", None)))
             return True
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
