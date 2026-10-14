@@ -184,11 +184,9 @@ def test_back_from_export_report_keeps_setup(fx):
     before = fx.sync_snapshot()
     app.out_path.set(str(fx.tmp / "out.xml"))
     app._aaf_done(2, 0, 3, [("CamA.wav-01", "CamA.mp4", "#00ff00")]); _pump(app, 5)
-    assert not fx.errors, "
-".join(fx.errors)
+    assert not fx.errors, "\n".join(fx.errors)
     app._aaf_step2(); _pump(app, 20)
-    assert not fx.errors, "
-".join(fx.errors)
+    assert not fx.errors, "\n".join(fx.errors)
     assert fx.sync_snapshot() == before
     assert set(app._aaf_video_paths) == {fx.vid_a, fx.vid_b}
 
