@@ -7,6 +7,7 @@ App helpers (_btn, _section, _scroll_frame, _clear, _ui, _mark_saved) and
 on episode.py for everything that is not a widget.
 """
 import os
+import re
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -15,6 +16,7 @@ from config import *
 from config import _SANS
 from gui_components import _FlatDropdown
 import episode as EP
+import gdocs
 
 
 class EpisodeWorkflowMixin:
@@ -209,6 +211,20 @@ class EpisodeWorkflowMixin:
             r.pack(fill="x", pady=2)
             self._btn(r, label, cmd, small=True, width=18).pack(side="left")
             tk.Label(r, text=note, font=FB, bg=SURF, fg=SUB).pack(side="left", padx=(12, 0))
+            if cmd is self._ep_launch_s2s:
+                # The script can live in Google Docs: link it once, then
+                # every launch fetches the latest text and checks it.
+                gd = links.get("gdoc") or {}
+                if gd.get("id"):
+                    tk.Label(r, text="\u00b7  Google Doc: {}".format(gd.get("name", "")),
+                             font=FB, bg=SURF, fg=SUCCESS).pack(side="left", padx=(12, 0))
+                    self._btn(r, "FETCH & CHECK", self._ep_gdoc_fetch, small=True
+                              ).pack(side="left", padx=(12, 0))
+                    self._btn(r, "CHANGE DOC\u2026", self._ep_gdoc_link, small=True
+                              ).pack(side="left", padx=(6, 0))
+                else:
+                    self._btn(r, "LINK GOOGLE DOC\u2026", self._ep_gdoc_link, small=True
+                              ).pack(side="left", padx=(12, 0))
 
     def _ep_render_sources(self, parent):
         ep = self._ep
@@ -452,6 +468,172 @@ class EpisodeWorkflowMixin:
         rec["status"] = "source"; rec["reason"] = ""
         self._ep_view()
 
+    # ── Google Docs ───────────────────────────────────────────────────────
+
+    def _ep_launch_s2s_fetched(self):
+        """Continue a Script -> Session launch after the Doc was fetched."""
+        self._ep_s2s_fetched = True
+        try:
+            self._ep_launch_s2s()
+        finally:
+            self._ep_s2s_fetched = False
+
+    def _ep_gdoc_script_path(self, name=None):
+        ep = self._ep
+        gd = ep.get("links", {}).get("gdoc") or {}
+        stem = re.sub(r'[\\/:*?"<>|]+', "_", name or gd.get("name") or ep["title"]).strip() or "script"
+        return os.path.join(ep["root"], stem + ".txt")
+
+    def _ep_gdoc_bg(self, work, done):
+        """Run *work()* off the UI thread (sign-in, network); hand its
+        result to *done(result)* on the UI thread, or show the error."""
+        def _run():
+            try:
+                res = work()
+            except Exception as e:
+                msg = str(e)
+                self._ui(lambda: messagebox.showerror("Google Docs", msg))
+                return
+            self._ui(lambda: done(res))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _ep_gdoc_link(self):
+        """Pick the episode's script Doc through Google's picker."""
+        if not self._ep_ready():
+            return
+        if not gdocs.is_configured():
+            messagebox.showinfo("Google Docs", gdocs.setup_message())
+            return
+        ep = self._ep
+
+        def _work():
+            creds = gdocs.get_credentials()
+            return gdocs.pick_document(creds)
+
+        def _done(pick):
+            if not pick:
+                return
+            ep.setdefault("links", {})["gdoc"] = {"id": pick["id"], "name": pick["name"]}
+            EP.save(ep)
+            self._ep_view()
+        self._ep_gdoc_bg(_work, _done)
+
+    def _ep_gdoc_fetch(self, then=None):
+        """Fetch the linked Doc as the episode's script, run Script Check,
+        show the findings; *then()* runs when the user continues."""
+        ep = self._ep
+        gd = (ep.get("links", {}).get("gdoc") or {})
+        if not gd.get("id"):
+            return
+        if not gdocs.is_configured():
+            messagebox.showinfo("Google Docs", gdocs.setup_message())
+            return
+        prev_text = ""
+        prev_path = EP.absp(ep, ep["links"].get("script"))
+        if prev_path and os.path.isfile(prev_path):
+            try:
+                with open(prev_path, encoding="utf-8", errors="replace") as f:
+                    prev_text = f.read()
+            except OSError:
+                pass
+
+        def _work():
+            creds = gdocs.get_credentials()
+            text, meta = gdocs.fetch_text(creds, gd["id"])
+            return text, meta
+
+        def _done(res):
+            text, meta = res
+            path = self._ep_gdoc_script_path(meta.get("name"))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            links = ep.setdefault("links", {})
+            links["script"] = EP.rel(ep, path)
+            links["gdoc"] = dict(gd, name=meta.get("name", gd.get("name", "")),
+                                 version=meta.get("version"), modified=meta.get("modifiedTime"))
+            EP.save(ep)
+            import script_check
+            findings = script_check.run_checks(text, script_path=path)
+            diff = gdocs.diff_pulls(prev_text, text) if prev_text else None
+            self._ep_show_findings(findings, text, meta, diff, then)
+        self._ep_gdoc_bg(_work, _done)
+
+    def _ep_show_findings(self, findings, text, meta, diff, then=None):
+        """Script Check results for a fetched Doc, with the Doc actions."""
+        import script_check
+        n_err, n_warn, n_info = script_check.summarize(findings)
+        win = tk.Toplevel(self)
+        win.title("Script check")
+        win.configure(bg=BG)
+        win.transient(self)
+        tk.Label(win, text="Script check \u2014 {}".format(meta.get("name", "")),
+                 font=FH, bg=BG, fg=TEXT, padx=20).pack(anchor="w", pady=(14, 2))
+        head = "{} error{}, {} warning{}, {} note{}".format(
+            n_err, "" if n_err == 1 else "s", n_warn, "" if n_warn == 1 else "s",
+            n_info, "" if n_info == 1 else "s")
+        if diff:
+            a, r, c = diff
+            head += "   \u00b7   since the last fetch: {} pull{} added, {} removed, {} changed".format(
+                a, "" if a == 1 else "s", r, c)
+        tk.Label(win, text=head, font=FB, bg=BG, fg=SUB, padx=20).pack(anchor="w", pady=(0, 8))
+        box = tk.Frame(win, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
+        box.pack(fill="both", expand=True, padx=20)
+        lst = tk.Text(box, font=FB, bg=SURF, fg=TEXT, relief="flat", bd=0, wrap="word",
+                      height=16, width=96)
+        lst.pack(fill="both", expand=True, padx=8, pady=8)
+        colours = {"error": "#e05050", "warn": WARN, "info": SUB}
+        for f in findings:
+            tag = f.severity
+            lst.tag_configure(tag, foreground=colours.get(tag, TEXT))
+            loc = "line {}  ".format(f.line) if f.line else ""
+            lst.insert("end", "{}{}  {}\n".format(f.severity.upper().ljust(6), loc, f.title), tag)
+            if f.detail:
+                lst.insert("end", "        {}\n".format(" ".join(str(f.detail).split())), "info")
+        if not findings:
+            lst.insert("end", "Nothing to report. The script is ready to reconcile.\n", "info")
+        lst.configure(state="disabled")
+        self._ep_findings_win = win
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(fill="x", padx=20, pady=(10, 14))
+        gd = self._ep.get("links", {}).get("gdoc") or {}
+
+        def _write():
+            notes = gdocs.findings_to_notes(findings, text)
+            def _work():
+                return gdocs.write_notes(gdocs.get_credentials(), gd["id"], notes)
+            def _done(res):
+                placed, unplaced = res
+                msg = "{} note{} written into the Doc.".format(placed, "" if placed == 1 else "s")
+                if unplaced:
+                    msg += "  {} could not find their line and sit at the top.".format(len(unplaced))
+                messagebox.showinfo("Google Docs", msg)
+            self._ep_gdoc_bg(_work, _done)
+
+        def _clear():
+            def _work():
+                return gdocs.clear_notes(gdocs.get_credentials(), gd["id"])
+            self._ep_gdoc_bg(_work, lambda n: messagebox.showinfo(
+                "Google Docs", "{} note{} removed from the Doc.".format(n, "" if n == 1 else "s")))
+
+        def _continue():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            if then is not None:
+                then()
+
+        if then is not None:
+            self._btn(nav, "CONTINUE  \u2192", _continue, color=ACCENT).pack(side="right")
+        else:
+            self._btn(nav, "CLOSE", _continue).pack(side="right")
+        self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
+        if findings:
+            self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
+                      ).pack(side="left", padx=(8, 0))
+        self._center_dialog(win, min_w=760, min_h=420)
+
     # ── Write-backs from the stages ───────────────────────────────────────
 
     def _ep_bound(self, ep_file):
@@ -685,6 +867,13 @@ class EpisodeWorkflowMixin:
         if sess and os.path.isfile(sess):
             self._open_session(sess)
             return
+        # A linked Google Doc is fetched (and checked) first, so the script
+        # that reconciles is the one Jordan has now.
+        if (links.get("gdoc") or {}).get("id") and gdocs.is_configured() \
+                and not getattr(self, "_ep_s2s_fetched", False):
+            self._ep_gdoc_fetch(then=self._ep_launch_s2s_fetched)
+            return
+        self._ep_s2s_fetched = False
         script = EP.absp(ep, links.get("script"))
         if not (script and os.path.isfile(script)):
             script = filedialog.askopenfilename(

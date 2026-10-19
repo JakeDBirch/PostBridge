@@ -1042,6 +1042,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         if width is not None:
             kw["width"] = width
         w   = tk.Label(parent, **kw)
+        w._pb_cmd = cmd      # the action, reachable without a mouse (tests)
         w.bind("<Enter>", lambda e, w=w: w.config(bg=ACCENT, fg=TEXT))
         w.bind("<Leave>", lambda e, w=w, c=bg: w.config(bg=c, fg=TEXT))
         def _press(e, w=w, f=cmd):

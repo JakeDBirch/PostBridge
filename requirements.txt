@@ -26,6 +26,12 @@ pyaaf2>=1.7.0
 # ── NumPy for waveform blob detection (optional — gracefully disabled if absent)
 numpy>=1.24.0
 
+# ── Google Docs bridge (optional — the Episode screen's LINK GOOGLE DOC,
+# FETCH & CHECK and SEND TO SCRIPT need these; everything else runs without)
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+
 # ── Audio playback
 # Live, callback-driven playback for the Step 4 waveform editor: edits and
 # speed changes are heard without restarting.  Also the first playback

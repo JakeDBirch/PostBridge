@@ -89,6 +89,11 @@ def _open_fresh(app, monkeypatch, project, reset=True):
         for n in os.listdir(project):
             if n.endswith(EP.EPISODE_EXT):
                 os.remove(os.path.join(project, n))
+        # Sessions other tests made (the fixture's own BUTLER one stays).
+        for dp, _dn, fns in os.walk(project):
+            for fn in fns:
+                if fn.endswith(".pb_session.json") and fn != "BUTLER.pb_session.json":
+                    os.remove(os.path.join(dp, fn))
     monkeypatch.setattr(episode_workflow.filedialog, "askdirectory", lambda **k: project)
     app._select_workflow("episode")
     assert _wait(app, lambda: bool(getattr(app, "_ep", None) and app._ep.get("media"))), \
@@ -201,7 +206,9 @@ def test_launch_script_session_prefills_the_pool(app, monkeypatch, project):
     assert rows["Butler Interview_JORDAN.wav"] == "BUTLER"
     assert rows["Butler Interview_CARY.wav"] == "BUTLER"
     assert rows["Butler Interview.MP4"] == "BUTLER"
-    assert rows["Ep 7 pt 1.wav"] == "— unassigned —"      # no such token in the script
+    # One narrated part, narrator sources carry no token: assigned to it.
+    assert rows["Ep 7 pt 1.wav"] == "VO: Open"
+    assert rows["Ep 7 pt 2.wav"] == "VO: Open"
     assert "Ep 7 CAM 1 01.mp4" in rows and "bed.wav" not in rows
     assert not app._errors, "\n".join(app._errors)
 
@@ -270,3 +277,90 @@ def test_launch_aaf_prefills_setup(app, monkeypatch, project):
     assert app._aaf_sync_locked_vars["Ep 7 pt 1"].get()
     assert app._aaf_get_drift("Ep 7 pt 1")["ppm"] == 8.4
     assert not app._errors, "\n".join(app._errors)
+
+
+def _click(app, win, text):
+    """Press the app-style button labelled *text* inside *win*."""
+    import tkinter as tk
+    stack = [win]
+    while stack:
+        w = stack.pop()
+        try:
+            if isinstance(w, tk.Label) and w.cget("text") == text:
+                # A withdrawn window may not deliver generated mouse events;
+                # the app's buttons expose their action directly.
+                w._pb_cmd()
+                return True
+        except tk.TclError:
+            pass
+        stack.extend(w.winfo_children())
+    return False
+
+
+def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
+    import gdocs
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    doc_text = ("[PART Open]\n[VO PART_0_NARRATOR]\nA quiet morning.\n"
+                "[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n"
+                "[JENA 00:00:05-00:00:20]\nNo such session.\n")
+    calls = {}
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "pick_document",
+                        lambda creds, timeout=300: {"id": "doc123", "name": "Ep 7 script"})
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id: (
+        doc_text, {"name": "Ep 7 script", "version": "3", "modifiedTime": "t"}))
+    monkeypatch.setattr(gdocs, "write_notes", lambda creds, doc_id, notes, docs=None: (
+        calls.update(doc_id=doc_id, notes=notes) or (len(notes), [])))
+
+    # Link through the (faked) picker.
+    app._ep_gdoc_link()
+    assert _wait(app, lambda: (app._ep["links"].get("gdoc") or {}).get("id") == "doc123", secs=10)
+
+    # Fetch: the Doc becomes the episode's script, version-stamped, checked.
+    app._ep_gdoc_fetch()
+    assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
+    _pump(app, 3)
+    script = os.path.join(project, "Ep 7 script.txt")
+    assert os.path.isfile(script)
+    assert open(script, encoding="utf-8").read() == doc_text
+    assert ep["links"]["script"] == "Ep 7 script.txt"
+    assert ep["links"]["gdoc"]["version"] == "3"
+
+    # Write the findings into the Doc: the unknown-session finding is
+    # anchored to its header line.
+    assert _click(app, app._ep_findings_win, "WRITE NOTES INTO DOC")
+    assert _wait(app, lambda: "notes" in calls, secs=10)
+    assert calls["doc_id"] == "doc123"
+    anchors = [a for a, _m in calls["notes"]]
+    assert "[JENA 00:00:05-00:00:20]" in anchors, calls["notes"]
+    # The confirmation is an info box, which the fixture records like any
+    # dialog; it is the expected outcome here.
+    assert any("notes written" in e for e in app._errors), app._errors
+    app._errors[:] = [e for e in app._errors if "notes written" not in e]
+    _click(app, app._ep_findings_win, "CLOSE")
+    app._ep_findings_win = None
+
+    # Launching Script -> Session fetches first, then continues into Step 2
+    # with the sources assigned.
+    app._ep_launch_s2s()
+    assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
+    _pump(app, 3)
+    assert _click(app, app._ep_findings_win, "CONTINUE  →")
+    assert _wait(app, lambda: getattr(app, "_pool", None) is not None
+                 and len(app._pool._rows) >= 9, secs=30)
+    _pump(app, 10)
+    rows = {os.path.basename(r["path"]): r["var"].get() for r in app._pool._rows}
+    assert rows["Butler Interview.MP4"] == "BUTLER"
+    assert rows["Ep 7 pt 1.wav"] == "VO: Open"
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_send_to_script_needs_a_selection_and_a_doc(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    app._ep_launch_pq(); _pump(app, 5)
+    # No session view open: nothing to send; the guard says so.
+    app._pq_send_to_script()
+    assert any("Select the words" in e for e in app._errors)
+    app._errors.clear()

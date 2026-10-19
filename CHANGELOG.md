@@ -2,6 +2,11 @@
 
 ---
 
+## October 19, 2026
+
+### Google Docs bridge
+The script stays in Google Docs. From the episode's Script → Session stage: **LINK GOOGLE DOC…** (Google's picker, `drive.file` scope only), **FETCH & CHECK** (the Doc as the episode's script, version-stamped, Script Check run, pulls added/removed/changed since the last fetch counted), **WRITE NOTES INTO DOC** (each finding as a highlighted `// ⚠ PostBridge:` line under its line, replaced on the next write, removable with CLEAR NOTES IN DOC) and, in a Pull Quotes session opened from the episode, **SEND TO SCRIPT** (the selected pull appended to the Doc). Launching Script → Session fetches first. Setup is a Cloud project, an Internal consent screen, a desktop OAuth client and a picker key; the README says how.
+
 ## October 14, 2026
 
 ### Episodes: one project file for every workflow

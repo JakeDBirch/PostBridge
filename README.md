@@ -98,6 +98,17 @@ The **STAGES** card opens each workflow already linked:
 
 Existing per-workflow files (`*_session.json`, `*_setup.json`, the old Pull Quotes `.pb_episode.json`) keep working exactly as before; episodes are for new work.
 
+### Google Docs
+
+The script can stay in Google Docs, where the writing, comments and revision history live, and PostBridge works with it there.
+
+- **LINK GOOGLE DOC…** on the Script → Session stage opens Google's picker; choose the episode's script Doc once.
+- **FETCH & CHECK** pulls the Doc as text into the episode's script file, stamped with its Drive version, and runs Script Check. The findings window shows errors, warnings and notes, and how many pulls were added, removed or changed since the last fetch. Launching Script → Session fetches first, so the script that reconciles is always the current one.
+- **WRITE NOTES INTO DOC** puts each finding into the Doc as a highlighted `// ⚠ PostBridge: …` line directly under the line it concerns. The script parser ignores `//` lines, so a note left behind never breaks a reconcile. The next write replaces PostBridge's own notes and leaves everything else alone; **CLEAR NOTES IN DOC** removes them. These are ordinary edits, attributed to whoever signed in — the Docs API cannot make suggestions.
+- **SEND TO SCRIPT** in a Pull Quotes session (opened from the episode) appends the selected pull block to the Doc, so pulls travel without the clipboard.
+
+**Setting it up** (once per team, in the Google Cloud console with a work account that may create projects): a project with the Google Drive, Docs and Picker APIs enabled; an OAuth consent screen of type Internal with the single scope `drive.file`; an OAuth client of type Desktop app, downloaded as `google_client.json`; and an API key restricted to the Picker API, saved as `google_picker_key.txt`. Both files go in PostBridge's app-data folder (next to `main.py` when running from source). The first use opens the browser for a one-time sign-in per machine. `drive.file` means PostBridge can only reach Docs a person picked for it, never the rest of Drive; if the Workspace restricts third-party apps, the admin allowlists the client for that scope.
+
 ## Workflow 1: Pull Quotes
 
 For browsing raw interview audio and lifting quotes straight into a script.

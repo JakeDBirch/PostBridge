@@ -1724,6 +1724,10 @@ class PqWorkflowMixin:
         self._btn(nav, "COPY SELECTION AS PULL",
                   self._pq_copy_as_pull,
                   color=ACCENT).pack(side="right")
+        _proj = getattr(self, "_pq_project", None) or {}
+        if _proj.get("episode_file"):
+            self._btn(nav, "SEND TO SCRIPT", self._pq_send_to_script
+                      ).pack(side="right", padx=(0, 8))
         self._pq_play_btn = self._btn(
             nav, "▶ PLAY SELECTION",
             self._pq_play_selection)
@@ -5314,6 +5318,49 @@ class PqWorkflowMixin:
 
     def _pq_copy_as_pull(self, event=None):
         """Convert the current transcript selection into a pull block."""
+        built = self._pq_build_pull_block()
+        if built is None:
+            return None if getattr(self, "_pq_tx_text", None) is None else "break"
+        block, in_tc, out_tc = built
+        self.clipboard_clear()
+        self.clipboard_append(block)
+        self.update()
+        self._pq_flash_status("\u2713 Pull copied  [{}\u2013{}]".format(in_tc, out_tc))
+        return "break"
+
+    def _pq_flash_status(self, text, secs=2000):
+        lbl = getattr(self, "_pq_status_lbl", None)
+        if lbl:
+            prev_text = lbl.cget("text")
+            prev_fg   = lbl.cget("fg")
+            lbl.config(text=text, fg=SUCCESS)
+            self.after(secs, lambda: lbl.config(text=prev_text, fg=prev_fg))
+
+    def _pq_send_to_script(self):
+        """Append the selected pull to the episode's Google Doc."""
+        built = self._pq_build_pull_block()
+        if built is None:
+            messagebox.showinfo("Send to script", "Select the words of the pull first.")
+            return
+        block, in_tc, out_tc = built
+        proj = getattr(self, "_pq_project", None) or {}
+        ep = self._ep_bound(proj.get("episode_file")) if proj.get("episode_file") else None
+        gd = (ep or {}).get("links", {}).get("gdoc") or {}
+        if not gd.get("id"):
+            messagebox.showinfo("Send to script",
+                "Open Pull Quotes from an episode that has a Google Doc linked "
+                "(Episode \u2192 STAGES \u2192 LINK GOOGLE DOC).")
+            return
+        import gdocs
+        if not gdocs.is_configured():
+            messagebox.showinfo("Google Docs", gdocs.setup_message())
+            return
+        self._ep_gdoc_bg(
+            lambda: gdocs.append_block(gdocs.get_credentials(), gd["id"], block),
+            lambda _r: self._pq_flash_status("\u2713 Sent to script  [{}\u2013{}]".format(in_tc, out_tc)))
+
+    def _pq_build_pull_block(self):
+        """(block, in_tc, out_tc) for the transcript selection, or None."""
         tx      = getattr(self, "_pq_tx_text", None)
         session = getattr(self, "_pq_current_session", None)
         if tx is None or session is None:
@@ -5330,12 +5377,12 @@ class PqWorkflowMixin:
 
         word_idx = getattr(self, "_pq_word_index", []) or []
         if not word_idx:
-            return "break"
+            return None
 
         # All words whose character range overlaps the selection.
         selected = [w for (s_, e_, w) in word_idx if e_ > c0 and s_ < c1]
         if not selected:
-            return "break"
+            return None
 
         in_s  = float(selected[0].get("start", 0))
         out_s = float(selected[-1].get("end", in_s))
@@ -5387,19 +5434,5 @@ class PqWorkflowMixin:
             session.get("token", "?"),
             in_tc, out_tc,
             body)
-        self.clipboard_clear()
-        self.clipboard_append(block)
-        self.update()
-
-        # Brief flash on the status label
-        lbl = getattr(self, "_pq_status_lbl", None)
-        if lbl:
-            prev_text = lbl.cget("text")
-            prev_fg   = lbl.cget("fg")
-            lbl.config(
-                text="✓ Pull copied  [{}–{}]".format(in_tc, out_tc),
-                fg=SUCCESS)
-            self.after(2000,
-                       lambda: lbl.config(text=prev_text, fg=prev_fg))
-        return "break"
+        return block, in_tc, out_tc
 
