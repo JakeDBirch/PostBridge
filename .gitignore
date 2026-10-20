@@ -21,3 +21,8 @@ waveform_cache/
 # macOS build venv (created by build.sh)
 .venv-build/
 installer-out/
+
+# Google Docs bridge credentials and sign-in token (per machine, never committed)
+google_client.json
+google_picker_key.txt
+google_token.json
