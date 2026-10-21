@@ -22,6 +22,13 @@ state and the AAF all see it:
     (all of it: the pull is IGNOREd);
   * , and . nudge the gap before the selected pull by a frame (< > by ten).
 
+It is also where the cut gets spotted.  I and O drop a music cue's in and
+out, M an SFX spot, at the playhead -- while it plays, too.  Each mark
+lives on the pull it lands on (engines.place_markers), so it rides with
+that audio through any retiming, and the AAF carries them as the MUSIC and
+SFX marker tracks beside PARTS.  Drag a flag to move it, double-click to
+name it, Delete to remove it.
+
 Audio is pulled per pull, with a few seconds of handle either side, from a
 small thread pool, nearest-the-view first, and composed on demand by
 _AssemblyAudio as the player asks for it.  Nothing is rendered to disk.
@@ -65,6 +72,8 @@ _C_FLAG     = WARN        # a pull Step 4 still flags for review
 _C_PLAYHEAD = ERR
 _C_PART     = ACCENT
 _C_CLIP_BG  = SURF
+_C_MUSIC    = "#4f9be0"   # music cue in / out
+_C_SFX      = "#e0609a"   # SFX spot
 
 
 
@@ -250,6 +259,9 @@ class AssemblyWindow(object):
         self._inputs    = None           # export inputs, held while dragging
         self._drag      = None           # the gesture in progress
         self._range     = None           # (order, a, b) Shift-drag selection
+        self.markers    = []             # place_markers' list, plus "t" (s)
+        self.sel_marker = None           # (order, index) of the chosen mark
+        self._rename    = None           # (entry widget, (order, index))
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=LOAD_WORKERS, thread_name_prefix="pb_assembly")
 
@@ -264,7 +276,8 @@ class AssemblyWindow(object):
         # line height, so the layout holds at any display scaling.
         self._font = tkfont.Font(family=_SMALL[0], size=_SMALL[1])
         self._ls   = self._font.metrics("linespace")
-        self._ruler_h = 2 * self._ls + 6       # timecodes, then Part flags
+        # Ruler rows: timecodes, Part flags, then music / SFX marks.
+        self._ruler_h = 3 * self._ls + 8
         self._gap_h   = self._ls + 6           # gap lengths under the track
 
         self._build_ui()
@@ -292,6 +305,8 @@ class AssemblyWindow(object):
         self.text.tag_config("tok", font=_MONO, foreground=SUB)
         self.text.tag_config("out", foreground="#6a6a6a")
         self.text.tag_config("cur", background=SURF3)
+        self.text.tag_config("mk_music", foreground=_C_MUSIC, font=_SMALL)
+        self.text.tag_config("mk_sfx", foreground=_C_SFX, font=_SMALL)
         self.text.tag_config("sel_pull", background=SURF2)
         self.text.tag_raise("cur")
         self.text.bind("<Button-1>", self._on_text_click)
@@ -325,6 +340,7 @@ class AssemblyWindow(object):
         tk.Label(bar, font=_SMALL, bg=SURF, fg=SUB,
                  text="drag an edge to trim  ·  drag a pull or gap to retime"
                       "  ·  Shift-drag + Delete cuts  ·  , . nudge"
+                      "  ·  I / O music  ·  M sfx"
                  ).pack(side="right", padx=10)
         self.load_lbl = tk.Label(bar, text="", font=_SMALL, bg=SURF, fg=SUB)
         self.load_lbl.pack(side="right", padx=8)
@@ -355,6 +371,7 @@ class AssemblyWindow(object):
         self.cv.bind("<B1-Motion>", self._on_track_drag)
         self.cv.bind("<ButtonRelease-1>", self._on_track_release)
         self.cv.bind("<Motion>", self._on_motion)
+        self.cv.bind("<Double-Button-1>", self._on_track_double)
         self.cv.bind("<MouseWheel>", self._on_wheel)
         self.ov.bind("<Button-1>", self._on_overview)
         self.ov.bind("<B1-Motion>", self._on_overview)
@@ -448,6 +465,11 @@ class AssemblyWindow(object):
         self.part_marks = sorted((sa / float(LAYOUT_SR), names.get(pi, ""))
                                  for pi, sa in part_starts.items())
         self.audio.set_clips(clips, self.total_s)
+        self.markers = [dict(m, t=m["pos"] / float(LAYOUT_SR))
+                        for m in engines.place_markers(placed, LAYOUT_SR)]
+        if self.sel_marker is not None and not any(
+                (m["order"], m["index"]) == self.sel_marker for m in self.markers):
+            self.sel_marker = None
 
     def _queue_loads(self):
         """Fetch every pull whose loaded audio no longer covers it,
@@ -588,6 +610,9 @@ class AssemblyWindow(object):
         t.delete("1.0", "end")
         placed = {c.order for c in self.clips}
         names  = {p.get("index"): p.get("name", "") for p in (self.app.parts or [])}
+        marks = {}
+        for m in self.markers:
+            marks.setdefault(m["order"], []).append(m)
         cur_part = object()
         for r in sorted(self.app.results, key=lambda r: r.get("order", 0)):
             pi = r.get("part_index")
@@ -603,7 +628,12 @@ class AssemblyWindow(object):
             body = (r.get("quote_text") or "").strip()
             if o not in placed:
                 body += "   (not in the cut)"
-            t.insert("end", body + "\n", (tag,) + out)
+            t.insert("end", body, (tag,) + out)
+            for m in marks.get(o, ()):
+                t.insert("end", "   [{}]".format(m["label"]),
+                         (tag, "mk_sfx" if m["kind"] == "sfx" else "mk_music",
+                          "mk{}_{}".format(o, m["index"])))
+            t.insert("end", "\n", (tag,) + out)
         t.config(state="disabled")
         t.yview_moveto(y0)
         self._cur_order = None
@@ -618,6 +648,15 @@ class AssemblyWindow(object):
         return None
 
     def _on_text_click(self, e):
+        idx = self.text.index("@{},{}".format(e.x, e.y))
+        for tag in self.text.tag_names(idx):
+            if tag.startswith("mk") and "_" in tag:
+                o, i = (int(v) for v in tag[2:].split("_"))
+                m = self._marker((o, i))
+                if m is not None:
+                    self.select_marker((o, i))
+                    self.seek(m["t"], center=True)
+                    return "break"
         o = self._order_from_text_event(e)
         c = self._clip(o)
         if c is not None:
@@ -727,6 +766,7 @@ class AssemblyWindow(object):
             if self._fits(name, nxt - x - 16):
                 cv.create_text(x + 10, ls + 4, text=name, anchor="nw",
                                font=self._font, fill=TEXT)
+        self._draw_marks(w, y1)
 
         # Clips
         i0 = max(0, bisect.bisect_right(self._starts, t0) - 1)
@@ -780,6 +820,53 @@ class AssemblyWindow(object):
         self.tc_lbl.config(text=_fmt_tc(self.playhead))
         self._light_word()
         self._draw_overview()
+
+    def _marker_row(self):
+        """Top and bottom of the ruler row the music / SFX flags sit on."""
+        return 2 * self._ls + 6, 3 * self._ls + 6
+
+    def _draw_marks(self, w, y1):
+        cv = self.cv
+        top, bot = self._marker_row()
+        # Cue spans: a bar from each in to the out that closes it.  A cue
+        # left open runs to the next one, or to the end of the cut.
+        spans, open_t = [], None
+        for m in self.markers:
+            if m["kind"] == "music_in":
+                if open_t is not None:
+                    spans.append((open_t, m["t"]))
+                open_t = m["t"]
+            elif m["kind"] == "music_out" and open_t is not None:
+                spans.append((open_t, m["t"]))
+                open_t = None
+        if open_t is not None:
+            spans.append((open_t, self.total_s))
+        for ta, tb in spans:
+            xa, xb = self._x(ta), self._x(tb)
+            if xb > 0 and xa < w:
+                cv.create_rectangle(xa, bot, xb, bot + 2, fill=_C_MUSIC,
+                                    outline="")
+        for n, m in enumerate(self.markers):
+            x = self._x(m["t"])
+            if x < -300 or x > w:
+                continue
+            col = _C_SFX if m["kind"] == "sfx" else _C_MUSIC
+            on = (m["order"], m["index"]) == self.sel_marker
+            cv.create_line(x, bot, x, y1, fill=col, dash=(2, 4))
+            cv.create_rectangle(x, top + 1, x + 6, bot - 1, fill=col,
+                                outline=TEXT if on else "", width=2 if on else 1)
+            nxt = self._x(self.markers[n + 1]["t"]) if n + 1 < len(self.markers) \
+                else w + 400
+            if self._fits(m["label"], nxt - x - 16):
+                cv.create_text(x + 10, top, text=m["label"], anchor="nw",
+                               font=self._font, fill=TEXT if on else SUB)
+        if self._rename is not None:
+            entry, key = self._rename
+            m = next((m for m in self.markers
+                      if (m["order"], m["index"]) == key), None)
+            if m is not None:
+                cv.create_window(self._x(m["t"]) + 10, top - 2, anchor="nw",
+                                 window=entry)
 
     def _draw_wave(self, c, xs, xe, mid, half, col, w):
         cv = self.cv
@@ -867,6 +954,9 @@ class AssemblyWindow(object):
                                 h - 7, fill=c.colour(), outline="")
         for pt, _ in self.part_marks:
             ov.create_line(pt * k, 0, pt * k, h, fill=_C_PART)
+        for m in self.markers:
+            ov.create_line(m["t"] * k, 0, m["t"] * k, 6,
+                           fill=_C_SFX if m["kind"] == "sfx" else _C_MUSIC)
         ov.create_rectangle(self.view0 * k, 1, (self.view0 + self._span()) * k,
                             h - 1, outline=TEXT)
         ov.create_line(self.playhead * k, 0, self.playhead * k, h,
@@ -885,6 +975,16 @@ class AssemblyWindow(object):
 
     # ── Status ───────────────────────────────────────────────────────────
     def _update_status(self):
+        m = self._marker(self.sel_marker)
+        if m is not None:
+            c = self._clip(m["order"])
+            kind = {"music_in": "music in", "music_out": "music out",
+                    "sfx": "SFX spot"}[m["kind"]]
+            self.status.config(fg=SUB, text="   ·   ".join((
+                m["label"], kind, _fmt_tc(m["t"]),
+                "on " + (c.label if c else "?"),
+                "drag to move, double-click to name, Delete to remove")))
+            return
         c = self._clip(self.sel_order) or self._clip(self._order_at(self.playhead))
         if c is None:
             self.status.config(text="{} pulls  ·  {}".format(
@@ -903,6 +1003,7 @@ class AssemblyWindow(object):
     # ── Selection / navigation ───────────────────────────────────────────
     def select(self, order):
         self.sel_order = order
+        self.sel_marker = None
         self._mark_selected_in_script()
         self.redraw()
         self._update_status()
@@ -926,12 +1027,19 @@ class AssemblyWindow(object):
         for an edge, ("body", clip) inside a pull, ("gap", the pull before
         it) between two, ("ruler",) above the track, or ("none",)."""
         y0, y1 = self._track_box()
+        reach = max(6, self._ls // 2)
         if y < y0:
+            top, bot = self._marker_row()
+            if top - 2 <= y <= bot + 4:
+                near = min(self.markers, default=None,
+                           key=lambda m: abs(x - self._x(m["t"]) - 3))
+                if near is not None and \
+                        abs(x - self._x(near["t"]) - 3) <= reach:
+                    return ("marker", near, None)
             return ("ruler", None, None)
         if y > y1:
             return ("none", None, None)
         t = self._t(x)
-        reach = max(6, self._ls // 2)
         i = bisect.bisect_right(self._starts, t) - 1
         best = None
         for c in self.clips[max(0, i - 1):i + 2]:
@@ -966,7 +1074,8 @@ class AssemblyWindow(object):
             return
         kind, c, k = self._hit(e.x, e.y)
         cur = {"in": "sb_h_double_arrow", "out": "sb_h_double_arrow",
-               "gap": "sb_h_double_arrow", "ruler": "hand2"}.get(kind, "xterm")
+               "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
+               "ruler": "hand2"}.get(kind, "xterm")
         if self.cv.cget("cursor") != cur:
             self.cv.config(cursor=cur)
         self.cv.delete("hover")
@@ -981,6 +1090,14 @@ class AssemblyWindow(object):
         self.cv.focus_set()
         t = self._t(e.x)
         kind, c, k = self._hit(e.x, e.y)
+        self._end_rename(commit=True)
+        if kind == "marker":
+            self._range = None
+            self.select_marker((c["order"], c["index"]))
+            self._drag = {"mode": "marker", "x0": e.x, "t0": c["t"],
+                          "key": (c["order"], c["index"]), "moved": False}
+            return
+        self.sel_marker = None
         if kind == "ruler":
             self._drag = {"mode": "scrub"}
             self.seek(t)
@@ -1035,6 +1152,15 @@ class AssemblyWindow(object):
             d["moved"] = True
             self.cv.delete("hover")
         dt = dx / self.pps
+        if mode == "marker":
+            d["value"] = min(max(d["t0"] + dt, 0.0), self.total_s)
+            m = self._marker(d["key"])
+            if m is not None:
+                m["t"] = d["value"]          # just the flag, until release
+            self.redraw()
+            self.status.config(fg=TEXT, text="{}   {}".format(
+                m["label"] if m else "", _fmt_tc(d["value"])))
+            return
         if mode == "gap":
             if d["target"] is None:
                 return
@@ -1075,6 +1201,9 @@ class AssemblyWindow(object):
                 self.redraw()
             return
         if not d.get("moved") or "value" not in d:
+            return
+        if d["mode"] == "marker":
+            self._move_marker(d["key"], d["value"])
             return
         if d["mode"] == "gap":
             self.app._assembly_set_gap(d["target"], d["value"])
@@ -1124,6 +1253,126 @@ class AssemblyWindow(object):
             self.app._assembly_ignore(o)
         self.refresh()
         self.seek(a)
+
+    # ── Spotting marks ───────────────────────────────────────────────────
+    def _marker(self, key):
+        return next((m for m in self.markers
+                     if (m["order"], m["index"]) == key), None) if key else None
+
+    def _anchor_at(self, t):
+        """(pull, anchor) for a mark at timeline time t: a moment of the
+        pull's source audio inside a pull, a point in the gap after it
+        between two."""
+        if not self.clips:
+            return None, None
+        c = self._clip_at(t)
+        if c is not None:
+            src = c.src_at(t)
+            if src is not None:
+                return c.order, {"src": round(src, 4)}
+        i = bisect.bisect_right(self._starts, t) - 1
+        if i < 0:
+            c = self.clips[0]
+            return c.order, {"src": round(c.pieces[0][2] if c.pieces else 0.0, 4)}
+        c = self.clips[i]
+        return c.order, {"tail": round(max(0.0, t - c.end), 4)}
+
+    def _pull_marks(self, order):
+        r = next((r for r in self.app.results if r.get("order") == order), None)
+        return list((r or {}).get("markers") or [])
+
+    def drop_marker(self, kind):
+        """A mark at the playhead -- the spotting keys, so it works while
+        the cut plays."""
+        order, anchor = self._anchor_at(self.playhead)
+        if order is None:
+            return
+        marks = self._pull_marks(order)
+        marks.append(dict(anchor, kind=kind, name=""))
+        self.app._assembly_set_markers({order: marks})
+        self.sel_marker = (order, len(marks) - 1)
+        self.refresh()
+
+    def select_marker(self, key):
+        self.sel_marker = key
+        self.sel_order = None
+        self._mark_selected_in_script()
+        self.redraw()
+        self._update_status()
+
+    def _move_marker(self, key, t):
+        """Re-anchor a dragged mark where it was dropped; it may change
+        pulls, which is one undo step across both."""
+        order, idx = key
+        marks = self._pull_marks(order)
+        if not 0 <= idx < len(marks):
+            self.refresh()
+            return
+        new_order, anchor = self._anchor_at(t)
+        m = marks[idx]
+        moved = dict(anchor, kind=m.get("kind"), name=m.get("name", ""))
+        if new_order == order:
+            marks[idx] = moved
+            changes = {order: marks}
+            self.sel_marker = (order, idx)
+        else:
+            del marks[idx]
+            dest = self._pull_marks(new_order) + [moved]
+            changes = {order: marks, new_order: dest}
+            self.sel_marker = (new_order, len(dest) - 1)
+        self.app._assembly_set_markers(changes)
+        self.refresh()
+
+    def delete_marker(self):
+        if self.sel_marker is None:
+            return
+        order, idx = self.sel_marker
+        marks = self._pull_marks(order)
+        self.sel_marker = None
+        if 0 <= idx < len(marks):
+            del marks[idx]
+            self.app._assembly_set_markers({order: marks})
+        self.refresh()
+
+    def _on_track_double(self, e):
+        kind, m, _k = self._hit(e.x, e.y)
+        if kind == "marker":
+            self._begin_rename((m["order"], m["index"]))
+
+    def _begin_rename(self, key):
+        """Name a mark in place: a field over its flag, Enter to keep,
+        Esc to leave it as it was.  An empty name goes back to the count."""
+        self._end_rename(commit=False)
+        m = self._marker(key)
+        if m is None:
+            return
+        entry = tk.Entry(self.cv, font=self._font, bg=SURF2, fg=TEXT,
+                         insertbackground=TEXT, relief="flat", width=28,
+                         highlightthickness=1, highlightbackground=ACCENT)
+        entry.insert(0, m["name"])
+        entry.bind("<Return>", lambda e: self._end_rename(commit=True))
+        entry.bind("<Escape>", lambda e: self._end_rename(commit=False))
+        self._rename = (entry, key)
+        self.redraw()
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+    def _end_rename(self, commit):
+        if self._rename is None:
+            return
+        entry, (order, idx) = self._rename
+        self._rename = None
+        name = entry.get().strip()
+        entry.destroy()
+        marks = self._pull_marks(order)
+        if commit and 0 <= idx < len(marks) and \
+                name != (marks[idx].get("name") or ""):
+            marks[idx] = dict(marks[idx], name=name)
+            self.app._assembly_set_markers({order: marks})
+            self.refresh()
+        else:
+            self.redraw()
+        self.cv.focus_set()
 
     def nudge_gap(self, frames):
         """Move the selected pull (and everything after it) by frames."""
@@ -1257,6 +1506,8 @@ class AssemblyWindow(object):
 
     # ── Keys ─────────────────────────────────────────────────────────────
     def _on_key(self, e):
+        if isinstance(e.widget, tk.Entry):
+            return "break"                   # typing a mark's name
         k = e.keysym
         ctrl = bool(e.state & 0x0004)
         if k == "space":
@@ -1278,7 +1529,13 @@ class AssemblyWindow(object):
         elif k == "Left":
             self._neighbour(-1)
         elif k in ("Delete", "BackSpace"):
-            self.delete_range()
+            if self.sel_marker is not None:
+                self.delete_marker()
+            else:
+                self.delete_range()
+        elif not ctrl and k.lower() in ("i", "o", "m"):
+            self.drop_marker({"i": "music_in", "o": "music_out",
+                              "m": "sfx"}[k.lower()])
         elif k in ("comma", "period"):
             self.nudge_gap(-1 if k == "comma" else 1)
         elif k in ("less", "greater"):
@@ -1294,8 +1551,10 @@ class AssemblyWindow(object):
             self.fit()
         elif k == "Escape":
             self._range = None
+            self.sel_marker = None
             self.stop()
             self.redraw()
+            self._update_status()
         return "break"
 
     # ── Lifetime ─────────────────────────────────────────────────────────

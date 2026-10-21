@@ -113,3 +113,61 @@ def test_segments_without_takes_a_span_out_of_the_cut():
     assert _segments_without(c, 1.5, 2.5) == [(10.0, 11.5), (20.5, 23.0)]
     # All of it.
     assert _segments_without(c, 0.0, 5.0) == []
+
+
+def _layout_with_markers():
+    res = [dict(order=1, token="GUEST", status="ok", part_index=0,
+                segments=[(1.0, 4.0), (6.0, 8.0)],
+                markers=[{"kind": "music_in", "src": 2.0},
+                         {"kind": "sfx", "src": 7.0, "name": "rifle shot"},
+                         {"kind": "sfx", "src": 5.0},   # cut out: where audio resumes
+                         {"kind": "music_out", "tail": 0.25}]),
+           dict(order=2, token="GUEST", status="ok", part_index=1,
+                segments=[(0.0, 1.0)],
+                markers=[{"kind": "sfx", "src": 0.5}])]
+    return res
+
+
+def test_markers_ride_their_pull():
+    placed, _, _ = engines.layout_timeline(
+        _layout_with_markers(), 0.5, SR, ASSETS)
+    m = engines.place_markers(placed, SR)
+    assert [(x["pos"], x["label"]) for x in m] == [
+        (1000, "Cue 1 in"), (3000, "SFX 1"), (4000, "rifle shot"),
+        (5250, "Cue 1 out"), (6000, "SFX 3")]
+
+
+def test_aaf_writes_music_and_sfx_marker_tracks(tmp_path):
+    import wave
+    import pytest
+    aaf2 = pytest.importorskip("aaf2")
+    wav = str(tmp_path / "guest.wav")
+    with wave.open(wav, "w") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(48000)
+        w.writeframes(b"\x00\x00" * 48000 * 10)
+    out = str(tmp_path / "cut.aaf")
+    engines.build_aaf(_layout_with_markers(), {"GUEST": [wav]}, {},
+                      [{"index": 0, "name": "Cold open"},
+                       {"index": 1, "name": "Act 1"}],
+                      "cut", 0.5, seq_sr=48000, out_path=out)
+    tracks = {}
+    with aaf2.open(out, "r") as f:
+        comp = next(f.content.toplevel())
+        for slot in comp.slots:
+            pos, clips = 0, []
+            for comp_ in slot.segment.components:
+                if isinstance(comp_, aaf2.components.SourceClip):
+                    clips.append((pos, comp_.length, comp_.mob.name))
+                pos += comp_.length
+            tracks[slot.name] = clips
+    s = 48000
+    assert tracks["PARTS"] == [(0, 2 * s, "Cold open"),
+                               (int(5.5 * s), 2 * s, "Act 1")]
+    # "Cue 1 in" stops where "Cue 1 out" starts, so the track stays in time.
+    assert tracks["MUSIC"] == [(1 * s, 2 * s, "Cue 1 in"),
+                               (int(5.25 * s), 2 * s, "Cue 1 out")]
+    # A mark closer than two seconds to the next is cut short to fit.
+    assert tracks["SFX"] == [(3 * s, 1 * s, "SFX 1"),
+                             (4 * s, 2 * s, "rifle shot"),
+                             (6 * s, 2 * s, "SFX 3")]
+    assert list(tracks)[-3:] == ["PARTS", "MUSIC", "SFX"]

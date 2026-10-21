@@ -5491,6 +5491,65 @@ def layout_timeline(results, gap_secs, sr, int_assets,
     return placed, skipped, part_starts
 
 
+# Spotting marks the Assembly view drops on pulls, exported as the MUSIC
+# and SFX marker tracks.  (Parts come from the script's [PART] lines.)
+MARKER_KINDS = ("music_in", "music_out", "sfx")
+
+
+def place_markers(placed, sr):
+    """Where every spotted marker lands on the timeline, in samples at `sr`.
+
+    A marker lives on the pull it was dropped on -- res["markers"], a list
+    of {"kind", "src" | "tail", "name"} -- so it rides with that pull
+    through any retiming.  "src" pins it to a moment of the pull's source
+    audio: it stays on that word through trims, and if the moment is cut
+    out it sits where the audio resumes.  "tail" is a point in the gap
+    after the pull.  Markers on pulls with nothing placed (IGNOREd,
+    unusable) are not placed either.
+
+    `placed` is layout_timeline's first return.  Returns [{"kind", "pos",
+    "name", "label", "order", "index"}] in timeline order; "label" is the
+    name, or for an unnamed marker its place in the count: cues numbered
+    as they come in ("Cue 3 in" ... "Cue 3 out"), SFX spots likewise.
+    """
+    out = []
+    for e in placed:
+        for i, m in enumerate(e["res"].get("markers") or []):
+            if m.get("kind") not in MARKER_KINDS:
+                continue
+            if "tail" in m:
+                pos = e["end"] + min(max(0, round(float(m["tail"]) * sr)),
+                                     e["gap"])
+            else:
+                src = round(float(m.get("src", 0.0)) * sr)
+                pos = e["end"]
+                for st, du, si in e["pieces"]:
+                    if src < si:            # cut out, or before the pull
+                        pos = st
+                        break
+                    if src < si + du:
+                        pos = st + (src - si)
+                        break
+            out.append({"kind": m["kind"], "pos": pos,
+                        "name": (m.get("name") or "").strip(),
+                        "order": e["res"]["order"], "index": i})
+    out.sort(key=lambda m: (m["pos"], m["order"], m["index"]))
+    cues = sfx = 0
+    open_cue = None                         # the cue an "out" closes
+    for m in out:
+        if m["kind"] == "music_in":
+            cues += 1
+            m["label"] = m["name"] or "Cue {} in".format(cues)
+            open_cue = m["name"] or "Cue {}".format(cues)
+        elif m["kind"] == "music_out":
+            m["label"] = m["name"] or "{} out".format(open_cue or "Music")
+            open_cue = None
+        else:
+            sfx += 1
+            m["label"] = m["name"] or "SFX {}".format(sfx)
+    return out
+
+
 def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
               seq_fps=24, seq_sr=48000, vo_takes_with_offset=None,
               out_path="output.aaf", progress_cb=None, cancel_event=None,
@@ -5503,10 +5562,15 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     Clips are placed at absolute timeline positions so gaps appear correctly
     in Pro Tools when the session is opened.
 
+    Three marker tracks follow the audio: PARTS (each [PART]'s first pull),
+    MUSIC (cue in / out points) and SFX (spots), the last two from the
+    markers spotted in the Assembly view (see place_markers).  Each is
+    named silent clips, since Pro Tools ignores AAF markers on import.
+
     only_orders: optional set of result "order" values.  The full timeline is
     still laid out (so positions and track names match a full export), but
     only clips from those results are written — used to re-export a single
-    pull and drop it into an existing session.  PARTS markers are omitted.
+    pull and drop it into an existing session.  Marker tracks are omitted.
     """
     if not HAS_AAF:
         raise RuntimeError("pyaaf2 is not installed. Run: pip install pyaaf2")
@@ -5666,12 +5730,27 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     # ── Subset export ─────────────────────────────────────────────────────────
     # Filter AFTER layout + overlap routing so the kept clips land exactly
     # where (and on the track) they would in the full export.
+    marks = place_markers(placed, sr)
     if only_orders is not None:
         _keep = set(only_orders)
         slots = [sl for sl, o in zip(slots, slot_orders) if o in _keep]
         part_starts = {}
+        marks = []
         if not slots:
             raise RuntimeError("Nothing to export for the selected pull(s).")
+
+    # ── Marker tracks: [(track name, [(position, label)])], empty ones dropped
+    part_map = {p["index"]: p["name"] for p in (parts or [])}
+    marker_tracks = [(name, pts) for name, pts in (
+        ("PARTS", [(pos, part_map.get(pi, "Part {}".format(pi + 1)))
+                   for pi, pos in sorted(part_starts.items(),
+                                         key=lambda kv: kv[1])]
+                  if parts else []),
+        ("MUSIC", [(m["pos"], m["label"]) for m in marks
+                   if m["kind"] in ("music_in", "music_out")]),
+        ("SFX",   [(m["pos"], m["label"]) for m in marks
+                   if m["kind"] == "sfx"]),
+    ) if pts]
 
     _prog("Analysing {} clips across {} tracks…".format(len(slots),
           len(set(s[4] for s in slots))))
@@ -5698,7 +5777,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     ff          = _ffmpeg_cmd()
     unique_srcs = list(dict.fromkeys(s[0] for s in slots))
 
-    # 2-second silent WAV used as source for PARTS marker clips.
+    # 2-second silent WAV used as source for every marker clip.
     # Must be at least ~0.5 s so Pro Tools renders the clip wide enough to
     # show its name label in the track.
     marker_dur_sa   = sr * 2         # 2 seconds in samples
@@ -5726,14 +5805,14 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             track_seqs[track_name]    = seq
             track_lengths[track_name] = 0
 
-        # ── PARTS marker track ────────────────────────────────────────────────
-        parts_seq = None
-        parts_cur = 0
-        if parts and part_starts and marker_wav_path:
-            parts_seq  = f.create.Sequence(media_kind="sound")
-            parts_slot = comp_mob.create_timeline_slot(sample_rate)
-            parts_slot.segment = parts_seq
-            parts_slot.name    = "PARTS"
+        # ── Marker tracks (PARTS, MUSIC, SFX) — after the audio ──────────────
+        marker_seqs = []
+        for mt_name, mt_points in (marker_tracks if marker_wav_path else []):
+            mt_seq  = f.create.Sequence(media_kind="sound")
+            mt_slot = comp_mob.create_timeline_slot(sample_rate)
+            mt_slot.segment = mt_seq
+            mt_slot.name    = mt_name
+            marker_seqs.append((mt_seq, mt_points))
 
         # ── One SourceMob + MasterMob per unique source file ─────────────────
         # The SourceMob is created FIRST so its MobID (UMID) is known before
@@ -5848,12 +5927,14 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             seq.components.append(clip)
             track_lengths[track_name] = start_sa + dur_sa
 
-        # ── Part markers (PARTS track) ────────────────────────────────────────
+        # ── Marker clips ──────────────────────────────────────────────────────
         # DescriptiveMarker/EventMobSlot objects are not surfaced by Pro Tools
-        # on AAF import.  Instead we create a dedicated "PARTS" audio track
-        # with one named 1-sample clip per part boundary.  Pro Tools shows the
-        # clip names inline on the track, giving clear visual part markers.
-        if parts_seq is not None and part_starts:
+        # on AAF import.  Instead each marker track holds one named clip of
+        # the silent marker WAV per mark; Pro Tools shows the clip names
+        # inline on the track.  A clip runs two seconds, or up to the next
+        # mark on its track if that comes sooner -- a track holds one clip
+        # at a time, and an overlap would push every later mark out of place.
+        if marker_seqs:
             # SourceMob for the silent marker WAV
             mk_src = f.create.SourceMob()
             mk_src.name = "_part_markers"
@@ -5876,25 +5957,27 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             mk_loc["URLString"].value = _file_uri(marker_wav_path)
             mk_src.descriptor["Locator"].append(mk_loc)
 
-            part_map = {p["index"]: p["name"] for p in parts}
-            for pi, pos_sa in sorted(part_starts.items()):
-                pname = part_map.get(pi, "Part {}".format(pi + 1))
-                # MasterMob whose name becomes the clip label in Pro Tools
-                mk_master      = f.create.MasterMob(pname)
-                mk_master_slot = mk_master.create_timeline_slot(sample_rate)
-                mk_master_slot.name    = "A1"
-                mk_master_slot.segment = mk_src.create_source_clip(
-                    slot_id=mk_src_slot.slot_id, media_kind="sound")
-                f.content.mobs.append(mk_master)
-                # Pad PARTS track up to this part's position
-                if pos_sa > parts_cur:
-                    parts_seq.components.append(
-                        f.create.Filler(media_kind="sound",
-                                        length=pos_sa - parts_cur))
-                clip = mk_master.create_source_clip(
-                    slot_id=mk_master_slot.slot_id, length=marker_dur_sa, start=0)
-                parts_seq.components.append(clip)
-                parts_cur = pos_sa + marker_dur_sa
+            for mt_seq, mt_points in marker_seqs:
+                mt_cur = 0
+                for n, (pos_sa, label) in enumerate(mt_points):
+                    pos_sa = max(pos_sa, mt_cur)   # two on one sample: next one waits
+                    nxt = mt_points[n + 1][0] if n + 1 < len(mt_points) else None
+                    dur_sa = marker_dur_sa if nxt is None else                         max(1, min(marker_dur_sa, nxt - pos_sa))
+                    # MasterMob whose name becomes the clip label in Pro Tools
+                    mk_master      = f.create.MasterMob(label)
+                    mk_master_slot = mk_master.create_timeline_slot(sample_rate)
+                    mk_master_slot.name    = "A1"
+                    mk_master_slot.segment = mk_src.create_source_clip(
+                        slot_id=mk_src_slot.slot_id, media_kind="sound")
+                    f.content.mobs.append(mk_master)
+                    if pos_sa > mt_cur:
+                        mt_seq.components.append(
+                            f.create.Filler(media_kind="sound",
+                                            length=pos_sa - mt_cur))
+                    clip = mk_master.create_source_clip(
+                        slot_id=mk_master_slot.slot_id, length=dur_sa, start=0)
+                    mt_seq.components.append(clip)
+                    mt_cur = pos_sa + dur_sa
 
     return out_path, skipped
 

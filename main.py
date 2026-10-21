@@ -2352,6 +2352,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 entry["export_source"] = r.get("export_source", "")
             if "gap_after_s" in r:
                 entry["gap_after_s"] = r["gap_after_s"]
+            # Spotting markers from the Assembly view (see engines.place_markers)
+            if r.get("markers"):
+                entry["markers"] = list(r["markers"])
             # Persist VO takes_data so edited segments survive save/load cycles
             if r.get("is_vo") and r.get("takes_data"):
                 entry["takes_data"] = r["takes_data"]
@@ -2490,6 +2493,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 r["gap_after_s"] = entry["gap_after_s"]
             elif "gap_after_s" in r:
                 del r["gap_after_s"]   # restore to "use global default"
+            if "markers" in entry:
+                r["markers"] = entry["markers"]
+            elif "markers" in r:
+                del r["markers"]
             # Restore VO takes_data (keeps edited per-take segments in sync)
             if "takes_data" in entry and r.get("is_vo"):
                 r["takes_data"] = entry["takes_data"]
@@ -3514,6 +3521,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 or r.get("_s4_reassigned")
         }
         self._confirmed_carryover = carryover
+        # Spotting markers belong to the cut, not to an approval: rows that
+        # get re-reconciled come back without them, so they ride along
+        # separately and are put back when Step 4 rebuilds.
+        self._marker_carryover = {
+            r["order"]: r["markers"]
+            for r in getattr(self, "results", []) if r.get("markers")}
         self._step2()
 
     def _build_setup_data(self):
@@ -7147,6 +7160,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self._s4_undo_stack = []
         self._s4_redo_stack = []
 
+        _mk = getattr(self, "_marker_carryover", None)
+        if _mk:
+            for r in self.results:
+                if r.get("order") in _mk and not r.get("markers"):
+                    r["markers"] = _mk[r["order"]]
+        self._marker_carryover = None
+
         self._clear()
         self._section("STEP 4 — REVIEW")
 
@@ -8539,6 +8559,22 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                   if e["res"].get("order") == order), None)
         if e is not None and not e["skip_var"].get():
             e["toggle_ignore_fn"]()
+
+    def _assembly_set_markers(self, changes):
+        """Spotting markers edited on the Assembly track: {order: [marker]}
+        for every pull whose list changed (a move touches two), as one
+        undo step."""
+        by_order = {r.get("order"): r for r in self.results}
+        self._s4_push_undo()
+        for order, markers in changes.items():
+            r = by_order.get(order)
+            if r is None:
+                continue
+            if markers:
+                r["markers"] = list(markers)
+            else:
+                r.pop("markers", None)
+        self._s4_save()
 
     def _assembly_set_gap(self, order, gap_s):
         """The silence after a pull, set from the Assembly track.  Lives on
