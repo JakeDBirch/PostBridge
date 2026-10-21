@@ -232,6 +232,49 @@ def extract_mono_pcm(media_path, sample_rate=8000):
     return _np.frombuffer(r.stdout, _np.int16).astype(_np.float32) / 32768.0
 
 
+def _seek_args(media_path, start_s):
+    """ffmpeg input arguments that land sample-accurately on `start_s`.
+
+    The "double-seek" pattern: a fast -ss BEFORE -i gets the demuxer close,
+    an accurate -ss AFTER -i does the last leg.  Pure fast-seek produces a
+    decoder-warmup transient (heard as a fade-in on the first syllable);
+    pure accurate-seek decodes from the top of a two-hour file.
+    """
+    _PRE_BUFFER_S = 2.0    # fast-seek land this far before the target
+    if is_vob(media_path):
+        # Input seeking in a VOB is unreliable — see audio_read_args.
+        from parsers import audio_read_args
+        return audio_read_args(media_path, start_s)
+    if start_s > _PRE_BUFFER_S:
+        return ["-ss", "{:.3f}".format(start_s - _PRE_BUFFER_S),
+                "-i", media_path,
+                "-ss", "{:.3f}".format(_PRE_BUFFER_S)]
+    # Near the start of the file — just accurate-seek from 0.
+    return ["-i", media_path, "-ss", "{:.3f}".format(start_s)]
+
+
+def extract_pcm_range(media_path, start_s, duration_s, sample_rate=16000):
+    """Mono int16 PCM for [start_s, start_s + duration_s] of *media_path*,
+    piped straight from ffmpeg.  Same seek as extract_audio_segment, without
+    the temp WAV.  A range running past the end of the file comes back
+    short rather than failing."""
+    import numpy as _np
+    start_s = max(0.0, start_s)
+    cmd = _ffmpeg_cmd() + _seek_args(media_path, start_s) + [
+        "-t", "{:.3f}".format(duration_s),
+        "-ac", "1", "-ar", str(sample_rate),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-vn", "pipe:1",
+    ]
+    r = _run(cmd, capture_output=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg failed reading {:.1f}s from {}:\n{}".format(
+                start_s, os.path.basename(media_path),
+                r.stderr.decode(errors="replace")[-400:]))
+    return _np.frombuffer(r.stdout, _np.int16)
+
+
 def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
                           sample_rate=16000):
     """
@@ -248,20 +291,7 @@ def extract_audio_segment(media_path, start_s, duration_s, out_wav_path,
     accurate seek does the last leg.
     """
     start_s = max(0.0, start_s)
-    _PRE_BUFFER_S = 2.0    # fast-seek land this far before the target
-    if is_vob(media_path):
-        # Input seeking in a VOB is unreliable — see audio_read_args.
-        from parsers import audio_read_args
-        seek_args = audio_read_args(media_path, start_s)
-    elif start_s > _PRE_BUFFER_S:
-        pre_seek  = start_s - _PRE_BUFFER_S
-        post_seek = _PRE_BUFFER_S
-        seek_args = (["-ss", "{:.3f}".format(pre_seek), "-i", media_path,
-                      "-ss", "{:.3f}".format(post_seek)])
-    else:
-        # Near the start of the file — just accurate-seek from 0.
-        seek_args = (["-i", media_path, "-ss", "{:.3f}".format(start_s)])
-    cmd = _ffmpeg_cmd() + ["-y"] + seek_args + [
+    cmd = _ffmpeg_cmd() + ["-y"] + _seek_args(media_path, start_s) + [
         "-t", "{:.3f}".format(duration_s),
         "-ar", str(sample_rate), "-ac", "1",
         "-acodec", "pcm_s16le",
@@ -5318,6 +5348,149 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     return xmeml
 
 # ── AAF builder ────────────────────────────────────────────────────────────────
+def _is_temp_mix_path(p):
+    """mix_for_transcript() writes temp WAVs (prefix "_pb_mix_") used solely
+    as the Whisper input for multi-track tokens.  They are 16 kHz mono and
+    may be cleaned up by the time anything plays or exports them."""
+    return bool(p) and os.path.basename(p).startswith("_pb_mix_")
+
+
+def interview_export_paths(res, int_assets):
+    """The files an interview pull is exported from, in track order.
+
+    _export_paths means the pull was pointed at other audio than its token's
+    files (set by the app's export-input collection).  Pure-audio files are
+    preferred; video files are the fallback, their embedded audio extracted
+    by ffmpeg (-vn).  Empty means the pull has nothing to place.
+    """
+    paths = [p for p in (res.get("_export_paths")
+                         or (int_assets or {}).get(res.get("token"), []))
+             if not _is_temp_mix_path(p)]
+    apaths = [p for p in paths if p and is_audio(p)]
+    if not apaths:
+        apaths = [p for p in paths if p and is_video(p)]
+    return apaths
+
+
+def layout_timeline(results, gap_secs, sr, int_assets,
+                    progress_cb=None, check_cancel=None):
+    """Where every pull lands on the sequence timeline, in samples at `sr`.
+
+    The single source of truth for placement: build_aaf writes clips at
+    these positions and the Assembly view draws and plays them from the
+    same numbers, so what is heard there is what Pro Tools opens.
+
+    A pull's segments butt together (the cuts between them are excised
+    tape); its gap -- gap_after_s, else the sequence default -- follows
+    the whole pull.
+
+    Returns (placed, skipped, part_starts):
+      placed      : [{"res", "segments", "paths", "pieces", "start", "end",
+                      "gap"}] in timeline order.  "res" is the caller's own
+                      dict; "segments" may be capped (see below); "pieces"
+                      is [(tl_start_sa, dur_sa, src_in_sa)] per segment;
+                      "end" is where the pull's audio stops, before its gap.
+      skipped     : results with nothing to place.
+      part_starts : part_index -> sample position of that part's first pull.
+    """
+    gap_sa = round(gap_secs * sr)
+
+    def s2sa(secs):
+        return round(secs * sr)
+
+    cursor      = 0  # samples — advances identically for all tracks
+    placed      = []
+    skipped     = []
+    part_starts = {}
+
+    for res in sorted(results, key=lambda r: r["order"]):
+        if check_cancel is not None:
+            check_cancel()
+        is_vo    = res.get("is_vo", False)
+        st       = res.get("status", "")
+        segments = res.get("segments") or []
+
+        if st in _TERMINAL_SKIP_STATUSES:
+            skipped.append(res); continue
+        if not is_vo and not segments:
+            skipped.append(res); continue
+
+        # ── Guard: cap clips whose source range is unreasonably long ──────────
+        # A segment spanning > 30 minutes almost always means a typo in the
+        # script pull timecodes.  Instead of skipping the clip entirely,
+        # cap each over-long segment to _CAP_SECS from its declared start so
+        # the clip still appears at the right spot in the timeline.
+        _MAX_SEG_SECS = 1800   # 30 minutes
+        _CAP_SECS     = 10.0   # fallback duration when a segment is over-long
+        takes_data    = res.get("takes_data") or []
+        _check_segs   = segments
+        if is_vo:
+            _td0 = (takes_data or [{}])[0]
+            _check_segs = _td0.get("segments") or segments
+        if any((e - s) > _MAX_SEG_SECS for s, e in _check_segs if e > s):
+            _max_dur = max((e - s) for s, e in _check_segs if e > s)
+            if callable(progress_cb):
+                progress_cb("WARNING: capping {} @ {} — source span {:.0f}s → {}s "
+                            "placeholder".format(res.get("token", "?"),
+                                                 res.get("in_tc", "?"),
+                                                 _max_dur, int(_CAP_SECS)))
+            def _cap(segs):
+                return [(s, s + _CAP_SECS) if (e - s) > _MAX_SEG_SECS else (s, e)
+                        for s, e in segs if e > s]
+            segments = _cap(segments)
+            if is_vo:
+                takes_data = [dict(_td, segments=_cap(_td.get("segments") or []))
+                              for _td in takes_data]
+            # Fall through — clip is placed with capped duration
+
+        # Record where this part first starts in the timeline
+        _pi = res.get("part_index", 0)
+        if _pi not in part_starts:
+            part_starts[_pi] = cursor
+
+        entry = {"res": res, "start": cursor, "pieces": []}
+        if is_vo:
+            if not takes_data:
+                skipped.append(res); continue
+            # Use the take that produced the best match, not necessarily [0].
+            best_i  = res.get("best_take_index", 0)
+            td      = takes_data[best_i] if best_i < len(takes_data) else takes_data[0]
+            # Prefer the top-level segments — these reflect any waveform-editor
+            # edits the user made in Step 4.  The take's own segments are the
+            # original Whisper output and would override manual adjustments.
+            # VO_TAIL_SECS is already baked into top-level segments at reconcile
+            # time, so no additional buffer is added here.
+            td_segs = segments or td.get("segments") or []
+            ap      = td.get("apath")
+            entry["segments"] = [(s, e) for s, e in td_segs if s < e]
+            entry["paths"]    = [ap] if ap else []
+            if ap:
+                for seg_in_s, seg_out_s in entry["segments"]:
+                    dur_sa = s2sa(seg_out_s - seg_in_s)
+                    entry["pieces"].append((cursor, dur_sa, s2sa(seg_in_s)))
+                    cursor += dur_sa
+            gap = (s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa) \
+                if res.get("gap_after", True) else 0
+        else:
+            apaths = interview_export_paths(res, int_assets)
+            if not apaths:
+                skipped.append(res); continue
+            entry["segments"] = [(s, e) for s, e in segments if s < e]
+            entry["paths"]    = apaths
+            for seg_in_s, seg_out_s in entry["segments"]:
+                dur_sa = s2sa(seg_out_s - seg_in_s)
+                entry["pieces"].append((cursor, dur_sa, s2sa(seg_in_s)))
+                cursor += dur_sa
+            gap = (s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa) \
+                if (entry["segments"] and res.get("gap_after", True)) else 0
+        entry["end"] = cursor
+        entry["gap"] = gap
+        cursor += gap
+        placed.append(entry)
+
+    return placed, skipped, part_starts
+
+
 def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
               seq_fps=24, seq_sr=48000, vo_takes_with_offset=None,
               out_path="output.aaf", progress_cb=None, cancel_event=None,
@@ -5370,7 +5543,6 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
     sr          = seq_sr
     sample_rate = aaf2.rational.AAFRational("{}/1".format(sr))
-    gap_sa      = round(gap_secs * sr)
     HOST_LC     = HOST_NAME.lower()
 
     def s2sa(secs):
@@ -5381,11 +5553,6 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     # the Whisper input for multi-track tokens.  They are 16 kHz mono and may
     # be windowed/cleaned up by the time export runs, so they must NEVER appear
     # in the AAF.  Filter them out of int_assets and any takes_data.apath here.
-    def _is_temp_mix_path(p):
-        if not p:
-            return False
-        return os.path.basename(p).startswith("_pb_mix_")
-
     _filtered_int_assets = {}
     _stripped_count = 0
     for _tok, _paths in (int_assets or {}).items():
@@ -5432,137 +5599,49 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             takes = pair_takes(paths)
             vo_takes_by_part[pi] = [(0.0, vp, ap) for vp, ap in takes]
 
-    cursor      = 0  # samples — advances identically for all tracks
-    skipped     = []
     # slots: (filepath, start_sa, dur_sa, src_in_sa, track_name)
     slots       = []
     slot_orders = []  # parallel to slots: the result "order" each slot came from
-    part_starts = {}  # part_index → sample position of first content in that part
 
-    for res in sorted(results, key=lambda r: r["order"]):
-        _check_cancel()
-        is_vo    = res.get("is_vo", False)
-        st       = res.get("status", "")
-        segments = res.get("segments") or []
+    placed, skipped, part_starts = layout_timeline(
+        results, gap_secs, sr, int_assets,
+        progress_cb=_prog, check_cancel=_check_cancel)
 
-        if st in _TERMINAL_SKIP_STATUSES:
-            skipped.append(res); continue
-        if not is_vo and not segments:
-            skipped.append(res); continue
-
-        # ── Guard: cap clips whose source range is unreasonably long ──────────
-        # A segment spanning > 30 minutes almost always means a typo in the
-        # script pull timecodes.  Instead of skipping the clip entirely,
-        # cap each over-long segment to _CAP_SECS from its declared start so
-        # the clip still appears at the right spot in the timeline.
-        _MAX_SEG_SECS = 1800   # 30 minutes
-        _CAP_SECS     = 10.0   # fallback duration when a segment is over-long
-        _check_segs   = segments
-        if is_vo:
-            _td0 = (res.get("takes_data") or [{}])[0]
-            _check_segs = _td0.get("segments") or segments
-        if any((e - s) > _MAX_SEG_SECS for s, e in _check_segs if e > s):
-            _max_dur = max((e - s) for s, e in _check_segs if e > s)
-            _prog("WARNING: capping {} @ {} — source span {:.0f}s → {}s placeholder".format(
-                res.get("token", "?"), res.get("in_tc", "?"),
-                _max_dur, int(_CAP_SECS)))
-            # Cap non-VO segments directly
-            segments = [
-                (s, s + _CAP_SECS) if (e - s) > _MAX_SEG_SECS else (s, e)
-                for s, e in segments if e > s
-            ]
-            # Cap VO takes_data segments
-            if is_vo:
-                _new_td = []
-                for _td in (res.get("takes_data") or []):
-                    _capped = [
-                        (s, s + _CAP_SECS) if (e - s) > _MAX_SEG_SECS else (s, e)
-                        for s, e in (_td.get("segments") or []) if e > s
-                    ]
-                    _new_td.append(dict(_td, segments=_capped))
-                res = dict(res, takes_data=_new_td, segments=segments)
-            # Fall through — clip is placed with capped duration
-
-        # Record where this part first starts in the timeline
-        _pi = res.get("part_index", 0)
-        if _pi not in part_starts:
-            part_starts[_pi] = cursor
+    for entry in placed:
+        res = entry["res"]
 
         # ── Track assignment ──────────────────────────────────────────────────
-        if is_vo:
-            track = "VO"
-        elif res.get("token", "").lower() == HOST_LC:
+        if res.get("is_vo", False):
+            for st_sa, dur_sa, src_in in entry["pieces"]:
+                slots.append((entry["paths"][0], st_sa, dur_sa, src_in, "VO"))
+                slot_orders.append(res["order"])
+            continue
+        if res.get("token", "").lower() == HOST_LC:
             # All host lines share a single track (e.g. all JORDAN questions)
             track = res["token"].upper()
         else:
             track = res.get("token", "UNKNOWN")
 
-        if is_vo:
-            takes_data = res.get("takes_data", [])
-            if not takes_data:
-                skipped.append(res); continue
-            # Use the take that produced the best match, not necessarily [0].
-            best_i  = res.get("best_take_index", 0)
-            td      = takes_data[best_i] if best_i < len(takes_data) else takes_data[0]
-            # Prefer the top-level segments — these reflect any waveform-editor
-            # edits the user made in Step 4.  The take's own segments are the
-            # original Whisper output and would override manual adjustments.
-            # VO_TAIL_SECS is already baked into top-level segments at reconcile
-            # time, so no additional buffer is added here.
-            td_segs = segments or td.get("segments")
-            ap      = td.get("apath")
-            if ap:
-                for seg_in_s, seg_out_s in td_segs:
-                    if seg_in_s >= seg_out_s: continue
-                    dur_sa = s2sa(seg_out_s - seg_in_s)
-                    slots.append((ap, cursor, dur_sa, s2sa(seg_in_s), track))
-                    slot_orders.append(res["order"])
-                    cursor += dur_sa
-            _vo_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
-            cursor += (_vo_gap if res.get("gap_after", True) else 0)
-        else:
-            tok    = res["token"]
-            # _export_paths: this pull was pointed at other audio than its
-            # token's files (set by the app's export-input collection).
-            paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok, []))
-                      if not _is_temp_mix_path(p)]
-            # Prefer pure-audio files; fall back to video files whose embedded
-            # audio will be extracted by ffmpeg (-vn) during the WAV conversion.
-            apaths = [p for p in paths if p and is_audio(p)]
-            if not apaths:
-                apaths = [p for p in paths if p and is_video(p)]
-            if not apaths:
-                skipped.append(res); continue
+        # Identify the host side by HOST_NAME appearing in the filename.
+        # Host files share a single track across all tokens; every other
+        # file gets its own dedicated track so no source is ever dropped
+        # — important for setups where Riverside exports anonymised
+        # "speaker-0" / "speaker-1" filenames or where a token has 3+
+        # parallel sources.
+        host_paths, guest_paths = split_host_guest(entry["paths"])
 
-            # Identify the host side by HOST_NAME appearing in the filename.
-            # Host files share a single track across all tokens; every other
-            # file gets its own dedicated track so no source is ever dropped
-            # — important for setups where Riverside exports anonymised
-            # "speaker-0" / "speaker-1" filenames or where a token has 3+
-            # parallel sources.
-            host_paths, guest_paths = split_host_guest(apaths)
-
-            for si, (seg_in_s, seg_out_s) in enumerate(segments):
-                if seg_in_s >= seg_out_s: continue
-                dur_sa  = s2sa(seg_out_s - seg_in_s)
-                is_last = (si == len(segments) - 1)
-                src_in  = s2sa(seg_in_s)
-
-                # Each non-host file → its own track.  Primary file uses the
-                # token name; additional files spill to "TOKEN (2)", … — not
-                # TOKEN_2, which collided with a real token named ADAM_2.
-                for gi, gp in enumerate(guest_paths):
-                    track_name = track if gi == 0 else "{} ({})".format(track, gi + 1)
-                    slots.append((gp, cursor, dur_sa, src_in, track_name))
-                    slot_orders.append(res["order"])
-                # All host-named files → shared JORDAN track
-                for hp in host_paths:
-                    slots.append((hp, cursor, dur_sa, src_in,
-                                  HOST_NAME.upper()))
-                    slot_orders.append(res["order"])
-
-                _int_gap = s2sa(res["gap_after_s"]) if "gap_after_s" in res else gap_sa
-                cursor += dur_sa + (_int_gap if (is_last and res.get("gap_after", True)) else 0)
+        for st_sa, dur_sa, src_in in entry["pieces"]:
+            # Each non-host file → its own track.  Primary file uses the
+            # token name; additional files spill to "TOKEN (2)", … — not
+            # TOKEN_2, which collided with a real token named ADAM_2.
+            for gi, gp in enumerate(guest_paths):
+                track_name = track if gi == 0 else "{} ({})".format(track, gi + 1)
+                slots.append((gp, st_sa, dur_sa, src_in, track_name))
+                slot_orders.append(res["order"])
+            # All host-named files → shared JORDAN track
+            for hp in host_paths:
+                slots.append((hp, st_sa, dur_sa, src_in, HOST_NAME.upper()))
+                slot_orders.append(res["order"])
 
     # ── Overlap guard ─────────────────────────────────────────────────────────
     # A track holds one clip at a time.  The writer below can only append,

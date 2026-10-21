@@ -190,6 +190,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self._export_fmt           = None   # "aaf" or "xml", chosen at Step 5 for script_session
         self._current_session_file = None   # path of the last Save / Save As target
         self._restore_s4           = False  # True only when explicitly opened via OPEN
+        self._assembly             = None   # open AssemblyWindow, if any
         self.tokens     = []
         self.parts      = []
         self.pulls      = []
@@ -451,6 +452,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             self._s4_save_flush()
         except Exception:
             pass
+        # The Assembly view is a view of Step 4's cards, which go with
+        # the screen.
+        if self._assembly is not None:
+            self._assembly.close()
         self.unbind_all("<MouseWheel>")
         # <x>/<X> are Step 4's "toggle IGNORE on the active card"
         # shortcut (bound via bind_all in _step4).  They were never
@@ -2373,6 +2378,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         close goes through _on_app_close; both flush synchronously, so
         nothing is ever lost by deferring.
         """
+        # Every Step 4 change comes through here, so this is where the
+        # Assembly view hears about it.
+        if self._assembly is not None:
+            self._assembly.schedule_refresh()
         if not self._step4_state_path():
             return
         self._s4_save_pending = True
@@ -7665,6 +7674,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self._btn(nav, "← BACK", self._s4_redo_to_step2).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,
                   small=True).pack(side="left", padx=(12,0))
+        self._btn(nav, "ASSEMBLY", self._open_assembly,
+                  small=True).pack(side="left", padx=(4,0))
         if DEV_DIAGNOSTIC:
             self._btn(nav, "DIAGNOSTIC", self._show_diagnostic,
                       small=True).pack(side="left", padx=(4,0))
@@ -8274,6 +8285,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     # don't have to full-rebuild all ~200 cards.
                     "stat_lbl":       stat_lbl,
                     "refresh_detail_fn": _refresh_clips_lbl,
+                    # The Assembly view opens a pull's editor through this.
+                    "open_review_fn": _open_review,
                 })
 
                 # ── Restore saved state ────────────────────────────────────────────
@@ -8487,6 +8500,25 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         ex = ThreadPoolExecutor(max_workers=1)
         ex.submit(_do).add_done_callback(_done)
         ex.shutdown(wait=False)
+
+    def _open_assembly(self):
+        """The reconciled cut as one continuous track under the script."""
+        if self._assembly is not None:
+            self._assembly.lift()
+            return
+        if not getattr(self, "_rv", None):
+            messagebox.showinfo("Nothing to assemble",
+                                "There are no reconciled pulls to lay out yet.")
+            return
+        from assembly_view import AssemblyWindow
+        self._assembly = AssemblyWindow(self)
+
+    def _assembly_open_card(self, order):
+        """Open one pull's waveform editor from the Assembly view."""
+        e = next((e for e in getattr(self, "_rv", [])
+                  if e["res"].get("order") == order), None)
+        if e is not None and e.get("open_review_fn"):
+            e["open_review_fn"]()
 
     def _show_reconcile_log(self):
         """Open a window showing the saved Step 3 reconcile log (for debugging)."""

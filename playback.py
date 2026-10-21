@@ -155,6 +155,15 @@ class LivePlayer(object):
             self._src    = np.ascontiguousarray(pcm, dtype=np.float32)
             self._src_t0 = float(t0)
 
+    def load_source(self, source, t0=0.0):
+        """Install a source that composes its audio on demand instead of a
+        flat buffer -- the Assembly view's whole cut, which is too long to
+        hold as float32.  `source` needs len() in samples at self.sr and
+        read(start_idx, n) -> float32 array of n samples (or None)."""
+        with self._lock:
+            self._src    = source
+            self._src_t0 = float(t0)
+
     def covers(self, start_s, end_s):
         """True when the loaded buffer spans [start_s, end_s]."""
         with self._lock:
@@ -255,6 +264,8 @@ class LivePlayer(object):
         src = self._src
         if i + n > len(src):
             return None
+        if not isinstance(src, np.ndarray):
+            return src.read(i, n)
         return src[i:i + n]
 
     def _render(self, frames):

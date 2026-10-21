@@ -2,6 +2,11 @@
 
 ---
 
+## October 21, 2026
+
+### Assembly view (phase 1: look and listen)
+**ASSEMBLY** on Step 4 opens the reconciled episode as one continuous track, the script above it and the cut below, over-under. Every placed pull sits exactly where the AAF puts it: placement now comes from one function, `engines.layout_timeline`, which `build_aaf` also uses (verified clip-for-clip identical on a 181-pull episode). The track plays as the same single reference Step 4 does, an interview pull from its transcription mix and a VO pull from its take, with the shared speed control (`[` / `]`, 0.75× to 3×). Transcript words are drawn on the waveform and the word under the playhead lights up. The script follows the playhead, and clicking a pull in either pane jumps there. Part starts are flagged on the ruler, gap lengths are shown under the track, and pulls Step 4 still flags are amber. Double-click (or Enter) opens that pull in the waveform editor; any Step 4 change redraws the cut. Space plays and stops, ← → step between pulls, `+` / `−` / `F` zoom, Ctrl+wheel zooms at the mouse. Audio loads per pull in the background with two seconds of handle either side, nearest the view first; a 57-minute episode loads in about five seconds and holds about 300 MB.
+
 ## October 19, 2026
 
 ### Google Docs bridge
