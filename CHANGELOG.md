@@ -4,6 +4,21 @@
 
 ## October 21, 2026
 
+### Assembly view: Smart Tool, command bar, speaker colours, monitoring
+- **The mouse works like Pro Tools' Smart Tool.**
+  - In a pull's top half (text cursor), a click places the insertion point and a drag highlights a span.
+  - In its bottom half (four-way move cursor), a click selects the whole pull and a drag moves it and everything after.
+  - The edges trim, as before.
+  - Shift-click extends a highlight. Delete takes out what is selected; a whole pull selected that way is IGNOREd.
+  - With a span highlighted, Space plays just that span.
+- **A command bar across the top is the window's key.** Every action is a button showing its key, grouped as Play, Monitor, Edit, Spot and View, with a line spelling out the mouse zones.
+- **Each speaker has its own colour.** VO and the host keep theirs, and each interview token gets one in alphabetical order, with a colour key at the right of the bar. A pull Step 4 still flags keeps an amber strip and label over its speaker's colour.
+- **Follow playhead (S).** It can be turned off, so the view stays put while you edit during playback. It never scrolls in the middle of a drag or while you're naming a mark.
+- **Pre-roll (P).** Its length is set with the − / + beside it (0.5–10 s). Playback starts that far ahead of the insertion point or highlighted span. After any edit, the insertion point lands on the new seam, so play with pre-roll runs straight into it.
+- **Return to start on stop (N).** When it is on, stopping goes back to the insertion point. When it is off, the playhead stays where it stopped; pressing **0** (stop) a second time goes back to where play started, as in Cubase. Clicking while the cut plays sets the insertion point (drawn dashed) without jumping playback.
+- **R and T zoom out and in**, as in Pro Tools.
+- The monitoring choices and the speed are kept for the rest of the run.
+
 ### Assembly view (phase 3: spotting, and three marker tracks in the AAF)
 While the cut plays, **I** and **O** drop a music cue's in and out at the playhead and **M** an SFX spot. The marks sit on their own row of the ruler, music in blue with a bar from each in to its out, SFX in pink, and appear in the script after the pull they land on, which makes the script the spotting list. Drag a flag to move it, double-click it to name it in place, select it and press Delete to remove it. Unnamed marks are counted in timeline order (`Cue 3 in` / `Cue 3 out`, `SFX 7`); a named cue's out takes its name. Each mark lives on the pull it was dropped on, pinned to that moment of the source audio (or to a point in the gap after the pull), so trims and retiming carry it along with its word. It is saved with the pull, shares Step 4's undo, and survives BACK and re-reconcile. The AAF now ends with three marker tracks: **PARTS** as before, **MUSIC** and **SFX**, each a named silent clip per mark, the same form Pro Tools already shows for PARTS. A mark closer than two seconds to the next one on its track is cut short to fit, rather than pushing the rest out of time. Placement comes from one function, `engines.place_markers`, used by both the view and the export. Marks on an IGNOREd pull drop out with it and come back if it is restored.
 

@@ -10,6 +10,12 @@ interview pull sounds from its transcription mix, a VO pull from its take --
 so it is a listening and timing view, not a mix.  The AAF still breaks the
 cut out by source.
 
+The mouse works like Pro Tools' Smart Tool: on a pull, the top half is
+the selector (click places the insertion point, drag highlights a span) and
+the bottom half the grabber (click selects the whole pull, drag moves it);
+the edges trim.  Every action is also a button with its key in the bar
+across the top, which is the window's key.
+
 The track is also the editor.  Every edit is the same edit Step 4 makes, committed through the card's own
 accept (segments) or the result's gap_after_s, so Step 4's undo, its saved
 state and the AAF all see it:
@@ -17,8 +23,8 @@ state and the AAF all see it:
   * drag a pull's edge, or either side of a cut inside it, to trim --
     shuffle-style, so everything after it moves up or back;
   * drag a pull, or the gap in front of it, to change that gap;
-  * Shift-drag across part of a pull and press Delete to take it out
-    (all of it: the pull is IGNOREd);
+  * highlight part of a pull and press Delete to take it out (a whole
+    pull, selected with the grabber: it is IGNOREd);
   * , and . nudge the gap before the selected pull by a frame (< > by ten);
   * double-click a pull (or Enter) to open Step 4's waveform editor on it,
     for hunting the right edit in audio outside the pull.
@@ -48,7 +54,7 @@ import engines
 import match_review
 import playback
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
-                    WARN, ERR, FB, FBT, HOST_NAME, WAVE_REF)
+                    WARN, ERR, FB, FBT, HOST_NAME)
 from utils import secs_tc
 
 PLAY_SR     = 32000   # playback / display rate -- the whole cut is held in
@@ -67,8 +73,11 @@ _MONO       = ("Consolas", 10)
 _TC_FONT    = ("Consolas", 15, "bold")
 
 _C_VO       = "#9d8cf0"   # VO waveform
-_C_INT      = WAVE_REF    # interview waveform
 _C_HOST     = "#8a8a8a"   # host waveform
+# Interview tokens, in alphabetical order of token -- clear of the amber
+# review flag, the orange accent and the music / SFX marker colours.
+_TOKEN_COLOURS = ("#20a080", "#4fc3f7", "#8bc34a", "#e57373", "#ba68c8",
+                  "#4db6ac", "#dce775", "#90a4ae", "#a1887f", "#7986cb")
 _C_FLAG     = WARN        # a pull Step 4 still flags for review
 _C_PLAYHEAD = ERR
 _C_PART     = ACCENT
@@ -76,6 +85,50 @@ _C_CLIP_BG  = SURF
 _C_MUSIC    = "#4f9be0"   # music cue in / out
 _C_SFX      = "#e0609a"   # SFX spot
 
+
+
+# Monitoring choices, kept for the run like the playback speed.
+_MONITOR = {"follow": True, "preroll_on": False, "preroll_s": 2.0,
+            "return_on": False}
+_PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
+
+
+class _KeyButton(object):
+    """One entry of the command bar: what it does, and its key -- a button
+    and the window's key at once.  A toggle shows its state."""
+
+    def __init__(self, parent, text, key, command, toggle=False):
+        self.toggle = toggle
+        self.on = False
+        self.frame = tk.Frame(parent, bg=BORDER, padx=1, pady=1, cursor="hand2")
+        self.lbl = tk.Label(self.frame, text=text, font=(FB[0], 10), bg=SURF3,
+                            fg=TEXT, padx=7, pady=2)
+        self.lbl.pack(side="left")
+        parts = [self.lbl]
+        if key:
+            self.key = tk.Label(self.frame, text=key, font=("Consolas", 10, "bold"),
+                                bg=SURF2, fg=ACCENT, padx=5, pady=2)
+            self.key.pack(side="left")
+            parts.append(self.key)
+        for w in parts:
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: self.lbl.config(bg=BORDER))
+            w.bind("<Leave>", lambda e: self._paint())
+
+    def _paint(self):
+        self.lbl.config(bg=ACCENT if self.on else SURF3,
+                        fg=TEXT)
+
+    def set_on(self, on):
+        self.on = bool(on)
+        self._paint()
+
+    def set_text(self, text):
+        self.lbl.config(text=text)
+
+    def pack(self, **kw):
+        self.frame.pack(**kw)
+        return self
 
 
 def _fmt_tc(t):
@@ -113,15 +166,14 @@ class _Clip(object):
             self.src_lo = self.src_hi = 0.0
         self.words = None              # [(tl_start, tl_end, text)] once loaded
         self.load_error = None
+        self.tint = _C_VO                # the token's colour (see _layout)
 
     @property
     def label(self):
         return "#{:03d}  {}".format(self.order, self.res.get("token", "?"))
 
     def colour(self):
-        if self.flagged:
-            return _C_FLAG
-        return {"vo": _C_VO, "host": _C_HOST}.get(self.kind, _C_INT)
+        return self.tint
 
     def src_at(self, t):
         """Source time under timeline time t, or None in no segment."""
@@ -243,6 +295,10 @@ class AssemblyWindow(object):
         self.view0      = 0.0            # timeline time at the left edge
         self.pps        = 30.0           # pixels per second
         self.playhead   = 0.0
+        self.insert     = 0.0            # insertion point: where play starts
+        self._playing   = False
+        self._play_origin = 0.0          # where the last play started
+        self._token_tints = {}
         self.sel_order  = None
         self._cur_order = None           # pull the playhead is in
         self._word_items = []            # [(tl_start, tl_end, item)] on screen
@@ -259,7 +315,7 @@ class AssemblyWindow(object):
         self._file_end  = {}             # path -> length, once a read ran short
         self._inputs    = None           # export inputs, held while dragging
         self._drag      = None           # the gesture in progress
-        self._range     = None           # (order, a, b) Shift-drag selection
+        self._range     = None           # (order, a, b) highlighted span
         self.markers    = []             # place_markers' list, plus "t" (s)
         self.sel_marker = None           # (order, index) of the chosen mark
         self._rename    = None           # (entry widget, (order, index))
@@ -287,6 +343,7 @@ class AssemblyWindow(object):
 
     # ── Construction ─────────────────────────────────────────────────────
     def _build_ui(self):
+        self._build_command_bar()
         pw = tk.PanedWindow(self.win, orient="vertical", bg=BORDER,
                             sashwidth=6, bd=0, sashrelief="flat")
         pw.pack(fill="both", expand=True)
@@ -314,49 +371,20 @@ class AssemblyWindow(object):
 
         # Track pane
         bottom = tk.Frame(pw, bg=BG)
-        bar = tk.Frame(bottom, bg=SURF, highlightbackground=BORDER,
-                       highlightthickness=1)
-        bar.pack(fill="x")
-        btn = self.app._btn
-        self.play_btn = btn(bar, "▶  PLAY", self.toggle_play, small=True,
-                            width=9)
-        self.play_btn.pack(side="left", padx=(8, 6), pady=6)
-        self.tc_lbl = tk.Label(bar, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
-                               fg=TEXT, width=10, anchor="w")
-        self.tc_lbl.pack(side="left", padx=(4, 14))
-        tk.Label(bar, text="SPEED", font=_SMALL, bg=SURF, fg=SUB
-                 ).pack(side="left", padx=(0, 4))
-        btn(bar, "−", lambda: self.step_rate(-1), small=True
-            ).pack(side="left")
-        self.rate_lbl = tk.Label(bar, text="", font=("Consolas", 12, "bold"),
-                                 bg=SURF, fg=TEXT, width=5)
-        self.rate_lbl.pack(side="left")
-        btn(bar, "+", lambda: self.step_rate(1), small=True).pack(side="left")
-        tk.Label(bar, text="ZOOM", font=_SMALL, bg=SURF, fg=SUB
-                 ).pack(side="left", padx=(18, 4))
-        btn(bar, "−", lambda: self.zoom(1 / 1.5), small=True
-            ).pack(side="left")
-        btn(bar, "FIT", self.fit, small=True).pack(side="left", padx=2)
-        btn(bar, "+", lambda: self.zoom(1.5), small=True).pack(side="left")
-        tk.Label(bar, font=_SMALL, bg=SURF, fg=SUB,
-                 text="drag an edge to trim  ·  drag a pull or gap to retime"
-                      "  ·  Shift-drag + Delete cuts  ·  , . nudge"
-                      "  ·  I / O music  ·  M sfx"
-                      "  ·  double-click: editor"
-                 ).pack(side="right", padx=10)
-        self.load_lbl = tk.Label(bar, text="", font=_SMALL, bg=SURF, fg=SUB)
-        self.load_lbl.pack(side="right", padx=8)
-        self._show_rate()
-
         self.ov = tk.Canvas(bottom, height=24, bg=SURF2, highlightthickness=0,
                             cursor="hand2")
         self.ov.pack(fill="x", pady=(6, 0))
         self.cv = tk.Canvas(bottom, bg=BG, highlightthickness=0,
-                            cursor="xterm")
+                            cursor="arrow")
         self.cv.pack(fill="both", expand=True, pady=(2, 0))
-        self.status = tk.Label(bottom, text="", font=(FB[0], 10), bg=BG,
+        foot = tk.Frame(bottom, bg=BG)
+        foot.pack(fill="x", pady=(0, 4))
+        self.load_lbl = tk.Label(foot, text="", font=(FB[0], 10), bg=BG,
+                                 fg=SUB, padx=10)
+        self.load_lbl.pack(side="right")
+        self.status = tk.Label(foot, text="", font=(FB[0], 10), bg=BG,
                                fg=SUB, anchor="w", padx=10)
-        self.status.pack(fill="x", pady=(0, 4))
+        self.status.pack(side="left", fill="x", expand=True)
 
         pw.add(top, minsize=120, stretch="always")
         pw.add(bottom, minsize=240, stretch="always")
@@ -381,6 +409,90 @@ class AssemblyWindow(object):
         # Ctrl+Z with bind_all, and those must not fire against a card
         # nobody is looking at while this window has focus.
         self.win.bind("<Key>", self._on_key)
+
+    def _build_command_bar(self):
+        """The window's key: every action as a button labelled with its
+        key, grouped the way the work goes -- play, monitor, edit, spot,
+        look -- with the mouse zones and the speakers' colours."""
+        bar = tk.Frame(self.win, bg=SURF, highlightbackground=BORDER,
+                       highlightthickness=1)
+        bar.pack(fill="x")
+        rows = [tk.Frame(bar, bg=SURF) for _ in range(3)]
+        for r in rows:
+            r.pack(fill="x", padx=8, pady=(4, 0))
+        rows[-1].pack_configure(pady=(4, 6))
+
+        def group(row, title):
+            tk.Label(row, text=title, font=(FB[0], 9, "bold"), bg=SURF,
+                     fg=SUB).pack(side="left", padx=(14, 6))
+
+        def key(row, text, k, cmd, toggle=False):
+            return _KeyButton(row, text, k, cmd, toggle).pack(side="left", padx=2)
+
+        r = rows[0]
+        self.tc_lbl = tk.Label(r, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
+                               fg=TEXT, width=10, anchor="w")
+        self.tc_lbl.pack(side="left", padx=(2, 4))
+        group(r, "PLAY")
+        self.play_key = key(r, "\u25B6  Play", "Space", self.toggle_play)
+        key(r, "\u25A0  Stop  (again: back to start)", "0",
+            lambda: self.stop(key=True))
+        key(r, "Slower", "[", lambda: self.step_rate(-1))
+        self.rate_lbl = tk.Label(r, text="", font=("Consolas", 12, "bold"),
+                                 bg=SURF, fg=TEXT, width=5)
+        self.rate_lbl.pack(side="left")
+        key(r, "Faster", "]", lambda: self.step_rate(1))
+        group(r, "MONITOR")
+        self.preroll_key = key(r, "", "P", self.toggle_preroll, toggle=True)
+        key(r, "\u2212", "", lambda: self.step_preroll(-1))
+        key(r, "+", "", lambda: self.step_preroll(1))
+        self.return_key = key(r, "Return to start on stop", "N",
+                              self.toggle_return, toggle=True)
+        self.follow_key = key(r, "Follow playhead", "S", self.toggle_follow,
+                              toggle=True)
+        self.legend = tk.Frame(r, bg=SURF)
+        self.legend.pack(side="right", padx=6)
+
+        r = rows[1]
+        group(r, "EDIT")
+        key(r, "Delete selection", "Del", self._delete_key)
+        key(r, "Gap \u2212 1 fr", ",", lambda: self.nudge_gap(-1))
+        key(r, "Gap + 1 fr", ".", lambda: self.nudge_gap(1))
+        key(r, "Undo", "Ctrl+Z", self.app._s4_undo)
+        key(r, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
+        key(r, "Open in editor", "Enter", self.open_selected)
+        group(r, "SPOT")
+        key(r, "Music in", "I", lambda: self.drop_marker("music_in"))
+        key(r, "Music out", "O", lambda: self.drop_marker("music_out"))
+        key(r, "SFX", "M", lambda: self.drop_marker("sfx"))
+        group(r, "VIEW")
+        key(r, "Zoom out", "R  \u2212", lambda: self.zoom(1 / 1.5))
+        key(r, "Zoom in", "T  +", lambda: self.zoom(1.5))
+        key(r, "Fit", "F", self.fit)
+        key(r, "Prev pull", "\u2190", lambda: self._neighbour(-1))
+        key(r, "Next pull", "\u2192", lambda: self._neighbour(1))
+
+        r = rows[2]
+        group(r, "MOUSE")
+        tk.Label(r, font=(FB[0], 10), bg=SURF, fg=TEXT, text=(
+            "pull top half: select (click = insertion point, drag = highlight)"
+            "   {d}   bottom half: grab (click = whole pull, drag = move)"
+            "   {d}   edge: trim   {d}   gap: drag to retime"
+            "   {d}   double-click: editor   {d}   flag: drag / double-click"
+            " to name   {d}   Ctrl+wheel: zoom").format(d="\u00b7")
+                 ).pack(side="left")
+        self._show_rate()
+        self._show_monitor()
+
+    def _show_legend(self):
+        """Swatches for the speakers on the track, refreshed as they change."""
+        for w in self.legend.winfo_children():
+            w.destroy()
+        for name, col in self._token_tints.items():
+            tk.Label(self.legend, bg=col, width=2, height=1, bd=0
+                     ).pack(side="left", padx=(8, 3), pady=3)
+            tk.Label(self.legend, text=name, font=(FB[0], 10), bg=SURF,
+                     fg=TEXT).pack(side="left")
 
     # ── Model ────────────────────────────────────────────────────────────
     def schedule_refresh(self):
@@ -459,6 +571,23 @@ class AssemblyWindow(object):
                     c.words = old.words if old.pieces == c.pieces \
                         else self._map_words(c, load=False)
             clips.append(c)
+
+        # A colour per speaker: VO and the host keep theirs; interview
+        # tokens take the palette in alphabetical order.
+        toks = sorted({c.res.get("token", "?") for c in clips
+                       if c.kind == "int"})
+        tints = {"VO": _C_VO} if any(c.kind == "vo" for c in clips) else {}
+        tints.update((t, _TOKEN_COLOURS[i % len(_TOKEN_COLOURS)])
+                     for i, t in enumerate(toks))
+        if any(c.kind == "host" for c in clips):
+            tints[HOST_NAME.upper()] = _C_HOST
+        for c in clips:
+            c.tint = tints["VO"] if c.kind == "vo" else (
+                _C_HOST if c.kind == "host" else tints[c.res.get("token", "?")])
+        if tints != self._token_tints:
+            self._token_tints = tints
+            if hasattr(self, "legend"):
+                self._show_legend()
 
         self.clips   = clips
         self._starts = [c.start for c in clips]
@@ -785,7 +914,8 @@ class AssemblyWindow(object):
             xs, xe = self._x(c.start), self._x(c.end)
             col = c.colour()
             cv.create_rectangle(xs, y0, xe, y1, fill=_C_CLIP_BG, outline=BORDER)
-            cv.create_rectangle(xs, y0, xe, y0 + 3, fill=col, outline="")
+            cv.create_rectangle(xs, y0, xe, y0 + (5 if c.flagged else 3),
+                                fill=_C_FLAG if c.flagged else col, outline="")
             for tl, du, si in c.pieces[1:]:
                 xc = self._x(tl)       # an internal cut inside the pull
                 cv.create_line(xc, y0 + 4, xc, y1, fill=BORDER, dash=(1, 3))
@@ -794,8 +924,8 @@ class AssemblyWindow(object):
                 lbl += "  ·  " + c.res.get("status", "")
             lx = max(xs, 0) + 6
             if self._fits(lbl, xe - lx - 4):
-                cv.create_text(lx, y0 + 5, text=lbl, anchor="nw",
-                               font=self._font, fill=SUB)
+                cv.create_text(lx, y0 + 6, text=lbl, anchor="nw",
+                               font=self._font, fill=_C_FLAG if c.flagged else SUB)
             self._draw_wave(c, xs, xe, lane_mid, lane_h, col, w)
             if c.load_error and xe - xs > 80:
                 cv.create_text(max(xs, 0) + 6, lane_mid, text=c.load_error[:120],
@@ -817,6 +947,9 @@ class AssemblyWindow(object):
             _o, a, b = self._range
             cv.create_rectangle(self._x(min(a, b)), y0, self._x(max(a, b)), y1,
                                 fill=TEXT, stipple="gray25", outline=TEXT)
+        if self._playing:
+            xi = self._x(self.insert)
+            cv.create_line(xi, 0, xi, y1, fill=TEXT, dash=(3, 3), tags=("ins",))
         x = self._x(self.playhead)
         cv.create_line(x, 0, x, y1, fill=_C_PLAYHEAD, width=2, tags=("ph",))
         self.tc_lbl.config(text=_fmt_tc(self.playhead))
@@ -1011,8 +1144,10 @@ class AssemblyWindow(object):
         self._update_status()
 
     def seek(self, t, center=False):
-        self.playhead = max(0.0, min(t, self.total_s))
-        if self.player is not None and self.player.is_playing():
+        """Go to t -- the playhead and the insertion point, and the
+        playback too if it is running (the ruler, the script, Home)."""
+        self.playhead = self.insert = max(0.0, min(t, self.total_s))
+        if self.player is not None and self._playing:
             self.player.seek(self.playhead)
         span = self._span()
         if center or not (self.view0 <= self.playhead <= self.view0 + span):
@@ -1023,11 +1158,26 @@ class AssemblyWindow(object):
         self._highlight_script(self._order_at(self.playhead))
         self._update_status()
 
+    def set_insert(self, t):
+        """Place the insertion point.  While the cut plays this leaves the
+        playback (and the view) alone -- it is where the next play starts,
+        and where a stop returns to."""
+        self.insert = max(0.0, min(t, self.total_s))
+        if self._playing:
+            self.redraw()
+            return
+        self.playhead = self.insert
+        self._move_playhead()
+        self._highlight_script(self._order_at(self.playhead))
+        self._update_status()
+
     # ── Editing on the track ─────────────────────────────────────────────
     def _hit(self, x, y):
-        """What a press at (x, y) would grab: ("in" | "out", clip, segment)
-        for an edge, ("body", clip) inside a pull, ("gap", the pull before
-        it) between two, ("ruler",) above the track, or ("none",)."""
+        """What a press at (x, y) would take: ("in" | "out", clip, segment)
+        on an edge, ("select", clip) in a pull's top half, ("grab", clip) in
+        its bottom half, ("gap", the pull before it) between two,
+        ("marker", mark) on a flag, ("ruler",) above the track, or
+        ("none",)."""
         y0, y1 = self._track_box()
         reach = max(6, self._ls // 2)
         if y < y0:
@@ -1062,7 +1212,8 @@ class AssemblyWindow(object):
             return best[1]
         c = self._clip_at(t)
         if c is not None:
-            return ("body", c, None)
+            # Pro Tools' Smart Tool split: selector above, grabber below.
+            return ("select" if y < (y0 + y1) / 2.0 else "grab", c, None)
         if 0 <= i < len(self.clips) - 1:
             return ("gap", self.clips[i], None)
         return ("none", None, None)
@@ -1077,7 +1228,8 @@ class AssemblyWindow(object):
         kind, c, k = self._hit(e.x, e.y)
         cur = {"in": "sb_h_double_arrow", "out": "sb_h_double_arrow",
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
-               "ruler": "hand2"}.get(kind, "xterm")
+               "select": "xterm", "grab": "fleur",
+               "ruler": "hand2"}.get(kind, "arrow")
         if self.cv.cget("cursor") != cur:
             self.cv.config(cursor=cur)
         self.cv.delete("hover")
@@ -1104,32 +1256,49 @@ class AssemblyWindow(object):
             self._drag = {"mode": "scrub"}
             self.seek(t)
             return
-        if e.state & 0x0001 and kind in ("body", "in", "out"):
-            # Shift: mark a span of this pull to take out.
-            a = min(max(t, c.start), c.end)
-            self._range = (c.order, a, a)
-            self._drag = {"mode": "range", "x0": e.x}
-            self.select(c.order)
-            return
-        self._range = None
         if kind in ("in", "out"):
+            self._range = None
             self._drag = {"mode": kind, "order": c.order, "k": k, "x0": e.x,
                           "segs0": list(c.segments), "moved": False}
             self.select(c.order)
             return
-        if kind in ("body", "gap"):
-            # The gap belongs to the pull before it; dragging a pull moves
-            # it and everything after by changing that gap.
-            owner = self._prev_clip(c) if kind == "body" else c
-            self._drag = {"mode": "gap", "x0": e.x, "moved": False,
-                          "target": owner.order if owner else None,
-                          "gap0": owner.gap if owner else 0.0}
-            if kind == "body" and c.order != self.sel_order:
+        if kind == "select":
+            # Selector: highlight from here; Shift extends the span.
+            a = min(max(t, c.start), c.end)
+            if e.state & 0x0001 and self._range and self._range[0] == c.order:
+                o, ra, rb = self._range
+                anchor = ra if abs(a - rb) < abs(a - ra) else rb
+                self._range = (o, anchor, a)
+            else:
+                self._range = (c.order, a, a)
+            self._drag = {"mode": "range", "x0": e.x, "t": a}
+            if c.order != self.sel_order:
                 self.sel_order = c.order
                 self._mark_selected_in_script()
-        self.seek(t)
+            self.redraw()
+            self._status_range()
+            return
+        if kind == "grab":
+            # Grabber: the whole pull is selected; dragging moves it (and
+            # everything after) by changing the gap in front of it.
+            owner = self._prev_clip(c)
+            self._range = (c.order, c.start, c.end)
+            self._drag = {"mode": "gap", "x0": e.x, "moved": False,
+                          "grabbed": c.order,
+                          "target": owner.order if owner else None,
+                          "gap0": owner.gap if owner else 0.0}
+            self.sel_order = c.order
+            self._mark_selected_in_script()
+            self.redraw()
+            self._status_range()
+            return
+        self._range = None
+        if kind == "gap":
+            self._drag = {"mode": "gap", "x0": e.x, "moved": False,
+                          "target": c.order, "gap0": c.gap, "t": t}
+            return
+        self.set_insert(t)
         self.redraw()
-        self._update_status()
 
     def _on_track_drag(self, e):
         d = self._drag
@@ -1140,6 +1309,8 @@ class AssemblyWindow(object):
             self.seek(self._t(e.x))
             return
         if mode == "range":
+            if self._range is None:
+                return
             o, a, _b = self._range
             c = self._clip(o)
             if c is not None:
@@ -1198,15 +1369,24 @@ class AssemblyWindow(object):
         if d["mode"] == "range":
             o, a, b = self._range
             if abs(self._x(b) - self._x(a)) < DRAG_PX:
-                self._range = None
-                self.seek(a)
-                self.redraw()
+                self._range = None           # a click: the insertion point
+                self.set_insert(d["t"])
+            else:
+                self.set_insert(min(a, b))   # a span starts where it starts
+            self.redraw()
             return
         if not d.get("moved") or "value" not in d:
+            if d["mode"] == "gap" and d.get("grabbed") is not None:
+                c = self._clip(d["grabbed"])
+                if c is not None:
+                    self.set_insert(c.start)
+            elif d["mode"] == "gap" and "t" in d:
+                self.set_insert(d["t"])
             return
         if d["mode"] == "marker":
             self._move_marker(d["key"], d["value"])
             return
+        self._range = None
         if d["mode"] == "gap":
             self.app._assembly_set_gap(d["target"], d["value"])
         else:
@@ -1214,6 +1394,22 @@ class AssemblyWindow(object):
             if segs and segs != _tidy(d["segs0"]):
                 self.app._assembly_set_segments(d["order"], segs)
         self.refresh()
+        self._park_at_edit(d)
+
+    def _park_at_edit(self, d):
+        """After an edit the insertion point sits on the new seam, so
+        play (with pre-roll) runs straight into it."""
+        if d["mode"] == "gap":
+            i = next((n for n, c in enumerate(self.clips)
+                      if c.order == d["target"]), None)
+            if i is not None and i + 1 < len(self.clips):
+                self.set_insert(self.clips[i + 1].start)
+            return
+        c = self._clip(d["order"])
+        if c is None or not c.pieces:
+            return
+        tl, du, _si = c.pieces[min(d["k"], len(c.pieces) - 1)]
+        self.set_insert(tl if d["mode"] == "in" else tl + du)
 
     def _status_drag(self, d):
         if d["mode"] == "gap":
@@ -1233,8 +1429,8 @@ class AssemblyWindow(object):
         o, a, b = self._range
         c = self._clip(o)
         whole = c is not None and abs(b - a) >= c.end - c.start - MIN_SEG_S
-        self.status.config(fg=TEXT, text="{}   {:.2f}s marked   ·   Delete "
-                           "takes it out{}".format(
+        self.status.config(fg=TEXT, text="{}   {:.2f}s selected   ·   "
+                           "Space plays it   ·   Delete takes it out{}".format(
                                c.label if c else "", abs(b - a),
                                " (the whole pull: IGNOREs it)" if whole else ""))
 
@@ -1254,7 +1450,17 @@ class AssemblyWindow(object):
         else:
             self.app._assembly_ignore(o)
         self.refresh()
-        self.seek(a)
+        self.set_insert(a)
+
+    def _delete_key(self):
+        if self.sel_marker is not None:
+            self.delete_marker()
+        else:
+            self.delete_range()
+
+    def open_selected(self):
+        self.open_card(self.sel_order if self.sel_order is not None
+                       else self._order_at(self.playhead))
 
     # ── Spotting marks ───────────────────────────────────────────────────
     def _marker(self, key):
@@ -1450,23 +1656,42 @@ class AssemblyWindow(object):
 
     # ── Playback ─────────────────────────────────────────────────────────
     def toggle_play(self):
+        if self._playing:
+            self.stop()
+        else:
+            self.play()
+
+    def play(self):
+        """Play from the insertion point -- or the highlighted span, and
+        only that -- with the pre-roll in front of it."""
         if self.player is None:
             self.status.config(text="Playback needs the sounddevice package "
                                     "(pip install sounddevice).", fg=ERR)
             return
-        if self.player.is_playing():
-            self.stop()
-            return
-        if self.playhead >= self.total_s - 0.05:
-            self.playhead = 0.0
+        end = None
+        if self._range is not None and abs(self._range[2] - self._range[1]) > 1e-3:
+            origin, end = sorted(self._range[1:])
+        else:
+            origin = self.insert
+            if origin >= self.total_s - 0.05:
+                origin = self.insert = 0.0
+        self._play_origin = origin
+        start = origin - (_MONITOR["preroll_s"] if _MONITOR["preroll_on"] else 0.0)
         self.player.set_rate(self._rate)
-        if not self.player.play(start_s=self.playhead):
+        if not self.player.play(start_s=max(0.0, start), end_s=end):
             self.status.config(text="Couldn't open the audio device.", fg=ERR)
             return
-        self.play_btn.config(text="❚❚  STOP")
+        self._playing = True
+        self.play_key.set_text("\u275A\u275A  Stop")
+        self.play_key.set_on(True)
         self._tick()
 
-    def stop(self):
+    def stop(self, key=False):
+        """Stop.  With Return to start on, the playhead goes back to the
+        insertion point; otherwise it stays, and pressing stop again (the
+        0 key) takes it back to where play started."""
+        was = self._playing
+        self._playing = False
         if self.player is not None:
             self.player.stop()
         if self._tick_after is not None:
@@ -1476,9 +1701,24 @@ class AssemblyWindow(object):
                 pass
             self._tick_after = None
         try:
-            self.play_btn.config(text="▶  PLAY")
+            self.play_key.set_text("\u25B6  Play")
+            self.play_key.set_on(False)
         except tk.TclError:
-            pass
+            return
+        if was:
+            if _MONITOR["return_on"]:
+                self.playhead = self.insert
+            else:
+                self.insert = self.playhead
+        elif key:
+            self.playhead = self.insert = self._play_origin
+        else:
+            return
+        if not (self.view0 <= self.playhead <= self.view0 + self._span()):
+            self.view0 = self.playhead - self._span() * 0.1
+        self.redraw()
+        self._highlight_script(self._order_at(self.playhead))
+        self._update_status()
 
     def _tick(self):
         self._tick_after = None
@@ -1487,19 +1727,47 @@ class AssemblyWindow(object):
         playing = self.player.is_playing()
         self.playhead = max(0.0, min(self.player.position(), self.total_s))
         span = self._span()
-        if self.playhead > self.view0 + span * 0.92 or self.playhead < self.view0:
+        # Follow: page the view along -- never while an edit is in hand.
+        if _MONITOR["follow"] and self._drag is None and self._rename is None \
+                and (self.playhead > self.view0 + span * 0.92
+                     or self.playhead < self.view0):
             self.view0 = self.playhead - span * 0.08
             self.redraw()
         else:
             self._move_playhead()
         order = self._order_at(self.playhead)
         if order != self._cur_order:
-            self._highlight_script(order)
+            self._highlight_script(order, see=_MONITOR["follow"])
             self._update_status()
         if playing:
             self._tick_after = self.win.after(30, self._tick)
         else:
             self.stop()
+
+    def toggle_follow(self):
+        _MONITOR["follow"] = not _MONITOR["follow"]
+        self._show_monitor()
+
+    def toggle_preroll(self):
+        _MONITOR["preroll_on"] = not _MONITOR["preroll_on"]
+        self._show_monitor()
+
+    def step_preroll(self, d):
+        cur = _MONITOR["preroll_s"]
+        i = min(range(len(_PREROLLS)), key=lambda k: abs(_PREROLLS[k] - cur))
+        _MONITOR["preroll_s"] = _PREROLLS[max(0, min(len(_PREROLLS) - 1, i + d))]
+        _MONITOR["preroll_on"] = True
+        self._show_monitor()
+
+    def toggle_return(self):
+        _MONITOR["return_on"] = not _MONITOR["return_on"]
+        self._show_monitor()
+
+    def _show_monitor(self):
+        self.preroll_key.set_text("Pre-roll  {:g} s".format(_MONITOR["preroll_s"]))
+        self.preroll_key.set_on(_MONITOR["preroll_on"])
+        self.return_key.set_on(_MONITOR["return_on"])
+        self.follow_key.set_on(_MONITOR["follow"])
 
     def step_rate(self, d):
         rates = match_review._PLAY_RATES
@@ -1534,6 +1802,7 @@ class AssemblyWindow(object):
             self.zoom(1 / 1.5)
         elif k == "Home":
             self.seek(0.0)
+            self._range = None
         elif k == "End":
             self.seek(self.total_s)
         elif k == "Right":
@@ -1541,13 +1810,21 @@ class AssemblyWindow(object):
         elif k == "Left":
             self._neighbour(-1)
         elif k in ("Delete", "BackSpace"):
-            if self.sel_marker is not None:
-                self.delete_marker()
-            else:
-                self.delete_range()
+            self._delete_key()
         elif k == "Return":
-            self.open_card(self.sel_order if self.sel_order is not None
-                           else self._order_at(self.playhead))
+            self.open_selected()
+        elif k in ("0", "KP_0", "KP_Insert"):
+            self.stop(key=True)
+        elif not ctrl and k.lower() == "p":
+            self.toggle_preroll()
+        elif not ctrl and k.lower() == "n":
+            self.toggle_return()
+        elif not ctrl and k.lower() == "s":
+            self.toggle_follow()
+        elif not ctrl and k.lower() == "r":
+            self.zoom(1 / 1.5)               # Pro Tools: R out, T in
+        elif not ctrl and k.lower() == "t":
+            self.zoom(1.5)
         elif not ctrl and k.lower() in ("i", "o", "m"):
             self.drop_marker({"i": "music_in", "o": "music_out",
                               "m": "sfx"}[k.lower()])
@@ -1567,7 +1844,6 @@ class AssemblyWindow(object):
         elif k == "Escape":
             self._range = None
             self.sel_marker = None
-            self.stop()
             self.redraw()
             self._update_status()
         return "break"
