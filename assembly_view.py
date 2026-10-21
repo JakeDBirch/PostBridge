@@ -10,8 +10,7 @@ interview pull sounds from its transcription mix, a VO pull from its take --
 so it is a listening and timing view, not a mix.  The AAF still breaks the
 cut out by source.
 
-The track is also the editor -- there is no second window to step into.
-Every edit is the same edit Step 4 makes, committed through the card's own
+The track is also the editor.  Every edit is the same edit Step 4 makes, committed through the card's own
 accept (segments) or the result's gap_after_s, so Step 4's undo, its saved
 state and the AAF all see it:
 
@@ -20,7 +19,9 @@ state and the AAF all see it:
   * drag a pull, or the gap in front of it, to change that gap;
   * Shift-drag across part of a pull and press Delete to take it out
     (all of it: the pull is IGNOREd);
-  * , and . nudge the gap before the selected pull by a frame (< > by ten).
+  * , and . nudge the gap before the selected pull by a frame (< > by ten);
+  * double-click a pull (or Enter) to open Step 4's waveform editor on it,
+    for hunting the right edit in audio outside the pull.
 
 It is also where the cut gets spotted.  I and O drop a music cue's in and
 out, M an SFX spot, at the playhead -- while it plays, too.  Each mark
@@ -341,6 +342,7 @@ class AssemblyWindow(object):
                  text="drag an edge to trim  ·  drag a pull or gap to retime"
                       "  ·  Shift-drag + Delete cuts  ·  , . nudge"
                       "  ·  I / O music  ·  M sfx"
+                      "  ·  double-click: editor"
                  ).pack(side="right", padx=10)
         self.load_lbl = tk.Label(bar, text="", font=_SMALL, bg=SURF, fg=SUB)
         self.load_lbl.pack(side="right", padx=8)
@@ -1335,9 +1337,19 @@ class AssemblyWindow(object):
         self.refresh()
 
     def _on_track_double(self, e):
-        kind, m, _k = self._hit(e.x, e.y)
+        kind, hit, _k = self._hit(e.x, e.y)
         if kind == "marker":
-            self._begin_rename((m["order"], m["index"]))
+            self._begin_rename((hit["order"], hit["index"]))
+        elif kind in ("body", "in", "out"):
+            self.open_card(hit.order)
+
+    def open_card(self, order):
+        """The pull in Step 4's waveform editor, which shows its whole
+        source file -- for finding an edit outside what was pulled."""
+        if order is None:
+            return
+        self.stop()
+        self.app._assembly_open_card(order)
 
     def _begin_rename(self, key):
         """Name a mark in place: a field over its flag, Enter to keep,
@@ -1533,6 +1545,9 @@ class AssemblyWindow(object):
                 self.delete_marker()
             else:
                 self.delete_range()
+        elif k == "Return":
+            self.open_card(self.sel_order if self.sel_order is not None
+                           else self._order_at(self.playhead))
         elif not ctrl and k.lower() in ("i", "o", "m"):
             self.drop_marker({"i": "music_in", "o": "music_out",
                               "m": "sfx"}[k.lower()])

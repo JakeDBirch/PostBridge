@@ -8316,8 +8316,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     # don't have to full-rebuild all ~200 cards.
                     "stat_lbl":       stat_lbl,
                     "refresh_detail_fn": _refresh_clips_lbl,
-                    # The Assembly track commits its edits through this.
+                    # The Assembly track commits its edits through this,
+                    # and opens a pull's waveform editor (the whole source
+                    # file, for audio outside the pull) through that.
                     "accept_fn": _accept,
+                    "open_review_fn": _open_review,
                 })
 
                 # ── Restore saved state ────────────────────────────────────────────
@@ -8543,6 +8546,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             return
         from assembly_view import AssemblyWindow
         self._assembly = AssemblyWindow(self)
+
+    def _assembly_open_card(self, order):
+        """Open a pull's waveform editor from the Assembly track.  Its
+        accept saves Step 4 state, which redraws the cut."""
+        e = next((e for e in getattr(self, "_rv", [])
+                  if e["res"].get("order") == order), None)
+        if e is not None and e.get("open_review_fn"):
+            e["open_review_fn"]()
 
     def _assembly_set_segments(self, order, segments):
         """An edit on the Assembly track: the pull's new kept source
