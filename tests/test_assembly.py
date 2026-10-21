@@ -73,6 +73,7 @@ def test_assembly_audio_composes_the_cut():
     from assembly_view import _AssemblyAudio, _Clip, LEAD_S
     sr = 100
     entry = {"start": 0, "end": 300, "gap": 0,                 # at 100 Hz:
+             "segments": [(1.0, 2.0), (3.0, 5.0)],
              "pieces": [(0, 100, 100), (100, 200, 300)]}       # 1 s + 2 s
     c = _Clip(entry, {"order": 7}, 100, "int", False, "x.wav")
     audio = _AssemblyAudio(sr)
@@ -90,3 +91,25 @@ def test_assembly_audio_composes_the_cut():
     assert np.allclose(out[100:300], np.arange(250, 450))
     # The lead-in before 0:00 is silent.
     assert not audio.read(0, lead).any()
+
+
+def test_tidy_joins_butted_segments_and_drops_slivers():
+    from assembly_view import _tidy
+    assert _tidy([(5.0, 6.0), (1.0, 2.0), (2.0, 3.0), (7.0, 7.01)]) == \
+        [(1.0, 3.0), (5.0, 6.0)]
+
+
+def test_segments_without_takes_a_span_out_of_the_cut():
+    from assembly_view import _Clip, _segments_without
+    # Two segments: source 10-12 s at 0-2 s, source 20-23 s at 2-5 s.
+    entry = {"start": 0, "end": 500, "gap": 0,
+             "segments": [(10.0, 12.0), (20.0, 23.0)],
+             "pieces": [(0, 200, 1000), (200, 300, 2000)]}
+    c = _Clip(entry, {"order": 1}, 100, "int", False, "x.wav")
+    # A pause inside the second segment.
+    assert _segments_without(c, 3.0, 3.5) == \
+        [(10.0, 12.0), (20.0, 21.0), (21.5, 23.0)]
+    # Across the cut: the tail of one and the head of the next.
+    assert _segments_without(c, 1.5, 2.5) == [(10.0, 11.5), (20.5, 23.0)]
+    # All of it.
+    assert _segments_without(c, 0.0, 5.0) == []

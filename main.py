@@ -8050,10 +8050,76 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     if not from_restore:
                         self._s4_save()
 
+                # ── Accept edited segments ──────────────────────────────────────────
+                # The waveform editor's OK, and every edit made on the
+                # Assembly track (which reaches it through _rv's accept_fn).
+                # `apath` is the audio the edit was made against, used when
+                # a no-match VO has no take to hold the segments yet.
+                def _accept(new_segs, new_token=None, new_audio_path=None,
+                            apath=None, r=res, af=_accepted_flag,
+                            ss=_set_accepted, sl=stat_lbl,
+                            rcl=_refresh_clips_lbl):
+                    self._s4_push_undo()
+                    old_status = r.get("status", "")
+                    # Re-accepting an already-accepted row must not count
+                    # it twice.
+                    _was_accepted = af[0]
+                    # Cross-token ADOPT from the match-review search: also
+                    # reassign this pull to the new token + audio file and
+                    # refresh the scripted timecode fields.  segments arg
+                    # is a single-hit window (in_s, out_s) from the sidecar.
+                    if new_token and new_token != r.get("token"):
+                        r["token"] = new_token
+                    if new_audio_path:
+                        r["source_audio"] = new_audio_path
+                        r["export_source"] = new_audio_path
+                        r["_s4_reassigned"] = True
+                        # source_video was a fallback for restored sessions;
+                        # once we've reassigned, clear it so future opens
+                        # use the new audio path.
+                        r.pop("source_video", None)
+                        if is_video(new_audio_path):
+                            r["source_video"] = new_audio_path
+                    r["segments"]   = new_segs
+                    r["rec_in_s"]   = new_segs[0][0]
+                    r["rec_out_s"]  = new_segs[-1][1]
+                    r["rec_in_tc"]  = secs_tc(new_segs[0][0])
+                    r["rec_out_tc"] = secs_tc(new_segs[-1][1])
+                    r["_s4_accepted"] = True   # persist across Step 4 re-entries
+                    # For VO clips, build_aaf reads takes_data[best_i]["segments"],
+                    # not the top-level segments, so keep them in sync.
+                    if r.get("is_vo"):
+                        _best_i = r.get("best_take_index", 0)
+                        # A new list, not an in-place write: the undo
+                        # snapshot holds the old one by reference.
+                        _td = list(r.get("takes_data") or [])
+                        if _td and _best_i < len(_td) and isinstance(_td[_best_i], dict):
+                            # Matched VO: update the winning take's segments.
+                            _td[_best_i] = dict(_td[_best_i], segments=list(new_segs))
+                            r["takes_data"] = _td
+                        elif not _td:
+                            # No-match VO: takes_data was empty so build_aaf would
+                            # skip this clip entirely.  Synthesise a minimal entry
+                            # from the audio file the waveform editor just used.
+                            r["takes_data"]      = [{"apath": apath or r.get("source_audio", ""),
+                                                     "segments": list(new_segs)}]
+                            r["best_take_index"] = 0
+                    if old_status not in self.SUCCESS_STATUSES:
+                        # Remember the original status so restore/un-accept
+                        # can decrement the correct tally bucket.
+                        r["_original_status"] = old_status
+                        r["status"] = "manual"
+                        sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
+                                  fg=STATUS_COLOR.get("manual", SUCCESS))
+                    af[0] = True
+                    ss()
+                    rcl()   # refresh sub-clip count badge
+                    if not _was_accepted:
+                        _increment_confirmed(old_status)
+                    self._s4_save()
+
                 # ── Open waveform editor — primary card action ──────────────────────
-                def _open_review(event=None, r=res, af=_accepted_flag,
-                                 ss=_set_accepted, sl=stat_lbl,
-                                 rcl=_refresh_clips_lbl):
+                def _open_review(event=None, r=res):
                     # Resolve source audio with a fallback ladder so cards
                     # from restored sessions / provisional-first / post-
                     # reassign flows all open cleanly.  A silent return here
@@ -8125,63 +8191,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     segs_r = r.get("segments") or [(0.0, 30.0)]
                     fps    = getattr(self, "_seq_fps", 24.0)
 
-                    def _accept(new_segs, new_token=None, new_audio_path=None,
-                                r=r, af=af, ss=ss, sl=sl, rcl=rcl):
-                        self._s4_push_undo()
-                        old_status = r.get("status", "")
-                        # Re-accepting an already-accepted row must not count
-                        # it twice.
-                        _was_accepted = af[0]
-                        # Cross-token ADOPT from the match-review search: also
-                        # reassign this pull to the new token + audio file and
-                        # refresh the scripted timecode fields.  segments arg
-                        # is a single-hit window (in_s, out_s) from the sidecar.
-                        if new_token and new_token != r.get("token"):
-                            r["token"] = new_token
-                        if new_audio_path:
-                            r["source_audio"] = new_audio_path
-                            r["export_source"] = new_audio_path
-                            r["_s4_reassigned"] = True
-                            # source_video was a fallback for restored sessions;
-                            # once we've reassigned, clear it so future opens
-                            # use the new audio path.
-                            r.pop("source_video", None)
-                            if is_video(new_audio_path):
-                                r["source_video"] = new_audio_path
-                        r["segments"]   = new_segs
-                        r["rec_in_s"]   = new_segs[0][0]
-                        r["rec_out_s"]  = new_segs[-1][1]
-                        r["rec_in_tc"]  = secs_tc(new_segs[0][0])
-                        r["rec_out_tc"] = secs_tc(new_segs[-1][1])
-                        r["_s4_accepted"] = True   # persist across Step 4 re-entries
-                        # For VO clips, build_aaf reads takes_data[best_i]["segments"],
-                        # not the top-level segments, so keep them in sync.
-                        if r.get("is_vo"):
-                            _best_i = r.get("best_take_index", 0)
-                            _td = r.get("takes_data") or []
-                            if _td and _best_i < len(_td) and isinstance(_td[_best_i], dict):
-                                # Matched VO: update the winning take's segments in-place.
-                                _td[_best_i] = dict(_td[_best_i], segments=list(new_segs))
-                            elif not _td:
-                                # No-match VO: takes_data was empty so build_aaf would
-                                # skip this clip entirely.  Synthesise a minimal entry
-                                # from the audio file the waveform editor just used.
-                                r["takes_data"]      = [{"apath": sa, "segments": list(new_segs)}]
-                                r["best_take_index"] = 0
-                        if old_status not in self.SUCCESS_STATUSES:
-                            # Remember the original status so restore/un-accept
-                            # can decrement the correct tally bucket.
-                            r["_original_status"] = old_status
-                            r["status"] = "manual"
-                            sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
-                                      fg=STATUS_COLOR.get("manual", SUCCESS))
-                        af[0] = True
-                        ss()
-                        rcl()   # refresh sub-clip count badge
-                        if not _was_accepted:
-                            _increment_confirmed(old_status)
-                        self._s4_save()
-
                     # Gather neighbouring quote text for script context
                     _ctx_before = _ctx_after = ""
                     _this_order = r.get("order", -1)
@@ -8237,7 +8246,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                                       context_after=_ctx_after,
                                       scripted_tc=_scripted_tc,
                                       words=_words,
-                                      on_accept=_accept, fps=fps,
+                                      on_accept=lambda *a, _sa=sa, **k:
+                                          _accept(*a, apath=_sa, **k),
+                                      fps=fps,
                                       pool_by_token=_pool_by_token)
                     try:
                         _w = _dlg._win
@@ -8285,8 +8296,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     # don't have to full-rebuild all ~200 cards.
                     "stat_lbl":       stat_lbl,
                     "refresh_detail_fn": _refresh_clips_lbl,
-                    # The Assembly view opens a pull's editor through this.
-                    "open_review_fn": _open_review,
+                    # The Assembly track commits its edits through this.
+                    "accept_fn": _accept,
                 })
 
                 # ── Restore saved state ────────────────────────────────────────────
@@ -8513,12 +8524,33 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         from assembly_view import AssemblyWindow
         self._assembly = AssemblyWindow(self)
 
-    def _assembly_open_card(self, order):
-        """Open one pull's waveform editor from the Assembly view."""
+    def _assembly_set_segments(self, order, segments):
+        """An edit on the Assembly track: the pull's new kept source
+        ranges, committed exactly as the waveform editor's accept does."""
         e = next((e for e in getattr(self, "_rv", [])
                   if e["res"].get("order") == order), None)
-        if e is not None and e.get("open_review_fn"):
-            e["open_review_fn"]()
+        if e is not None and e.get("accept_fn") and segments:
+            e["accept_fn"]([[float(a), float(b)] for a, b in segments])
+
+    def _assembly_ignore(self, order):
+        """The whole pull deleted on the Assembly track: IGNORE it, exactly
+        as the card's own toggle (and its undo) would."""
+        e = next((e for e in getattr(self, "_rv", [])
+                  if e["res"].get("order") == order), None)
+        if e is not None and not e["skip_var"].get():
+            e["toggle_ignore_fn"]()
+
+    def _assembly_set_gap(self, order, gap_s):
+        """The silence after a pull, set from the Assembly track.  Lives on
+        the result as gap_after_s, which the build and Step 4's undo
+        already honour."""
+        r = next((r for r in self.results if r.get("order") == order), None)
+        if r is None:
+            return
+        self._s4_push_undo()
+        r["gap_after"]   = True
+        r["gap_after_s"] = round(max(0.0, float(gap_s)), 4)
+        self._s4_save()
 
     def _show_reconcile_log(self):
         """Open a window showing the saved Step 3 reconcile log (for debugging)."""
