@@ -3,7 +3,11 @@
 Step 4 reviews one pull at a time.  This is the other way of looking at the
 same data: every placed pull laid end to end, exactly where build_aaf will
 put it (engines.layout_timeline is the one source of placement for both),
-played back as a single reference track with the script running above it.
+played back as a single reference track, the script beside the controls
+above it.  Every divider drags (narrow the script, size each control
+panel), and the layout is kept in the app's prefs.  Ctrl+= goes back to
+Step 4 and comes here again, like Pro Tools' Edit / Mix toggle; Ctrl+S
+saves the session.
 
 The track is the same "single reference" Step 4 already plays -- an
 interview pull sounds from its transcription mix, a VO pull from its take --
@@ -12,9 +16,10 @@ cut out by source.
 
 The mouse works like Pro Tools' Smart Tool: on a pull, the top half is
 the selector (click places the insertion point, drag highlights a span) and
-the bottom half the grabber (click selects the whole pull, drag moves it);
-the edges trim.  Every action is also a button with its key in the bar
-across the top, which is the window's key.
+the bottom half the grabber (click selects the region, drag moves it,
+double-click opens the waveform editor); the edges trim.  Every action is
+also a button with its key in the panels beside the script, which are the
+window's key.
 
 The track is also the editor.  Every edit is the same edit Step 4 makes, committed through the card's own
 accept (segments, and seg_gaps -- the silence at their joins) or the
@@ -33,15 +38,19 @@ AAF:
     the same way (< > by ten), for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
-  * double-click a pull (or Enter) to open Step 4's waveform editor on it,
-    for hunting the right edit in audio outside the pull.
+  * double-click a pull with the grabber (or Enter) to open Step 4's
+    waveform editor on it, for hunting the right edit in audio outside the
+    pull; double-click with the selector takes the whole region.
 
 It is also where the cut gets spotted.  I and O drop a music cue's in and
-out, M an SFX spot, at the playhead -- while it plays, too.  Each mark
-lives on the pull it lands on (engines.place_markers), so it rides with
-that audio through any retiming, and the AAF carries them as the MUSIC and
-SFX marker tracks beside PARTS.  Drag a flag to move it, double-click to
-name it, Delete to remove it; an SFX spot opens for naming as it lands.
+out, U a music inflection (a moment the music should answer, in or out to
+be decided), M an SFX spot and K a note, at the playhead -- while it plays,
+too.  Music and SFX share a lane on the ruler, notes have their own.  Each
+mark lives on the pull it lands on (engines.place_markers), so it rides
+with that audio through any retiming, and the AAF carries them as the
+MUSIC, SFX and NOTES marker tracks beside PARTS.  Drag a flag to move it,
+double-click to name it, Delete to remove it; an SFX spot or a note opens
+for naming as it lands.
 
 While the cut plays, the script lights each word as it is said.
 
@@ -97,6 +106,7 @@ _C_PART     = ACCENT
 _C_CLIP_BG  = SURF
 _C_MUSIC    = "#4f9be0"   # music cue in / out
 _C_SFX      = "#e0609a"   # SFX spot
+_C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
 
 
 
@@ -104,6 +114,49 @@ _C_SFX      = "#e0609a"   # SFX spot
 _MONITOR = {"follow": True, "preroll_on": False, "preroll_s": 2.0,
             "return_on": False}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
+
+
+class _Flow(tk.Frame):
+    """Widgets laid out left to right, wrapping at the frame's width -- so
+    a control panel can be made as narrow or as wide as you like.  Only a
+    change of width re-flows it.  The width is the parent's less `pad`: a
+    panel squeezed shut unmaps the flow, which then hears nothing."""
+
+    def __init__(self, parent, pad=0, **kw):
+        tk.Frame.__init__(self, parent, **kw)
+        self._items = []                 # (widget, wraps to the width)
+        self._width = 0
+        self._pad = pad
+        parent.bind("<Configure>", self._on_configure, add="+")
+
+    def add(self, widget, fill=False):
+        self._items.append((widget, fill))
+        if self._width:
+            self._reflow()
+        return widget
+
+    def remove(self, widget):
+        self._items = [it for it in self._items if it[0] is not widget]
+
+    def _on_configure(self, e):
+        width = e.width - self._pad
+        if width != self._width:
+            self._width = width
+            self._reflow()
+
+    def _reflow(self):
+        x = y = row_h = 0
+        width = max(1, self._width)
+        for w, fill in self._items:
+            if fill:
+                w.config(wraplength=max(60, width - 4))
+            rw, rh = w.winfo_reqwidth(), w.winfo_reqheight()
+            if x and x + rw > width:
+                x, y, row_h = 0, y + row_h + 4, 0
+            w.place(x=x, y=y)
+            x += rw + 4
+            row_h = max(row_h, rh)
+        self.config(height=max(1, y + row_h))
 
 
 class _KeyButton(object):
@@ -424,8 +477,8 @@ class AssemblyWindow(object):
         # line height, so the layout holds at any display scaling.
         self._font = tkfont.Font(family=_SMALL[0], size=_SMALL[1])
         self._ls   = self._font.metrics("linespace")
-        # Ruler rows: timecodes, Part flags, then music / SFX marks.
-        self._ruler_h = 3 * self._ls + 8
+        # Ruler rows: timecodes, Part flags, music / SFX marks, notes.
+        self._ruler_h = 4 * self._ls + 10
         self._gap_h   = self._ls + 6           # gap lengths under the track
 
         self._build_ui()
@@ -434,19 +487,24 @@ class AssemblyWindow(object):
 
     # ── Construction ─────────────────────────────────────────────────────
     def _build_ui(self):
-        self._build_command_bar()
-        pw = tk.PanedWindow(self.win, orient="vertical", bg=BORDER,
-                            sashwidth=6, bd=0, sashrelief="flat")
-        pw.pack(fill="both", expand=True)
+        """Script on the left, the controls in resizable panels to its
+        right, the track across the bottom.  Every divider drags, and the
+        layout is kept in the app's prefs for next time."""
+        self._outer = tk.PanedWindow(self.win, orient="vertical", bg=BORDER,
+                                     sashwidth=6, bd=0, sashrelief="flat")
+        self._outer.pack(fill="both", expand=True)
+        self._top = tk.PanedWindow(self._outer, orient="horizontal",
+                                   bg=BORDER, sashwidth=6, bd=0,
+                                   sashrelief="flat")
 
         # Script pane
-        top = tk.Frame(pw, bg=BG)
-        sb = tk.Scrollbar(top, orient="vertical")
+        script = tk.Frame(self._top, bg=BG)
+        sb = tk.Scrollbar(script, orient="vertical")
         sb.pack(side="right", fill="y")
-        self.text = tk.Text(top, bg=BG, fg=TEXT, font=(FB[0], 12), wrap="word",
-                            bd=0, highlightthickness=0, padx=24, pady=14,
-                            spacing1=2, spacing3=8, cursor="arrow",
-                            insertwidth=0, yscrollcommand=sb.set)
+        self.text = tk.Text(script, bg=BG, fg=TEXT, font=(FB[0], 12),
+                            wrap="word", bd=0, highlightthickness=0, padx=24,
+                            pady=14, spacing1=2, spacing3=8, cursor="arrow",
+                            insertwidth=0, yscrollcommand=sb.set, width=40)
         self.text.pack(side="left", fill="both", expand=True)
         sb.config(command=self.text.yview)
         self.text.tag_config("part", font=FBT, foreground=_C_PART,
@@ -456,14 +514,22 @@ class AssemblyWindow(object):
         self.text.tag_config("cur", background=SURF3)
         self.text.tag_config("mk_music", foreground=_C_MUSIC, font=_SMALL)
         self.text.tag_config("mk_sfx", foreground=_C_SFX, font=_SMALL)
+        self.text.tag_config("mk_note", foreground=_C_NOTE, font=_SMALL)
         self.text.tag_config("sel_pull", background=SURF2)
         self.text.tag_config("word", background=ACCENT, foreground=TEXT)
         self.text.tag_raise("cur")
         self.text.tag_raise("word")
         self.text.bind("<Button-1>", self._on_text_click)
+        self._top.add(script, minsize=200, stretch="always")
+
+        # Control panels, one above the other
+        self._side = tk.PanedWindow(self._top, orient="vertical", bg=BORDER,
+                                    sashwidth=5, bd=0, sashrelief="flat")
+        self._top.add(self._side, minsize=180, stretch="never")
+        self._build_panels()
 
         # Track pane
-        bottom = tk.Frame(pw, bg=BG)
+        bottom = tk.Frame(self._outer, bg=BG)
         self.ov = tk.Canvas(bottom, height=24, bg=SURF2, highlightthickness=0,
                             cursor="hand2")
         self.ov.pack(fill="x", pady=(6, 0))
@@ -479,13 +545,10 @@ class AssemblyWindow(object):
                                fg=SUB, anchor="w", padx=10)
         self.status.pack(side="left", fill="x", expand=True)
 
-        pw.add(top, minsize=120, stretch="always")
-        pw.add(bottom, minsize=240, stretch="always")
+        self._outer.add(self._top, minsize=160, stretch="always")
+        self._outer.add(bottom, minsize=240, stretch="always")
         self.win.update_idletasks()
-        try:
-            pw.sash_place(0, 0, int(self.win.winfo_height() * 0.42))
-        except tk.TclError:
-            pass
+        self._restore_layout()
 
         self.cv.bind("<Configure>", lambda e: self.redraw())
         self.ov.bind("<Configure>", lambda e: self._draw_overview())
@@ -503,92 +566,180 @@ class AssemblyWindow(object):
         # nobody is looking at while this window has focus.
         self.win.bind("<Key>", self._on_key)
 
-    def _build_command_bar(self):
+    def _panel(self, title):
+        """One control panel: a title and its buttons, wrapping to the
+        panel's width."""
+        f = tk.Frame(self._side, bg=SURF)
+        tk.Label(f, text=title, font=(FB[0], 9, "bold"), bg=SURF, fg=SUB,
+                 anchor="w").pack(fill="x", padx=8, pady=(6, 2))
+        flow = _Flow(f, pad=16, bg=SURF)
+        flow.pack(fill="x", padx=8, pady=(0, 6))
+        self._side.add(f, minsize=self._ls + 12, stretch="always")
+        return flow
+
+    def _build_panels(self):
         """The window's key: every action as a button labelled with its
-        key, grouped the way the work goes -- play, monitor, edit, spot,
-        look -- with the mouse zones and the speakers' colours."""
-        bar = tk.Frame(self.win, bg=SURF, highlightbackground=BORDER,
-                       highlightthickness=1)
-        bar.pack(fill="x")
-        rows = [tk.Frame(bar, bg=SURF) for _ in range(3)]
-        for r in rows:
-            r.pack(fill="x", padx=8, pady=(4, 0))
-        rows[-1].pack_configure(pady=(4, 6))
+        key, in panels the way the work goes -- session, play and monitor,
+        edit, spot, look -- then the mouse zones and the speakers'
+        colours."""
+        def key(flow, text, k, cmd, toggle=False):
+            b = _KeyButton(flow, text, k, cmd, toggle)
+            flow.add(b.frame)
+            return b
 
-        def group(row, title):
-            tk.Label(row, text=title, font=(FB[0], 9, "bold"), bg=SURF,
-                     fg=SUB).pack(side="left", padx=(14, 6))
+        p = self._panel("SESSION")
+        key(p, "◂  Step 4", "Ctrl+=", self.to_step4)
+        self.save_key = key(p, "Save", "Ctrl+S", self.save)
 
-        def key(row, text, k, cmd, toggle=False):
-            return _KeyButton(row, text, k, cmd, toggle).pack(side="left", padx=2)
-
-        r = rows[0]
-        self.tc_lbl = tk.Label(r, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
+        p = self._panel("PLAY  ·  MONITOR")
+        self.tc_lbl = tk.Label(p, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
                                fg=TEXT, width=10, anchor="w")
-        self.tc_lbl.pack(side="left", padx=(2, 4))
-        group(r, "PLAY")
-        self.play_key = key(r, "\u25B6  Play", "Space", self.toggle_play)
-        key(r, "\u25A0  Stop  (again: back to start)", "0",
+        p.add(self.tc_lbl)
+        self.play_key = key(p, "▶  Play", "Space", self.toggle_play)
+        key(p, "■  Stop  (again: back to start)", "0",
             lambda: self.stop(key=True))
-        key(r, "Slower", "[", lambda: self.step_rate(-1))
-        self.rate_lbl = tk.Label(r, text="", font=("Consolas", 12, "bold"),
+        key(p, "Slower", "[", lambda: self.step_rate(-1))
+        self.rate_lbl = tk.Label(p, text="", font=("Consolas", 12, "bold"),
                                  bg=SURF, fg=TEXT, width=5)
-        self.rate_lbl.pack(side="left")
-        key(r, "Faster", "]", lambda: self.step_rate(1))
-        group(r, "MONITOR")
-        self.preroll_key = key(r, "", "P", self.toggle_preroll, toggle=True)
-        key(r, "\u2212", "", lambda: self.step_preroll(-1))
-        key(r, "+", "", lambda: self.step_preroll(1))
-        self.return_key = key(r, "Return to start on stop", "N",
+        p.add(self.rate_lbl)
+        key(p, "Faster", "]", lambda: self.step_rate(1))
+        self.preroll_key = key(p, "", "P", self.toggle_preroll, toggle=True)
+        key(p, "−", "", lambda: self.step_preroll(-1))
+        key(p, "+", "", lambda: self.step_preroll(1))
+        self.return_key = key(p, "Return to start on stop", "N",
                               self.toggle_return, toggle=True)
-        self.follow_key = key(r, "Follow playhead", "S", self.toggle_follow,
+        self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
                               toggle=True)
-        self.legend = tk.Frame(r, bg=SURF)
-        self.legend.pack(side="right", padx=6)
 
-        r = rows[1]
-        group(r, "EDIT")
-        key(r, "Delete selection", "Del", self._delete_key)
-        key(r, "Split", "B", self.split)
-        key(r, "Nudge earlier", ",", lambda: self.nudge(-1))
-        key(r, "Nudge later", ".", lambda: self.nudge(1))
-        key(r, "Undo", "Ctrl+Z", self.app._s4_undo)
-        key(r, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
-        key(r, "Open in editor", "Enter", self.open_selected)
+        p = self._panel("EDIT")
+        key(p, "Delete selection", "Del", self._delete_key)
+        key(p, "Split", "B", self.split)
+        key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
+        key(p, "Nudge later", ".", lambda: self.nudge(1))
+        key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
+        key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
+        key(p, "Open in editor", "Enter", self.open_selected)
         if any(res.get("monolog") for res in (self.app.results or ())):
-            key(r, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
-        group(r, "SPOT")
-        key(r, "Music in", "I", lambda: self.drop_marker("music_in"))
-        key(r, "Music out", "O", lambda: self.drop_marker("music_out"))
-        key(r, "SFX", "M", lambda: self.drop_marker("sfx"))
-        group(r, "VIEW")
-        key(r, "Zoom out", "R  \u2212", lambda: self.zoom(1 / 1.5))
-        key(r, "Zoom in", "T  +", lambda: self.zoom(1.5))
-        key(r, "Fit", "F", self.fit)
-        key(r, "Prev pull", "\u2190", lambda: self._neighbour(-1))
-        key(r, "Next pull", "\u2192", lambda: self._neighbour(1))
+            key(p, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
 
-        r = rows[2]
-        group(r, "MOUSE")
-        tk.Label(r, font=(FB[0], 10), bg=SURF, fg=TEXT, text=(
-            "pull top half: select (click = insertion point, drag = highlight)"
-            "   {d}   bottom half: grab (click = region, drag = move)"
-            "   {d}   edge: trim   {d}   gap: drag to retime"
-            "   {d}   double-click: editor   {d}   flag: drag / double-click"
-            " to name   {d}   Ctrl+wheel: zoom").format(d="\u00b7")
-                 ).pack(side="left")
+        p = self._panel("SPOT")
+        key(p, "Music in", "I", lambda: self.drop_marker("music_in"))
+        key(p, "Inflection", "U", lambda: self.drop_marker("music_inflection"))
+        key(p, "Music out", "O", lambda: self.drop_marker("music_out"))
+        key(p, "SFX", "M", lambda: self.drop_marker("sfx"))
+        key(p, "Note", "K", lambda: self.drop_marker("note"))
+
+        p = self._panel("VIEW")
+        key(p, "Zoom out", "R  −", lambda: self.zoom(1 / 1.5))
+        key(p, "Zoom in", "T  +", lambda: self.zoom(1.5))
+        key(p, "Fit", "F", self.fit)
+        key(p, "Prev pull", "←", lambda: self._neighbour(-1))
+        key(p, "Next pull", "→", lambda: self._neighbour(1))
+
+        p = self._panel("MOUSE  ·  SPEAKERS")
+        p.add(tk.Label(p, font=(FB[0], 10), bg=SURF, fg=TEXT, justify="left",
+                       anchor="w", text=(
+            "Top half of a region: select (click = insertion point, drag = "
+            "highlight).  Bottom half: grab (click = region, drag = move, "
+            "double-click = waveform editor).  Edge: trim.  Gap: drag to "
+            "retime.  Flag: drag, or double-click to name.  "
+            "Ctrl+wheel: zoom.")), fill=True)
+        self.legend = p
+        self._legend_items = []
         self._show_rate()
         self._show_monitor()
 
     def _show_legend(self):
         """Swatches for the speakers on the track, refreshed as they change."""
-        for w in self.legend.winfo_children():
+        for w in self._legend_items:
+            self.legend.remove(w)
             w.destroy()
+        self._legend_items = []
         for name, col in self._token_tints.items():
-            tk.Label(self.legend, bg=col, width=2, height=1, bd=0
-                     ).pack(side="left", padx=(8, 3), pady=3)
-            tk.Label(self.legend, text=name, font=(FB[0], 10), bg=SURF,
-                     fg=TEXT).pack(side="left")
+            f = tk.Frame(self.legend, bg=SURF)
+            tk.Label(f, bg=col, width=2, height=1, bd=0).pack(
+                side="left", padx=(0, 3), pady=3)
+            tk.Label(f, text=name, font=(FB[0], 10), bg=SURF,
+                     fg=TEXT).pack(side="left", padx=(0, 8))
+            self.legend.add(f)
+            self._legend_items.append(f)
+
+    def _layout_prefs(self):
+        prefs = getattr(self.app, "_prefs", None)
+        return prefs if isinstance(prefs, dict) else None
+
+    def _restore_layout(self, tries=40):
+        """Put the dividers where they were last time (fractions of the
+        window), or at the defaults -- once the window has its size (a
+        zoomed window is a sliver until it is mapped)."""
+        if self._closed:
+            return
+        self.win.update_idletasks()
+        if self._outer.winfo_height() < 300 and tries > 0:
+            self.win.after(50, lambda: self._restore_layout(tries - 1))
+            return
+        lay = (self._layout_prefs() or {}).get("assembly_layout") or {}
+        try:
+            h = max(1, self._outer.winfo_height())
+            w = max(1, self._top.winfo_width())
+            self._outer.sash_place(0, 0, int(h * lay.get("track", 0.42)))
+            self._top.sash_place(0, int(w * lay.get("script", 0.6)), 0)
+            self.win.update_idletasks()
+            sh = max(1, self._side.winfo_height())
+            panels = lay.get("panels") or []
+            if len(panels) != len(self._side.panes()) - 1:
+                self._fit_panels()
+                return
+            for i, f in enumerate(panels):
+                self._side.sash_place(i, 0, int(sh * f))
+        except (tk.TclError, TypeError, ValueError, AttributeError):
+            pass
+
+    def _fit_panels(self):
+        """Each control panel as tall as its buttons need at this width (a
+        pane keeps the height it had when added, before they wrapped)."""
+        self.win.update_idletasks()
+        y = 0
+        for i, name in enumerate(self._side.panes()[:-1]):
+            y += self._side.nametowidget(str(name)).winfo_reqheight()
+            self._side.sash_place(i, 0, y)
+            self.win.update_idletasks()
+            y = self._side.sash_coord(i)[1] + int(self._side.cget("sashwidth"))
+
+    def _save_layout(self):
+        prefs = self._layout_prefs()
+        if prefs is None:
+            return
+        try:
+            h = max(1, self._outer.winfo_height())
+            w = max(1, self._top.winfo_width())
+            sh = max(1, self._side.winfo_height())
+            n = len(self._side.panes())
+            prefs["assembly_layout"] = {
+                "track":  self._outer.sash_coord(0)[1] / float(h),
+                "script": self._top.sash_coord(0)[0] / float(w),
+                "panels": [self._side.sash_coord(i)[1] / float(sh)
+                           for i in range(n - 1)]}
+        except tk.TclError:
+            return
+        save = getattr(self.app, "_save_prefs", None)
+        if callable(save):
+            save()
+
+    def to_step4(self):
+        """Back to Step 4's cards; Ctrl+= there comes back here, like Pro
+        Tools' Edit / Mix toggle."""
+        self.stop()
+        try:
+            self.app.deiconify()
+            self.app.lift()
+            self.app.focus_force()
+        except tk.TclError:
+            pass
+
+    def save(self):
+        """Save the session, exactly as the header's SAVE (Ctrl+S) does."""
+        self.app._quick_save([self.save_key.lbl])
 
     # ── Model ────────────────────────────────────────────────────────────
     def schedule_refresh(self):
@@ -925,7 +1076,8 @@ class AssemblyWindow(object):
             t.insert("end", body, (tag, "b{}".format(o)) + out)
             for m in marks.get(o, ()):
                 t.insert("end", "   [{}]".format(m["label"]),
-                         (tag, "mk_sfx" if m["kind"] == "sfx" else "mk_music",
+                         (tag, {"sfx": "mk_sfx", "note": "mk_note"}.get(
+                             m["kind"], "mk_music"),
                           "mk{}_{}".format(o, m["index"])))
             t.insert("end", "\n", (tag,) + out)
         t.config(state="disabled")
@@ -1191,9 +1343,19 @@ class AssemblyWindow(object):
         self._light_script_word()
         self._draw_overview()
 
-    def _marker_row(self):
-        """Top and bottom of the ruler row the music / SFX flags sit on."""
-        return 2 * self._ls + 6, 3 * self._ls + 6
+    def _marker_row(self, lane=0):
+        """Top and bottom of a marker lane on the ruler: 0 for music and
+        SFX, 1 for notes."""
+        top = 2 * self._ls + 6 + lane * (self._ls + 2)
+        return top, top + self._ls
+
+    @staticmethod
+    def _lane(m):
+        return 1 if m["kind"] == "note" else 0
+
+    @staticmethod
+    def _mark_colour(m):
+        return {"sfx": _C_SFX, "note": _C_NOTE}.get(m["kind"], _C_MUSIC)
 
     def _draw_marks(self, w, y1):
         cv = self.cv
@@ -1216,27 +1378,40 @@ class AssemblyWindow(object):
             if xb > 0 and xa < w:
                 cv.create_rectangle(xa, bot, xb, bot + 2, fill=_C_MUSIC,
                                     outline="")
-        for n, m in enumerate(self.markers):
-            x = self._x(m["t"])
-            if x < -300 or x > w:
-                continue
-            col = _C_SFX if m["kind"] == "sfx" else _C_MUSIC
-            on = (m["order"], m["index"]) == self.sel_marker
-            cv.create_line(x, bot, x, y1, fill=col, dash=(2, 4))
-            cv.create_rectangle(x, top + 1, x + 6, bot - 1, fill=col,
-                                outline=TEXT if on else "", width=2 if on else 1)
-            nxt = self._x(self.markers[n + 1]["t"]) if n + 1 < len(self.markers) \
-                else w + 400
-            if self._fits(m["label"], nxt - x - 16):
-                cv.create_text(x + 10, top, text=m["label"], anchor="nw",
-                               font=self._font, fill=TEXT if on else SUB)
+        for lane in (0, 1):
+            top, bot = self._marker_row(lane)
+            marks = [m for m in self.markers if self._lane(m) == lane]
+            for n, m in enumerate(marks):
+                x = self._x(m["t"])
+                if x < -300 or x > w:
+                    continue
+                col = self._mark_colour(m)
+                on = (m["order"], m["index"]) == self.sel_marker
+                cv.create_line(x, bot, x, y1, fill=col, dash=(2, 4))
+                edge = dict(outline=TEXT if on else "", width=2 if on else 1)
+                if m["kind"] == "music_inflection":
+                    # A diamond: a music moment, not yet an in or an out.
+                    mid = (top + bot) / 2.0
+                    r = (bot - top) / 2.0 - 1
+                    cv.create_polygon(x + 3, mid - r, x + 3 + r, mid,
+                                      x + 3, mid + r, x + 3 - r, mid,
+                                      fill=col, **edge)
+                else:
+                    cv.create_rectangle(x, top + 1, x + 6, bot - 1, fill=col,
+                                        **edge)
+                nxt = self._x(marks[n + 1]["t"]) if n + 1 < len(marks) \
+                    else w + 400
+                if self._fits(m["label"], nxt - x - 16):
+                    cv.create_text(x + 10, top, text=m["label"], anchor="nw",
+                                   font=self._font, fill=TEXT if on else SUB)
         if self._rename is not None:
             entry, key = self._rename
             m = next((m for m in self.markers
                       if (m["order"], m["index"]) == key), None)
             if m is not None:
-                cv.create_window(self._x(m["t"]) + 10, top - 2, anchor="nw",
-                                 window=entry)
+                cv.create_window(self._x(m["t"]) + 10,
+                                 self._marker_row(self._lane(m))[0] - 2,
+                                 anchor="nw", window=entry)
 
     def _draw_wave(self, c, xs, xe, mid, half, col, w):
         cv = self.cv
@@ -1326,7 +1501,7 @@ class AssemblyWindow(object):
             ov.create_line(pt * k, 0, pt * k, h, fill=_C_PART)
         for m in self.markers:
             ov.create_line(m["t"] * k, 0, m["t"] * k, 6,
-                           fill=_C_SFX if m["kind"] == "sfx" else _C_MUSIC)
+                           fill=self._mark_colour(m))
         ov.create_rectangle(self.view0 * k, 1, (self.view0 + self._span()) * k,
                             h - 1, outline=TEXT)
         ov.create_line(self.playhead * k, 0, self.playhead * k, h,
@@ -1350,7 +1525,8 @@ class AssemblyWindow(object):
         if m is not None:
             c = self._clip(m["order"])
             kind = {"music_in": "music in", "music_out": "music out",
-                    "sfx": "SFX spot"}[m["kind"]]
+                    "music_inflection": "music inflection",
+                    "sfx": "SFX spot", "note": "note"}.get(m["kind"], "mark")
             self.status.config(fg=SUB, text="   ·   ".join((
                 m["label"], kind, _fmt_tc(m["t"]),
                 "on " + (c.label if c else "?"),
@@ -1453,9 +1629,11 @@ class AssemblyWindow(object):
         y0, y1 = self._track_box()
         reach = max(6, self._ls // 2)
         if y < y0:
-            top, bot = self._marker_row()
-            if top - 2 <= y <= bot + 4:
-                near = min(self.markers, default=None,
+            lane = next((ln for ln in (0, 1) if self._marker_row(ln)[0] - 2
+                         <= y <= self._marker_row(ln)[1] + 1), None)
+            if lane is not None:
+                near = min((m for m in self.markers if self._lane(m) == lane),
+                           default=None,
                            key=lambda m: abs(x - self._x(m["t"]) - 3))
                 if near is not None and \
                         abs(x - self._x(near["t"]) - 3) <= reach:
@@ -1935,7 +2113,7 @@ class AssemblyWindow(object):
         self.app._assembly_set_markers({order: marks})
         self.sel_marker = (order, len(marks) - 1)
         self.refresh()
-        if kind == "sfx":
+        if kind in ("sfx", "note"):
             self._begin_rename(self.sel_marker)
 
     def select_marker(self, key):
@@ -1983,8 +2161,13 @@ class AssemblyWindow(object):
         kind, hit, _k = self._hit(e.x, e.y)
         if kind == "marker":
             self._begin_rename((hit["order"], hit["index"]))
-        elif kind in ("body", "in", "out"):
-            self.open_card(hit.order)
+        elif kind in ("grab", "in", "out"):
+            self.open_card(hit.order)         # the grabber steps into the editor
+        elif kind == "select":
+            # The selector takes the whole region, as in Pro Tools.
+            self._select_region(hit.order, _k)
+            self.redraw()
+            self._status_range()
 
     def open_card(self, order):
         """The pull in Step 4's waveform editor, which shows its whole
@@ -2237,7 +2420,7 @@ class AssemblyWindow(object):
             self.step_rate(-1)
         elif k == "bracketright":
             self.step_rate(1)
-        elif k in ("plus", "equal", "KP_Add"):
+        elif k in ("plus", "equal", "KP_Add") and not ctrl:
             self.zoom(1.5)
         elif k in ("minus", "underscore", "KP_Subtract"):
             self.zoom(1 / 1.5)
@@ -2268,9 +2451,14 @@ class AssemblyWindow(object):
             self.zoom(1 / 1.5)               # Pro Tools: R out, T in
         elif not ctrl and k.lower() == "t":
             self.zoom(1.5)
-        elif not ctrl and k.lower() in ("i", "o", "m"):
+        elif not ctrl and k.lower() in ("i", "o", "u", "m", "k"):
             self.drop_marker({"i": "music_in", "o": "music_out",
-                              "m": "sfx"}[k.lower()])
+                              "u": "music_inflection", "m": "sfx",
+                              "k": "note"}[k.lower()])
+        elif ctrl and k in ("equal", "plus"):
+            self.to_step4()                  # Pro Tools' Edit / Mix toggle
+        elif ctrl and k.lower() == "s":
+            self.save()
         elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
             self.split()                     # Pro Tools: B, or Ctrl+E
         elif k in ("comma", "period"):
@@ -2305,6 +2493,7 @@ class AssemblyWindow(object):
     def close(self):
         if self._closed:
             return
+        self._save_layout()
         self._closed = True
         self.stop()
         if self.player is not None:

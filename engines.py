@@ -5569,9 +5569,11 @@ def layout_timeline(results, gap_secs, sr, int_assets,
     return placed, skipped, part_starts
 
 
-# Spotting marks the Assembly view drops on pulls, exported as the MUSIC
-# and SFX marker tracks.  (Parts come from the script's [PART] lines.)
-MARKER_KINDS = ("music_in", "music_out", "sfx")
+# Spotting marks the Assembly view drops on pulls, exported as the MUSIC,
+# SFX and NOTES marker tracks.  (Parts come from the script's [PART]
+# lines.)  An inflection is a music moment not yet called an in or an out.
+MARKER_KINDS = ("music_in", "music_out", "music_inflection", "sfx", "note")
+MUSIC_KINDS  = ("music_in", "music_out", "music_inflection")
 
 
 def place_markers(placed, sr):
@@ -5588,7 +5590,8 @@ def place_markers(placed, sr):
     `placed` is layout_timeline's first return.  Returns [{"kind", "pos",
     "name", "label", "order", "index"}] in timeline order; "label" is the
     name, or for an unnamed marker its place in the count: cues numbered
-    as they come in ("Cue 3 in" ... "Cue 3 out"), SFX spots likewise.
+    as they come in ("Cue 3 in" ... "Cue 3 out"), SFX spots, inflections
+    and notes likewise ("SFX 7", "Inflection 2", "Note 4").
     """
     out = []
     for e in placed:
@@ -5612,7 +5615,7 @@ def place_markers(placed, sr):
                         "name": (m.get("name") or "").strip(),
                         "order": e["res"]["order"], "index": i})
     out.sort(key=lambda m: (m["pos"], m["order"], m["index"]))
-    cues = sfx = 0
+    cues = sfx = hits = notes = 0
     open_cue = None                         # the cue an "out" closes
     for m in out:
         if m["kind"] == "music_in":
@@ -5622,6 +5625,12 @@ def place_markers(placed, sr):
         elif m["kind"] == "music_out":
             m["label"] = m["name"] or "{} out".format(open_cue or "Music")
             open_cue = None
+        elif m["kind"] == "music_inflection":
+            hits += 1
+            m["label"] = m["name"] or "Inflection {}".format(hits)
+        elif m["kind"] == "note":
+            notes += 1
+            m["label"] = m["name"] or "Note {}".format(notes)
         else:
             sfx += 1
             m["label"] = m["name"] or "SFX {}".format(sfx)
@@ -5640,9 +5649,10 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     Clips are placed at absolute timeline positions so gaps appear correctly
     in Pro Tools when the session is opened.
 
-    Three marker tracks follow the audio: PARTS (each [PART]'s first pull),
-    MUSIC (cue in / out points) and SFX (spots), the last two from the
-    markers spotted in the Assembly view (see place_markers).  Each is
+    Marker tracks follow the audio: PARTS (each [PART]'s first pull),
+    MUSIC (cue ins, outs and inflections), SFX (spots) and NOTES (anything
+    else), the last three from the markers spotted in the Assembly view
+    (see place_markers); an empty one is left out.  Each is
     named silent clips, since Pro Tools ignores AAF markers on import.
 
     only_orders: optional set of result "order" values.  The full timeline is
@@ -5825,9 +5835,11 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                                          key=lambda kv: kv[1])]
                   if parts else []),
         ("MUSIC", [(m["pos"], m["label"]) for m in marks
-                   if m["kind"] in ("music_in", "music_out")]),
+                   if m["kind"] in MUSIC_KINDS]),
         ("SFX",   [(m["pos"], m["label"]) for m in marks
                    if m["kind"] == "sfx"]),
+        ("NOTES", [(m["pos"], m["label"]) for m in marks
+                   if m["kind"] == "note"]),
     ) if pts]
 
     _prog("Analysing {} clips across {} tracks…".format(len(slots),
@@ -5883,7 +5895,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             track_seqs[track_name]    = seq
             track_lengths[track_name] = 0
 
-        # ── Marker tracks (PARTS, MUSIC, SFX) — after the audio ──────────────
+        # ── Marker tracks (PARTS, MUSIC, SFX, NOTES) — after the audio ───────
         marker_seqs = []
         for mt_name, mt_points in (marker_tracks if marker_wav_path else []):
             mt_seq  = f.create.Sequence(media_kind="sound")

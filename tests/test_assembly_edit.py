@@ -109,6 +109,10 @@ def view(monkeypatch):
     app._s4_save = lambda: (setattr(app, "saves", app.saves + 1),
                             app._assembly and app._assembly.schedule_refresh())
     app._assembly_open_card = app.opened.append
+    app._prefs, app.saved, app.lifted = {}, [], []
+    app._save_prefs = lambda: None
+    app._quick_save = app.saved.append
+    app.lift = lambda *a: app.lifted.append(True)
     app._assembly_ignore = lambda order: None
     app._ui = lambda cb: app.after(0, cb)
     app._rv = []
@@ -311,3 +315,141 @@ def test_script_timing_spreads_words_the_transcript_says_differently():
                    ("there", 0.8, 1.0), ("now.", 1.0, 1.2)]
     assert _script_timing(body, []) == []
     assert _script_timing("Nothing alike", [(0, 1, "different")]) == []
+
+
+def _key(app, widget, keysym, state=0):
+    widget.focus_force()
+    app.update()
+    widget.event_generate("<KeyPress>", keysym=keysym, state=state, when="now")
+    app.update()
+
+
+def test_inflection_and_notes(view):
+    app, win = view
+    win.set_insert(0.5)
+    _key(app, win.cv, "u")                  # inflection: no name field
+    assert win._rename is None
+    win.set_insert(1.5)
+    _key(app, win.cv, "k")                  # a note opens for naming
+    assert win._rename is not None
+    win._rename[0].insert(0, "check the date")
+    _key(app, win._rename[0], "Return")
+    kinds = [(m["kind"], m["label"]) for m in win.markers]
+    assert kinds == [("music_inflection", "Inflection 1"),
+                     ("note", "check the date")]
+    assert app.opened == []
+    # Notes have their own lane on the ruler.
+    win.redraw()
+    note = win.markers[1]
+    top, bot = win._marker_row(1)
+    kind, hit, _k = win._hit(win._x(note["t"]) + 3, (top + bot) / 2.0)
+    assert kind == "marker" and hit["kind"] == "note"
+    top, bot = win._marker_row(0)
+    kind, hit, _k = win._hit(win._x(note["t"]) + 3, (top + bot) / 2.0)
+    assert kind != "marker"
+
+
+def test_double_click_with_the_grabber_opens_the_editor(view):
+    app, win = view
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    class _E(object):
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+    x = win._x(1.0)
+    win._on_track_double(_E(x, y1 - 4))
+    assert app.opened == [1]
+    # The selector's double-click takes the whole region instead.
+    win._on_track_double(_E(x, y0 + 6))
+    assert app.opened == [1]
+    assert win.sel_region == (1, 0) and win._range[1:] == (0.0, 4.0)
+
+
+def test_step4_and_save_from_the_assembly(view):
+    app, win = view
+    _key(app, win.cv, "equal", state=0x0004)          # Ctrl+=
+    assert app.lifted
+    assert win.pps == pytest.approx(win.pps)          # and it didn't zoom
+    _key(app, win.cv, "s", state=0x0004)              # Ctrl+S
+    assert app.saved == [[win.save_key.lbl]]
+
+
+def test_panels_wrap_and_the_layout_is_kept(view):
+    app, win = view
+    side = win._side
+    flow = win.legend.master.winfo_children()[1]
+    win._top.sash_place(0, win._top.winfo_width() - 600, 0)
+    app.update()
+    tall_wide = flow.winfo_reqheight()
+    win._top.sash_place(0, win._top.winfo_width() - 200, 0)
+    app.update()
+    assert flow.winfo_reqheight() > tall_wide       # narrower: it wraps
+    # Every panel opens as tall as its buttons need, where there is room.
+    win._top.sash_place(0, win._top.winfo_width() - 900, 0)
+    app.update()
+    win._fit_panels()
+    app.update()
+    panes = [side.nametowidget(str(n)) for n in side.panes()]
+    if sum(f.winfo_reqheight() + 5 for f in panes) <= side.winfo_height():
+        for f in panes[:-1]:
+            assert f.winfo_height() >= f.winfo_reqheight() - 1
+    frac = win._top.sash_coord(0)[0] / float(win._top.winfo_width())
+    n_panes = len(side.panes())
+    win.close()
+    lay = app._prefs["assembly_layout"]
+    assert lay["script"] == pytest.approx(frac, abs=0.01)
+    assert len(lay["panels"]) == n_panes - 1
+
+
+def test_editor_accept_edits_its_own_card(tmp_path):
+    """The waveform editor's Accept used to edit the LAST card in Step 4,
+    whichever card it was opened from."""
+    import wave
+    import main
+    wav = str(tmp_path / "GUEST.wav")
+    with wave.open(wav, "w") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000 * 30)
+    try:
+        app = main.App()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        app.results = [
+            dict(order=o, token="GUEST", status="ok", part_index=0,
+                 segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
+                 rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
+                 source_audio=wav)
+            for o, a in ((1, 2.0), (2, 10.0), (3, 20.0))]
+        app.parts = [{"index": 0, "name": "Part 0"}]
+        app.tokens, app.workflow = ["GUEST"], "script_session"
+        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2, 3)]
+        app._script_path = str(tmp_path / "script.txt")
+        app.update()
+        app._step4()
+        for _ in range(60):
+            app.update()
+        import match_review
+        dialogs = []
+        orig = match_review.MatchReviewDialog.__init__
+
+        def _init(self, *a, **k):
+            orig(self, *a, **k)
+            dialogs.append(self)
+        match_review.MatchReviewDialog.__init__ = _init
+        try:
+            next(e for e in app._rv if e["res"]["order"] == 1)["open_review_fn"]()
+            for _ in range(20):
+                app.update()
+        finally:
+            match_review.MatchReviewDialog.__init__ = orig
+        d = dialogs[-1]
+        d._in_s += 0.5
+        d._on_accept_click()
+        app.update()
+        segs = {r["order"]: [list(s) for s in r["segments"]] for r in app.results}
+        assert segs[1] == [[2.5, 4.0]]
+        assert segs[3] == [[20.0, 22.0]]
+    finally:
+        app.destroy()

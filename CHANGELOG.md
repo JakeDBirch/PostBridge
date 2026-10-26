@@ -4,6 +4,14 @@
 
 ## October 26, 2026
 
+### Waveform editor edits stick again; Assembly layout, inflections and notes
+- **Accepting in the waveform editor edits the pull you opened.** Since the Assembly's track editing went in (Oct 21), Accept wrote the edit into the last card in Step 4, whichever card the editor was opened from. So no editor edit appeared to stick, in Step 4 or the Assembly. Each card's editor now accepts into its own card, and the Assembly redraws.
+- **The controls sit beside the script, in resizable panels.** Session, Play · Monitor, Edit, Spot, View and Mouse · Speakers stack to the right of the script, and their buttons wrap to the panel's width. Drag the divider to narrow the script, drag between panels to size each one, and drag above the track as before. The layout is remembered for next time.
+- **Back to Step 4, and save, from the Assembly.** **◂ Step 4** (Ctrl+=) brings the cards forward, and Ctrl+= on Step 4 comes back, like Pro Tools' Edit / Mix toggle. **Save** (Ctrl+S) saves the session as the header's SAVE does.
+- **Music inflection (U).** A music moment you haven't called an in or an out yet: a blue diamond in the music lane, `Inflection 3` until named. It goes out on the MUSIC track.
+- **Notes (K), in a lane of their own.** For anything else worth marking, a second marker lane on the ruler. A note opens straight into naming it, like an SFX spot. They go out on a new NOTES marker track after SFX.
+- **Double-click a region with the grabber to open it in the waveform editor.** (Double-clicking a pull's body had stopped opening it when the Smart Tool zones went in.) Double-clicking with the selector takes the whole region.
+
 ### Assembly view: split and nudge regions, karaoke script, quicker SFX naming
 - **Split a pull into regions (B, or Ctrl+E as in Pro Tools).** The region under the insertion point (the playhead, while the cut plays) splits in two there; with a span highlighted it splits at both ends, so the span becomes a region of its own. The two sides are the same continuous audio, and each trims and moves on its own. Every region is its own clip in the AAF.
 - **Nudge a region for pacing (`,` / `.` a frame, `<` / `>` ten).** The selected region moves earlier or later, and everything after it moves with it, shuffle-style. It stops once it butts against what plays before it. A grabber click (bottom half) now selects the region under the mouse rather than the whole pull; on a pull with one region that is the same thing. Dragging a region moves it the same way, and the silence opened inside a pull drags like a gap, with its length shown under the track.

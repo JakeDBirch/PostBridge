@@ -285,3 +285,34 @@ def test_xml_places_silence_at_a_join(tmp_path):
               int(ci.find("in").text))
              for tr in xmeml.iter("track") for ci in tr.iter("clipitem")]
     assert clips == [(0, 24, 24), (36, 84, 48), (96, 120, 120)]
+
+
+def test_inflections_and_notes_are_counted_and_get_their_tracks(tmp_path):
+    import pytest
+    res = [_int(1, [(0.0, 6.0)], part_index=0, markers=[
+        {"kind": "music_in", "src": 0.5},
+        {"kind": "music_inflection", "src": 1.0},
+        {"kind": "music_inflection", "src": 2.0, "name": "button"},
+        {"kind": "music_out", "src": 3.0},
+        {"kind": "note", "src": 4.0},
+        {"kind": "note", "src": 5.0, "name": "check the date"}])]
+    placed, _, _ = engines.layout_timeline(res, 0.5, SR, ASSETS)
+    assert [m["label"] for m in engines.place_markers(placed, SR)] == [
+        "Cue 1 in", "Inflection 1", "button", "Cue 1 out", "Note 1",
+        "check the date"]
+    aaf2 = pytest.importorskip("aaf2")
+    wav = _guest_wav(tmp_path)
+    out = str(tmp_path / "cut.aaf")
+    engines.build_aaf(res, {"GUEST": [wav]}, {}, [], "cut", 0.5,
+                      seq_sr=48000, out_path=out)
+    tracks = {}
+    with aaf2.open(out, "r") as f:
+        comp = next(f.content.toplevel())
+        for slot in comp.slots:
+            tracks[slot.name] = [c.mob.name for c in slot.segment.components
+                                 if isinstance(c, aaf2.components.SourceClip)]
+    # Inflections ride the MUSIC track; notes get NOTES, after SFX's place.
+    assert tracks["MUSIC"] == ["Cue 1 in", "Inflection 1", "button",
+                               "Cue 1 out"]
+    assert tracks["NOTES"] == ["Note 1", "check the date"]
+    assert "SFX" not in tracks and list(tracks)[-2:] == ["MUSIC", "NOTES"]

@@ -246,6 +246,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self.bind_all("<Control-s>",       lambda e: self._quick_save(self._footer_save_btn))
         self.bind_all("<Control-S>",       lambda e: self._save_as())
         self.bind_all("<Control-o>",       lambda e: self._open_session())
+        # Step 4 <-> Assembly, like Pro Tools' Edit / Mix toggle (the
+        # Assembly window handles its own Ctrl+= to come back here).
+        self.bind_all("<Control-equal>",   lambda e: self._step4_to_assembly())
 
         # Unsaved-work guard — signature of the last-saved (or freshly
         # loaded) state.  _on_app_close compares it to the live state and
@@ -8242,7 +8245,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     self._s4_save()
 
                 # ── Open waveform editor — primary card action ──────────────────────
-                def _open_review(event=None, r=res):
+                # acc: this card's own accept, bound now -- looked up when
+                # the editor's Accept fires, `_accept` is the LAST card's.
+                def _open_review(event=None, r=res, acc=_accept):
                     # Resolve source audio with a fallback ladder so cards
                     # from restored sessions / provisional-first / post-
                     # reassign flows all open cleanly.  A silent return here
@@ -8370,7 +8375,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                                       scripted_tc=_scripted_tc,
                                       words=_words,
                                       on_accept=lambda *a, _sa=sa, **k:
-                                          _accept(*a, apath=_sa, **k),
+                                          acc(*a, apath=_sa, **k),
                                       fps=fps,
                                       pool_by_token=_pool_by_token)
                     try:
@@ -8649,6 +8654,19 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             return
         from assembly_view import AssemblyWindow
         self._assembly = AssemblyWindow(self)
+
+    def _step4_to_assembly(self):
+        """Ctrl+= on Step 4: over to the Assembly view (opened if need be)."""
+        if self._assembly is not None:
+            self._assembly.lift()
+        else:
+            cv = getattr(self, "_s4_scroll_canvas", None)   # Step 4 showing
+            try:
+                showing = cv is not None and cv.winfo_exists()
+            except tk.TclError:
+                showing = False
+            if showing and getattr(self, "_rv", None):
+                self._open_assembly()
 
     def _assembly_open_card(self, order):
         """Open a pull's waveform editor from the Assembly track.  Its
