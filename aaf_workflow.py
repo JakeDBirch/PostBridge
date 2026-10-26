@@ -682,8 +682,7 @@ class AafWorkflowMixin:
             # so anyone with a saved-since-a94bac2 session gets the
             # same export they had before.
             self._aaf_source_multi_mode_vars      = {}
-        self._aaf_sync_btns  = {}  # always reset — widget refs are stale after _clear()
-        self._aaf_align_btns = {}
+        self._aaf_reset_pages()    # the old page's widgets went with _clear()
         # Close any sync preview dialogs left open from a previous visit
         for _dlg in getattr(self, "_aaf_sync_previews", {}).values():
             try: _dlg.close()
@@ -974,33 +973,122 @@ class AafWorkflowMixin:
         the user's choice end-to-end."""
         return self._aaf_pool_label(path, getattr(self, "_aaf_audio_paths", []))
 
-    def _rebuild_aaf_source_rows(self):
-        """Rebuild per-source rows; layout depends on current page mode."""
-        for w in self._aaf_assign_frame.winfo_children():
-            w.destroy()
-        # Clear per-row widget refs — repopulated below
-        if not hasattr(self, "_aaf_vid_btn_labels"):   self._aaf_vid_btn_labels   = {}
-        if not hasattr(self, "_aaf_ctr_n_labels"):     self._aaf_ctr_n_labels     = {}
-        if not hasattr(self, "_aaf_ctr_minus_btns"):   self._aaf_ctr_minus_btns   = {}
-        self._aaf_vid_btn_labels.clear()
-        self._aaf_ctr_n_labels.clear()
-        self._aaf_ctr_minus_btns.clear()
-        self._aaf_sync_btns       = {}   # stale widget refs — repopulated below
-        self._aaf_align_btns      = {}   # stale widget refs — repopulated below
-        self._aaf_sync_dot_labels = getattr(self, "_aaf_sync_dot_labels", {})
-        self._aaf_sync_dot_labels.clear()
-        self._aaf_qa_btns = getattr(self, "_aaf_qa_btns", {})
-        self._aaf_qa_btns.clear()
-        self._aaf_try_next_btns = getattr(self, "_aaf_try_next_btns", {})
-        self._aaf_try_next_btns.clear()
-        self._aaf_confirm_btns = getattr(self, "_aaf_confirm_btns", {})
-        self._aaf_confirm_btns.clear()
-        self._aaf_lock_btns = getattr(self, "_aaf_lock_btns", {})
-        self._aaf_lock_btns.clear()
-        self._aaf_ck_lbl_map = getattr(self, "_aaf_ck_lbl_map", {})
-        self._aaf_ck_lbl_map.clear()
-        self._aaf_ck_container_map = getattr(self, "_aaf_ck_container_map", {})
-        self._aaf_ck_container_map.clear()
+    # ── Source rows ─────────────────────────────────────────────────────────
+    # A Step 2 page is 300+ widgets, and on Windows every Tk widget is a
+    # native window: about 1-2 ms each to create, lay out and destroy.
+    # Redrawing a whole page therefore froze the window for most of a
+    # second -- and it happened on every SOURCE ASSIGN / SOURCE SYNC switch,
+    # lock, accept, undo and reference change.  So each page is kept while
+    # the other one is showing, and every row remembers the state it was
+    # drawn from (_aaf_row_signature): a rebuild redraws only the rows whose
+    # state changed, and a page is redrawn whole only when its shape -- which
+    # rows, in what order, against which pools and columns -- changed
+    # (_aaf_page_signature).
+
+    # Widget registries filled by each page's rows.  In-place updaters
+    # (sync results, lock icon, QA button...) look widgets up here, so a
+    # page's entries live exactly as long as its rows.
+    _AAF_PAGE_WIDGETS = {
+        "assign": ("_aaf_vid_btn_labels", "_aaf_ctr_n_labels",
+                   "_aaf_ctr_minus_btns", "_aaf_ck_lbl_map",
+                   "_aaf_ck_container_map"),
+        "sync":   ("_aaf_sync_btns", "_aaf_align_btns",
+                   "_aaf_sync_dot_labels", "_aaf_qa_btns",
+                   "_aaf_try_next_btns", "_aaf_confirm_btns",
+                   "_aaf_lock_btns"),
+    }
+
+    def _aaf_reset_pages(self):
+        """Forget both pages.  For a fresh Step 2 screen: the widgets went
+        with the old one."""
+        self._aaf_pages = {}
+        for names in self._AAF_PAGE_WIDGETS.values():
+            for name in names:
+                setattr(self, name, {})
+
+    def _aaf_forget_page(self, mode):
+        """Destroy *mode*'s page and drop its widget registries."""
+        page = getattr(self, "_aaf_pages", {}).pop(mode, None)
+        for name in self._AAF_PAGE_WIDGETS[mode]:
+            reg = getattr(self, name, None)
+            if reg is None:
+                setattr(self, name, {})
+            else:
+                reg.clear()
+        if page:
+            for key in ("hdr", "rows_frame"):
+                try:
+                    page[key].destroy()
+                except tk.TclError:
+                    pass
+
+    def _aaf_page_bases(self, mode):
+        """The sources *mode*'s page shows, in display order."""
+        hidden = getattr(self, "_aaf_hidden_sources", set())
+        return [b for b in self._aaf_sources
+                if b not in hidden
+                and (mode != "sync" or self._aaf_needs_sync_vars[b].get())]
+
+    def _aaf_page_signature(self, mode):
+        """The shape of a page.  When it changes the page is redrawn whole."""
+        sig = (mode, tuple(self._aaf_page_bases(mode)),
+               tuple(self._aaf_video_paths), tuple(self._aaf_audio_paths),
+               tuple(sorted(self._aaf_col_widths.items())))
+        if mode == "assign":
+            hidden = getattr(self, "_aaf_hidden_sources", set())
+            sig += (tuple(getattr(self, "_aaf_col_order", ["video", "tracks"])),
+                    getattr(self, "_aaf_sort_col", None),
+                    getattr(self, "_aaf_sort_dir", "asc"),
+                    tuple(b for b in self._aaf_sources if b in hidden))
+        return sig
+
+    def _aaf_row_signature(self, mode, base):
+        """Everything *base*'s row on *mode*'s page is drawn from.  Parts of
+        a row also update in place (a sync result, the lock icon, the state
+        dot); those values are in here too, so a row an in-place update
+        missed is redrawn rather than left wrong.  The vars a row binds to
+        are in by identity: a replaced var leaves the old row bound to
+        nothing."""
+        sv = self._aaf_source_file_vars[base]
+        sig = (id(sv), sv.get(), self._aaf_needs_sync_vars[base].get())
+        if mode == "assign":
+            return sig + (
+                self._aaf_source_slot_counts.get(base, 1),
+                tuple(ev.get() for ev in
+                      self._aaf_source_extra_vars.get(base, [])))
+        ov = self._aaf_source_offset_vars[base]
+        return sig + (
+            id(ov), ov.get(),
+            self._aaf_sync_locked_vars[base].get(),
+            self._aaf_sync_state_vars[base].get(),
+            self._aaf_source_syncaudio_vars[base].get(),
+            self._aaf_source_sync_label_vars[base].get(),
+            self._aaf_source_has_slate_vars[base].get(),
+            tuple(getattr(self, "_aaf_source_sync_candidates", {}).get(base, [])),
+            getattr(self, "_aaf_source_sync_cand_idx", {}).get(base, 0),
+            getattr(self, "_aaf_qa_playing", None) == base)
+
+    def _aaf_row_is_current(self, mode, base):
+        """True when *base*'s row on *mode*'s page shows its state as it
+        stands now."""
+        page = getattr(self, "_aaf_pages", {}).get(mode)
+        return (page is not None and base in page["rows"]
+                and page["row_sigs"].get(base) == self._aaf_row_signature(mode, base))
+
+    def _aaf_mark_row_current(self, mode, base):
+        """Record that *base*'s row on *mode*'s page -- brought up to date
+        in place by the caller -- shows its state as it stands now."""
+        page = getattr(self, "_aaf_pages", {}).get(mode)
+        if page is not None and base in page["rows"]:
+            page["row_sigs"][base] = self._aaf_row_signature(mode, base)
+
+    def _rebuild_aaf_source_rows(self, force=False):
+        """Bring the current page's source rows in line with the state:
+        rows whose state changed are redrawn, a page whose shape changed is
+        redrawn whole, and a page switched back to is reused when nothing it
+        shows has changed.  force=True redraws the whole page."""
+        if not hasattr(self, "_aaf_pages"):
+            self._aaf_reset_pages()
         self._aaf_drag_sync = None
 
         # Ensure vars exist even if called before full page init
@@ -1072,122 +1160,6 @@ class AafWorkflowMixin:
                 except Exception:
                     pass
 
-        # ── Rebuild column headers ─────────────────────────────────────────────
-        hdr = getattr(self, "_aaf_col_hdr_frame", None)
-        if hdr:
-            for w in hdr.winfo_children():
-                w.destroy()
-            if mode == "assign":
-                _col_widths = getattr(self, "_aaf_col_widths",
-                                      {"name": 200, "tracks": 110, "video": 200})
-                _col_order  = getattr(self, "_aaf_col_order",  ["video", "tracks"])
-
-                # Sort indicator helper
-                _sc = getattr(self, "_aaf_sort_col", None)
-                _sd = getattr(self, "_aaf_sort_dir", "asc")
-                def _sort_lbl(text, sort_key):
-                    if _sc == sort_key:
-                        return text + (" \u25b2" if _sd == "asc" else " \u25bc")
-                    return text
-
-                # SOURCE CLIP (click-to-sort, fixed width from content measurement)
-                nf = tk.Frame(hdr, bg=SURF, width=_col_widths["name"], cursor="hand2")
-                nf.pack_propagate(False)
-                nf.pack(side="left", fill="y")
-                _nl = tk.Label(nf, text=_sort_lbl("SOURCE CLIP", "name"),
-                               font=FB, bg=SURF, fg=SUB, anchor="w", padx=4,
-                               cursor="hand2")
-                _nl.pack(fill="both", expand=True)
-                for _w in (nf, _nl):
-                    _w.bind("<ButtonRelease-1>", lambda e: self._aaf_sort_by("name"))
-                self._aaf_col_sash(hdr, "name", SURF)
-
-                # Middle columns (click-to-sort only)
-                for _col in _col_order:
-                    if _col == "tracks":
-                        tf = tk.Frame(hdr, bg=SURF,
-                                      width=_col_widths.get("tracks", 80),
-                                      cursor="hand2")
-                        tf.pack_propagate(False)
-                        tf.pack(side="left", fill="y")
-                        _th = tk.Label(tf, text=_sort_lbl("TRACK", "tracks"),
-                                       font=FB, bg=SURF, fg=SUB,
-                                       cursor="hand2", anchor="w", padx=4)
-                        _th.pack(fill="both", expand=True)
-                        for _w in (tf, _th):
-                            _w.bind("<ButtonRelease-1>",
-                                    lambda e: self._aaf_sort_by("tracks"))
-                        self._aaf_col_sash(hdr, "tracks", SURF)
-                    elif _col == "video":
-                        vf = tk.Frame(hdr, bg=SURF,
-                                      width=_col_widths.get("video", 200),
-                                      cursor="hand2")
-                        vf.pack_propagate(False)
-                        vf.pack(side="left", fill="y")
-                        _vh = tk.Label(vf, text=_sort_lbl("VIDEO FILE", "video"),
-                                       font=FB, bg=SURF, fg=SUB,
-                                       cursor="hand2", anchor="w", padx=4)
-                        _vh.pack(fill="both", expand=True)
-                        for _w in (vf, _vh):
-                            _w.bind("<ButtonRelease-1>",
-                                    lambda e: self._aaf_sort_by("video"))
-                        self._aaf_col_sash(hdr, "video", SURF)
-
-                # FILES — dedicated column for multi-slot counter
-                _ff = tk.Frame(hdr, bg=SURF,
-                               width=_col_widths.get("files", 82))
-                _ff.pack_propagate(False)
-                _ff.pack(side="left", fill="y")
-                tk.Label(_ff, text="FILES", font=FB, bg=SURF, fg=SUB,
-                         anchor="center").pack(fill="both", expand=True)
-
-                # SYNC and HIDE — left-packed immediately after last column
-                tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
-                         width=5, anchor="center").pack(side="left", padx=(6, 0))
-                tk.Label(hdr, text="HIDE", font=FB, bg=SURF, fg=SUB,
-                         width=5, anchor="center").pack(side="left", padx=(2, 0))
-
-            else:
-                _cw_s   = getattr(self, "_aaf_col_widths", {"name": 200, "audio": 260})
-                _nw_s   = _cw_s.get("name", 200)
-                _aw_s   = _cw_s.get("audio", 260)
-                _ow_s   = 110   # offset column width — shared with rows
-
-                # Global controls anchor far right (packed right-to-left)
-                self._btn(hdr, "SYNC ALL",
-                          self._aaf_sync_all, small=True).pack(side="right", padx=(0, 4))
-                self._btn(hdr, "RESET ALL",
-                          self._aaf_reset_all, small=True).pack(side="right", padx=(0, 4))
-                self._btn(hdr, "UNLOCK ALL",
-                          self._aaf_unlock_all, small=True).pack(side="right", padx=(0, 4))
-
-                # SOURCE CLIP (left, fixed width)
-                _snf = tk.Frame(hdr, bg=SURF, width=_nw_s)
-                _snf.pack_propagate(False)
-                _snf.pack(side="left", fill="y")
-                tk.Label(_snf, text="\u25cf SOURCE CLIP", font=FB, bg=SURF, fg=SUB,
-                         anchor="w", padx=4).pack(fill="both", expand=True)
-                self._aaf_col_sash(hdr, "name", SURF)
-
-                # REFERENCE AUDIO (left, fixed width)
-                af = tk.Frame(hdr, bg=SURF, width=_aw_s)
-                af.pack_propagate(False)
-                af.pack(side="left", fill="y")
-                tk.Label(af, text="REFERENCE AUDIO", font=FB, bg=SURF, fg=SUB,
-                         anchor="w", padx=4).pack(fill="both", expand=True)
-                self._aaf_col_sash(hdr, "audio", SURF)
-
-                # OFFSET (left, fixed width)
-                _sof = tk.Frame(hdr, bg=SURF, width=_ow_s)
-                _sof.pack_propagate(False)
-                _sof.pack(side="left", fill="y")
-                tk.Label(_sof, text="OFFSET", font=FB, bg=SURF, fg=SUB,
-                         anchor="w", padx=4).pack(fill="both", expand=True)
-
-                # SYNC (remaining space)
-                tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
-                         anchor="w", padx=8).pack(side="left", fill="x", expand=True)
-
         # Ensure clip counts exist — may be absent if AAF was loaded before this
         # field was added, or if a setup was restored without a fresh AAF parse.
         if not hasattr(self, "_aaf_source_clip_counts") or not self._aaf_source_clip_counts:
@@ -1199,6 +1171,207 @@ class AafWorkflowMixin:
                         _cc[_b] = _cc.get(_b, 0) + 1
             self._aaf_source_clip_counts = _cc
 
+        ctx = self._aaf_row_context()
+        for base in self._aaf_sources:
+            self._aaf_init_source_state(base, ctx["options"])
+        # Before drawing, so rows are drawn from the matched state.
+        self._aaf_auto_match()
+
+        sig  = self._aaf_page_signature(mode)
+        page = self._aaf_pages.get(mode)
+        try:
+            alive = page is not None and bool(page["rows_frame"].winfo_exists())
+        except tk.TclError:
+            alive = False
+        if force or not alive or page["sig"] != sig:
+            self._aaf_build_page(mode, ctx, sig)
+        else:
+            for base, row in list(page["rows"].items()):
+                if page["row_sigs"].get(base) != self._aaf_row_signature(mode, base):
+                    self._aaf_build_source_row(page, mode, base, ctx, replace=row)
+        self._aaf_show_page(mode)
+
+        # The custom track map lists cameras by assignment and slot count;
+        # redraw it when those changed.
+        if getattr(self, "_aaf_group_var", None) is not None and \
+                self._aaf_group_var.get() == "custom":
+            try:
+                if (not self._aaf_track_map_frame.winfo_children()
+                        or self._aaf_track_map_signature()
+                        != getattr(self, "_aaf_track_map_sig", None)):
+                    self._aaf_build_track_map_panel()
+            except tk.TclError:
+                pass
+
+        # If opened via the generic Open Session from the home screen, restore
+        # any saved setup state that was stashed before navigating here.
+        pending = getattr(self, "_pending_aaf_setup", None)
+        if pending is not None:
+            self._pending_aaf_setup = None
+            after = getattr(self, "_pending_aaf_after_restore", None)
+            self._pending_aaf_after_restore = None
+            def _apply(d=pending, after=after):
+                self._aaf_restore_setup(d)
+                if after is not None:
+                    after()
+            self._ui(_apply)
+
+    def _aaf_show_page(self, mode):
+        """Show *mode*'s page; the other one stays built, out of sight."""
+        for m, page in getattr(self, "_aaf_pages", {}).items():
+            for key in ("hdr", "rows_frame"):
+                w = page[key]
+                try:
+                    if m == mode:
+                        if not w.winfo_manager():
+                            w.pack(fill="x")
+                    elif w.winfo_manager():
+                        w.pack_forget()
+                except tk.TclError:
+                    pass
+
+    def _aaf_build_page(self, mode, ctx, sig):
+        """Draw *mode*'s page from scratch: column headers, a row per
+        source, and the footer."""
+        self._aaf_forget_page(mode)
+        page = {"hdr":        tk.Frame(self._aaf_col_hdr_frame, bg=SURF),
+                "rows_frame": tk.Frame(self._aaf_assign_frame, bg=SURF),
+                "rows": {}, "row_sigs": {}, "sig": sig}
+        self._aaf_pages[mode] = page
+        self._aaf_build_page_header(page["hdr"], mode)
+        bases = self._aaf_page_bases(mode)
+        for base in bases:
+            self._aaf_build_source_row(page, mode, base, ctx)
+
+        # Show placeholder when SYNC page has nothing to display
+        if mode == "sync" and not bases:
+            tk.Label(page["rows_frame"],
+                     text="No sources marked for sync.\n"
+                          "Go to SOURCE ASSIGN and tick the sync checkbox on each source.",
+                     font=FB, bg=SURF, fg=SUB, justify="center",
+                     pady=20).pack(fill="x")
+
+        # ── Hidden sources collapsible section (assign mode only) ─────────────
+        if mode == "assign":
+            self._aaf_build_hidden_section(page["rows_frame"])
+        return page
+
+    def _aaf_build_page_header(self, hdr, mode):
+        """Column headers for *mode*'s page."""
+        if mode == "assign":
+            _col_widths = getattr(self, "_aaf_col_widths",
+                                  {"name": 200, "tracks": 110, "video": 200})
+            _col_order  = getattr(self, "_aaf_col_order",  ["video", "tracks"])
+
+            # Sort indicator helper
+            _sc = getattr(self, "_aaf_sort_col", None)
+            _sd = getattr(self, "_aaf_sort_dir", "asc")
+            def _sort_lbl(text, sort_key):
+                if _sc == sort_key:
+                    return text + (" \u25b2" if _sd == "asc" else " \u25bc")
+                return text
+
+            # SOURCE CLIP (click-to-sort, fixed width from content measurement)
+            nf = tk.Frame(hdr, bg=SURF, width=_col_widths["name"], cursor="hand2")
+            nf.pack_propagate(False)
+            nf.pack(side="left", fill="y")
+            _nl = tk.Label(nf, text=_sort_lbl("SOURCE CLIP", "name"),
+                           font=FB, bg=SURF, fg=SUB, anchor="w", padx=4,
+                           cursor="hand2")
+            _nl.pack(fill="both", expand=True)
+            for _w in (nf, _nl):
+                _w.bind("<ButtonRelease-1>", lambda e: self._aaf_sort_by("name"))
+            self._aaf_col_sash(hdr, "name", SURF)
+
+            # Middle columns (click-to-sort only)
+            for _col in _col_order:
+                if _col == "tracks":
+                    tf = tk.Frame(hdr, bg=SURF,
+                                  width=_col_widths.get("tracks", 80),
+                                  cursor="hand2")
+                    tf.pack_propagate(False)
+                    tf.pack(side="left", fill="y")
+                    _th = tk.Label(tf, text=_sort_lbl("TRACK", "tracks"),
+                                   font=FB, bg=SURF, fg=SUB,
+                                   cursor="hand2", anchor="w", padx=4)
+                    _th.pack(fill="both", expand=True)
+                    for _w in (tf, _th):
+                        _w.bind("<ButtonRelease-1>",
+                                lambda e: self._aaf_sort_by("tracks"))
+                    self._aaf_col_sash(hdr, "tracks", SURF)
+                elif _col == "video":
+                    vf = tk.Frame(hdr, bg=SURF,
+                                  width=_col_widths.get("video", 200),
+                                  cursor="hand2")
+                    vf.pack_propagate(False)
+                    vf.pack(side="left", fill="y")
+                    _vh = tk.Label(vf, text=_sort_lbl("VIDEO FILE", "video"),
+                                   font=FB, bg=SURF, fg=SUB,
+                                   cursor="hand2", anchor="w", padx=4)
+                    _vh.pack(fill="both", expand=True)
+                    for _w in (vf, _vh):
+                        _w.bind("<ButtonRelease-1>",
+                                lambda e: self._aaf_sort_by("video"))
+                    self._aaf_col_sash(hdr, "video", SURF)
+
+            # FILES — dedicated column for multi-slot counter
+            _ff = tk.Frame(hdr, bg=SURF,
+                           width=_col_widths.get("files", 82))
+            _ff.pack_propagate(False)
+            _ff.pack(side="left", fill="y")
+            tk.Label(_ff, text="FILES", font=FB, bg=SURF, fg=SUB,
+                     anchor="center").pack(fill="both", expand=True)
+
+            # SYNC and HIDE — left-packed immediately after last column
+            tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
+                     width=5, anchor="center").pack(side="left", padx=(6, 0))
+            tk.Label(hdr, text="HIDE", font=FB, bg=SURF, fg=SUB,
+                     width=5, anchor="center").pack(side="left", padx=(2, 0))
+
+        else:
+            _cw_s   = getattr(self, "_aaf_col_widths", {"name": 200, "audio": 260})
+            _nw_s   = _cw_s.get("name", 200)
+            _aw_s   = _cw_s.get("audio", 260)
+            _ow_s   = 110   # offset column width — shared with rows
+
+            # Global controls anchor far right (packed right-to-left)
+            self._btn(hdr, "SYNC ALL",
+                      self._aaf_sync_all, small=True).pack(side="right", padx=(0, 4))
+            self._btn(hdr, "RESET ALL",
+                      self._aaf_reset_all, small=True).pack(side="right", padx=(0, 4))
+            self._btn(hdr, "UNLOCK ALL",
+                      self._aaf_unlock_all, small=True).pack(side="right", padx=(0, 4))
+
+            # SOURCE CLIP (left, fixed width)
+            _snf = tk.Frame(hdr, bg=SURF, width=_nw_s)
+            _snf.pack_propagate(False)
+            _snf.pack(side="left", fill="y")
+            tk.Label(_snf, text="\u25cf SOURCE CLIP", font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=4).pack(fill="both", expand=True)
+            self._aaf_col_sash(hdr, "name", SURF)
+
+            # REFERENCE AUDIO (left, fixed width)
+            af = tk.Frame(hdr, bg=SURF, width=_aw_s)
+            af.pack_propagate(False)
+            af.pack(side="left", fill="y")
+            tk.Label(af, text="REFERENCE AUDIO", font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=4).pack(fill="both", expand=True)
+            self._aaf_col_sash(hdr, "audio", SURF)
+
+            # OFFSET (left, fixed width)
+            _sof = tk.Frame(hdr, bg=SURF, width=_ow_s)
+            _sof.pack_propagate(False)
+            _sof.pack(side="left", fill="y")
+            tk.Label(_sof, text="OFFSET", font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=4).pack(fill="both", expand=True)
+
+            # SYNC (remaining space)
+            tk.Label(hdr, text="SYNC", font=FB, bg=SURF, fg=SUB,
+                     anchor="w", padx=8).pack(side="left", fill="x", expand=True)
+
+    def _aaf_row_context(self):
+        """What every row of a page is drawn against: the pool options and
+        the colour each assigned video gives its row."""
         options      = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
         aud_options  = ["— no audio —"] + [self._aaf_aud_label(p) for p in self._aaf_audio_paths]
         aud_by_name  = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}
@@ -1230,76 +1403,357 @@ class AafWorkflowMixin:
         # Sync state dot colours
         _STATE_DOT = {"": SUB, "auto": WARN, "manual": SUCCESS}
 
-        for base in self._aaf_sources:
-            # ── Persistent vars (survive rebuilds) ────────────────────────────
-            if base not in self._aaf_source_file_vars:
-                self._aaf_source_file_vars[base]       = tk.StringVar(value="— no video —")
-            if base not in self._aaf_source_sync_vars:
-                self._aaf_source_sync_vars[base]       = tk.BooleanVar(value=False)
-            if base not in self._aaf_source_syncaudio_vars:
-                # Default to the file the AAF measures this source's src_in
-                # against.  A user pick overwrites it and survives rebuilds;
-                # only a new AAF (which prunes these dicts) resets it.
-                # is_media() gates pool membership, so a file the pool
-                # would reject must not become the default either - that
-                # would point the picker at something it cannot show.
-                _dflt = getattr(self, "_aaf_source_media", {}).get(base, "")
-                _dflt = os.path.abspath(_dflt) if (
-                    _dflt and os.path.isfile(_dflt)
-                    and is_media(_dflt)) else ""
-                self._aaf_source_syncaudio_vars[base]  = tk.StringVar(
-                    value=_dflt)
-            if base not in self._aaf_source_offset_vars:
-                self._aaf_source_offset_vars[base]     = tk.StringVar(value="0.000")
-            # Per-extra-slot parallels + multi-mode.  Empty lists / default
-            # "simultaneous" are correct for the N=1 case; grown by
-            # _aaf_update_slot_count when the user adds slots.
-            if base not in getattr(self, "_aaf_source_sync_extra_vars", {}):
-                self._aaf_source_sync_extra_vars[base]      = []
-            if base not in getattr(self, "_aaf_source_syncaudio_extra_vars", {}):
-                self._aaf_source_syncaudio_extra_vars[base] = []
-            if base not in getattr(self, "_aaf_source_offset_extra_vars", {}):
-                self._aaf_source_offset_extra_vars[base]    = []
-            if base not in getattr(self, "_aaf_source_multi_mode_vars", {}):
-                self._aaf_source_multi_mode_vars[base]      = tk.StringVar(
-                    value="simultaneous")
-            if base not in self._aaf_source_sync_label_vars:
-                self._aaf_source_sync_label_vars[base] = tk.StringVar(value="")
-            if base not in self._aaf_sync_state_vars:
-                self._aaf_sync_state_vars[base]        = tk.StringVar(value="")
-            if base not in self._aaf_needs_sync_vars:
-                self._aaf_needs_sync_vars[base]        = tk.BooleanVar(value=False)
-            if base not in self._aaf_sync_locked_vars:
-                self._aaf_sync_locked_vars[base]       = tk.BooleanVar(value=False)
-            # Has-slate flag enables PHAT-weighted xcorr in Pass A, which
-            # sharpens slate transient peaks instead of smearing them.
-            if not hasattr(self, "_aaf_source_has_slate_vars"):
-                self._aaf_source_has_slate_vars = {}
-            if base not in self._aaf_source_has_slate_vars:
-                self._aaf_source_has_slate_vars[base] = tk.BooleanVar(value=False)
+        return {"options": options, "aud_options": aud_options,
+                "row_bg": _row_bg, "apply_color": _apply_color,
+                "state_dot": _STATE_DOT}
 
-            # Multi-slot state
-            if not hasattr(self, "_aaf_source_slot_counts"):
-                self._aaf_source_slot_counts = {}
-            if not hasattr(self, "_aaf_source_extra_vars"):
-                self._aaf_source_extra_vars = {}
-            if base not in self._aaf_source_slot_counts:
-                self._aaf_source_slot_counts[base] = 1
-            if base not in self._aaf_source_extra_vars:
-                self._aaf_source_extra_vars[base] = []
-            _n_slots = self._aaf_source_slot_counts[base]
-            # Trim extra_vars if count decreased
-            del self._aaf_source_extra_vars[base][_n_slots - 1:]
-            # Extend extra_vars if count increased
-            while len(self._aaf_source_extra_vars[base]) < _n_slots - 1:
-                self._aaf_source_extra_vars[base].append(
-                    tk.StringVar(value="— no video —"))
+    def _aaf_init_source_state(self, base, options):
+        """Create *base*'s persistent vars on first sight, and drop
+        assignments whose file has left the pool."""
+        # ── Persistent vars (survive rebuilds) ────────────────────────────
+        if base not in self._aaf_source_file_vars:
+            self._aaf_source_file_vars[base]       = tk.StringVar(value="— no video —")
+        if base not in self._aaf_source_sync_vars:
+            self._aaf_source_sync_vars[base]       = tk.BooleanVar(value=False)
+        if base not in self._aaf_source_syncaudio_vars:
+            # Default to the file the AAF measures this source's src_in
+            # against.  A user pick overwrites it and survives rebuilds;
+            # only a new AAF (which prunes these dicts) resets it.
+            # is_media() gates pool membership, so a file the pool
+            # would reject must not become the default either - that
+            # would point the picker at something it cannot show.
+            _dflt = getattr(self, "_aaf_source_media", {}).get(base, "")
+            _dflt = os.path.abspath(_dflt) if (
+                _dflt and os.path.isfile(_dflt)
+                and is_media(_dflt)) else ""
+            self._aaf_source_syncaudio_vars[base]  = tk.StringVar(
+                value=_dflt)
+        if base not in self._aaf_source_offset_vars:
+            self._aaf_source_offset_vars[base]     = tk.StringVar(value="0.000")
+        # Per-extra-slot parallels + multi-mode.  Empty lists / default
+        # "simultaneous" are correct for the N=1 case; grown by
+        # _aaf_update_slot_count when the user adds slots.
+        if base not in getattr(self, "_aaf_source_sync_extra_vars", {}):
+            self._aaf_source_sync_extra_vars[base]      = []
+        if base not in getattr(self, "_aaf_source_syncaudio_extra_vars", {}):
+            self._aaf_source_syncaudio_extra_vars[base] = []
+        if base not in getattr(self, "_aaf_source_offset_extra_vars", {}):
+            self._aaf_source_offset_extra_vars[base]    = []
+        if base not in getattr(self, "_aaf_source_multi_mode_vars", {}):
+            self._aaf_source_multi_mode_vars[base]      = tk.StringVar(
+                value="simultaneous")
+        if base not in self._aaf_source_sync_label_vars:
+            self._aaf_source_sync_label_vars[base] = tk.StringVar(value="")
+        if base not in self._aaf_sync_state_vars:
+            self._aaf_sync_state_vars[base]        = tk.StringVar(value="")
+        if base not in self._aaf_needs_sync_vars:
+            self._aaf_needs_sync_vars[base]        = tk.BooleanVar(value=False)
+        if base not in self._aaf_sync_locked_vars:
+            self._aaf_sync_locked_vars[base]       = tk.BooleanVar(value=False)
+        # Has-slate flag enables PHAT-weighted xcorr in Pass A, which
+        # sharpens slate transient peaks instead of smearing them.
+        if not hasattr(self, "_aaf_source_has_slate_vars"):
+            self._aaf_source_has_slate_vars = {}
+        if base not in self._aaf_source_has_slate_vars:
+            self._aaf_source_has_slate_vars[base] = tk.BooleanVar(value=False)
 
-            sv = self._aaf_source_file_vars[base]
-            if sv.get() not in options:
-                sv.set("— no video —")
+        # Multi-slot state
+        if not hasattr(self, "_aaf_source_slot_counts"):
+            self._aaf_source_slot_counts = {}
+        if not hasattr(self, "_aaf_source_extra_vars"):
+            self._aaf_source_extra_vars = {}
+        if base not in self._aaf_source_slot_counts:
+            self._aaf_source_slot_counts[base] = 1
+        if base not in self._aaf_source_extra_vars:
+            self._aaf_source_extra_vars[base] = []
+        _n_slots = self._aaf_source_slot_counts[base]
+        # Trim extra_vars if count decreased
+        del self._aaf_source_extra_vars[base][_n_slots - 1:]
+        # Extend extra_vars if count increased
+        while len(self._aaf_source_extra_vars[base]) < _n_slots - 1:
+            self._aaf_source_extra_vars[base].append(
+                tk.StringVar(value="— no video —"))
 
-            # ── Audio display var — recreated fresh each rebuild ───────────────
+        sv = self._aaf_source_file_vars[base]
+        if sv.get() not in options:
+            sv.set("— no video —")
+        # Extra slots likewise (they have no row widget of their own).
+        for _slot_ev in self._aaf_source_extra_vars.get(base, []):
+            if _slot_ev.get() not in options:
+                _slot_ev.set("— no video —")
+        # The SYNC page's reference picker replaces this with its own var;
+        # until it is drawn, readers still find one per source.
+        if base not in self._aaf_source_audio_disp_vars:
+            cur_full = self._aaf_source_syncaudio_vars[base].get()
+            self._aaf_source_audio_disp_vars[base] = tk.StringVar(
+                value=self._aaf_aud_label(cur_full)
+                if cur_full and cur_full in self._aaf_audio_paths
+                else "— no audio —")
+
+    def _aaf_build_source_row(self, page, mode, base, ctx, replace=None):
+        """Draw *base*'s row on *mode*'s page -- in place of *replace*, the
+        row it supersedes, when given."""
+        page["row_sigs"][base] = self._aaf_row_signature(mode, base)
+        container = self._aaf_draw_source_row(page["rows_frame"], mode, base, ctx)
+        if replace is None:
+            container.pack(fill="x", pady=2)
+        else:
+            # Lay the new row out before it takes the old one's place.  Packed
+            # unsized, it starts out flat: the rows shrink, then grow back,
+            # and each change of height runs up through every frame that
+            # holds the rows -- each of which repaints all of its 300-odd
+            # widgets on Windows.  Same size in, same size out, and only
+            # the new row draws.
+            container.update_idletasks()
+            container.pack(fill="x", pady=2, before=replace)
+            replace.destroy()
+        page["rows"][base] = container
+        return container
+
+    def _aaf_draw_source_row(self, parent, mode, base, ctx):
+        """Build *base*'s row widgets for *mode*'s page inside a new frame
+        in *parent*, and return that frame unpacked."""
+        aud_options  = ctx["aud_options"]
+        _row_bg      = ctx["row_bg"]
+        _apply_color = ctx["apply_color"]
+        _STATE_DOT   = ctx["state_dot"]
+        sv = self._aaf_source_file_vars[base]
+
+        # ── Container — accent border when source is marked for sync ──────
+        _is_sync = self._aaf_needs_sync_vars[base].get()
+        bg = _row_bg(sv.get())
+        container = tk.Frame(parent, bg=bg,
+                             highlightbackground=ACCENT if _is_sync else BORDER,
+                             highlightthickness=2 if _is_sync else 1)
+
+        row1 = tk.Frame(container, bg=bg)
+        row1.pack(fill="x", padx=6, pady=(4, 0))
+
+        if mode == "assign":
+            # ── ASSIGN mode: SOURCE | VIDEO | PT TRACK | SYNC | hide ────
+            _col_widths = getattr(self, "_aaf_col_widths",
+                                  {"name": 200, "tracks": 110, "video": 200})
+            _col_order  = getattr(self, "_aaf_col_order",  ["video", "tracks"])
+
+            # Left side: name | video | tracks | SYNC | HIDE
+            nf = tk.Frame(row1, bg=bg, width=_col_widths["name"])
+            nf.pack_propagate(False)
+            nf.pack(side="left", fill="y")
+            name_lbl = tk.Label(nf, text=base, font=FB, bg=bg, fg=TEXT,
+                                anchor="w")
+            name_lbl.pack(fill="x")
+            self._tooltip(name_lbl, base)
+
+            # Middle columns in stored order
+            tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
+            for _col in _col_order:
+                if _col == "tracks":
+                    tf = tk.Frame(row1, bg=bg,
+                                  width=_col_widths.get("tracks", 110))
+                    tf.pack_propagate(False)
+                    tf.pack(side="left", fill="y", padx=(1, 0))
+                    tk.Label(tf, text=tracks_str, font=FB, bg=bg, fg=SUB,
+                             anchor="w").pack(fill="x")
+                elif _col == "video":
+                    _n_slots2  = self._aaf_source_slot_counts.get(base, 1)
+                    _extra_evs = self._aaf_source_extra_vars.get(base, [])
+                    _n_filled2 = (1 if sv.get() != "— no video —" else 0) + sum(
+                        1 for _ev in _extra_evs if _ev.get() != "— no video —")
+                    _partial2  = _n_slots2 > 1 and _n_filled2 < _n_slots2
+
+                    # Build button label text
+                    if _n_slots2 == 1:
+                        _vid_lbl_txt = sv.get()
+                    else:
+                        _clip_cnt2 = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+                        _vid_lbl_txt = "{}/{} files".format(_n_filled2, _n_slots2)
+                        if _clip_cnt2 > 0:
+                            _vid_lbl_txt += "  ·  {} clips".format(_clip_cnt2)
+
+                    vrf = tk.Frame(row1, bg=bg,
+                                   width=_col_widths.get("video", 200))
+                    vrf.pack_propagate(False)
+                    vrf.pack(side="left", fill="y", padx=(1, 0))
+
+                    # Multi-select button (replaces _FlatDropdown)
+                    _vid_btn_frame = tk.Frame(
+                        vrf, bg=SURF3,
+                        highlightbackground=BORDER, highlightthickness=1,
+                        cursor="hand2")
+                    _vid_btn_frame.pack(fill="x")
+                    _vid_btn_lbl = tk.Label(
+                        _vid_btn_frame,
+                        text=_vid_lbl_txt,
+                        font=FB, bg=SURF3,
+                        fg=WARN if _partial2 else (SUB if sv.get() == "— no video —" else TEXT),
+                        anchor="w", padx=6, pady=3)
+                    _vid_btn_lbl.pack(side="left", fill="x", expand=True)
+                    tk.Label(_vid_btn_frame, text="\u25bc", font=(_SANS, 7),
+                             bg=SURF3, fg=SUB, padx=4).pack(side="right")
+                    # Store ref for in-place update (avoids full rebuild on popup apply)
+                    self._aaf_vid_btn_labels[base] = _vid_btn_lbl
+
+                    def _open_ms(e, b=base, w=_vid_btn_frame):
+                        self._aaf_open_video_multiselect(b, w)
+                    _vid_btn_frame.bind("<ButtonRelease-1>", _open_ms)
+                    _vid_btn_lbl.bind("<ButtonRelease-1>",   _open_ms)
+
+            # ── FILES column: dedicated counter [−] N [+] ─────────────────
+            _n_slots   = self._aaf_source_slot_counts.get(base, 1)
+            _extra_evs = self._aaf_source_extra_vars.get(base, [])
+            _n_filled  = (1 if sv.get() != "— no video —" else 0) + sum(
+                1 for _ev in _extra_evs if _ev.get() != "— no video —")
+            _partial   = _n_slots > 1 and _n_filled < _n_slots
+            _clip_cnt  = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
+
+            _files_col = tk.Frame(row1, bg=bg,
+                                  width=_col_widths.get("files", 82))
+            _files_col.pack_propagate(False)
+            _files_col.pack(side="left", fill="y")
+
+            _ctr = tk.Frame(_files_col, bg=bg)
+            _ctr.pack(anchor="center", expand=True)
+            _minus_btn = tk.Label(
+                _ctr, text="\u2212", font=FB,
+                bg=SURF3, fg=TEXT if _n_slots > 1 else BORDER,
+                cursor="hand2" if _n_slots > 1 else "",
+                padx=5, pady=1, bd=0,
+                highlightbackground=BORDER, highlightthickness=1)
+            _minus_btn.pack(side="left")
+            _n_lbl = tk.Label(
+                _ctr, text=str(_n_slots), font=FB,
+                bg=SURF3, fg=WARN if _partial else TEXT,
+                padx=6, pady=1)
+            _n_lbl.pack(side="left", padx=(1, 1))
+            _plus_btn = tk.Label(
+                _ctr, text="+", font=FB,
+                bg=SURF3, fg=TEXT,
+                cursor="hand2", padx=5, pady=1, bd=0,
+                highlightbackground=BORDER, highlightthickness=1)
+            _plus_btn.pack(side="left")
+            # Store refs for in-place counter updates (no rebuild needed)
+            self._aaf_ctr_n_labels[base]   = _n_lbl
+            self._aaf_ctr_minus_btns[base] = _minus_btn
+
+            # Always bind both buttons; handler guards against N<1
+            _plus_btn.bind("<ButtonRelease-1>",
+                           lambda e, b=base: self._aaf_update_slot_count(b, +1))
+            _minus_btn.bind("<ButtonRelease-1>",
+                            lambda e, b=base: self._aaf_update_slot_count(b, -1))
+
+            # SYNC checkbox + HIDE — left-packed immediately after TRACK
+            _ck_var = self._aaf_needs_sync_vars[base]
+            _ck_lbl = tk.Label(row1,
+                               text="\u2611" if _ck_var.get() else "\u2610",
+                               font=(_SANS, 15), bg=bg,
+                               fg=ACCENT if _ck_var.get() else SUB,
+                               cursor="hand2", padx=4, width=5, anchor="center")
+            _ck_lbl.pack(side="left", padx=(6, 0))
+            # Register in maps for drag-select hit-testing
+            self._aaf_ck_lbl_map[base]       = _ck_lbl
+            self._aaf_ck_container_map[base] = container
+
+            def _ck_press(e, b=base):
+                idx    = self._aaf_sources.index(b)
+                target = not self._aaf_needs_sync_vars[b].get()
+                self._aaf_drag_sync = {"start_idx": idx, "target": target,
+                                       "last_idx": idx}
+                self._aaf_apply_sync_range(idx, idx, target)
+
+            def _ck_move(e, b=base):
+                if not self._aaf_drag_sync:
+                    return
+                cur = self._aaf_ck_hit_test(e.y_root)
+                if cur is None:
+                    return
+                try:
+                    cur_idx = self._aaf_sources.index(cur)
+                except ValueError:
+                    return
+                if cur_idx == self._aaf_drag_sync.get("last_idx"):
+                    return
+                self._aaf_drag_sync["last_idx"] = cur_idx
+                lo = min(self._aaf_drag_sync["start_idx"], cur_idx)
+                hi = max(self._aaf_drag_sync["start_idx"], cur_idx)
+                self._aaf_apply_sync_range(lo, hi,
+                                           self._aaf_drag_sync["target"])
+
+            def _ck_release(e):
+                self._aaf_drag_sync = None
+
+            _ck_lbl.bind("<ButtonPress-1>",   _ck_press)
+            _ck_lbl.bind("<B1-Motion>",        _ck_move)
+            _ck_lbl.bind("<ButtonRelease-1>",  _ck_release)
+
+            hide_lbl = tk.Label(row1, text="HIDE", font=FB, bg=bg, fg=SUB,
+                                cursor="hand2", padx=4, width=5, anchor="center")
+            hide_lbl.pack(side="left", padx=(2, 0))
+            hide_lbl.bind("<Enter>",  lambda e, w=hide_lbl: w.config(fg=WARN))
+            hide_lbl.bind("<Leave>",  lambda e, w=hide_lbl: w.config(fg=SUB))
+            hide_lbl.bind("<Button-1>",
+                          lambda e, b=base: self._aaf_hide_source(b))
+
+            # Remove stale video-change traces then re-add
+            for _tr in list(sv.trace_info()):
+                if _tr[0] == "write":
+                    try: sv.trace_remove("write", _tr[1])
+                    except Exception: pass
+            def _on_vid_change(*args, c=container, s=sv, b=base,
+                               _last=[sv.get()]):
+                _new = s.get()
+                _apply_color(c, _row_bg(_new))
+                # Keep the button label in sync with the StringVar too —
+                # the trace previously only refreshed the background,
+                # so _aaf_auto_match (which writes sv directly) and any
+                # other programmatic sv.set() left the label stuck at
+                # its row-construction value (reported: bg updated,
+                # label still "— no video —" until picker round-trip).
+                self._aaf_refresh_vid_btn_label(b)
+                # A write of the SAME video is not a change.  Tk fires
+                # write traces on every set(); a setup restore re-sets
+                # each assignment to its current value, and that must
+                # not invalidate a sync measured against that video.
+                if _new == _last[0]:
+                    return
+                _last[0] = _new
+                # If this source had a locked/completed sync, invalidate it —
+                # the assignment changed so the old sync result is stale.
+                lkv = self._aaf_sync_locked_vars.get(b)
+                was_locked = lkv and lkv.get()
+                ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
+                if was_locked or ssv:
+                    if lkv: lkv.set(False)
+                    ov = self._aaf_source_offset_vars.get(b)
+                    if ov: ov.set("0.000")
+                    sv2 = self._aaf_source_sync_vars.get(b)
+                    if sv2: sv2.set(False)
+                    lv = self._aaf_source_sync_label_vars.get(b)
+                    if lv: lv.set("")
+                    self._aaf_set_sync_state(b, "")
+                    self._aaf_set_drift(b, None)
+                    # Drop the now-stale candidate list too — they
+                    # were measured against the previous video.
+                    # Without this, TRY NEXT remains visible and
+                    # clicking it applies an offset that doesn't
+                    # match the freshly-picked video.
+                    self._aaf_clear_sync_candidates(b)
+                    # Refresh sync-tab row so lock icon updates immediately
+                    self._ui(self._rebuild_aaf_source_rows)
+            sv.trace_add("write", _on_vid_change)
+
+            # Remove stale traces on extra slot vars (no row rendered — managed via popup)
+            for _slot_ev in self._aaf_source_extra_vars.get(base, []):
+                for _tr in list(_slot_ev.trace_info()):
+                    if _tr[0] == "write":
+                        try: _slot_ev.trace_remove("write", _tr[1])
+                        except Exception: pass
+                _slot_ev.trace_add("write", lambda *_a: None)
+
+            # Pad bottom of assign-mode row
+            tk.Frame(container, bg=bg, height=4).pack()
+
+        else:
+            # ── Audio display var — a fresh one for each SYNC row ──────────
             # Use _aaf_aud_label so the displayed string matches the dropdown
             # options (which now go through the same label) on a basename
             # collision; bare basename here would leave the picker showing a
@@ -1311,566 +1765,291 @@ class AafWorkflowMixin:
             aud_disp  = tk.StringVar(value=cur_lbl if cur_lbl else "— no audio —")
             self._aaf_source_audio_disp_vars[base] = aud_disp
 
-            # Skip hidden sources (shown in collapsible section below)
-            if base in getattr(self, "_aaf_hidden_sources", set()):
-                continue
+            locked    = self._aaf_sync_locked_vars[base].get()
+            state_val = self._aaf_sync_state_vars[base].get()
+            _cw_s     = getattr(self, "_aaf_col_widths", {"name": 200, "audio": 260})
+            _nw_s     = _cw_s.get("name", 200)
+            _aw_s     = _cw_s.get("audio", 260)
+            _ow_s     = 110   # offset column — matches sync header
 
-            # ── Container — accent border when source is marked for sync ──────
-            _is_sync = self._aaf_needs_sync_vars[base].get()
-            bg = _row_bg(sv.get())
-            container = tk.Frame(self._aaf_assign_frame, bg=bg,
-                                 highlightbackground=ACCENT if _is_sync else BORDER,
-                                 highlightthickness=2 if _is_sync else 1)
-            container.pack(fill="x", pady=2)
+            # ── SOURCE CLIP (left, fixed width) ───────────────────────────
+            dot_color  = _STATE_DOT.get(state_val, SUB)
+            clip_frame = tk.Frame(row1, bg=bg, width=_nw_s)
+            clip_frame.pack_propagate(False)
+            clip_frame.pack(side="left", fill="y")
+            dot_lbl = tk.Label(clip_frame, text="\u25cf", font=FB, bg=bg,
+                               fg=dot_color, padx=2)
+            dot_lbl.pack(side="left")
+            self._aaf_sync_dot_labels[base] = dot_lbl
+            name_lbl = tk.Label(clip_frame, text=base, font=FB, bg=bg,
+                                fg=TEXT, anchor="w")
+            name_lbl.pack(side="left", fill="x", expand=True)
+            self._tooltip(name_lbl, base)
 
-            row1 = tk.Frame(container, bg=bg)
-            row1.pack(fill="x", padx=6, pady=(4, 0))
+            # ── REFERENCE AUDIO (left, fixed width) ───────────────────────
+            aud_frame    = tk.Frame(row1, bg=bg, width=_aw_s)
+            aud_frame.pack_propagate(False)
+            aud_frame.pack(side="left", fill="y")
+            aud_dd_state = "disabled" if locked else "readonly"
+            aud_dd = _FlatDropdown(aud_frame, textvariable=aud_disp,
+                                   values=aud_options,
+                                   state=aud_dd_state, font=FB)
+            aud_dd.pack(fill="x", expand=True)
 
-            if mode == "assign":
-                # ── ASSIGN mode: SOURCE | VIDEO | PT TRACK | SYNC | hide ────
-                _col_widths = getattr(self, "_aaf_col_widths",
-                                      {"name": 200, "tracks": 110, "video": 200})
-                _col_order  = getattr(self, "_aaf_col_order",  ["video", "tracks"])
+            # ── OFFSET (left, fixed width) ─────────────────────────────────
+            off_frame = tk.Frame(row1, bg=bg, width=_ow_s)
+            off_frame.pack_propagate(False)
+            off_frame.pack(side="left", fill="y")
+            tk.Label(off_frame,
+                     textvariable=self._aaf_source_offset_vars[base],
+                     font=FB, bg=bg, fg=ACCENT,
+                     anchor="e").pack(side="left", fill="x", expand=True)
+            tk.Label(off_frame, text="s", font=FB, bg=bg,
+                     fg=SUB).pack(side="left", padx=(2, 4))
 
-                # Left side: name | video | tracks | SYNC | HIDE
-                nf = tk.Frame(row1, bg=bg, width=_col_widths["name"])
-                nf.pack_propagate(False)
-                nf.pack(side="left", fill="y")
-                name_lbl = tk.Label(nf, text=base, font=FB, bg=bg, fg=TEXT,
-                                    anchor="w")
-                name_lbl.pack(fill="x")
-                self._tooltip(name_lbl, base)
+            # ── SYNC controls (left, remaining space) ─────────────────────
+            # 🔒 Lock toggle
+            lock_text = "\U0001f512" if locked else "\U0001f513"
+            lock_fg   = WARN if locked else SUB
+            lock_btn  = tk.Label(row1, text=lock_text, font=FB, bg=SURF3,
+                                 fg=lock_fg, cursor="hand2", padx=6, pady=2,
+                                 bd=0, highlightbackground=BORDER,
+                                 highlightthickness=1)
+            lock_btn.pack(side="left", padx=(8, 2))
+            lock_btn.bind("<Enter>",  lambda e, w=lock_btn: w.config(bg=ACCENT))
+            lock_btn.bind("<Leave>",  lambda e, w=lock_btn: w.config(bg=SURF3))
+            lock_btn.bind("<ButtonRelease-1>",
+                          lambda e, b=base: self._aaf_toggle_lock(b))
+            self._aaf_lock_btns[base] = lock_btn
 
-                # Middle columns in stored order
-                tracks_str = ", ".join(sorted(self._aaf_source_tracks.get(base, set())))
-                for _col in _col_order:
-                    if _col == "tracks":
-                        tf = tk.Frame(row1, bg=bg,
-                                      width=_col_widths.get("tracks", 110))
-                        tf.pack_propagate(False)
-                        tf.pack(side="left", fill="y", padx=(1, 0))
-                        tk.Label(tf, text=tracks_str, font=FB, bg=bg, fg=SUB,
-                                 anchor="w").pack(fill="x")
-                    elif _col == "video":
-                        _n_slots2  = self._aaf_source_slot_counts.get(base, 1)
-                        _extra_evs = self._aaf_source_extra_vars.get(base, [])
-                        _n_filled2 = (1 if sv.get() != "— no video —" else 0) + sum(
-                            1 for _ev in _extra_evs if _ev.get() != "— no video —")
-                        _partial2  = _n_slots2 > 1 and _n_filled2 < _n_slots2
+            # ✓ ACCEPT
+            cfm_text, cfm_fg = self._confirm_btn_style(state_val)
+            cfm_btn = tk.Label(row1, text=cfm_text, font=FB, bg=SURF3,
+                               fg=cfm_fg, cursor="hand2", padx=6, pady=2,
+                               bd=0, highlightbackground=BORDER,
+                               highlightthickness=1)
+            cfm_btn.pack(side="left", padx=(2, 0))
+            cfm_btn.bind("<Enter>",  lambda e, w=cfm_btn: w.config(bg=ACCENT))
+            cfm_btn.bind("<Leave>",  lambda e, w=cfm_btn: w.config(bg=SURF3))
+            cfm_btn.bind("<ButtonRelease-1>",
+                         lambda e, b=base: self._aaf_confirm_sync(b))
+            if locked:
+                cfm_btn.config(state="disabled", fg=SUB)
+            self._aaf_confirm_btns[base] = cfm_btn
 
-                        # Build button label text
-                        if _n_slots2 == 1:
-                            _vid_lbl_txt = sv.get()
-                        else:
-                            _clip_cnt2 = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
-                            _vid_lbl_txt = "{}/{} files".format(_n_filled2, _n_slots2)
-                            if _clip_cnt2 > 0:
-                                _vid_lbl_txt += "  ·  {} clips".format(_clip_cnt2)
+            # ▶ PREVIEW
+            # Initial state must consult _aaf_qa_playing so a row
+            # rebuild during QA playback (page toggle, ALIGN accept,
+            # drag-select apply, etc.) doesn't show "play" on a
+            # button whose audio is actively playing.  The previous
+            # always-default construction left the button reading
+            # PREVIEW while audio kept rolling; the eventual
+            # _qa_poll-driven _aaf_qa_stop then tried to reset an
+            # already-default-styled (new) widget \u2014 silent no-op.
+            _is_playing = getattr(self, "_aaf_qa_playing", None) == base
+            _qa_text    = "\u25a0 STOP" if _is_playing else "\u25b6 PREVIEW"
+            _qa_fg      = WARN          if _is_playing else TEXT
+            prev_btn = tk.Label(row1, text=_qa_text, font=FB, bg=SURF3,
+                                fg=_qa_fg, cursor="hand2", padx=6, pady=2, bd=0,
+                                highlightbackground=BORDER, highlightthickness=1)
+            prev_btn.pack(side="left", padx=(2, 0))
+            prev_btn.bind("<Enter>",  lambda e, w=prev_btn: w.config(bg=ACCENT))
+            prev_btn.bind("<Leave>",  lambda e, w=prev_btn: w.config(bg=SURF3))
+            prev_btn.bind("<ButtonRelease-1>",
+                          lambda e, b=base: self._aaf_qa_toggle(b))
+            self._aaf_qa_btns[base] = prev_btn
 
-                        vrf = tk.Frame(row1, bg=bg,
-                                       width=_col_widths.get("video", 200))
-                        vrf.pack_propagate(False)
-                        vrf.pack(side="left", fill="y", padx=(1, 0))
+            # ALIGN…
+            align_btn = tk.Label(row1, text="ALIGN\u2026", font=FB, bg=SURF3,
+                                 fg=SUB if locked else TEXT,
+                                 cursor="" if locked else "hand2",
+                                 padx=6, pady=2, bd=0,
+                                 highlightbackground=BORDER, highlightthickness=1)
+            align_btn.pack(side="left", padx=(2, 0))
+            if not locked:
+                align_btn.bind("<Enter>",  lambda e, w=align_btn: w.config(bg=ACCENT))
+                align_btn.bind("<Leave>",  lambda e, w=align_btn: w.config(bg=SURF3))
+                align_btn.bind("<ButtonRelease-1>",
+                               lambda e, b=base: self._aaf_open_align(b))
+            self._aaf_align_btns[base] = align_btn
+            # Grey out when the assigned video carries no audio track
+            # (kicks off the probe on first sight of the file).
+            self._aaf_refresh_align_btn(base)
 
-                        # Multi-select button (replaces _FlatDropdown)
-                        _vid_btn_frame = tk.Frame(
-                            vrf, bg=SURF3,
-                            highlightbackground=BORDER, highlightthickness=1,
-                            cursor="hand2")
-                        _vid_btn_frame.pack(fill="x")
-                        _vid_btn_lbl = tk.Label(
-                            _vid_btn_frame,
-                            text=_vid_lbl_txt,
-                            font=FB, bg=SURF3,
-                            fg=WARN if _partial2 else (SUB if sv.get() == "— no video —" else TEXT),
-                            anchor="w", padx=6, pady=3)
-                        _vid_btn_lbl.pack(side="left", fill="x", expand=True)
-                        tk.Label(_vid_btn_frame, text="\u25bc", font=(_SANS, 7),
-                                 bg=SURF3, fg=SUB, padx=4).pack(side="right")
-                        # Store ref for in-place update (avoids full rebuild on popup apply)
-                        self._aaf_vid_btn_labels[base] = _vid_btn_lbl
-
-                        def _open_ms(e, b=base, w=_vid_btn_frame):
-                            self._aaf_open_video_multiselect(b, w)
-                        _vid_btn_frame.bind("<ButtonRelease-1>", _open_ms)
-                        _vid_btn_lbl.bind("<ButtonRelease-1>",   _open_ms)
-
-                # ── FILES column: dedicated counter [−] N [+] ─────────────────
-                _n_slots   = self._aaf_source_slot_counts.get(base, 1)
-                _extra_evs = self._aaf_source_extra_vars.get(base, [])
-                _n_filled  = (1 if sv.get() != "— no video —" else 0) + sum(
-                    1 for _ev in _extra_evs if _ev.get() != "— no video —")
-                _partial   = _n_slots > 1 and _n_filled < _n_slots
-                _clip_cnt  = getattr(self, "_aaf_source_clip_counts", {}).get(base, 0)
-
-                _files_col = tk.Frame(row1, bg=bg,
-                                      width=_col_widths.get("files", 82))
-                _files_col.pack_propagate(False)
-                _files_col.pack(side="left", fill="y")
-
-                _ctr = tk.Frame(_files_col, bg=bg)
-                _ctr.pack(anchor="center", expand=True)
-                _minus_btn = tk.Label(
-                    _ctr, text="\u2212", font=FB,
-                    bg=SURF3, fg=TEXT if _n_slots > 1 else BORDER,
-                    cursor="hand2" if _n_slots > 1 else "",
-                    padx=5, pady=1, bd=0,
-                    highlightbackground=BORDER, highlightthickness=1)
-                _minus_btn.pack(side="left")
-                _n_lbl = tk.Label(
-                    _ctr, text=str(_n_slots), font=FB,
-                    bg=SURF3, fg=WARN if _partial else TEXT,
-                    padx=6, pady=1)
-                _n_lbl.pack(side="left", padx=(1, 1))
-                _plus_btn = tk.Label(
-                    _ctr, text="+", font=FB,
-                    bg=SURF3, fg=TEXT,
-                    cursor="hand2", padx=5, pady=1, bd=0,
-                    highlightbackground=BORDER, highlightthickness=1)
-                _plus_btn.pack(side="left")
-                # Store refs for in-place counter updates (no rebuild needed)
-                self._aaf_ctr_n_labels[base]   = _n_lbl
-                self._aaf_ctr_minus_btns[base] = _minus_btn
-
-                # Always bind both buttons; handler guards against N<1
-                _plus_btn.bind("<ButtonRelease-1>",
-                               lambda e, b=base: self._aaf_update_slot_count(b, +1))
-                _minus_btn.bind("<ButtonRelease-1>",
-                                lambda e, b=base: self._aaf_update_slot_count(b, -1))
-
-                # SYNC checkbox + HIDE — left-packed immediately after TRACK
-                _ck_var = self._aaf_needs_sync_vars[base]
-                _ck_lbl = tk.Label(row1,
-                                   text="\u2611" if _ck_var.get() else "\u2610",
-                                   font=(_SANS, 15), bg=bg,
-                                   fg=ACCENT if _ck_var.get() else SUB,
-                                   cursor="hand2", padx=4, width=5, anchor="center")
-                _ck_lbl.pack(side="left", padx=(6, 0))
-                # Register in maps for drag-select hit-testing
-                self._aaf_ck_lbl_map[base]       = _ck_lbl
-                self._aaf_ck_container_map[base] = container
-
-                def _ck_press(e, b=base):
-                    idx    = self._aaf_sources.index(b)
-                    target = not self._aaf_needs_sync_vars[b].get()
-                    self._aaf_drag_sync = {"start_idx": idx, "target": target,
-                                           "last_idx": idx}
-                    self._aaf_apply_sync_range(idx, idx, target)
-
-                def _ck_move(e, b=base):
-                    if not self._aaf_drag_sync:
-                        return
-                    cur = self._aaf_ck_hit_test(e.y_root)
-                    if cur is None:
-                        return
-                    try:
-                        cur_idx = self._aaf_sources.index(cur)
-                    except ValueError:
-                        return
-                    if cur_idx == self._aaf_drag_sync.get("last_idx"):
-                        return
-                    self._aaf_drag_sync["last_idx"] = cur_idx
-                    lo = min(self._aaf_drag_sync["start_idx"], cur_idx)
-                    hi = max(self._aaf_drag_sync["start_idx"], cur_idx)
-                    self._aaf_apply_sync_range(lo, hi,
-                                               self._aaf_drag_sync["target"])
-
-                def _ck_release(e):
-                    self._aaf_drag_sync = None
-
-                _ck_lbl.bind("<ButtonPress-1>",   _ck_press)
-                _ck_lbl.bind("<B1-Motion>",        _ck_move)
-                _ck_lbl.bind("<ButtonRelease-1>",  _ck_release)
-
-                hide_lbl = tk.Label(row1, text="HIDE", font=FB, bg=bg, fg=SUB,
-                                    cursor="hand2", padx=4, width=5, anchor="center")
-                hide_lbl.pack(side="left", padx=(2, 0))
-                hide_lbl.bind("<Enter>",  lambda e, w=hide_lbl: w.config(fg=WARN))
-                hide_lbl.bind("<Leave>",  lambda e, w=hide_lbl: w.config(fg=SUB))
-                hide_lbl.bind("<Button-1>",
-                              lambda e, b=base: self._aaf_hide_source(b))
-
-                # Remove stale video-change traces then re-add
-                for _tr in list(sv.trace_info()):
-                    if _tr[0] == "write":
-                        try: sv.trace_remove("write", _tr[1])
-                        except Exception: pass
-                def _on_vid_change(*args, c=container, s=sv, b=base,
-                                   _last=[sv.get()]):
-                    _new = s.get()
-                    _apply_color(c, _row_bg(_new))
-                    # Keep the button label in sync with the StringVar too —
-                    # the trace previously only refreshed the background,
-                    # so _aaf_auto_match (which writes sv directly) and any
-                    # other programmatic sv.set() left the label stuck at
-                    # its row-construction value (reported: bg updated,
-                    # label still "— no video —" until picker round-trip).
-                    self._aaf_refresh_vid_btn_label(b)
-                    # A write of the SAME video is not a change.  Tk fires
-                    # write traces on every set(); a setup restore re-sets
-                    # each assignment to its current value, and that must
-                    # not invalidate a sync measured against that video.
-                    if _new == _last[0]:
-                        return
-                    _last[0] = _new
-                    # If this source had a locked/completed sync, invalidate it —
-                    # the assignment changed so the old sync result is stale.
-                    lkv = self._aaf_sync_locked_vars.get(b)
-                    was_locked = lkv and lkv.get()
-                    ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
-                    if was_locked or ssv:
-                        if lkv: lkv.set(False)
-                        ov = self._aaf_source_offset_vars.get(b)
-                        if ov: ov.set("0.000")
-                        sv2 = self._aaf_source_sync_vars.get(b)
-                        if sv2: sv2.set(False)
-                        lv = self._aaf_source_sync_label_vars.get(b)
-                        if lv: lv.set("")
-                        self._aaf_set_sync_state(b, "")
-                        self._aaf_set_drift(b, None)
-                        # Drop the now-stale candidate list too — they
-                        # were measured against the previous video.
-                        # Without this, TRY NEXT remains visible and
-                        # clicking it applies an offset that doesn't
-                        # match the freshly-picked video.
-                        self._aaf_clear_sync_candidates(b)
-                        # Refresh sync-tab row so lock icon updates immediately
-                        self._ui(self._rebuild_aaf_source_rows)
-                sv.trace_add("write", _on_vid_change)
-
-                # Remove stale traces on extra slot vars (no row rendered — managed via popup)
-                for _slot_ev in self._aaf_source_extra_vars.get(base, []):
-                    if _slot_ev.get() not in options:
-                        _slot_ev.set("— no video —")
-                    for _tr in list(_slot_ev.trace_info()):
-                        if _tr[0] == "write":
-                            try: _slot_ev.trace_remove("write", _tr[1])
-                            except Exception: pass
-                    _slot_ev.trace_add("write", lambda *_a: None)
-
-                # Pad bottom of assign-mode row
-                tk.Frame(container, bg=bg, height=4).pack()
-
+            # ↺ Reset
+            rst_btn = tk.Label(row1, text="\u21ba", font=FB, bg=SURF3,
+                               fg=SUB, cursor="hand2", padx=6, pady=2, bd=0,
+                               highlightbackground=BORDER, highlightthickness=1)
+            rst_btn.pack(side="left", padx=(2, 0))
+            if locked:
+                rst_btn.config(state="disabled", cursor="")
             else:
-                # ── SYNC mode: only show sources marked "needs sync" ───────────
-                if not self._aaf_needs_sync_vars[base].get():
-                    container.destroy()
-                    continue
+                rst_btn.bind("<Enter>",  lambda e, w=rst_btn: w.config(bg="#5a2020"))
+                rst_btn.bind("<Leave>",  lambda e, w=rst_btn: w.config(bg=SURF3))
+                rst_btn.bind("<ButtonRelease-1>",
+                             lambda e, b=base: self._aaf_reset_sync(b))
 
-                locked    = self._aaf_sync_locked_vars[base].get()
-                state_val = self._aaf_sync_state_vars[base].get()
-                _cw_s     = getattr(self, "_aaf_col_widths", {"name": 200, "audio": 260})
-                _nw_s     = _cw_s.get("name", 200)
-                _aw_s     = _cw_s.get("audio", 260)
-                _ow_s     = 110   # offset column — matches sync header
+            # Slate-aware toggle — when checked, the next SYNC run uses
+            # GCC-PHAT weighting to lock onto the slate transient peak
+            # instead of treating it as broadband noise.  Useful when
+            # the clapper is the strongest/cleanest sync signal in
+            # short clips where the speech-rhythm xcorr is ambiguous.
+            slate_var = self._aaf_source_has_slate_vars[base]
+            slate_ck = tk.Label(row1,
+                text="☑ slate" if slate_var.get() else "☐ slate",
+                font=FB, bg=BG,
+                fg=ACCENT if slate_var.get() else SUB,
+                cursor="hand2", padx=4)
+            slate_ck.pack(side="left", padx=(8, 0))
+            if locked:
+                slate_ck.config(cursor="")
+            else:
+                def _toggle_slate(_e=None, b=base, w=slate_ck,
+                                   v=slate_var):
+                    v.set(not v.get())
+                    w.config(text="☑ slate" if v.get() else "☐ slate",
+                             fg=ACCENT if v.get() else SUB)
+                slate_ck.bind("<Button-1>", _toggle_slate)
 
-                # ── SOURCE CLIP (left, fixed width) ───────────────────────────
-                dot_color  = _STATE_DOT.get(state_val, SUB)
-                clip_frame = tk.Frame(row1, bg=bg, width=_nw_s)
-                clip_frame.pack_propagate(False)
-                clip_frame.pack(side="left", fill="y")
-                dot_lbl = tk.Label(clip_frame, text="\u25cf", font=FB, bg=bg,
-                                   fg=dot_color, padx=2)
-                dot_lbl.pack(side="left")
-                self._aaf_sync_dot_labels[base] = dot_lbl
-                name_lbl = tk.Label(clip_frame, text=base, font=FB, bg=bg,
-                                    fg=TEXT, anchor="w")
-                name_lbl.pack(side="left", fill="x", expand=True)
-                self._tooltip(name_lbl, base)
+            # SYNC button
+            sync_btn = self._btn(row1, "SYNC",
+                                 lambda b=base: self._aaf_do_sync(b),
+                                 small=True)
+            sync_btn.pack(side="left", padx=(2, 0))
+            if locked:
+                sync_btn.config(state="disabled", fg=SUB)
+            self._aaf_sync_btns[base] = sync_btn
+            self._aaf_refresh_sync_btn(base, sync_btn)
+            # A sync still running for this source keeps spinning on the
+            # redrawn row (see _aaf_do_sync).
+            if base in getattr(self, "_aaf_syncing", {}):
+                sync_btn.config(text=self._aaf_syncing[base],
+                                state="disabled", fg=SUB)
 
-                # ── REFERENCE AUDIO (left, fixed width) ───────────────────────
-                aud_frame    = tk.Frame(row1, bg=bg, width=_aw_s)
-                aud_frame.pack_propagate(False)
-                aud_frame.pack(side="left", fill="y")
-                aud_dd_state = "disabled" if locked else "readonly"
-                aud_dd = _FlatDropdown(aud_frame, textvariable=aud_disp,
-                                       values=aud_options,
-                                       state=aud_dd_state, font=FB)
-                aud_dd.pack(fill="x", expand=True)
+            # ⏭ TRY NEXT — cycles through alternate sync candidates
+            # right here on the row so the user doesn't have to open
+            # ALIGN just to audition a runner-up.  Only visible when
+            # auto-sync produced one or more alternates; otherwise
+            # packed-hidden so the row width stays consistent.
+            nxt_btn = tk.Label(
+                row1, text="⏭ NEXT", font=FB, bg=SURF3, fg=SUB,
+                cursor="hand2", padx=6, pady=2, bd=0,
+                highlightbackground=BORDER, highlightthickness=1)
+            nxt_btn.bind(
+                "<Enter>", lambda e, w=nxt_btn: w.config(bg=ACCENT))
+            nxt_btn.bind(
+                "<Leave>", lambda e, w=nxt_btn: w.config(bg=SURF3))
+            nxt_btn.bind(
+                "<ButtonRelease-1>",
+                lambda e, b=base: self._aaf_cycle_candidate(b))
+            if not hasattr(self, "_aaf_try_next_btns"):
+                self._aaf_try_next_btns = {}
+            self._aaf_try_next_btns[base] = nxt_btn
+            # Pack only when there are alternates to audition.
+            self._aaf_refresh_try_next_btn(base)
 
-                # ── OFFSET (left, fixed width) ─────────────────────────────────
-                off_frame = tk.Frame(row1, bg=bg, width=_ow_s)
-                off_frame.pack_propagate(False)
-                off_frame.pack(side="left", fill="y")
-                tk.Label(off_frame,
-                         textvariable=self._aaf_source_offset_vars[base],
-                         font=FB, bg=bg, fg=ACCENT,
-                         anchor="e").pack(side="left", fill="x", expand=True)
-                tk.Label(off_frame, text="s", font=FB, bg=bg,
-                         fg=SUB).pack(side="left", padx=(2, 4))
+            # Audio dropdown trace — keep the canonical full-path var
+            # in sync with the displayed label AND fully invalidate
+            # any prior sync state for this source.  Mirror of the
+            # _on_vid_change invalidation: changing the reference
+            # audio invalidates the offset just as fully as changing
+            # the video does.  The previous version only cleared the
+            # sync label, leaving offset / sync_var / state dot /
+            # lock / candidates stale — TRY NEXT would still cycle
+            # offsets measured against the previous reference audio.
+            def _on_aud_change(*args, b=base, dv=aud_disp,
+                               _last=[aud_disp.get()]):
+                fn   = dv.get()
+                full = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}.get(fn, "")
+                self._aaf_source_syncaudio_vars[b].set(full)
+                # Same reference audio re-set (setup restore): not a
+                # change; the offset measured against it still holds.
+                if fn == _last[0]:
+                    return
+                _last[0] = fn
+                lkv = self._aaf_sync_locked_vars.get(b)
+                was_locked = lkv and lkv.get()
+                ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
+                lv  = self._aaf_source_sync_label_vars.get(b)
+                had_label = lv and lv.get()
+                if was_locked or ssv or had_label:
+                    if lkv: lkv.set(False)
+                    ov = self._aaf_source_offset_vars.get(b)
+                    if ov: ov.set("0.000")
+                    sv2 = self._aaf_source_sync_vars.get(b)
+                    if sv2: sv2.set(False)
+                    if lv: lv.set("")
+                    self._aaf_set_sync_state(b, "")
+                    self._aaf_set_drift(b, None)
+                    self._aaf_clear_sync_candidates(b)
+                    btn_ = self._aaf_sync_btns.get(b)
+                    if btn_:
+                        self._aaf_refresh_sync_btn(b, btn_)
+                    # Refresh row layout so lock icon / state colour update.
+                    self._ui(self._rebuild_aaf_source_rows)
+            aud_disp.trace_add("write", _on_aud_change)
+        return container
 
-                # ── SYNC controls (left, remaining space) ─────────────────────
-                # 🔒 Lock toggle
-                lock_text = "\U0001f512" if locked else "\U0001f513"
-                lock_fg   = WARN if locked else SUB
-                lock_btn  = tk.Label(row1, text=lock_text, font=FB, bg=SURF3,
-                                     fg=lock_fg, cursor="hand2", padx=6, pady=2,
-                                     bd=0, highlightbackground=BORDER,
-                                     highlightthickness=1)
-                lock_btn.pack(side="left", padx=(8, 2))
-                lock_btn.bind("<Enter>",  lambda e, w=lock_btn: w.config(bg=ACCENT))
-                lock_btn.bind("<Leave>",  lambda e, w=lock_btn: w.config(bg=SURF3))
-                lock_btn.bind("<ButtonRelease-1>",
-                              lambda e, b=base: self._aaf_toggle_lock(b))
-                self._aaf_lock_btns[base] = lock_btn
+    def _aaf_build_hidden_section(self, parent):
+        """The collapsible list of hidden sources under the ASSIGN rows."""
+        _hidden_set = getattr(self, "_aaf_hidden_sources", set())
+        _hidden_list = [b for b in self._aaf_sources if b in _hidden_set]
+        if _hidden_list:
+            if not hasattr(self, "_aaf_hidden_expanded"):
+                self._aaf_hidden_expanded = False
+            _exp = self._aaf_hidden_expanded
+            _count = len(_hidden_list)
 
-                # ✓ ACCEPT
-                cfm_text, cfm_fg = self._confirm_btn_style(state_val)
-                cfm_btn = tk.Label(row1, text=cfm_text, font=FB, bg=SURF3,
-                                   fg=cfm_fg, cursor="hand2", padx=6, pady=2,
-                                   bd=0, highlightbackground=BORDER,
-                                   highlightthickness=1)
-                cfm_btn.pack(side="left", padx=(2, 0))
-                cfm_btn.bind("<Enter>",  lambda e, w=cfm_btn: w.config(bg=ACCENT))
-                cfm_btn.bind("<Leave>",  lambda e, w=cfm_btn: w.config(bg=SURF3))
-                cfm_btn.bind("<ButtonRelease-1>",
-                             lambda e, b=base: self._aaf_confirm_sync(b))
-                if locked:
-                    cfm_btn.config(state="disabled", fg=SUB)
-                self._aaf_confirm_btns[base] = cfm_btn
+            h_hdr = tk.Frame(parent, bg=SURF3, cursor="hand2")
+            h_hdr.pack(fill="x", pady=(10, 0))
+            tk.Label(h_hdr,
+                     text=("  \u25be " if _exp else "  \u25b8 ") +
+                          "HIDDEN  ({})".format(_count),
+                     font=FB, bg=SURF3, fg=SUB,
+                     anchor="w", pady=4).pack(side="left")
+            tk.Label(h_hdr, text="click to expand / collapse",
+                     font=FB, bg=SURF3, fg=BORDER,
+                     anchor="e", padx=8).pack(side="right")
 
-                # ▶ PREVIEW
-                # Initial state must consult _aaf_qa_playing so a row
-                # rebuild during QA playback (page toggle, ALIGN accept,
-                # drag-select apply, etc.) doesn't show "play" on a
-                # button whose audio is actively playing.  The previous
-                # always-default construction left the button reading
-                # PREVIEW while audio kept rolling; the eventual
-                # _qa_poll-driven _aaf_qa_stop then tried to reset an
-                # already-default-styled (new) widget \u2014 silent no-op.
-                _is_playing = getattr(self, "_aaf_qa_playing", None) == base
-                _qa_text    = "\u25a0 STOP" if _is_playing else "\u25b6 PREVIEW"
-                _qa_fg      = WARN          if _is_playing else TEXT
-                prev_btn = tk.Label(row1, text=_qa_text, font=FB, bg=SURF3,
-                                    fg=_qa_fg, cursor="hand2", padx=6, pady=2, bd=0,
-                                    highlightbackground=BORDER, highlightthickness=1)
-                prev_btn.pack(side="left", padx=(2, 0))
-                prev_btn.bind("<Enter>",  lambda e, w=prev_btn: w.config(bg=ACCENT))
-                prev_btn.bind("<Leave>",  lambda e, w=prev_btn: w.config(bg=SURF3))
-                prev_btn.bind("<ButtonRelease-1>",
-                              lambda e, b=base: self._aaf_qa_toggle(b))
-                self._aaf_qa_btns[base] = prev_btn
+            h_body = tk.Frame(parent, bg=SURF3)
+            if _exp:
+                h_body.pack(fill="x")
+                for _hb in _hidden_list:
+                    _hr = tk.Frame(h_body, bg=SURF3)
+                    _hr.pack(fill="x", padx=12, pady=1)
+                    tk.Label(_hr, text=_hb, font=FB, bg=SURF3, fg=SUB,
+                             anchor="w").pack(side="left", fill="x", expand=True)
+                    _show = tk.Label(_hr, text="SHOW", font=FB, bg=SURF3,
+                                     fg=ACCENT, cursor="hand2", padx=8)
+                    _show.pack(side="right")
+                    _show.bind("<Button-1>",
+                               lambda e, b=_hb: self._aaf_unhide_source(b))
 
-                # ALIGN…
-                align_btn = tk.Label(row1, text="ALIGN\u2026", font=FB, bg=SURF3,
-                                     fg=SUB if locked else TEXT,
-                                     cursor="" if locked else "hand2",
-                                     padx=6, pady=2, bd=0,
-                                     highlightbackground=BORDER, highlightthickness=1)
-                align_btn.pack(side="left", padx=(2, 0))
-                if not locked:
-                    align_btn.bind("<Enter>",  lambda e, w=align_btn: w.config(bg=ACCENT))
-                    align_btn.bind("<Leave>",  lambda e, w=align_btn: w.config(bg=SURF3))
-                    align_btn.bind("<ButtonRelease-1>",
-                                   lambda e, b=base: self._aaf_open_align(b))
-                self._aaf_align_btns[base] = align_btn
-                # Grey out when the assigned video carries no audio track
-                # (kicks off the probe on first sight of the file).
-                self._aaf_refresh_align_btn(base)
-
-                # ↺ Reset
-                rst_btn = tk.Label(row1, text="\u21ba", font=FB, bg=SURF3,
-                                   fg=SUB, cursor="hand2", padx=6, pady=2, bd=0,
-                                   highlightbackground=BORDER, highlightthickness=1)
-                rst_btn.pack(side="left", padx=(2, 0))
-                if locked:
-                    rst_btn.config(state="disabled", cursor="")
-                else:
-                    rst_btn.bind("<Enter>",  lambda e, w=rst_btn: w.config(bg="#5a2020"))
-                    rst_btn.bind("<Leave>",  lambda e, w=rst_btn: w.config(bg=SURF3))
-                    rst_btn.bind("<ButtonRelease-1>",
-                                 lambda e, b=base: self._aaf_reset_sync(b))
-
-                # Slate-aware toggle — when checked, the next SYNC run uses
-                # GCC-PHAT weighting to lock onto the slate transient peak
-                # instead of treating it as broadband noise.  Useful when
-                # the clapper is the strongest/cleanest sync signal in
-                # short clips where the speech-rhythm xcorr is ambiguous.
-                slate_var = self._aaf_source_has_slate_vars[base]
-                slate_ck = tk.Label(row1,
-                    text="☑ slate" if slate_var.get() else "☐ slate",
-                    font=FB, bg=BG,
-                    fg=ACCENT if slate_var.get() else SUB,
-                    cursor="hand2", padx=4)
-                slate_ck.pack(side="left", padx=(8, 0))
-                if locked:
-                    slate_ck.config(cursor="")
-                else:
-                    def _toggle_slate(_e=None, b=base, w=slate_ck,
-                                       v=slate_var):
-                        v.set(not v.get())
-                        w.config(text="☑ slate" if v.get() else "☐ slate",
-                                 fg=ACCENT if v.get() else SUB)
-                    slate_ck.bind("<Button-1>", _toggle_slate)
-
-                # SYNC button
-                sync_btn = self._btn(row1, "SYNC",
-                                     lambda b=base: self._aaf_do_sync(b),
-                                     small=True)
-                sync_btn.pack(side="left", padx=(2, 0))
-                if locked:
-                    sync_btn.config(state="disabled", fg=SUB)
-                self._aaf_sync_btns[base] = sync_btn
-                self._aaf_refresh_sync_btn(base, sync_btn)
-
-                # ⏭ TRY NEXT — cycles through alternate sync candidates
-                # right here on the row so the user doesn't have to open
-                # ALIGN just to audition a runner-up.  Only visible when
-                # auto-sync produced one or more alternates; otherwise
-                # packed-hidden so the row width stays consistent.
-                nxt_btn = tk.Label(
-                    row1, text="⏭ NEXT", font=FB, bg=SURF3, fg=SUB,
-                    cursor="hand2", padx=6, pady=2, bd=0,
-                    highlightbackground=BORDER, highlightthickness=1)
-                nxt_btn.bind(
-                    "<Enter>", lambda e, w=nxt_btn: w.config(bg=ACCENT))
-                nxt_btn.bind(
-                    "<Leave>", lambda e, w=nxt_btn: w.config(bg=SURF3))
-                nxt_btn.bind(
-                    "<ButtonRelease-1>",
-                    lambda e, b=base: self._aaf_cycle_candidate(b))
-                if not hasattr(self, "_aaf_try_next_btns"):
-                    self._aaf_try_next_btns = {}
-                self._aaf_try_next_btns[base] = nxt_btn
-                # Pack only when there are alternates to audition.
-                self._aaf_refresh_try_next_btn(base)
-
-                # Audio dropdown trace — keep the canonical full-path var
-                # in sync with the displayed label AND fully invalidate
-                # any prior sync state for this source.  Mirror of the
-                # _on_vid_change invalidation: changing the reference
-                # audio invalidates the offset just as fully as changing
-                # the video does.  The previous version only cleared the
-                # sync label, leaving offset / sync_var / state dot /
-                # lock / candidates stale — TRY NEXT would still cycle
-                # offsets measured against the previous reference audio.
-                def _on_aud_change(*args, b=base, dv=aud_disp,
-                                   _last=[aud_disp.get()]):
-                    fn   = dv.get()
-                    full = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}.get(fn, "")
-                    self._aaf_source_syncaudio_vars[b].set(full)
-                    # Same reference audio re-set (setup restore): not a
-                    # change; the offset measured against it still holds.
-                    if fn == _last[0]:
-                        return
-                    _last[0] = fn
-                    lkv = self._aaf_sync_locked_vars.get(b)
-                    was_locked = lkv and lkv.get()
-                    ssv = self._aaf_sync_state_vars.get(b, tk.StringVar()).get()
-                    lv  = self._aaf_source_sync_label_vars.get(b)
-                    had_label = lv and lv.get()
-                    if was_locked or ssv or had_label:
-                        if lkv: lkv.set(False)
-                        ov = self._aaf_source_offset_vars.get(b)
-                        if ov: ov.set("0.000")
-                        sv2 = self._aaf_source_sync_vars.get(b)
-                        if sv2: sv2.set(False)
-                        if lv: lv.set("")
-                        self._aaf_set_sync_state(b, "")
-                        self._aaf_set_drift(b, None)
-                        self._aaf_clear_sync_candidates(b)
-                        btn_ = self._aaf_sync_btns.get(b)
-                        if btn_:
-                            self._aaf_refresh_sync_btn(b, btn_)
-                        # Refresh row layout so lock icon / state colour update.
-                        self._ui(self._rebuild_aaf_source_rows)
-                aud_disp.trace_add("write", _on_aud_change)
-
-        # Show placeholder when SYNC page has nothing to display
-        if mode == "sync":
-            visible = [b for b in self._aaf_sources
-                       if self._aaf_needs_sync_vars.get(b, tk.BooleanVar()).get()]
-            if not visible:
-                tk.Label(self._aaf_assign_frame,
-                         text="No sources marked for sync.\n"
-                              "Go to SOURCE ASSIGN and tick the sync checkbox on each source.",
-                         font=FB, bg=SURF, fg=SUB, justify="center",
-                         pady=20).pack(fill="x")
-
-        # ── Hidden sources collapsible section (assign mode only) ─────────────
-        if mode == "assign":
-            _hidden_set = getattr(self, "_aaf_hidden_sources", set())
-            _hidden_list = [b for b in self._aaf_sources if b in _hidden_set]
-            if _hidden_list:
-                if not hasattr(self, "_aaf_hidden_expanded"):
-                    self._aaf_hidden_expanded = False
-                _exp = self._aaf_hidden_expanded
-                _count = len(_hidden_list)
-
-                h_hdr = tk.Frame(self._aaf_assign_frame, bg=SURF3, cursor="hand2")
-                h_hdr.pack(fill="x", pady=(10, 0))
-                tk.Label(h_hdr,
-                         text=("  \u25be " if _exp else "  \u25b8 ") +
-                              "HIDDEN  ({})".format(_count),
-                         font=FB, bg=SURF3, fg=SUB,
-                         anchor="w", pady=4).pack(side="left")
-                tk.Label(h_hdr, text="click to expand / collapse",
-                         font=FB, bg=SURF3, fg=BORDER,
-                         anchor="e", padx=8).pack(side="right")
-
-                h_body = tk.Frame(self._aaf_assign_frame, bg=SURF3)
-                if _exp:
-                    h_body.pack(fill="x")
-                    for _hb in _hidden_list:
-                        _hr = tk.Frame(h_body, bg=SURF3)
+            def _toggle_hidden(e, body=h_body, hdr_lbl=h_hdr.winfo_children()[0],
+                               lst=_hidden_list):
+                self._aaf_hidden_expanded = not getattr(self, "_aaf_hidden_expanded", False)
+                ex = self._aaf_hidden_expanded
+                hdr_lbl.config(text=("  \u25be " if ex else "  \u25b8 ") +
+                                    "HIDDEN  ({})".format(len(lst)))
+                if ex:
+                    body.pack(fill="x")
+                    for _hb in lst:
+                        _hr = tk.Frame(body, bg=SURF3)
                         _hr.pack(fill="x", padx=12, pady=1)
                         tk.Label(_hr, text=_hb, font=FB, bg=SURF3, fg=SUB,
                                  anchor="w").pack(side="left", fill="x", expand=True)
-                        _show = tk.Label(_hr, text="SHOW", font=FB, bg=SURF3,
-                                         fg=ACCENT, cursor="hand2", padx=8)
-                        _show.pack(side="right")
-                        _show.bind("<Button-1>",
-                                   lambda e, b=_hb: self._aaf_unhide_source(b))
-
-                def _toggle_hidden(e, body=h_body, hdr_lbl=h_hdr.winfo_children()[0],
-                                   lst=_hidden_list):
-                    self._aaf_hidden_expanded = not getattr(self, "_aaf_hidden_expanded", False)
-                    ex = self._aaf_hidden_expanded
-                    hdr_lbl.config(text=("  \u25be " if ex else "  \u25b8 ") +
-                                        "HIDDEN  ({})".format(len(lst)))
-                    if ex:
-                        body.pack(fill="x")
-                        for _hb in lst:
-                            _hr = tk.Frame(body, bg=SURF3)
-                            _hr.pack(fill="x", padx=12, pady=1)
-                            tk.Label(_hr, text=_hb, font=FB, bg=SURF3, fg=SUB,
-                                     anchor="w").pack(side="left", fill="x", expand=True)
-                            _s = tk.Label(_hr, text="SHOW", font=FB, bg=SURF3,
-                                          fg=ACCENT, cursor="hand2", padx=8)
-                            _s.pack(side="right")
-                            _s.bind("<Button-1>",
-                                    lambda ev, b=_hb: self._aaf_unhide_source(b))
-                    else:
-                        for _w in list(body.winfo_children()):
-                            _w.destroy()
-                        body.pack_forget()
-                h_hdr.bind("<Button-1>", _toggle_hidden)
-                for _ch in h_hdr.winfo_children():
-                    _ch.bind("<Button-1>", _toggle_hidden)
-
-        self._aaf_auto_match()
-
-        # The custom track map lists cameras by assignment and slot count,
-        # both of which may just have changed.
-        if getattr(self, "_aaf_group_var", None) is not None and \
-                self._aaf_group_var.get() == "custom":
-            try:
-                self._aaf_build_track_map_panel()
-            except tk.TclError:
-                pass
-
-        # If opened via the generic Open Session from the home screen, restore
-        # any saved setup state that was stashed before navigating here.
-        pending = getattr(self, "_pending_aaf_setup", None)
-        if pending is not None:
-            self._pending_aaf_setup = None
-            after = getattr(self, "_pending_aaf_after_restore", None)
-            self._pending_aaf_after_restore = None
-            def _apply(d=pending, after=after):
-                self._aaf_restore_setup(d)
-                if after is not None:
-                    after()
-            self._ui(_apply)
+                        _s = tk.Label(_hr, text="SHOW", font=FB, bg=SURF3,
+                                      fg=ACCENT, cursor="hand2", padx=8)
+                        _s.pack(side="right")
+                        _s.bind("<Button-1>",
+                                lambda ev, b=_hb: self._aaf_unhide_source(b))
+                else:
+                    for _w in list(body.winfo_children()):
+                        _w.destroy()
+                    body.pack_forget()
+            h_hdr.bind("<Button-1>", _toggle_hidden)
+            for _ch in h_hdr.winfo_children():
+                _ch.bind("<Button-1>", _toggle_hidden)
 
     # FPS priority order: higher quality / higher frame rate wins
     _FPS_PRIORITY = [
@@ -2049,7 +2228,6 @@ class AafWorkflowMixin:
     def _aaf_auto_match(self):
         """Auto-assign video AND reference audio files to unassigned sources."""
         vid_options = ["— no video —"] + [self._aaf_vid_label(p) for p in self._aaf_video_paths]
-        aud_by_name = {self._aaf_aud_label(p): p for p in self._aaf_audio_paths}
 
         for base in self._aaf_sources:
             # Video auto-match (never override a manual assignment).
@@ -2066,21 +2244,19 @@ class AafWorkflowMixin:
                     if fn in vid_options:
                         sv.set(fn)
 
-            # Audio auto-match (never override a manual assignment).
-            # Same disambiguation as video: the display var carries the
-            # collision-safe label so the on-change trace can map it back
-            # to the right physical path.
-            aud_disp = self._aaf_source_audio_disp_vars.get(base)
+            # Audio auto-match (never override a manual assignment).  The
+            # canonical full path is set directly -- the SYNC row's picker
+            # may not be drawn yet -- and the picker shows it through the
+            # same collision-safe label as video.
             full_var = self._aaf_source_syncaudio_vars.get(base)
-            if (aud_disp and full_var
-                    and aud_disp.get() == "— no audio —"
-                    and self._aaf_audio_paths):
+            if (full_var is not None and self._aaf_audio_paths
+                    and full_var.get() not in self._aaf_audio_paths):
                 ap = match_source_to_video(base, self._aaf_audio_paths)
                 if ap:
-                    fn = self._aaf_aud_label(ap)
-                    if fn in aud_by_name:
-                        # Set display var; the trace will update the full-path var
-                        aud_disp.set(fn)
+                    full_var.set(ap)
+                    aud_disp = self._aaf_source_audio_disp_vars.get(base)
+                    if aud_disp is not None:
+                        aud_disp.set(self._aaf_aud_label(ap))
 
     # ── Sync checkbox drag-select helpers ────────────────────────────────────
 
@@ -2819,10 +2995,13 @@ class AafWorkflowMixin:
         """Run sync detection for this source using the selected reference audio."""
         if self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get():
             return
+        if not hasattr(self, "_aaf_syncing"):
+            self._aaf_syncing = {}   # base -> spinner text, while its sync runs
+        if base in self._aaf_syncing:
+            return                   # already running (SYNC ALL pressed twice)
         if not self._aaf_ffmpeg_ready():
             return
         self._aaf_push_undo(base)
-        btn = self._aaf_sync_btns.get(base)
 
         # The reference audio is whatever the user has selected in the dropdown.
         # If nothing is selected yet, try one last auto-match.
@@ -2887,25 +3066,33 @@ class AafWorkflowMixin:
         _has_slate_flag = bool(self._aaf_source_has_slate_vars.get(
             base, tk.BooleanVar()).get())
 
-        # Disable button and start spinner animation while running
-        if btn:
-            btn.config(text="SYNCING \u00b7  ", state="disabled", fg=SUB)
-
-        _animating = [True]
+        # Disable button and start spinner animation while running.  The row
+        # can be redrawn mid-sync (a page switch, another row's lock), so
+        # every step looks the button up afresh rather than holding on to
+        # the one there now, and a redrawn row reads _aaf_syncing to come
+        # back up spinning.
         _spin_frames = ["SYNCING \u00b7  ", "SYNCING \u00b7\u00b7 ", "SYNCING \u00b7\u00b7\u00b7"]
         _spin_idx    = [0]
+        self._aaf_syncing[base] = _spin_frames[0]
+
+        def _show_spin():
+            btn = self._aaf_sync_btns.get(base)
+            if btn is not None:
+                try:
+                    btn.config(text=self._aaf_syncing[base],
+                               state="disabled", fg=SUB)
+                except tk.TclError:
+                    pass
 
         def _spin_tick():
-            if not _animating[0]:
+            if base not in self._aaf_syncing:
                 return
-            if btn:
-                try:
-                    btn.config(text=_spin_frames[_spin_idx[0] % len(_spin_frames)])
-                except Exception:
-                    return
             _spin_idx[0] += 1
+            self._aaf_syncing[base] = _spin_frames[_spin_idx[0] % len(_spin_frames)]
+            _show_spin()
             self.after(350, _spin_tick)
 
+        _show_spin()
         self.after(350, _spin_tick)
 
         _ap_basename = basename(ap)
@@ -2949,20 +3136,28 @@ class AafWorkflowMixin:
                     _sem.release()
 
         def _done(fut):
-            _animating[0] = False
             try:
                 offset, confidence, best_vp, alt_candidates, drift = fut.result()
             except Exception as exc:
+                # Not `exc` inside _err: Python unbinds it when this block
+                # ends, before _err runs, so the reason was never shown.
+                msg = str(exc)
                 def _err():
+                    self._aaf_syncing.pop(base, None)
                     lv = self._aaf_source_sync_label_vars.get(base)
                     if lv: lv.set("\u26a0 error")
+                    btn = self._aaf_sync_btns.get(base)
                     if btn:
                         btn.config(text="\u26a0 error", fg="#e05050", state="normal")
-                    messagebox.showerror("Sync Failed", str(exc))
+                    messagebox.showerror("Sync Failed", msg)
                 self._ui(_err)
                 return
 
             def _apply():
+                self._aaf_syncing.pop(base, None)
+                # Whether the SYNC row is up to date going in (see the end).
+                was_current = self._aaf_row_is_current("sync", base)
+                video_before = self._aaf_source_file_vars[base].get()
                 # For multi-file sources, promote the winning file to slot-1 so
                 # the build step always uses the sync-verified file for all clips.
                 # Use _aaf_vid_label (not bare basename) so the stored value
@@ -3054,6 +3249,10 @@ class AafWorkflowMixin:
 
                 lv = self._aaf_source_sync_label_vars.get(base)
                 if lv: lv.set(lbl)
+                # Stop the spinner here: a re-sync that lands on exactly the
+                # result already shown leaves the row's state unchanged, so
+                # the redraw below would skip it.
+                btn = self._aaf_sync_btns.get(base)
                 if btn:
                     btn.config(state="normal")
                     self._aaf_refresh_sync_btn(base, btn)
@@ -3067,6 +3266,18 @@ class AafWorkflowMixin:
                     self._aaf_refresh_try_next_btn(base)
                 except Exception:
                     pass
+
+                # That is every part of the SYNC row a result changes --
+                # verdict, offset, dot, ACCEPT, TRY NEXT -- so a row that was
+                # up to date going in still is: record it rather than redraw
+                # it (SYNC ALL lands a dozen results at once, and a redraw
+                # each stalled the window).  A row already behind, or whose
+                # video was just swapped, is redrawn.
+                if (was_current
+                        and self._aaf_source_file_vars[base].get() == video_before):
+                    self._aaf_mark_row_current("sync", base)
+                else:
+                    self._rebuild_aaf_source_rows()
 
             self._ui(_apply)
 
@@ -3502,7 +3713,8 @@ class AafWorkflowMixin:
             if b in _multi_mode_snap and b in getattr(self, "_aaf_source_multi_mode_vars", {}):
                 self._aaf_source_multi_mode_vars[b].set(_multi_mode_snap[b])
 
-        self._rebuild_aaf_source_rows()
+        # Everything may have changed: redraw the page outright.
+        self._rebuild_aaf_source_rows(force=True)
 
     def _aaf_sync_restore(self, base, snap):
         """Apply a snapshot dict to *base* and refresh the UI."""
@@ -3709,6 +3921,25 @@ class AafWorkflowMixin:
                 _FlatDropdown(r, self._aaf_track_map_var(base, slot),
                               self._TRACK_MAP_CHOICES, font=FB, width=10
                               ).pack(side="left")
+        self._aaf_track_map_sig = self._aaf_track_map_signature()
+
+    def _aaf_track_map_signature(self):
+        """What the custom track map lists: each camera, and the var its
+        dropdown is bound to.  The panel is redrawn when this changes."""
+        hidden = getattr(self, "_aaf_hidden_sources", set())
+        tm_vars = getattr(self, "_aaf_track_map_vars", {})
+        sig = []
+        for base in getattr(self, "_aaf_sources", []):
+            if base in hidden:
+                continue
+            sv = self._aaf_source_file_vars.get(base)
+            labels = [sv.get() if sv is not None else "— no video —"]
+            labels += [ev.get() for ev in
+                       getattr(self, "_aaf_source_extra_vars", {}).get(base, [])]
+            n = max(1, getattr(self, "_aaf_source_slot_counts", {}).get(base, 1))
+            sig.append((base, n, tuple(labels[:n]),
+                        tuple(id(tm_vars.get((base, s))) for s in range(n))))
+        return tuple(sig)
 
     def _aaf_get_drift(self, base):
         """Camera-clock drift for *base* as {"ppm", "t_ref", ...} or None."""
@@ -3901,9 +4132,10 @@ class AafWorkflowMixin:
             try:
                 wav = fut.result()
             except Exception as exc:
+                msg = str(exc)    # `exc` is unbound by the time _err runs
                 def _err():
                     self._aaf_qa_stop()
-                    messagebox.showerror("QA Play failed", str(exc))
+                    messagebox.showerror("QA Play failed", msg)
                 self._ui(_err)
                 return
             if not wav:
@@ -4958,7 +5190,7 @@ class AafWorkflowMixin:
 
         # Single rebuild + FPS probe for the entire load
         if hasattr(self, "_aaf_assign_frame"):
-            self._rebuild_aaf_source_rows()
+            self._rebuild_aaf_source_rows(force=True)
         self._aaf_schedule_detect_fps()
 
         # Restore other settings

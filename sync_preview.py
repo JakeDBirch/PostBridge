@@ -37,6 +37,8 @@ _PLAY_DUR_DEFAULT = 1                                # index into _PLAY_DUR_OPTI
 _PLAYHEAD_COLOR = "#e070c0"
 _FRAME_S      = 1.0 / 60   # one frame at 60 fps
 _NUDGE_SAMP   = int(_FRAME_S * _SR)  # samples per single-frame nudge
+_PEAK_SHIFT   = 6          # finest peak level: min/max per 2**6 = 64 samples
+_PEAK_SUBDIV  = 16         # blocks per pixel, at least, when drawing from peaks
 
 # Blended fill colours (tinted towards BG so overlapping regions stay readable)
 _REF_FILL = "#1a4038"      # teal tinted dark
@@ -82,6 +84,8 @@ class SyncPreviewDialog:
         # Waveform data (populated by background thread)
         self._vid_samples = None
         self._ref_samples = None
+        self._vid_peaks   = None      # see _build_peaks
+        self._ref_peaks   = None
 
         # View state
         self._view_start = 0          # first visible sample (in ref coords)
@@ -315,7 +319,7 @@ class SyncPreviewDialog:
             vid = vid / peak_v * 0.85
         if peak_r > 1e-6:
             ref = ref / peak_r * 0.85
-        return vid, ref
+        return vid, ref, self._build_peaks(vid), self._build_peaks(ref)
 
     def _extraction_done(self, fut):
         # Guard against callbacks firing after the window was closed
@@ -326,15 +330,20 @@ class SyncPreviewDialog:
             return
 
         try:
-            vid, ref = fut.result()
+            vid, ref, vid_peaks, ref_peaks = fut.result()
         except Exception as exc:
+            # Python unbinds `exc` when this block ends, so _err -- which
+            # runs later -- must not refer to it: it raised NameError, which
+            # its own except swallowed, and a failed extraction sat on
+            # "loading waveforms" for good instead of saying why.
+            msg = str(exc)
             def _err():
                 try:
                     # justify/wraplength so a multi-line diagnostic (e.g. the
                     # cloud-placeholder report) stays inside the canvas
                     # instead of running off both edges.
                     self._loading_lbl.config(
-                        text="Extraction failed:\n\n{}".format(exc),
+                        text="Extraction failed:\n\n{}".format(msg),
                         justify="left", wraplength=520, fg=WARN)
                     # A multi-line diagnostic is taller than the canvas
                     # when centred, so it runs off both ends and the one
@@ -354,6 +363,8 @@ class SyncPreviewDialog:
                     return
                 self._vid_samples = vid
                 self._ref_samples = ref
+                self._vid_peaks   = vid_peaks
+                self._ref_peaks   = ref_peaks
                 self._loading_lbl.destroy()
                 # Initial zoom: show the full reference file
                 self._canvas_w = max(100, self._cv.winfo_width())
@@ -369,12 +380,48 @@ class SyncPreviewDialog:
     # ── Waveform Rendering ────────────────────────────────────────────────
 
     @staticmethod
-    def _compute_bins(samples, width, view_start, view_end):
+    def _build_peaks(samples):
+        """Min/max pyramid of *samples*: level k holds the min and max of
+        every 2**k-sample block, from k = _PEAK_SHIFT up until a level is
+        down to a few hundred blocks.  A zoomed-out view is then binned from
+        a few thousand of these instead of every sample it spans -- on a
+        two-hour recording that is 60 million samples per waveform, rescanned
+        on every redraw, which made each drag step of the waveform ~40 ms.
+
+        Returns [(k, mins, maxs), ...], finest level first.  The partial
+        block at the end is left out; at the zooms that use these levels it
+        is narrower than a pixel."""
+        import numpy as _np
+        levels = []
+        shift  = _PEAK_SHIFT
+        n = len(samples) >> shift
+        if n < 1:
+            return levels
+        blocks = samples[:n << shift].reshape(n, 1 << shift)
+        mins, maxs = blocks.min(axis=1), blocks.max(axis=1)
+        while True:
+            levels.append((shift, mins, maxs))
+            if len(mins) < 512:
+                break
+            m = len(mins) // 2
+            mins = _np.minimum(mins[0:2 * m:2], mins[1:2 * m:2])
+            maxs = _np.maximum(maxs[0:2 * m:2], maxs[1:2 * m:2])
+            shift += 1
+        return levels
+
+    @staticmethod
+    def _compute_bins(samples, width, view_start, view_end, peaks=None):
         """Downsample samples[view_start:view_end] to *width* min/max bins.
 
         view_start / view_end may extend outside [0, len(samples)].
         Out-of-bounds regions are zero-padded so the waveform holds its
         shape and position rather than stretching to fill the canvas.
+
+        *peaks* (from _build_peaks) answers wide pixels from the coarsest
+        level that still puts _PEAK_SUBDIV blocks in each, rather than from
+        the raw samples.  A block straddling two pixels counts toward one of
+        them, so a pixel's edges are only as exact as a block -- a sixteenth
+        of a pixel here.
         """
         import numpy as _np
         view_start = int(view_start)
@@ -399,8 +446,31 @@ class SyncPreviewDialog:
         if px_w <= 0:
             return mins, maxs
 
+        n = clamp_e - clamp_s
+        bin_size = n // px_w
+        level = None
+        for lv in (peaks or ()):
+            if (1 << lv[0]) * _PEAK_SUBDIV <= bin_size:
+                level = lv           # coarsest level fine enough for a pixel
+            else:
+                break
+        if level is not None:
+            shift, lmins, lmaxs = level
+            # Pixel j spans samples [clamp_s + j*bin_size, +bin_size): the
+            # blocks starting in that span.  A pixel holds _PEAK_SUBDIV or
+            # more blocks, so the starts strictly increase.
+            starts = (clamp_s + _np.arange(px_w) * bin_size) >> shift
+            end    = min(len(lmins), (clamp_s + px_w * bin_size) >> shift)
+            k      = int(_np.count_nonzero(starts < end))
+            if k:
+                seg = starts[:k] - starts[0]
+                mins[px_start:px_start + k] = _np.minimum.reduceat(
+                    lmins[starts[0]:end], seg)
+                maxs[px_start:px_start + k] = _np.maximum.reduceat(
+                    lmaxs[starts[0]:end], seg)
+            return mins, maxs
+
         chunk = samples[clamp_s:clamp_e]
-        n = len(chunk)
         if n == 0:
             return mins, maxs
         if n <= px_w:
@@ -433,17 +503,18 @@ class SyncPreviewDialog:
         # ── Helper: build a waveform polygon from min/max bins ─────────────
         def _wave_poly(bins_min, bins_max):
             """Return a flat coordinate list tracing max L→R then min R→L."""
-            pts = []
-            for i in range(w):
-                pts.append(i)
-                pts.append(int(mid - bins_max[i] * scale))
-            for i in range(w - 1, -1, -1):
-                pts.append(i)
-                pts.append(int(mid - bins_min[i] * scale))
-            return pts
+            import numpy as _np
+            xs  = _np.arange(w)
+            pts = _np.empty(4 * w, dtype=int)
+            pts[0:2 * w:2]     = xs
+            pts[1:2 * w:2]     = (mid - bins_max * scale).astype(int)
+            pts[2 * w::2]      = xs[::-1]
+            pts[2 * w + 1::2]  = (mid - bins_min * scale).astype(int)[::-1]
+            return pts.tolist()
 
         # ── Reference waveform (fixed) ────────────────────────────────────
-        r_min, r_max = self._compute_bins(self._ref_samples, w, vs, ve)
+        r_min, r_max = self._compute_bins(self._ref_samples, w, vs, ve,
+                                          self._ref_peaks)
         ref_poly = _wave_poly(r_min, r_max)
         if len(ref_poly) >= 6:
             cv.create_polygon(ref_poly, fill=_REF_FILL, outline=WAVE_REF,
@@ -452,7 +523,8 @@ class SyncPreviewDialog:
         # ── Video waveform (shifted by offset) ────────────────────────────
         vid_vs = vs - self._offset_samples
         vid_ve = vid_vs + w * spp
-        v_min, v_max = self._compute_bins(self._vid_samples, w, vid_vs, vid_ve)
+        v_min, v_max = self._compute_bins(self._vid_samples, w, vid_vs, vid_ve,
+                                          self._vid_peaks)
         vid_poly = _wave_poly(v_min, v_max)
         if len(vid_poly) >= 6:
             cv.create_polygon(vid_poly, fill=_VID_FILL, outline=WAVE_VID,

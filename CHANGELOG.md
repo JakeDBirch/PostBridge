@@ -2,6 +2,17 @@
 
 ---
 
+## October 26, 2026
+
+### AAF → XML: Step 2 stops hanging
+Measured on a 16-source episode with a 600-clip AAF; every number is from that session.
+- **Opening from the episode** read the AAF twice in a row on the UI thread, about two seconds each with the window frozen. It is now read once, in the background, while the AAF → XML button reads OPENING AAF…; the read is kept while the file is unchanged, so Step 2 and the setup pre-fill share it. Launch to Step 2: 3.7 s → 2.0 s, and the window never freezes for more than about 0.4 s.
+- **Moving around Step 2.** Every SOURCE ASSIGN / SOURCE SYNC switch, lock, accept, ALIGN accept, undo and reference change tore the page down and rebuilt it, about 650 ms each. Each page is now kept while the other one shows, and only the rows whose state changed are redrawn. A redrawn row is laid out before it replaces the old one, so nothing else on the page resizes; each resize used to repaint every widget on the page. Tab switch: 650 → ~200 ms. Lock, accept, undo: 670 → ~50 ms. Results landing during SYNC ALL update their rows in place.
+- **A sync that finished after its row was redrawn** (a tab switch or another row's lock while it ran) crashed partway through applying its result. The row was left with an offset but no state, so ACCEPT did nothing. It now lands on whatever row is showing, and a redrawn row keeps spinning until its result arrives. Pressing SYNC ALL twice no longer runs a source's sync twice.
+- **ALIGN on long recordings.** Every redraw rescanned every sample of both recordings, which is 64 million for a 2 h 14 min Riverside file, so each drag step took 40 ms. The waveform is now drawn from a min/max peak pyramid built once on load: 4 ms per redraw, 7 ms per drag step.
+- **Error messages that never appeared.** A failed SYNC now says why in a dialog instead of only showing "⚠ error". The same goes for a failed PREVIEW, a failed ALIGN load (which sat on "Extracting waveforms…" forever), a failed waveform-editor load and a failed episode folder scan. Each handler referred to the exception after Python had unbound it.
+- Auto-match now picks a source's reference audio on SOURCE ASSIGN too, not only once SOURCE SYNC has been drawn.
+
 ## October 21, 2026
 
 ### Assembly view: Smart Tool, command bar, speaker colours, monitoring

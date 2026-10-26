@@ -805,10 +805,11 @@ class MatchReviewDialog:
                 self._file_dur_s = real_dur
         except Exception as exc:
             _log.exception("preview extraction failed")
+            msg = str(exc)    # `exc` is unbound by the time _err runs
             def _err():
                 try:
                     self._loading_lbl.config(
-                        text="Extraction failed: {}".format(exc))
+                        text="Extraction failed: {}".format(msg))
                 except Exception:
                     pass
             self._win.after(0, _err)

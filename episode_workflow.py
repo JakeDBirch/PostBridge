@@ -122,7 +122,8 @@ class EpisodeWorkflowMixin:
                 res = EP.scan(ep["root"], progress=_progress,
                               excluded=ep.get("excluded"))
             except Exception as e:
-                self._ui(lambda: messagebox.showerror("Scan failed", str(e)))
+                msg = str(e)    # `e` is unbound by the time the lambda runs
+                self._ui(lambda: messagebox.showerror("Scan failed", msg))
                 self._ui(self._ep_view)
                 return
             def _done():
@@ -209,7 +210,10 @@ class EpisodeWorkflowMixin:
         for label, note, cmd in rows:
             r = tk.Frame(body, bg=SURF)
             r.pack(fill="x", pady=2)
-            self._btn(r, label, cmd, small=True, width=18).pack(side="left")
+            b = self._btn(r, label, cmd, small=True, width=18)
+            b.pack(side="left")
+            if cmd is self._ep_launch_aaf:
+                self._ep_aaf_btn = b      # says "opening" while the AAF is read
             tk.Label(r, text=note, font=FB, bg=SURF, fg=SUB).pack(side="left", padx=(12, 0))
             if cmd is self._ep_launch_s2s:
                 # The script can live in Google Docs: link it once, then
@@ -936,10 +940,48 @@ class EpisodeWorkflowMixin:
                 return
             links["aaf"] = EP.rel(ep, aaf)
             EP.save(ep)
-        self._pending_aaf_setup = self._ep_aaf_setup_for(aaf)
-        self._pending_aaf_saved_path = None
-        self._pending_mark_saved = False
-        self._aaf_load(aaf)
+        self._ep_open_aaf(aaf)
+
+    def _ep_open_aaf(self, aaf):
+        """Pre-fill the setup from the sources and open Step 2 on *aaf*.
+
+        Both need the AAF read, and a large Pro Tools export takes a couple
+        of seconds to read -- long enough for a frozen window to look hung.
+        So the first read happens off the UI thread; it is cached, and the
+        pre-fill and Step 2 then reuse it."""
+        if getattr(self, "_ep_aaf_opening", False):
+            return                        # already on its way
+        self._ep_aaf_opening = True
+        btn = getattr(self, "_ep_aaf_btn", None)
+        try:
+            label = btn.cget("text")
+            btn.config(text="OPENING AAF…")
+        except (AttributeError, tk.TclError):
+            btn = None
+
+        def _read():
+            from parsers import parse_aaf_session
+            try:
+                parse_aaf_session(aaf)
+            except Exception:
+                pass                      # _aaf_load reads it again and says why
+            self._ui(_open)
+
+        def _open():
+            self._ep_aaf_opening = False
+            if btn is not None:
+                try:
+                    if not btn.winfo_exists():
+                        return            # the user left the episode meanwhile
+                    btn.config(text=label)
+                except tk.TclError:
+                    return
+            self._pending_aaf_setup = self._ep_aaf_setup_for(aaf)
+            self._pending_aaf_saved_path = None
+            self._pending_mark_saved = False
+            self._aaf_load(aaf)
+
+        threading.Thread(target=_read, daemon=True).start()
 
     def _ep_aaf_setup_for(self, aaf_path):
         """An AAF setup built from the sources: each Pro Tools source (a clip

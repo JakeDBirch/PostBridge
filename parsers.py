@@ -1,3 +1,4 @@
+import copy
 import os
 from utils import app_state_dir as _app_state_dir
 import re
@@ -2058,7 +2059,37 @@ def get_clip_base_name(clip_name):
     return name or None
 
 
+_aaf_parse_cache = {}
+
+
 def parse_aaf_session(aaf_path):
+    """
+    Parse a Pro Tools AAF export.  Returns a fresh copy of the structure
+    described in _parse_aaf_session_uncached.
+
+    Opening an AAF from an episode reads it twice back to back -- once to
+    pre-fill the setup, once to load Step 2 -- and a 600-clip export takes
+    about two seconds per read, all on the UI thread.  So the parse is kept
+    for the file it came from and reused while that file is unchanged
+    (same size and modification time).
+    """
+    try:
+        st  = os.stat(aaf_path)
+        key = (os.path.normcase(os.path.abspath(aaf_path)),
+               st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    parsed = _aaf_parse_cache.get(key) if key else None
+    if parsed is None:
+        parsed = _parse_aaf_session_uncached(aaf_path)
+        if key:
+            _aaf_parse_cache.clear()   # every flow works on one AAF at a time
+            _aaf_parse_cache[key] = parsed
+    # Callers own what they get back; the cached copy must stay pristine.
+    return copy.deepcopy(parsed)
+
+
+def _parse_aaf_session_uncached(aaf_path):
     """
     Parse a Pro Tools AAF export.
 
