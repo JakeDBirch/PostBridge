@@ -4,6 +4,13 @@
 
 ## October 26, 2026
 
+### Script → Session: plain scripts cut a narrator's raw read (Gunfighters)
+A script with no markers (title, paragraphs, underscore rules between sections) now loads as a plain narration script instead of being refused. Step 2 offers one target, **VO: Narration**, that every audio file takes; reconcile (`monolog.py`) lines the whole script up against the whole raw read and keeps the last full reading of every stretch. False starts, retakes, stumbles and talk between takes are cut. Lines reworded as they were read, ad-libs read straight through and pickups recorded after their paragraph are kept, the pickup spliced in place. Edit points come from the waveform: in ~0.05 s ahead of the voice, out ~0.6 s after it dies away, and silences over 2 s inside a reading are trimmed to ~1 s. Lines never found come up as no-match rows.
+- Scored against the finished Ep 6 edit (98.9 min of raw read, 35.0 min kept): PostBridge keeps 35.7 min. Its cut holds 99.3% of the words the edit kept, and 98.6% of its words are in the edit, with edit points within 0.04 s of the editor's at the median. The remaining differences are mostly editorial trims and choices between readings.
+- Assembly view: a ✂ badge under the track wherever the cut skips tape, showing how much went; hover it to read what was said there. Pulls with more than one reading show `reading n/N`; ↑ / ↓ swaps the reading, with undo (Step 4's undo now restores which reading a VO pull uses).
+- Episodes launch a plain script's narrator recordings already assigned to VO: Narration.
+- `monolog_bench.py` scores a run against any finished edit's AAF → XML export.
+
 ### AAF → XML: Step 2 stops hanging
 Measured on a 16-source episode with a 600-clip AAF; every number is from that session.
 - **Opening from the episode** read the AAF twice in a row on the UI thread, about two seconds each with the window frozen. It is now read once, in the background, while the AAF → XML button reads OPENING AAF…; the read is kept while the file is unchanged, so Step 2 and the setup pre-fill share it. Launch to Step 2: 3.7 s → 2.0 s, and the window never freezes for more than about 0.4 s.

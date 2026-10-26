@@ -347,6 +347,101 @@ def parse_script(text):
     return tokens, parts, pulls, vo_blocks, doc_title, warnings
 
 
+# ── Plain (monolog) scripts ────────────────────────────────────────────────────
+#
+# A finished narration script with none of the markers above -- the way a
+# Gunfighters script arrives: a title line, then paragraphs, with a rule of
+# underscores between sections.  Every paragraph becomes a VO block and every
+# section a part; the whole read is matched against it by monolog.py.
+
+# A section rule: a line of nothing but underscores, dashes, asterisks...
+_PLAIN_RULE_RE = re.compile(r"^[_\-*=~#—–\s]{3,}$")
+# Google Docs comment anchors left in a .txt export: "gasped[a]" in the body
+# and the comment itself, "[a]SFX not VO", on its own line at the end.
+_PLAIN_ANCHOR_RE  = re.compile(r"\[[a-z]{1,2}\]")
+_PLAIN_COMMENT_RE = re.compile(r"^\[[a-z]{1,2}\]")
+
+
+def is_plain_script(text):
+    """True when `text` has none of the bracketed headers -- it can only
+    be read as a plain monolog script."""
+    for ln in text.split("\n"):
+        if _HEADER_RE.match(_strip_comment(ln).strip()):
+            return False
+    return bool(text.strip())
+
+
+def parse_plain_script(text):
+    """Parse a plain narration script (no markers).
+
+    Same return shape as parse_script.  The first line is the title (not
+    read); each later paragraph is one VO block, every block flagged
+    "plain".  A paragraph is a line of its own (a Google Docs export) or
+    several hard-wrapped lines run together; a rule line starts a new part.
+    """
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
+    lines = [ln for ln in lines if not _PLAIN_COMMENT_RE.match(ln.strip())]
+    lines = [_PLAIN_ANCHOR_RE.sub("", ln).replace("﻿", "") for ln in lines]
+
+    doc_title = "PostBridge Episode"
+    body = []
+    for k, ln in enumerate(lines):
+        if ln.strip() and not ln.strip().startswith("//"):
+            doc_title = ln.strip()
+            body = lines[k + 1:]
+            break
+
+    # Paragraphs, by part.  A line that does not finish a sentence and is
+    # followed by one starting in lower case is a hard wrap, not a break.
+    paras_by_part = [[]]
+    cur = []
+
+    def _flush():
+        if cur:
+            paras_by_part[-1].append(" ".join(cur))
+            cur[:] = []
+
+    for k, raw in enumerate(body):
+        s = _strip_comment(raw).strip()
+        if not s:
+            _flush()
+            continue
+        if _PLAIN_RULE_RE.match(s):
+            _flush()
+            if paras_by_part[-1]:
+                paras_by_part.append([])
+            continue
+        cur.append(s)
+        nxt = body[k + 1].strip() if k + 1 < len(body) else ""
+        wraps = (nxt and not re.search(r"[.!?:\"'”’)]$", s)
+                 and nxt[0].islower())
+        if not wraps:
+            _flush()
+    _flush()
+    paras_by_part = [p for p in paras_by_part if p]
+
+    parts, vo_blocks = [], []
+    many = len(paras_by_part) > 1
+    order = 1
+    for pi, paras in enumerate(paras_by_part, 1):
+        parts.append({"index": pi,
+                      "name": "Part {}".format(pi) if many else "Episode VO"})
+        for para in paras:
+            vo_blocks.append({
+                "order":      order,
+                "id":         "P{:03d}".format(order),
+                "part_index": pi,
+                "text":       para,
+                "paragraphs": [para],
+                "gap_after":  True,
+                "plain":      True,
+            })
+            order += 1
+
+    warnings = [] if vo_blocks else ["No script text found."]
+    return [], parts, [], vo_blocks, doc_title, warnings
+
+
 # ── Pull Quotes session discovery ───────────────────────────────────────────────────────────────────
 def discover_pq_sessions(script_path, max_walk_up=6):
     """Locate Pull Quotes session JSONs in the script's project folder.

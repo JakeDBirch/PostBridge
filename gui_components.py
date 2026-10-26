@@ -576,11 +576,14 @@ class MediaPool(tk.Frame):
     Assignment is live — get_assignments() returns
       { token: [paths] } and { "VO:N": [paths] } dicts.
     """
-    def __init__(self, parent, tokens, parts, aaf_mode=False, **kw):
+    def __init__(self, parent, tokens, parts, aaf_mode=False, default_vo=None, **kw):
         super().__init__(parent, bg=SURF,
                          highlightbackground=BORDER, highlightthickness=1, **kw)
         self._tokens  = tokens
         self._parts   = parts
+        # Where an audio file nothing else claims goes -- a monolog's one
+        # narration target, so a raw read is assigned on drop.
+        self._default_vo = default_vo
         self._rows         = []
         self._auto_assigned = set()
         self._aaf_mode          = aaf_mode
@@ -695,6 +698,8 @@ class MediaPool(tk.Frame):
             vo = suggest_vo_part(fn, self._parts)
             if vo:
                 tok = vo
+        if not tok and self._default_vo and not is_video(path):
+            tok = self._default_vo
 
         options = ["— unassigned —"] + sorted(self._tokens) + [
             "VO: {}".format(p["name"]) for p in self._parts

@@ -67,6 +67,7 @@ LEAD_S      = 0.5     # silence ahead of 0:00 so playback can start at the top
 LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
+CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -170,7 +171,12 @@ class _Clip(object):
 
     @property
     def label(self):
-        return "#{:03d}  {}".format(self.order, self.res.get("token", "?"))
+        lbl = "#{:03d}  {}".format(self.order, self.res.get("token", "?"))
+        n = len(self.res.get("takes_data") or [])
+        if self.res.get("monolog") and n > 1:
+            lbl += "  ·  reading {}/{}".format(
+                (self.res.get("best_take_index") or 0) + 1, n)
+        return lbl
 
     def colour(self):
         return self.tint
@@ -461,6 +467,8 @@ class AssemblyWindow(object):
         key(r, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(r, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
         key(r, "Open in editor", "Enter", self.open_selected)
+        if any(res.get("monolog") for res in (self.app.results or ())):
+            key(r, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
         group(r, "SPOT")
         key(r, "Music in", "I", lambda: self.drop_marker("music_in"))
         key(r, "Music out", "O", lambda: self.drop_marker("music_out"))
@@ -591,6 +599,7 @@ class AssemblyWindow(object):
 
         self.clips   = clips
         self._starts = [c.start for c in clips]
+        self.joints  = self._find_joints(clips)
         self.total_s = clips[-1].end if clips else 0.0
         names = {p.get("index"): p.get("name", "") for p in (app.parts or [])}
         self.part_marks = sorted((sa / float(LAYOUT_SR), names.get(pi, ""))
@@ -601,6 +610,68 @@ class AssemblyWindow(object):
         if self.sel_marker is not None and not any(
                 (m["order"], m["index"]) == self.sel_marker for m in self.markers):
             self.sel_marker = None
+
+    @staticmethod
+    def _find_joints(clips):
+        """Where a monolog's cut skips over tape: every join, inside a pull
+        or between two, whose two sides are not continuous in the one
+        recording -- the false starts and talk taken out, or a pickup
+        brought in from elsewhere in the read."""
+        joints, prev = [], None          # prev: (path, source end)
+        for c in clips:
+            if c.kind != "vo" or not c.res.get("monolog"):
+                prev = None
+                continue
+            for tl, du, si in c.pieces:
+                if prev is not None and (prev[0] != c.play_path
+                                         or abs(si - prev[1]) >= CUT_SHOW_S):
+                    joints.append({"t": tl, "order": c.order, "path": c.play_path,
+                                   "a": prev[1], "b": si,
+                                   "same": prev[0] == c.play_path})
+                prev = (c.play_path, si + du)
+        return joints
+
+    def _joint_text(self, j):
+        if not j["same"]:
+            return "⇄ other file"
+        if j["b"] < j["a"]:
+            return "↶ pickup"
+        return "✂ {}".format(_fmt_tc(j["b"] - j["a"]).split(".")[0]
+                                   if j["b"] - j["a"] >= 60
+                                   else "{:.1f}s".format(j["b"] - j["a"]))
+
+    def _joint_at(self, x, y):
+        y0, y1 = self._track_box()
+        if not (y1 <= y <= y1 + self._gap_h + 2):
+            return None
+        near = min(getattr(self, "joints", ()), default=None,
+                   key=lambda j: abs(x - self._x(j["t"])))
+        if near is None:
+            return None
+        half = self._font.measure(self._joint_text(near)) / 2.0 + 4
+        return near if abs(x - self._x(near["t"])) <= half else None
+
+    def _show_joint(self, j):
+        """The status line for a hovered cut: how much tape went and what
+        was said on it."""
+        c = self._clip(j["order"])
+        if not j["same"]:
+            self.status.config(fg=TEXT, text="Joins two recordings here  ·  "
+                               "now from {}".format(os.path.basename(j["path"] or "")))
+            return
+        a, b = sorted((j["a"], j["b"]))
+        words = self._raw_words(c) if c is not None else []
+        said = " ".join(str(w.get("word", "")).strip() for w in words or ()
+                        if isinstance(w, dict) and a <= float(w.get("start", -1)) < b)
+        head = ("Pickup from later in the read ({} → {})".format(
+                    secs_tc(b), secs_tc(a)) if j["b"] < j["a"] else
+                "Cut here: {:.1f}s of the read ({} → {})".format(
+                    b - a, secs_tc(a), secs_tc(b)))
+        if j["b"] < j["a"]:
+            said = ""
+        self.status.config(fg=TEXT, text=head + (
+            "  ·  “{}”".format(said[:220] + ("…" if len(said) > 220 else ""))
+            if said else ""))
 
     def _queue_loads(self):
         """Fetch every pull whose loaded audio no longer covers it,
@@ -943,6 +1014,22 @@ class AssemblyWindow(object):
                     cv.create_text((gx0 + gx1) / 2.0, y1 + self._gap_h / 2.0,
                                    text=txt, font=self._font, fill=SUB)
 
+        # Where the cut skips tape: a tick on the track, and a badge under
+        # it when there is room (hover one for what was taken out).
+        free_x = -1e9
+        for j in getattr(self, "joints", ()):
+            if not t0 <= j["t"] <= t1:
+                continue
+            jx = self._x(j["t"])
+            cv.create_line(jx, y1 - 6, jx, y1 + 3, fill=WARN)
+            txt = self._joint_text(j)
+            half = self._font.measure(txt) / 2.0
+            if jx - half > free_x + 6:
+                cv.create_text(jx, y1 + self._gap_h / 2.0, text=txt,
+                               font=self._font, fill=WARN if j is getattr(
+                                   self, "_hover_joint", None) else SUB)
+                free_x = jx + half
+
         if self._range is not None:
             _o, a, b = self._range
             cv.create_rectangle(self._x(min(a, b)), y0, self._x(max(a, b)), y1,
@@ -1225,6 +1312,14 @@ class AssemblyWindow(object):
     def _on_motion(self, e):
         if self._drag is not None:
             return
+        j = self._joint_at(e.x, e.y)
+        if j is not getattr(self, "_hover_joint", None):
+            self._hover_joint = j
+            self.redraw()
+            if j is not None:
+                self._show_joint(j)
+            else:
+                self._update_status()
         kind, c, k = self._hit(e.x, e.y)
         cur = {"in": "sb_h_double_arrow", "out": "sb_h_double_arrow",
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
@@ -1457,6 +1552,23 @@ class AssemblyWindow(object):
             self.delete_marker()
         else:
             self.delete_range()
+
+    def cycle_reading(self, d):
+        """Swap the selected pull to the next (or previous) reading of its
+        lines: a monolog keeps every delivery it found as takes_data."""
+        o = self.sel_order if self.sel_order is not None             else self._order_at(self.playhead)
+        c = self._clip(o)
+        if c is None:
+            return
+        n = len(c.res.get("takes_data") or [])
+        if n < 2:
+            self.status.config(fg=SUB, text="{}   ·   no other reading of "
+                               "these lines was found".format(c.label))
+            return
+        self.app._assembly_set_reading(
+            o, ((c.res.get("best_take_index") or 0) + d) % n)
+        self.sel_order = o
+        self.refresh()
 
     def open_selected(self):
         self.open_card(self.sel_order if self.sel_order is not None
@@ -1809,6 +1921,8 @@ class AssemblyWindow(object):
             self._neighbour(1)
         elif k == "Left":
             self._neighbour(-1)
+        elif k in ("Up", "Down"):
+            self.cycle_reading(-1 if k == "Up" else 1)
         elif k in ("Delete", "BackSpace"):
             self._delete_key()
         elif k == "Return":

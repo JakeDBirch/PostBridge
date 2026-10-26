@@ -891,14 +891,20 @@ class EpisodeWorkflowMixin:
         # the source's token when the script knows it.
         known, part_names, vo_parts = set(), set(), set()
         try:
-            from parsers import parse_script
+            from parsers import parse_script, is_plain_script
             with open(script, encoding="utf-8", errors="replace") as f:
-                tokens, parts, _pulls, vo_blocks, _t, _w = parse_script(f.read())
+                text = f.read()
+            tokens, parts, _pulls, vo_blocks, _t, _w = parse_script(text)
             known = set(tokens or [])
             by_index = {p["index"]: p["name"] for p in parts}
             part_names = set(by_index.values())
             vo_parts = {by_index[v["part_index"]] for v in vo_blocks
                         if v.get("part_index") in by_index}
+            if not _pulls and not vo_blocks and is_plain_script(text):
+                # A plain narration script is cut as a monolog: its one
+                # VO target takes every narrator recording.
+                import monolog
+                part_names = vo_parts = {monolog.NARRATION["name"]}
         except Exception:
             pass
         assignments = {}

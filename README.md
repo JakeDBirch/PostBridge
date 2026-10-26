@@ -45,7 +45,7 @@ PostBridge handles four workflows:
 |---|---|
 | **Pull Quotes** | You have raw interview audio and want to read the transcript, highlight quotes, and copy them straight into your script with precise timecodes baked in. |
 | **Format Script** | You have a draft script written in any format and want help converting it to PostBridge markup — block builders, token lists, an AI prompt for ChatGPT/Claude. |
-| **Script → Session** | You have a formatted script with marked interview pulls and want PostBridge to find each quote on tape and assemble an editor-ready timeline. |
+| **Script → Session** | You have a formatted script with marked interview pulls and want PostBridge to find each quote on tape and assemble an editor-ready timeline — or a plain narration script and the narrator's raw read, to be cut down to the script. |
 | **AAF → XML** | Pro Tools audio is locked. You need to hand it off to Premiere/FCP with the correct video synced underneath. |
 
 The four workflows share transcript caches — a session transcribed in Pull Quotes is instantly available to Script → Session reconcile, and vice versa.
@@ -188,6 +188,14 @@ Drop or open a PostBridge-formatted `.txt` script. The parser validates token st
 ### Step 2 — Assign Media
 
 Drop interview recordings onto the pool. PostBridge auto-detects speaker assignments from Riverside filenames. Adjust any incorrect assignments via the dropdown on each row.
+
+### Plain scripts: cutting a narrator's raw read
+
+A script with no markers at all — a title line, then paragraphs, with a line of underscores between sections, the way a Gunfighters script comes out of Google Docs — is read as a plain narration script. Each paragraph becomes a line to find; each section a part. Script Check is skipped (it checks markers), and Step 2 offers one target, **VO: Narration**, which every audio file dropped on the pool takes. Drop every raw recording of the read; they are searched in filename order, which is recording order.
+
+Reconcile lines the whole script up against the whole read and keeps, for every stretch of script, the last time it was read in full. False starts, retakes, stumbles ("both these killing — both these killings") and talk between takes are cut; a line reworded as it was read, an ad-lib read straight through, and a pickup recorded after its paragraph are kept, the pickup spliced in where it belongs. Edit points come from the waveform: in just ahead of the voice, out about half a second after it dies away, and a silence over two seconds inside a reading taken down to about one. A paragraph read in one go is one pull; one assembled from several readings is a pull per stretch of tape. Lines never found come up as no-match rows, so nothing goes missing quietly.
+
+In the Assembly view, every place the cut skips tape shows a ✂ badge under the track with how much was taken out; hover it to read what was said there. A pull with more than one reading shows `reading 2/3` on its label; ↑ / ↓ swaps it to another reading, with undo. On Ep 6 the cut held 99.3% of the words the finished edit kept, and 98.6% of its own words were in that edit, with edit points within 0.04 s of the editor's at the median; most of the rest were editorial trims and choices of reading. `monolog_bench.py` scores a run against any finished edit's AAF → XML export.
 
 ### Step 3 — Reconcile
 
@@ -332,7 +340,7 @@ Each source is declared with its own audio channel count, probed from the file. 
 
 ## Script Format
 
-PostBridge scripts use a bracketed markup:
+A script with none of the markup below is read as a plain narration script; see [Plain scripts](#plain-scripts-cutting-a-narrators-raw-read). Otherwise, PostBridge scripts use a bracketed markup:
 
 ```
 Episode Title

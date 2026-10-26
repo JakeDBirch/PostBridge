@@ -55,9 +55,11 @@ from utils import (basename, secs_tc, tc_secs, is_video, is_audio, is_media,
 from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
-                     detect_sync_offset, verify_sync_at_offset)
+                     detect_sync_offset, verify_sync_at_offset,
+                     is_plain_script, parse_plain_script)
 from gui_components import VoBin, MediaPool, _SlimScrollbar, _FlatDropdown, _FlatProgressBar
 import engines
+import monolog
 from sync_preview import SyncPreviewDialog
 from match_review import MatchReviewDialog
 from aaf_workflow import AafWorkflowMixin
@@ -195,6 +197,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self.parts      = []
         self.pulls      = []
         self.vo_blocks  = []
+        self._monolog   = False   # plain script: one raw read, cut by monolog.py
         self.doc_title  = ""
         self.bins       = {}    
         self.vo_bins    = {}    
@@ -1405,8 +1408,18 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             messagebox.showerror("Error", str(e)); return
 
         tokens, parts, pulls, vo_blocks, doc_title, warnings = parse_script(text)
+        # No markers at all: a finished narration script (Gunfighters),
+        # cut from one raw read by monolog.reconcile instead of from pulls.
+        self._monolog = not pulls and not vo_blocks and is_plain_script(text)
+        if self._monolog:
+            tokens, parts, pulls, vo_blocks, doc_title, warnings =                 parse_plain_script(text)
+            if not vo_blocks:
+                _clear_pending_restore()
+                messagebox.showerror("Nothing Found",
+                    "The script has no text to match against a recording.")
+                return
 
-        if not pulls:
+        if not pulls and not self._monolog:
             _clear_pending_restore()
             messagebox.showerror("Nothing Found",
                 "No interview pulls found.\n\n"
@@ -1436,7 +1449,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
         self.seq_name.set("{} (AUTO)".format(doc_title))
 
-        if hasattr(self, "_s1"):
+        if hasattr(self, "_s1") and self._monolog:
+            self._s1.config(
+                text="✓  {}  ·  plain script, cut as a monolog  ·  {} paragraphs"
+                     "  ·  {} parts".format(doc_title, len(vo_blocks), len(parts)),
+                fg=SUCCESS)
+        elif hasattr(self, "_s1"):
             self._s1.config(
                 text="✓  {}  ·  {} pulls  ·  {} VO  ·  {} parts  ·  {} tokens: {}{}".format(
                     doc_title, len(pulls), len(vo_blocks), len(parts), len(tokens),
@@ -1451,8 +1469,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
         # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
         if hasattr(self, "_step1_nav") and not getattr(self, "_step1_next_added", False):
-            self._btn(self._step1_nav, "NEXT  →  SCRIPT CHECK",
-                      self._step_check, color=ACCENT).pack(side="right")
+            # Script Check reads the bracketed markers a plain script has none of.
+            if self._monolog:
+                self._btn(self._step1_nav, "NEXT  →  ASSIGN MEDIA",
+                          self._step2, color=ACCENT).pack(side="right")
+            else:
+                self._btn(self._step1_nav, "NEXT  →  SCRIPT CHECK",
+                          self._step_check, color=ACCENT).pack(side="right")
             self._step1_next_added = True
         else:
             self._ui(self._step2)
@@ -1560,9 +1583,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self.vo_bins = {}
         self._section("STEP 2 — ASSIGN MEDIA")
         tk.Label(self.body,
-                 text="Drop all episode files at once — or browse a folder.  "
-                      "The app guesses speaker assignments from Riverside filenames.  "
-                      "Adjust any incorrect assignments via the dropdown on each row.",
+                 text=("Drop the raw narration recordings — every take, in "
+                       "recording order by filename.  PostBridge finds each "
+                       "paragraph of the script in them and keeps its last "
+                       "full reading; false starts, retakes and talk between "
+                       "reads are cut." if self._monolog else
+                       "Drop all episode files at once — or browse a folder.  "
+                       "The app guesses speaker assignments from Riverside filenames.  "
+                       "Adjust any incorrect assignments via the dropdown on each row."),
                  font=FB, bg=BG, fg=SUB, wraplength=860).pack(anchor="w", pady=(0,10))
 
         # ── Confirmed-carryover banner (shown when coming back via ← BACK) ────
@@ -1656,8 +1684,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # ── Scrollable content area fills remaining space ─────────────────────
         sf = self._scroll_frame(self.body)
 
-        self._pool = MediaPool(sf, self.tokens, self.parts,
-                              aaf_mode=(self.workflow in ("script_aaf", "script_session")))
+        if self._monolog:
+            # One narration target for the whole script: every recording is
+            # searched for every paragraph, whatever part it falls in.
+            self._pool = MediaPool(sf, [], [monolog.NARRATION],
+                                   aaf_mode=(self.workflow in ("script_aaf", "script_session")),
+                                   default_vo="VO: " + monolog.NARRATION["name"])
+        else:
+            self._pool = MediaPool(sf, self.tokens, self.parts,
+                                  aaf_mode=(self.workflow in ("script_aaf", "script_session")))
         self._pool.pack(fill="x", pady=(0,10), padx=2)
         self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
                   small=True).pack(side="left", padx=(10, 0))
@@ -2358,6 +2393,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             # Persist VO takes_data so edited segments survive save/load cycles
             if r.get("is_vo") and r.get("takes_data"):
                 entry["takes_data"] = r["takes_data"]
+                entry["best_take_index"] = r.get("best_take_index", 0)
             snap[str(order)] = entry
         return snap
 
@@ -2500,6 +2536,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             # Restore VO takes_data (keeps edited per-take segments in sync)
             if "takes_data" in entry and r.get("is_vo"):
                 r["takes_data"] = entry["takes_data"]
+                if "best_take_index" in entry:
+                    r["best_take_index"] = entry["best_take_index"]
 
             was_ignored  = e["skip_var"].get()
             was_accepted = e.get("accepted_flag", [False])[0]
@@ -2884,6 +2922,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         clean and the user defines the new range from scratch.  Flags
         and status reset the same way interview reassigns do.
         """
+        if res.get("monolog"):
+            # A monolog pull is a stretch of the narration read, not a part's
+            # own file: change it by choosing another reading of its lines.
+            messagebox.showinfo(
+                "Choose another reading",
+                "This pull is cut from the narration recordings.  To use a "
+                "different delivery of these lines, open the Assembly view, "
+                "select the pull and press ↑ / ↓.  To widen or "
+                "narrow it, trim its edges there or open it in the editor.",
+                parent=self)
+            return
         pi = res.get("part_index", -1)
         # Look up the human-readable part name from the pool so the
         # dialog can label WHICH VO we're editing.  Falls back to the
@@ -3439,6 +3488,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         """
         # Find the original VO block dict from self.vo_blocks so the
         # reconciler has the script text + gap flag to match against.
+        if res.get("monolog"):
+            return          # numbered by the cut, not the script's blocks
         vo_block = None
         _order = res.get("order")
         for vb in getattr(self, "vo_blocks", []) or []:
@@ -4942,8 +4993,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # reconciled TCs.  _run_reconcile's final merge preserves any
         # row the user confirmed/ignored while transcription was
         # still running in the background.
-        self.results = self._build_provisional_results(int_assets)
-        self._bg_reconcile_active = True
+        if self._monolog:
+            # A monolog's pulls only exist once the whole read is matched,
+            # so there are no per-pull rows to show early.
+            self.results = []
+            self._bg_reconcile_active = False
+        else:
+            self.results = self._build_provisional_results(int_assets)
+            self._bg_reconcile_active = True
         self._bg_stats      = {"upgraded": 0, "reopened": 0, "kept": 0}
         self._bg_deferred   = {}
         self._final_results = None
@@ -6564,6 +6621,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 return [dict(engines._vo_base_result(b), status="cancelled")
                         for b in blocks]
             takes = vo_takes_by_part.get(part_index, [])
+            if self._monolog:
+                # The whole script against the whole read.  Its pulls are
+                # numbered by the cut, not by the script, so a prior
+                # pass's confirmed rows cannot carry over by number.
+                return monolog.reconcile(blocks, takes)
             fresh = engines.reconcile_vo_part(blocks, takes)
             # Same order-keyed passthrough as process_token_pulls above:
             # a VO block the user already confirmed/ignored in a prior
@@ -6579,6 +6641,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         _vo_by_part = _dd(list)
         for vb in self.vo_blocks:
             _vo_by_part[vb["part_index"]].append(vb)
+        if self._monolog:
+            _vo_by_part = {pi: list(self.vo_blocks) for pi in self.vo_bins}
 
         _pulls_by_token = _dd(list)
         for p in pulls:
@@ -8562,6 +8626,25 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                   if e["res"].get("order") == order), None)
         if e is not None and e.get("accept_fn") and segments:
             e["accept_fn"]([[float(a), float(b)] for a, b in segments])
+
+    def _assembly_set_reading(self, order, index):
+        """Swap a monolog pull to another reading of the same lines -- one
+        of the deliveries monolog.reconcile kept as takes_data -- as one
+        undo step."""
+        r = next((r for r in self.results if r.get("order") == order), None)
+        td = (r or {}).get("takes_data") or []
+        if r is None or not 0 <= index < len(td):
+            return
+        segs = [tuple(sg) for sg in (td[index].get("segments") or [])]
+        if not segs:
+            return
+        self._s4_push_undo()
+        r["best_take_index"] = index
+        r["segments"]   = segs
+        r["source_audio"] = td[index].get("apath") or r.get("source_audio", "")
+        r["rec_in_s"],  r["rec_out_s"]  = segs[0][0], segs[-1][1]
+        r["rec_in_tc"], r["rec_out_tc"] = secs_tc(segs[0][0]), secs_tc(segs[-1][1])
+        self._s4_save()
 
     def _assembly_ignore(self, order):
         """The whole pull deleted on the Assembly track: IGNORE it, exactly
