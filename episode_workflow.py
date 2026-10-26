@@ -6,6 +6,7 @@ Mixed into main.App beside the AAF and Pull Quotes mixins; relies on the
 App helpers (_btn, _section, _scroll_frame, _clear, _ui, _mark_saved) and
 on episode.py for everything that is not a widget.
 """
+import json
 import os
 import re
 import threading
@@ -76,8 +77,44 @@ class EpisodeWorkflowMixin:
         except Exception as e:
             messagebox.showerror("Save episode failed", str(e))
             return False
-        self._mark_saved()
+        # The baseline belongs to the active workflow: saving the episode
+        # from under a stage (closing from it) must not mark that stage's
+        # own unsaved work clean.
+        if self.workflow == "episode":
+            self._mark_saved()
         return True
+
+    @staticmethod
+    def _ep_comparable(data):
+        """What decides whether an episode is saved: everything save()
+        writes but its root, which load() takes from where the file now is
+        (a moved folder is not an unsaved change)."""
+        return {k: v for k, v in data.items() if k not in ("root", "file_path")}
+
+    def _ep_saved_form(self):
+        """The open episode as it would be saved, for _state_signature."""
+        return self._ep_comparable(EP.disk_form(self._ep))
+
+    def _ep_file_signature(self):
+        """_state_signature of the open episode's file as it is on disk, or
+        None when it has none yet."""
+        ep = getattr(self, "_ep", None)
+        path = ep.get("file_path") if ep else None
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return self._signature_of(self._ep_comparable(data))
+
+    def _ep_unsaved(self):
+        """True when the open episode differs from its file -- or has never
+        been saved -- whatever screen is showing."""
+        if not getattr(self, "_ep", None):
+            return False
+        return self._signature_of(self._ep_saved_form()) != self._ep_file_signature()
 
     def _ep_note_link(self, key, path, owner=None):
         """A workflow launched from this episode saved its own file: remember
@@ -138,8 +175,15 @@ class EpisodeWorkflowMixin:
     def _ep_view(self):
         ep = self._ep
         self._clear()
-        self.unbind_all("<Control-s>")
-        self.bind_all("<Control-s>", lambda e: self._ep_save())
+        # This screen is the episode workflow: the header SAVE and Ctrl+S
+        # (both _quick_save) save the episode from here.  It used to rebind
+        # Ctrl+S to the episode for good, so every stage opened afterwards
+        # saved the episode on Ctrl+S instead of its own file.
+        self.workflow = "episode"
+        # Unsaved means different from the file.  The stages write into the
+        # episode as they save, so the file -- not the last Save pressed
+        # here -- is what an edit is measured against.
+        self._saved_signature = self._ep_file_signature()
 
         # Header: title, root, actions
         hdr = tk.Frame(self.body, bg=BG)
@@ -152,8 +196,11 @@ class EpisodeWorkflowMixin:
         ent.pack(side="left", padx=(12, 0))
         self._ep_title_var.trace_add(
             "write", lambda *_: ep.__setitem__("title", self._ep_title_var.get().strip() or ep["title"]))
-        self._btn(hdr, "SAVE EPISODE", self._ep_save, small=True, color=ACCENT
-                  ).pack(side="right")
+        save_btn = [None]
+        save_btn[0] = self._btn(hdr, "SAVE EPISODE",
+                                lambda: self._quick_save(save_btn),
+                                small=True, color=ACCENT)
+        save_btn[0].pack(side="right")
         self._btn(hdr, "↻ RESCAN FOLDER", self._ep_scan, small=True
                   ).pack(side="right", padx=(0, 6))
         self._btn(hdr, "CHANGE FOLDER…", self._ep_start, small=True

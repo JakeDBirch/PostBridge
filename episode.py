@@ -143,14 +143,20 @@ def load(path):
     return ep
 
 
-def save(ep, path=None):
-    path = path or ep.get("file_path") or episode_file_for(ep["root"], ep.get("title"))
+def disk_form(ep):
+    """The episode exactly as save() writes it."""
     out = {k: v for k, v in ep.items() if k != "file_path"}
     # Sessions are kept relative on disk like everything else; load()
     # makes them absolute for Pull Quotes.
     out["sessions"] = [rel(ep, s) for s in sorted(
         {absp(ep, src.get("session")) for src in ep["sources"].values()
          if src.get("session")} | {absp(ep, s) for s in ep.get("sessions", []) if s})]
+    return out
+
+
+def save(ep, path=None):
+    path = path or ep.get("file_path") or episode_file_for(ep["root"], ep.get("title"))
+    out = disk_form(ep)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
     ep["file_path"] = os.path.abspath(path)

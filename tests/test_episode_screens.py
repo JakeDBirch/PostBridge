@@ -184,6 +184,62 @@ def test_pull_quotes_session_registers_a_source(app, monkeypatch, project):
     assert not app._errors, "\n".join(app._errors)
 
 
+def test_episode_saves_like_every_other_screen(app, monkeypatch, project):
+    """Ctrl+S, the SAVED tick and the unsaved-changes prompt in Episode
+    mode.  The episode screen used to take Ctrl+S over for good, so every
+    stage opened from it saved the episode instead of its own file; coming
+    back from a stage read as unsaved; and closing from a stage, or from
+    Home, dropped unsaved episode edits without asking."""
+    import main as main_mod
+    _open_fresh(app, monkeypatch, project)
+    path = os.path.join(project, "Ep 7" + EP.EPISODE_EXT)
+
+    # Ctrl+S goes through the same quick save as everywhere else.
+    calls = []
+    real = app._quick_save
+    monkeypatch.setattr(app, "_quick_save",
+                        lambda btn_ref=None: (calls.append(app.workflow), real(btn_ref)))
+    # Run the app-wide Ctrl+S binding itself: a withdrawn window has no
+    # keyboard focus, so a generated key event would never arrive.
+    import re
+    app.tk.eval(re.sub(r"%[#a-zA-Z]", "0", app.bind_all("<Control-s>")))
+    _pump(app, 3)
+    assert calls == ["episode"]
+    assert os.path.isfile(path) and not app._is_dirty()
+    assert app._footer_save_btn[0].cget("text") == "SAVED ✓"
+
+    # A stage that saves on its own leaves nothing unsaved behind it.
+    app._ep_launch_pq(); _pump(app, 5)
+    assert app.workflow == "pull_quotes"
+    app._ep_enter(); _pump(app, 3)
+    assert app.workflow == "episode" and not app._is_dirty()
+
+    # An edit not yet saved is caught on close from a stage...
+    app._ep["sources"]["Ep 7 pt 1"]["token"] = "NARR9"
+    app._ep_launch_pq(); _pump(app, 5)
+    asked, answer, closed = [], [None], []
+    monkeypatch.setattr(main_mod.messagebox, "askyesnocancel",
+                        lambda title, msg, **k: (asked.append(msg), answer[0])[1])
+    app.destroy = lambda: closed.append(True)
+    try:
+        app._on_app_close()                      # Cancel
+        assert asked and "episode has unsaved changes" in asked[0] and not closed
+        # ...and Save writes it, then closes.
+        answer[0] = True
+        app._on_app_close()
+        assert closed
+        assert EP.load(path)["sources"]["Ep 7 pt 1"]["token"] == "NARR9"
+        # From Home too.
+        app._ep["title"] = "Ep 7 retitled"
+        app._home(); _pump(app, 3)
+        asked[:], closed[:], answer[0] = [], [], None
+        app._on_app_close()
+        assert asked and not closed
+    finally:
+        del app.destroy
+    assert not app._errors, "\n".join(app._errors)
+
+
 def test_launch_script_session_prefills_the_pool(app, monkeypatch, project):
     _open_fresh(app, monkeypatch, project)
     ep = app._ep

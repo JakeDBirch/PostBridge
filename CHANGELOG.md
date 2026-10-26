@@ -30,6 +30,11 @@ On the same episode, six of the sixteen Step 2 sources had another recording's c
 - **Script → Session no longer relabels a narrator.** Assigning a camera to a VO part stamped that part on whichever source held the camera, even when a scan had put it there wrongly. The camera now moves to the source narrating the part.
 - **Step 2 auto-match stays out rather than guess.** It ignores copy suffixes, never pairs names whose numbers disagree ("…_0388" with "…_0453", "Part 5" with "Part 1"), and needs more than one word of a short name. An unassigned row is plain to see, while a wrong camera can sync convincingly.
 
+### Episodes: saving works like everywhere else
+- **Ctrl+S saves what's on screen again.** Showing the episode screen took Ctrl+S over for good. From then on, Ctrl+S in AAF → XML, Script → Session and Pull Quotes saved the episode instead of that stage's own file: no first-save dialog, no SAVED ✓, and the stage's work stayed unsaved. Ctrl+S now goes through the same quick save as the header SAVE on every screen. SAVE EPISODE shows SAVED ✓ too.
+- **Unsaved means different from the episode file.** Coming back to the episode from a stage read as unsaved, because the comparison point was the stage's last save, so closing asked about changes that didn't exist. The stages write into the episode as they save, so an edit is now measured against the file itself. A moved folder doesn't count as a change.
+- **Closing asks about the episode from anywhere.** The episode stays open under the stages and Home. Closing from there with episode edits not yet saved used to lose them without asking. Now it asks, and Save writes the episode without marking the stage's own work saved.
+
 ## October 21, 2026
 
 ### Assembly view: Smart Tool, command bar, speaker colours, monitoring

@@ -3644,10 +3644,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     return None
                 data = self._aaf_build_setup_data()
             elif wf == "episode":
-                ep = getattr(self, "_ep", None)
-                if not ep:
+                if not getattr(self, "_ep", None):
                     return None
-                data = {k: v for k, v in ep.items() if k != "file_path"}
+                data = self._ep_saved_form()
             elif wf == "pull_quotes":
                 proj = getattr(self, "_pq_project", None)
                 if not proj:
@@ -3667,12 +3666,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 }
             else:
                 return None
-            blob = json.dumps(data, sort_keys=True, default=str)
-            return hashlib.md5(blob.encode("utf-8", "ignore")).hexdigest()
+            return self._signature_of(data)
         except Exception:
             # Never let a signature failure block the close path; treat
             # an un-hashable state as "not dirty" so close still works.
             return None
+
+    @staticmethod
+    def _signature_of(data):
+        """The hash _state_signature compares: of anything JSON can hold."""
+        blob = json.dumps(data, sort_keys=True, default=str)
+        return hashlib.md5(blob.encode("utf-8", "ignore")).hexdigest()
 
     def _mark_saved(self):
         """Capture the current state as the clean baseline.  Call after
@@ -3719,26 +3723,38 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             dirty = self._is_dirty()
         except Exception:
             dirty = False
-        if not dirty:
+        # An open episode stays open under the stages launched from it and
+        # under Home, where it is not the active workflow, so it is checked
+        # on its own: closing from there lost its edits without a word.
+        try:
+            ep_dirty = self.workflow != "episode" and self._ep_unsaved()
+        except Exception:
+            ep_dirty = False
+        if not dirty and not ep_dirty:
             self.destroy()
             return
         # Save / Don't Save / Cancel via the native yes/no/cancel box.
         resp = messagebox.askyesnocancel(
             "Unsaved changes",
+            "The episode has unsaved changes.\n\nSave before closing?"
+            if ep_dirty and not dirty else
             "You have unsaved changes.\n\nSave before closing?",
             default="yes", icon="warning")
         if resp is None:
             return                      # Cancel — keep the app open
         if resp:                        # Yes — save first
             try:
-                self._quick_save()
+                if dirty:
+                    self._quick_save()
+                if ep_dirty:
+                    self._ep_save()
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
                 return                  # stay open so work isn't lost
             # If the save was itself cancelled (e.g. user dismissed a
             # first-time Save As dialog), the state is still dirty —
             # don't close and discard the work.
-            if self._is_dirty():
+            if self._is_dirty() or (ep_dirty and self._ep_unsaved()):
                 return
         self.destroy()                  # No — discard and close
 
@@ -3793,18 +3809,31 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
+    def _flash_saved(self, btn_ref):
+        """Show SAVED \u2713 on the button that saved, then put its own label
+        back (the header's SAVE, the episode's SAVE EPISODE)."""
+        b = btn_ref[0] if btn_ref else None
+        if not b:
+            return
+        try:
+            label = getattr(b, "_pb_label", None) or b.cget("text")
+            b._pb_label = label     # a second save mid-flash restores this, not "SAVED"
+            b.config(text="SAVED \u2713")
+        except tk.TclError:
+            return
+        def _restore():
+            try:
+                b.config(text=label)
+            except tk.TclError:
+                pass                # the screen changed meanwhile
+        self.after(1800, _restore)
+
     def _quick_save(self, btn_ref=None):
         """Save to the current session file; prompt for a path on the first save."""
         def _flash_saved():
             # Show SAVED \u2713 only when a save actually happened \u2014 a
             # cancelled Save-As dialog must not read as success.
-            b = btn_ref[0] if btn_ref else None
-            if b:
-                try:
-                    b.config(text="SAVED \u2713")
-                    self.after(1800, lambda: b.config(text="SAVE"))
-                except Exception:
-                    pass
+            self._flash_saved(btn_ref)
 
         if getattr(self, 'workflow', None) == 'episode':
             if self._ep_save():
@@ -3848,13 +3877,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._mark_saved()
             self._ep_absorb_s2s(self._current_session_file)
-            b = btn_ref[0] if btn_ref else None
-            if b:
-                try:
-                    b.config(text="SAVED \u2713")
-                    self.after(1800, lambda: b.config(text="SAVE"))
-                except Exception:
-                    pass
+            _flash_saved()
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
