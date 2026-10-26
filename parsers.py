@@ -716,6 +716,13 @@ def match_source_to_video(source_base, video_paths):
     • Roman-numeral tokens i–xii — distinguishes "Part I" from "Part III"
 
     Returns the best matching path, or None if no confident match found.
+
+    It stays out rather than guess: a camera from another session or part
+    syncs badly at best and, at worst, convincingly against the wrong
+    footage, while an unassigned row is plain to see.  So a copy suffix
+    ("Part 5 (1)") is not part of a name, two names whose numbers disagree
+    ("..._0388" and "..._0453", "Part 5" and "Part 1") never match, and a
+    short name needs more than one of its words found.
     """
     # Standalone roman numerals that are worth distinguishing as ordinals.
     # Single-char 'i', 'v', 'x' are included because in file names they almost
@@ -726,16 +733,22 @@ def match_source_to_video(source_base, video_paths):
     })
 
     def _sig_words(text):
-        """Lowercase alphanumeric tokens that are 4+ chars, pure digits, or roman numerals."""
+        """Lowercase alphanumeric tokens that are 4+ chars, pure digits, or
+        roman numerals -- numbers without leading zeros, so CAM 01 is CAM 1
+        -- after dropping a copy suffix such as " (1)"."""
         result = set()
+        text = re.sub(r'\s*\(\d+\)$', '', text)
         for w in re.findall(r'[a-z0-9]+', text.lower()):
-            if len(w) >= 4 or w.isdigit() or w in _ROMAN:
+            if w.isdigit():
+                result.add(str(int(w)))
+            elif len(w) >= 4 or w in _ROMAN:
                 result.add(w)
         return result
 
     src_sig = _sig_words(source_base)
     if not src_sig:
         return None
+    src_nums = {w for w in src_sig if w.isdigit()}
 
     best_path  = None
     best_score = 0.0
@@ -745,6 +758,11 @@ def match_source_to_video(source_base, video_paths):
         fn_sig  = _sig_words(fn)
         if not fn_sig:
             continue
+        # Each name carrying a number the other lacks: another session,
+        # take or part.
+        fn_nums = {w for w in fn_sig if w.isdigit()}
+        if (src_nums - fn_nums) and (fn_nums - src_nums):
+            continue
 
         overlap  = len(fn_sig & src_sig)
         # Coverage: fraction of the video filename covered by the source.
@@ -753,7 +771,13 @@ def match_source_to_video(source_base, video_paths):
         # Jaccard: symmetric overlap, better for longer descriptive names.
         jaccard  = overlap / max(len(fn_sig), len(src_sig))
 
-        score = coverage if len(fn_sig) <= 3 else jaccard
+        if len(fn_sig) <= 3:
+            # A short name counts when all of it, or two words of it, are
+            # found: one shared word paired a Riverside recording
+            # ("..._lynn_richardson_...") with "Richardson Intro".
+            score = coverage if (overlap == len(fn_sig) or overlap >= 2) else 0.0
+        else:
+            score = jaccard
 
         if score > best_score:
             best_score = score

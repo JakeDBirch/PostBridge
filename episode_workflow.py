@@ -730,6 +730,10 @@ class EpisodeWorkflowMixin:
         pool = getattr(self, "_pool", None)
         rows = [(r["path"], r["var"].get()) for r in getattr(pool, "_rows", [])]
         from utils import is_video
+        # Recordings first: a camera assigned to a VO part follows the
+        # recording that narrates it, so every part must be placed before
+        # any camera looks for it.
+        rows.sort(key=lambda row: is_video(row[0]))
         for path, tok in rows:
             if not tok or tok.startswith("\u2014"):
                 continue
@@ -738,26 +742,34 @@ class EpisodeWorkflowMixin:
             if tok.startswith("VO:"):
                 # A narrator take: the source owning the file remembers the
                 # part, so the next script version opens assigned.  A
-                # camera for a part goes to the source narrating that part.
+                # camera for a part goes to the source narrating that part
+                # -- never the other way round: the camera's current source
+                # may be a scan's wrong guess, and stamping the part on it
+                # relabelled that source's narration.
                 part = tok[3:].strip()
-                name = self._ep_source_for(ep, [r], kind)
-                if name is None and kind == "video":
+                if kind == "video":
                     name = next((n for n, s in ep["sources"].items()
                                  if s.get("vo_part") == part), None)
-                if name is None:
-                    if kind == "video":
+                    if name is None:
                         continue
-                    name, i = EP._stem(r), 2
-                    while name in ep["sources"]:
-                        name = "{} ({})".format(EP._stem(r), i); i += 1
-                    ep["sources"][name] = {"token": None, "audio": [], "video": [],
-                                           "session": None, "user_made": True}
+                else:
+                    name = self._ep_source_for(ep, [r], kind)
+                    if name is None:
+                        name, i = EP._stem(r), 2
+                        while name in ep["sources"]:
+                            name = "{} ({})".format(EP._stem(r), i); i += 1
+                        ep["sources"][name] = {"token": None, "audio": [], "video": [],
+                                               "session": None, "user_made": True}
+                    ep["sources"][name]["vo_part"] = part
                 src = ep["sources"][name]
-                src["vo_part"] = part
                 self._ep_ensure_media(ep, r, kind)
                 if r not in src.setdefault(kind, []):
+                    for other_name, other in ep["sources"].items():
+                        if other_name != name and r in other.get(kind, []):
+                            other[kind].remove(r)
                     src[kind].append(r)
                     src[kind].sort()
+                    src["user_made"] = True     # the user placed it: a rescan keeps it
                 continue
             name = None
             for n, src in ep["sources"].items():
@@ -783,6 +795,7 @@ class EpisodeWorkflowMixin:
                         other[kind].remove(r)
                 src[kind].append(r)
                 src[kind].sort()
+                src["user_made"] = True         # the user placed it: a rescan keeps it
         try:
             EP.save(ep)
         except Exception:
@@ -818,6 +831,14 @@ class EpisodeWorkflowMixin:
                 if vids:
                     for v in vids:
                         self._ep_ensure_media(ep, v, "video")
+                    if set(vids) != set(src.get("video", [])):
+                        # The user picked these cameras in Step 2: they
+                        # leave any other source, and a rescan keeps them.
+                        for other_name, other in ep["sources"].items():
+                            if other_name != name:
+                                other["video"] = [v for v in other.get("video", [])
+                                                  if v not in vids]
+                        src["user_made"] = True
                     src["video"] = vids
                 sd = data.get("sync", {}).get(base, {})
                 src["aaf_sync"] = {

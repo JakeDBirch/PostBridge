@@ -20,6 +20,16 @@ Measured on a 16-source episode with a 600-clip AAF; every number is from that s
 - **Error messages that never appeared.** A failed SYNC now says why in a dialog instead of only showing "⚠ error". The same goes for a failed PREVIEW, a failed ALIGN load (which sat on "Extracting waveforms…" forever), a failed waveform-editor load and a failed episode folder scan. Each handler referred to the exception after Python had unbound it.
 - Auto-match now picks a source's reference audio on SOURCE ASSIGN too, not only once SOURCE SYNC has been drawn.
 
+### Episodes: cameras go to the recordings they were shot with
+On the same episode, six of the sixteen Step 2 sources had another recording's camera. Each synced at 0–77% against it, or at 94% against the footage of a different part. Every one syncs at 100% against its own camera.
+- **Each camera now goes to the recording it matches best.** Discovery used to take recordings longest first and give each the cameras that scored near its best as "other angles". So Part 2 took the Part 5 and Part 6 cameras, and Parts 5 and 6 fell back to whatever was left.
+- **A copy suffix is not a part number.** "Richardson Part 5 (1)" matched "Part 1.MP4" as well as it matched "Part 5.MP4".
+- **Sessions that share a name all survive.** Three Riverside sessions all reduced to "riverside", and each replaced the last, so two sessions' cameras were attached to nothing. Such sessions are now named after their first recording.
+- **One common word is not a match.** Running time plus a single shared word ("Interview") had given the grandmother's recording an unrelated camera of the same length.
+- **Rescanning corrects guesses and keeps decisions.** A rescan used to keep every camera list it found, so a wrong pairing could never be fixed by scanning again. It now re-proposes cameras that nobody chose, and keeps the name, token, VO part and stage memory; a rescan used to drop VO parts. Sources you made or edited stay exactly as they are. Script → Session and AAF → XML saves that place a recording or camera now count as your edits. A source you made with recordings but no cameras, such as one Script → Session made for a token, takes the cameras discovery finds for those recordings. No file ends up in two sources. **Rescan an existing episode once to get its pairings corrected.**
+- **Script → Session no longer relabels a narrator.** Assigning a camera to a VO part stamped that part on whichever source held the camera, even when a scan had put it there wrongly. The camera now moves to the source narrating the part.
+- **Step 2 auto-match stays out rather than guess.** It ignores copy suffixes, never pairs names whose numbers disagree ("…_0388" with "…_0453", "Part 5" with "Part 1"), and needs more than one word of a short name. An unassigned row is plain to see, while a wrong camera can sync convincingly.
+
 ## October 21, 2026
 
 ### Assembly view: Smart Tool, command bar, speaker colours, monitoring

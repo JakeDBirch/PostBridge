@@ -198,11 +198,16 @@ def _sig_words(text):
     return out
 
 
-def _name_score(src_stem, video_stem):
-    s, v = _sig_words(src_stem), _sig_words(video_stem)
+def _name_match(src_name, video_stem):
+    """(fraction of the source's identifying words the camera's name
+    carries, how many that is).  A copy suffix on the recording is not part
+    of its name: "Richardson Part 5 (1)" is Part 5, not a Part 1."""
+    s = _sig_words(re.sub(r"\s*\(\d+\)$", "", src_name))
+    v = _sig_words(video_stem)
     if not s or not v:
-        return 0.0
-    return len(s & v) / float(len(s))
+        return 0.0, 0
+    shared = len(s & v)
+    return shared / float(len(s)), shared
 
 
 def _stem(path):
@@ -383,10 +388,10 @@ def propose_sources(files, sessions=None):
     """Group the source recordings into sources and attach footage.
 
     Recordings with the same running time (within a second) that share a
-    name are one multi-track session (a mic per speaker).  Footage goes to
-    the source whose running time it matches (a camera rolled on the same
-    session runs within a few percent of the recorder) and whose name it
-    shares; several cameras match one source.  A Pull Quotes session whose
+    name are one multi-track session (a mic per speaker).  Each camera goes
+    to the one source it matches best: running time (a camera rolled on the
+    same session runs within a few percent of the recorder) together with a
+    shared name; several cameras can match one source.  A Pull Quotes session whose
     media names match gives the source its token."""
     sessions = sessions or {}
     audio = sorted((r for r, rec in files.items()
@@ -412,31 +417,58 @@ def propose_sources(files, sessions=None):
         if len(s["audio"]) > 1:
             s["name"] = _common_name(s["audio"])
             s["audio"].sort()
+    # Names key the episode's sources, so two must never share one.  Three
+    # Riverside sessions all reduce to the prefix "riverside", and each one
+    # silently replaced the last -- its recordings and cameras with it.
+    # Sessions that share a name all go by their first recording instead.
+    counts = {}
+    for s in sources:
+        counts[s["name"]] = counts.get(s["name"], 0) + 1
+    taken = set()
+    for s in sources:
+        name = s["name"] if counts[s["name"]] == 1 else _stem(s["audio"][0])
+        base, i = name, 2
+        while name in taken:
+            name = "{} ({})".format(base, i); i += 1
+        s["name"] = name
+        taken.add(name)
 
     # 2. Footage: by running time first, then by name.
-    claimed = set()
-    for s in sources:
+    def _score(s, v):
         d0 = files[s["audio"][0]]["duration_s"] or 0.0
-        scored = []
-        for v in video:
-            if v in claimed:
-                continue
-            dv = files[v]["duration_s"] or 0.0
-            dur_ok = d0 > 0 and dv > 0 and abs(dv - d0) / max(d0, dv) <= 0.08
-            ns = max(_name_score(s["name"], _stem(v)),
-                     max(_name_score(_stem(a), _stem(v)) for a in s["audio"]))
-            if dur_ok and ns >= 0.25:
-                scored.append((2 + ns, v))
-            elif ns >= 0.6:
-                scored.append((ns, v))
-        scored.sort(key=lambda t: (-t[0], t[1]))
+        dv = files[v]["duration_s"] or 0.0
+        dur_ok = d0 > 0 and dv > 0 and abs(dv - d0) / max(d0, dv) <= 0.08
+        ns, shared = max(_name_match(n, _stem(v))
+                         for n in [s["name"]] + [_stem(a) for a in s["audio"]])
+        # Running time agreeing counts only alongside a real share of the
+        # name: one common word ("Interview") pinned an unrelated camera
+        # of the same length on a recording.
+        if dur_ok and (ns >= 0.5 or (ns >= 0.25 and shared >= 2)):
+            return 2 + ns
+        if ns >= 0.6:
+            return ns
+        return 0.0
+
+    # Each camera goes to the source it matches best.  Taking the sources
+    # one at a time, longest first, let a recording claim the cameras of
+    # shorter ones it merely resembled: "Part 2" took the Part 5 and Part 6
+    # cameras as extra angles, and Parts 5 and 6 fell back to Part 1's and
+    # Part 3's.
+    best_for = {}          # camera -> (score, index of its source)
+    for v in sorted(video):
+        for i, s in enumerate(sources):
+            sc = _score(s, v)
+            if sc > best_for.get(v, (0.0, None))[0]:
+                best_for[v] = (sc, i)
+    for i, s in enumerate(sources):
+        scored = sorted(((sc, v) for v, (sc, j) in best_for.items() if j == i),
+                        key=lambda t: (-t[0], t[1]))
         if not scored:
             s["video"] = []
             continue
         best = scored[0][0]
         # Everything close to the best is another angle of the same shoot.
         s["video"] = sorted(v for sc, v in scored if sc >= best - 0.5 and sc >= 1.0 or sc == best)
-        claimed.update(s["video"])
 
     # 3. Tokens from Pull Quotes sessions.
     out = {}
@@ -460,23 +492,57 @@ def _common_name(paths):
 
 def apply_scan(ep, result):
     """Write a scan result into the episode: media records (keeping the
-    user's exclusions), proposed sources (keeping tokens and edits for
-    names that already exist), the mix link and the Pull Quotes sessions."""
+    user's exclusions), sources, the mix link and the Pull Quotes sessions.
+
+    A rescan keeps what was decided and proposes the rest afresh:
+
+    * A source the user made or edited (user_made) stays exactly as it is,
+      and its recordings and cameras stay its own.  When a proposal's
+      recordings all sit in such a source and it has no cameras yet, it
+      takes the cameras proposed for them.
+    * Any other source that comes back -- under its name, or as the same
+      recordings under a new one -- keeps its name, token, session, VO part
+      and stage memory, and takes the cameras proposed now.  Nobody chose
+      those, so a better scan may correct them; keeping them froze every
+      wrong pairing a scan ever made.
+    """
     ep["media"] = {r: dict(rec) for r, rec in result["files"].items()}
     old = ep.get("sources", {})
-    new = {}
+    new = {n: s for n, s in old.items() if s.get("user_made")}
+    owner_of = {}                     # file a user-made source holds -> it
+    for n, s in new.items():
+        for f in s.get("audio", []) + s.get("video", []):
+            owner_of[f] = n
+    by_recordings = {frozenset(s["audio"]): n for n, s in old.items()
+                     if s.get("audio") and not s.get("user_made")}
+    carried = set()
     for name, src in result["sources"].items():
-        prev = old.get(name)
-        if prev:
-            src = dict(src, token=prev.get("token") or src.get("token"),
+        audio = [a for a in src["audio"] if a not in owner_of]
+        video = [v for v in src["video"] if v not in owner_of]
+        if not audio:
+            owners = {owner_of[a] for a in src["audio"]}
+            if len(owners) == 1:
+                mine = new[owners.pop()]
+                if video and not mine.get("video"):
+                    mine["video"] = sorted(video)
+            continue
+        prev_name = name if name in old and not old[name].get("user_made") \
+            else by_recordings.get(frozenset(audio))
+        if prev_name in carried:
+            prev_name = None
+        prev = old.get(prev_name) if prev_name else None
+        if prev is not None:
+            carried.add(prev_name)
+            src = dict(prev, audio=audio, video=video,
+                       token=prev.get("token") or src.get("token"),
                        session=prev.get("session") or src.get("session"))
-            if prev.get("video"):
-                src["video"] = prev["video"]
+            name = prev_name
+        else:
+            src = dict(src, audio=audio, video=video)
+        base, i = name, 2
+        while name in new:
+            name = "{} ({})".format(base, i); i += 1
         new[name] = src
-    # Sources the user made by hand (not re-proposed) stay.
-    for name, src in old.items():
-        if name not in new and src.get("user_made"):
-            new[name] = src
     ep["sources"] = new
     ep.setdefault("links", {})
     if result.get("mix") and not ep["links"].get("mix"):
