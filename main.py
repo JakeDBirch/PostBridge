@@ -2390,6 +2390,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             # Spotting markers from the Assembly view (see engines.place_markers)
             if r.get("markers"):
                 entry["markers"] = list(r["markers"])
+            # Silence at the joins of regions split off and moved on the
+            # Assembly track (see engines.kept_segments)
+            if r.get("seg_gaps"):
+                entry["seg_gaps"] = list(r["seg_gaps"])
             # Persist VO takes_data so edited segments survive save/load cycles
             if r.get("is_vo") and r.get("takes_data"):
                 entry["takes_data"] = r["takes_data"]
@@ -2533,6 +2537,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 r["markers"] = entry["markers"]
             elif "markers" in r:
                 del r["markers"]
+            if "seg_gaps" in entry:
+                r["seg_gaps"] = entry["seg_gaps"]
+            elif "seg_gaps" in r:
+                del r["seg_gaps"]
             # Restore VO takes_data (keeps edited per-take segments in sync)
             if "takes_data" in entry and r.get("is_vo"):
                 r["takes_data"] = entry["takes_data"]
@@ -8187,6 +8195,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                         r.pop("source_video", None)
                         if is_video(new_audio_path):
                             r["source_video"] = new_audio_path
+                    # The waveform editor doesn't know about the silences
+                    # at a pull's joins; keep the ones its edit left alone.
+                    _gaps = engines.realign_seg_gaps(
+                        r.get("segments") or [], r.get("seg_gaps"), new_segs)
+                    if _gaps:
+                        r["seg_gaps"] = _gaps
+                    else:
+                        r.pop("seg_gaps", None)
                     r["segments"]   = new_segs
                     r["rec_in_s"]   = new_segs[0][0]
                     r["rec_out_s"]  = new_segs[-1][1]
@@ -8642,13 +8658,23 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         if e is not None and e.get("open_review_fn"):
             e["open_review_fn"]()
 
-    def _assembly_set_segments(self, order, segments):
+    def _assembly_set_segments(self, order, segments, gaps=None):
         """An edit on the Assembly track: the pull's new kept source
-        ranges, committed exactly as the waveform editor's accept does."""
+        ranges, committed exactly as the waveform editor's accept does --
+        and with `gaps`, the silence at each of their joins (seg_gaps, see
+        engines.kept_segments), in the same undo step."""
         e = next((e for e in getattr(self, "_rv", [])
                   if e["res"].get("order") == order), None)
-        if e is not None and e.get("accept_fn") and segments:
-            e["accept_fn"]([[float(a), float(b)] for a, b in segments])
+        if e is None or not e.get("accept_fn") or not segments:
+            return
+        e["accept_fn"]([[float(a), float(b)] for a, b in segments])
+        if gaps is not None:
+            r = e["res"]
+            gaps = [round(max(0.0, float(g)), 4) for g in gaps]
+            if any(gaps):
+                r["seg_gaps"] = gaps
+            else:
+                r.pop("seg_gaps", None)
 
     def _assembly_set_reading(self, order, index):
         """Swap a monolog pull to another reading of the same lines -- one
@@ -8664,6 +8690,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self._s4_push_undo()
         r["best_take_index"] = index
         r["segments"]   = segs
+        r.pop("seg_gaps", None)          # the other reading has its own joins
         r["source_audio"] = td[index].get("apath") or r.get("source_audio", "")
         r["rec_in_s"],  r["rec_out_s"]  = segs[0][0], segs[-1][1]
         r["rec_in_tc"], r["rec_out_tc"] = secs_tc(segs[0][0]), secs_tc(segs[-1][1])
@@ -9365,16 +9392,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 edited.append(res)
                 continue
 
-            if segs:
-                clean_segs = [(s, e) for s, e in segs if e > s]
-            else:
-                clean_segs = []
+            clean_segs, _gaps = engines.kept_segments(segs, res.get("seg_gaps"))
 
             if not clean_segs:
                 continue
 
             res = dict(res)
             res["segments"]  = clean_segs
+            if res.get("seg_gaps"):
+                res["seg_gaps"] = _gaps[1:]   # still one per join
             res["rec_in_s"]  = clean_segs[0][0]
             res["rec_out_s"] = clean_segs[-1][1]
             edited.append(res)

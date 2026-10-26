@@ -17,15 +17,22 @@ the edges trim.  Every action is also a button with its key in the bar
 across the top, which is the window's key.
 
 The track is also the editor.  Every edit is the same edit Step 4 makes, committed through the card's own
-accept (segments) or the result's gap_after_s, so Step 4's undo, its saved
-state and the AAF all see it:
+accept (segments, and seg_gaps -- the silence at their joins) or the
+result's gap_after_s, so Step 4's undo, its saved state and the AAF all
+see it.  Each of a pull's segments is a region, and its own clip in the
+AAF:
 
-  * drag a pull's edge, or either side of a cut inside it, to trim --
-    shuffle-style, so everything after it moves up or back;
-  * drag a pull, or the gap in front of it, to change that gap;
+  * B splits the region under the insertion point in two there (or at
+    both ends of a highlighted span): the same audio, two regions;
+  * drag a pull's edge, or either side of a cut or split inside it, to
+    trim -- shuffle-style, so everything after it moves up or back;
+  * drag a region, or the gap in front of it, to change that gap -- the
+    gap after the pull before it, or inside a pull, the silence at that
+    join;
+  * , and . nudge the selected region (or pull) a frame earlier or later
+    the same way (< > by ten), for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
-  * , and . nudge the gap before the selected pull by a frame (< > by ten);
   * double-click a pull (or Enter) to open Step 4's waveform editor on it,
     for hunting the right edit in audio outside the pull.
 
@@ -34,7 +41,9 @@ out, M an SFX spot, at the playhead -- while it plays, too.  Each mark
 lives on the pull it lands on (engines.place_markers), so it rides with
 that audio through any retiming, and the AAF carries them as the MUSIC and
 SFX marker tracks beside PARTS.  Drag a flag to move it, double-click to
-name it, Delete to remove it.
+name it, Delete to remove it; an SFX spot opens for naming as it lands.
+
+While the cut plays, the script lights each word as it is said.
 
 Audio is pulled per pull, with a few seconds of handle either side, from a
 small thread pool, nearest-the-view first, and composed on demand by
@@ -42,8 +51,10 @@ _AssemblyAudio as the player asks for it.  Nothing is rendered to disk.
 """
 import bisect
 import concurrent.futures
+import difflib
 import math
 import os
+import re
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -68,6 +79,7 @@ LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
 CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
+WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -160,6 +172,10 @@ class _Clip(object):
         # The exact source ranges behind the pieces -- what an edit
         # rewrites (the pieces are rounded to the layout's sample grid).
         self.segments  = [(float(a), float(b)) for a, b in entry["segments"]]
+        # Seconds of silence at each join between them (engines.kept_segments).
+        gaps = [float(g) for g in entry.get("seg_gaps") or ()]
+        self.seg_gaps  = gaps if len(gaps) == len(self.segments) - 1 else \
+            [0.0] * max(0, len(self.segments) - 1)
         if self.pieces:
             self.src_lo = min(si for _, _, si in self.pieces)
             self.src_hi = max(si + du for _, du, si in self.pieces)
@@ -183,36 +199,101 @@ class _Clip(object):
 
     def src_at(self, t):
         """Source time under timeline time t, or None in no segment."""
-        for tl, du, si in self.pieces:
+        k = self.piece_at(t)
+        return None if k is None else self.pieces[k][2] + (t - self.pieces[k][0])
+
+    def piece_at(self, t):
+        """Index of the region (segment) under timeline time t, or None."""
+        for k, (tl, du, _si) in enumerate(self.pieces):
             if tl <= t < tl + du:
-                return si + (t - tl)
+                return k
         return None
 
 
-def _tidy(segments):
-    """Drop slivers and join segments a trim has butted together."""
-    out = []
-    for a, b in sorted(segments):
+def _tidy(segments, gaps=None):
+    """Drop the slivers an edit has left, keeping the regions in timeline
+    order.  `gaps` is the silence at each join; a sliver's passes to the
+    region after it.  Regions that butt stay apart -- a split is two
+    regions of continuous audio.  Returns (segments, gaps)."""
+    gaps = list(gaps or ())
+    out, out_g, carry = [], [], 0.0
+    for k, (a, b) in enumerate(segments):
+        if 0 < k <= len(gaps):
+            carry += gaps[k - 1]
         if b - a < MIN_SEG_S:
             continue
-        if out and a - out[-1][1] <= 1e-3:
-            out[-1] = (out[-1][0], max(out[-1][1], b))
-        else:
-            out.append((a, b))
-    return out
+        if out:
+            out_g.append(carry)
+        out.append((a, b))
+        carry = 0.0
+    return out, out_g
 
 
 def _segments_without(clip, a, b):
-    """The clip's segments with timeline span [a, b] taken out."""
-    out = []
-    for (s, e), (tl, du, _si) in zip(clip.segments, clip.pieces):
+    """The clip's segments, and the silence at their joins, with timeline
+    span [a, b] taken out -- audio and silence alike, shuffle-style."""
+    segs, before, pend = [], [], 0.0
+    for k, ((s, e), (tl, du, _si)) in enumerate(zip(clip.segments, clip.pieces)):
+        if k:
+            g = clip.seg_gaps[k - 1]
+            pend += max(0.0, g - max(0.0, min(b, tl) - max(a, tl - g)))
         ra, rb = max(a, tl), min(b, tl + du)
-        if rb <= ra:
-            out.append((s, e))
+        for seg in ([(s, e)] if rb <= ra else
+                    [(s, s + (ra - tl)), (s + (rb - tl), e)]):
+            segs.append(seg)
+            before.append(pend)
+            pend = 0.0
+    return _tidy(segs, before[1:])
+
+
+_WORD_RE = re.compile(r"\S+")
+
+
+def _norm_word(w):
+    return re.sub(r"[^0-9a-z]", "", w.lower())
+
+
+def _script_timing(body, words):
+    """When each word of a pull's script line is said.
+
+    body  : the line as the script pane shows it.
+    words : the pull's transcript words on the timeline, [(t0, t1, text)].
+
+    The line's words are matched to the transcript's in order (difflib); a
+    run the transcript has differently ("gonna" for "going to") shares out
+    the time between its matched neighbours.  Returns [(t0, t1, char_start,
+    char_end)] in order -- empty when nothing matches."""
+    toks = [(m.start(), m.end(), _norm_word(m.group()))
+            for m in _WORD_RE.finditer(body or "")]
+    toks = [x for x in toks if x[2]]
+    if not toks or not words:
+        return []
+    sm = difflib.SequenceMatcher(None, [x[2] for x in toks],
+                                 [_norm_word(w[2]) for w in words],
+                                 autojunk=False)
+    times = [None] * len(toks)
+    for i, j, n in sm.get_matching_blocks():
+        for d in range(n):
+            times[i + d] = (words[j + d][0], words[j + d][1])
+    if not any(times):
+        return []
+    i = 0
+    while i < len(toks):
+        if times[i] is not None:
+            i += 1
             continue
-        out.append((s, s + (ra - tl)))
-        out.append((s + (rb - tl), e))
-    return _tidy(out)
+        j = i
+        while j < len(toks) and times[j] is None:
+            j += 1
+        if i > 0 and j < len(toks):
+            lo, hi = times[i - 1][1], times[j][0]
+            if hi - lo >= 0.05 * (j - i):    # else the words were cut out
+                step = (hi - lo) / (j - i)
+                for n in range(i, j):
+                    times[n] = (lo + (n - i) * step, lo + (n - i + 1) * step)
+        i = j
+    return [(tm[0], tm[1], cs, ce)
+            for (cs, ce, _k), tm in zip(toks, times) if tm is not None]
 
 
 class _AssemblyAudio(object):
@@ -306,9 +387,13 @@ class AssemblyWindow(object):
         self._play_origin = 0.0          # where the last play started
         self._token_tints = {}
         self.sel_order  = None
+        self.sel_region = None           # (order, k): one region, by the grabber
         self._cur_order = None           # pull the playhead is in
         self._word_items = []            # [(tl_start, tl_end, item)] on screen
         self._lit_word  = None
+        self._karaoke   = {}             # order -> (words, (starts, spans))
+        self._lit_script = None          # (order, char_start, char_end) lit
+        self._lit_range = None           # its Text indices
         self._env       = {}             # order -> (t0, envelope float32)
         self._env_scale = 0.25           # amplitude that fills the lane
         self._loading   = set()
@@ -372,7 +457,9 @@ class AssemblyWindow(object):
         self.text.tag_config("mk_music", foreground=_C_MUSIC, font=_SMALL)
         self.text.tag_config("mk_sfx", foreground=_C_SFX, font=_SMALL)
         self.text.tag_config("sel_pull", background=SURF2)
+        self.text.tag_config("word", background=ACCENT, foreground=TEXT)
         self.text.tag_raise("cur")
+        self.text.tag_raise("word")
         self.text.bind("<Button-1>", self._on_text_click)
 
         # Track pane
@@ -462,8 +549,9 @@ class AssemblyWindow(object):
         r = rows[1]
         group(r, "EDIT")
         key(r, "Delete selection", "Del", self._delete_key)
-        key(r, "Gap \u2212 1 fr", ",", lambda: self.nudge_gap(-1))
-        key(r, "Gap + 1 fr", ".", lambda: self.nudge_gap(1))
+        key(r, "Split", "B", self.split)
+        key(r, "Nudge earlier", ",", lambda: self.nudge(-1))
+        key(r, "Nudge later", ".", lambda: self.nudge(1))
         key(r, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(r, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
         key(r, "Open in editor", "Enter", self.open_selected)
@@ -484,7 +572,7 @@ class AssemblyWindow(object):
         group(r, "MOUSE")
         tk.Label(r, font=(FB[0], 10), bg=SURF, fg=TEXT, text=(
             "pull top half: select (click = insertion point, drag = highlight)"
-            "   {d}   bottom half: grab (click = whole pull, drag = move)"
+            "   {d}   bottom half: grab (click = region, drag = move)"
             "   {d}   edge: trim   {d}   gap: drag to retime"
             "   {d}   double-click: editor   {d}   flag: drag / double-click"
             " to name   {d}   Ctrl+wheel: zoom").format(d="\u00b7")
@@ -533,6 +621,7 @@ class AssemblyWindow(object):
             self.sel_order = None
         if self._range is not None and self._clip(self._range[0]) is None:
             self._range = None
+        self._sync_region_range()
         self._render_script()
         self._queue_loads()
         self.redraw()
@@ -832,7 +921,8 @@ class AssemblyWindow(object):
             body = (r.get("quote_text") or "").strip()
             if o not in placed:
                 body += "   (not in the cut)"
-            t.insert("end", body, (tag,) + out)
+            # b<order>: where the line starts, for lighting its words.
+            t.insert("end", body, (tag, "b{}".format(o)) + out)
             for m in marks.get(o, ()):
                 t.insert("end", "   [{}]".format(m["label"]),
                          (tag, "mk_sfx" if m["kind"] == "sfx" else "mk_music",
@@ -841,6 +931,8 @@ class AssemblyWindow(object):
         t.config(state="disabled")
         t.yview_moveto(y0)
         self._cur_order = None
+        self._karaoke = {}
+        self._lit_script = self._lit_range = None
         self._highlight_script(self._order_at(self.playhead), see=False)
         self._mark_selected_in_script()
 
@@ -890,6 +982,50 @@ class AssemblyWindow(object):
         rng = t.tag_ranges("o{}".format(self.sel_order))
         if rng:
             t.tag_add("sel_pull", rng[0], rng[-1])
+
+    def _script_words(self, c):
+        """(starts, spans) of _script_timing for a pull's line, worked out
+        once per set of words it has on the timeline."""
+        memo = self._karaoke.get(c.order)
+        if memo is None or memo[0] is not c.words:
+            spans = _script_timing((c.res.get("quote_text") or "").strip(),
+                                   c.words or [])
+            memo = (c.words, ([s[0] for s in spans], spans))
+            self._karaoke[c.order] = memo
+        return memo[1]
+
+    def _light_script_word(self):
+        """Karaoke: light the script word being said at the playhead.  A
+        lookup per tick, and two tag calls only when the word changes, so
+        it keeps up at playback rate."""
+        hit = None
+        i = bisect.bisect_right(self._starts, self.playhead) - 1
+        c = self.clips[i] if 0 <= i < len(self.clips) else None
+        if c is not None and c.words:
+            starts, spans = self._script_words(c)
+            j = bisect.bisect_right(starts, self.playhead) - 1
+            if j >= 0:
+                _t0, t1, cs, ce = spans[j]
+                nxt = starts[j + 1] if j + 1 < len(starts) else c.end
+                if self.playhead < max(t1, min(nxt, t1 + WORD_HOLD_S)):
+                    hit = (c.order, cs, ce)
+        if hit == self._lit_script:
+            return
+        t = self.text
+        if self._lit_range is not None:
+            t.tag_remove("word", *self._lit_range)
+        self._lit_script, self._lit_range = hit, None
+        if hit is None:
+            return
+        try:
+            a = t.index("b{}.first + {} chars".format(hit[0], hit[1]))
+            b = t.index("b{}.first + {} chars".format(hit[0], hit[2]))
+        except tk.TclError:              # no line for it in the script
+            return
+        t.tag_add("word", a, b)
+        self._lit_range = (a, b)
+        if _MONITOR["follow"] and t.bbox(a) is None:
+            t.see(a)                     # a long line runs off the pane
 
     # ── Geometry ─────────────────────────────────────────────────────────
     def _span(self):
@@ -989,8 +1125,17 @@ class AssemblyWindow(object):
             cv.create_rectangle(xs, y0, xe, y1, fill=_C_CLIP_BG, outline=BORDER)
             cv.create_rectangle(xs, y0, xe, y0 + (5 if c.flagged else 3),
                                 fill=_C_FLAG if c.flagged else col, outline="")
-            for tl, du, si in c.pieces[1:]:
-                xc = self._x(tl)       # an internal cut inside the pull
+            for k, (tl, du, si) in enumerate(c.pieces[1:], 1):
+                xc = self._x(tl)       # a cut or split inside the pull
+                g = c.seg_gaps[k - 1] if k - 1 < len(c.seg_gaps) else 0.0
+                if g > 0:              # a region moved later: open track
+                    xg = self._x(tl - g)
+                    cv.create_rectangle(xg, y0 + 1, xc, y1 - 1, fill=BG,
+                                        outline="")
+                    txt = "{:.2f}s".format(g)
+                    if self._fits(txt, xc - xg + 20):
+                        cv.create_text((xg + xc) / 2.0, y1 + self._gap_h / 2.0,
+                                       text=txt, font=self._font, fill=SUB)
                 cv.create_line(xc, y0 + 4, xc, y1, fill=BORDER, dash=(1, 3))
             lbl = c.label
             if c.flagged:
@@ -1043,6 +1188,7 @@ class AssemblyWindow(object):
         cv.create_line(x, 0, x, y1, fill=_C_PLAYHEAD, width=2, tags=("ph",))
         self.tc_lbl.config(text=_fmt_tc(self.playhead))
         self._light_word()
+        self._light_script_word()
         self._draw_overview()
 
     def _marker_row(self):
@@ -1196,6 +1342,7 @@ class AssemblyWindow(object):
                            self.ov.winfo_height())
         self.tc_lbl.config(text=_fmt_tc(self.playhead))
         self._light_word()
+        self._light_script_word()
 
     # ── Status ───────────────────────────────────────────────────────────
     def _update_status(self):
@@ -1214,6 +1361,17 @@ class AssemblyWindow(object):
             self.status.config(text="{} pulls  ·  {}".format(
                 len(self.clips), _fmt_tc(self.total_s)), fg=SUB)
             return
+        reg = self.sel_region
+        if reg is not None and reg[0] == c.order and reg[1] < len(c.segments):
+            s, e = c.segments[reg[1]]
+            sp = self._space(*reg)
+            self.status.config(fg=SUB, text="   ·   ".join(p for p in (
+                c.label, "region {} of {}".format(reg[1] + 1, len(c.segments)),
+                "{} → {}".format(secs_tc(s), secs_tc(e)),
+                "{:.1f}s".format(e - s),
+                "{:.2f}s in front".format(sp["value"]) if sp else "",
+                ", . nudge it   ·   B splits") if p))
+            return
         segs = len(c.pieces)
         parts = ["{}".format(c.label),
                  "{} → {}".format(secs_tc(c.src_lo), secs_tc(c.src_hi)),
@@ -1227,10 +1385,34 @@ class AssemblyWindow(object):
     # ── Selection / navigation ───────────────────────────────────────────
     def select(self, order):
         self.sel_order = order
+        if self.sel_region is not None:
+            self._range = None           # the pull replaces the region
+        self.sel_region = None
         self.sel_marker = None
         self._mark_selected_in_script()
         self.redraw()
         self._update_status()
+
+    def _select_region(self, order, k):
+        """One region of a pull, as the grabber takes it: highlighted, so
+        Delete takes it out and Space plays it, and the one , . nudge."""
+        self.sel_order  = order
+        self.sel_region = (order, k)
+        self.sel_marker = None
+        self._mark_selected_in_script()
+        self._sync_region_range()
+
+    def _sync_region_range(self):
+        """Keep the selected region's highlight on it as edits move it."""
+        if self.sel_region is None:
+            return
+        o, k = self.sel_region
+        c = self._clip(o)
+        if c is None or k >= len(c.pieces):
+            self.sel_region = self._range = None
+            return
+        tl, du, _si = c.pieces[k]
+        self._range = (o, tl, tl + du)
 
     def seek(self, t, center=False):
         """Go to t -- the playhead and the insertion point, and the
@@ -1263,10 +1445,11 @@ class AssemblyWindow(object):
     # ── Editing on the track ─────────────────────────────────────────────
     def _hit(self, x, y):
         """What a press at (x, y) would take: ("in" | "out", clip, segment)
-        on an edge, ("select", clip) in a pull's top half, ("grab", clip) in
-        its bottom half, ("gap", the pull before it) between two,
-        ("marker", mark) on a flag, ("ruler",) above the track, or
-        ("none",)."""
+        on an edge, ("select", clip, segment) in a region's top half,
+        ("grab", clip, segment) in its bottom half, ("gap", clip, segment)
+        in the silence in front of a region -- between two pulls, or
+        inside one -- ("marker", mark) on a flag, ("ruler",) above the
+        track, or ("none",)."""
         y0, y1 = self._track_box()
         reach = max(6, self._ls // 2)
         if y < y0:
@@ -1301,10 +1484,16 @@ class AssemblyWindow(object):
             return best[1]
         c = self._clip_at(t)
         if c is not None:
+            k = c.piece_at(t)
+            if k is None:
+                # Silence inside the pull, where a region was moved later.
+                k = next((n for n, (tl, _du, _si) in enumerate(c.pieces)
+                          if tl > t), None)
+                return ("gap", c, k) if k else ("none", None, None)
             # Pro Tools' Smart Tool split: selector above, grabber below.
-            return ("select" if y < (y0 + y1) / 2.0 else "grab", c, None)
+            return ("select" if y < (y0 + y1) / 2.0 else "grab", c, k)
         if 0 <= i < len(self.clips) - 1:
-            return ("gap", self.clips[i], None)
+            return ("gap", self.clips[i + 1], 0)
         return ("none", None, None)
 
     def _prev_clip(self, c):
@@ -1356,7 +1545,8 @@ class AssemblyWindow(object):
         if kind in ("in", "out"):
             self._range = None
             self._drag = {"mode": kind, "order": c.order, "k": k, "x0": e.x,
-                          "segs0": list(c.segments), "moved": False}
+                          "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
+                          "moved": False}
             self.select(c.order)
             return
         if kind == "select":
@@ -1368,6 +1558,7 @@ class AssemblyWindow(object):
                 self._range = (o, anchor, a)
             else:
                 self._range = (c.order, a, a)
+            self.sel_region = None
             self._drag = {"mode": "range", "x0": e.x, "t": a}
             if c.order != self.sel_order:
                 self.sel_order = c.order
@@ -1376,23 +1567,20 @@ class AssemblyWindow(object):
             self._status_range()
             return
         if kind == "grab":
-            # Grabber: the whole pull is selected; dragging moves it (and
-            # everything after) by changing the gap in front of it.
-            owner = self._prev_clip(c)
-            self._range = (c.order, c.start, c.end)
+            # Grabber: the region is selected; dragging moves it (and
+            # everything after) by changing the silence in front of it.
+            self._select_region(c.order, k)
             self._drag = {"mode": "gap", "x0": e.x, "moved": False,
-                          "grabbed": c.order,
-                          "target": owner.order if owner else None,
-                          "gap0": owner.gap if owner else 0.0}
-            self.sel_order = c.order
-            self._mark_selected_in_script()
+                          "grabbed": (c.order, k),
+                          "space": self._space(c.order, k)}
             self.redraw()
             self._status_range()
             return
         self._range = None
+        self.sel_region = None
         if kind == "gap":
             self._drag = {"mode": "gap", "x0": e.x, "moved": False,
-                          "target": c.order, "gap0": c.gap, "t": t}
+                          "space": self._space(c.order, k), "t": t}
             return
         self.set_insert(t)
         self.redraw()
@@ -1432,16 +1620,63 @@ class AssemblyWindow(object):
                 m["label"] if m else "", _fmt_tc(d["value"])))
             return
         if mode == "gap":
-            if d["target"] is None:
+            sp = d["space"]
+            if sp is None:
                 return
-            d["value"] = max(0.0, d["gap0"] + dt)
-            self._layout({d["target"]: {"gap_after_s": d["value"],
-                                        "gap_after": True}})
+            d["value"] = max(0.0, sp["value"] + dt)
+            self._layout(self._space_override(sp, d["value"]))
+            self._sync_region_range()
         else:
             d["value"] = self._trimmed(d, dt)
             self._layout({d["order"]: {"segments": d["value"]}})
         self.redraw()
         self._status_drag(d)
+
+    # A "space" is the silence in front of one region, which is what
+    # moving that region changes: {"order", "k", "owner", "value"}, and for
+    # a join inside a pull the pull's "segments" and "gaps" too.
+    def _space(self, order, k):
+        """The space in front of region k of a pull: the gap after the
+        pull before it (k == 0), else the pull's own silence at that join.
+        None in front of the first pull -- nothing there to give or take."""
+        c = self._clip(order)
+        if c is None or k is None or not 0 <= k < max(1, len(c.pieces)):
+            return None
+        if k == 0:
+            prev = self._prev_clip(c)
+            if prev is None:
+                return None
+            return {"order": order, "k": 0, "owner": prev.order,
+                    "value": prev.gap}
+        return {"order": order, "k": k, "owner": order,
+                "value": c.seg_gaps[k - 1], "gaps": list(c.seg_gaps),
+                "segments": list(c.segments)}
+
+    def _space_override(self, sp, value):
+        """The space set to `value`, as _layout overrides (a drag)."""
+        if sp["k"] == 0:
+            return {sp["owner"]: {"gap_after_s": value, "gap_after": True}}
+        gaps = list(sp["gaps"])
+        gaps[sp["k"] - 1] = value
+        return {sp["owner"]: {"seg_gaps": gaps}}
+
+    def _commit_space(self, sp, value):
+        """The space set to `value` in Step 4: the gap after the pull in
+        front, or the pull's own joins through its card's accept."""
+        if sp["k"] == 0:
+            self.app._assembly_set_gap(sp["owner"], value)
+            return
+        gaps = list(sp["gaps"])
+        gaps[sp["k"] - 1] = value
+        self.app._assembly_set_segments(sp["owner"], sp["segments"], gaps)
+
+    def _space_name(self, sp):
+        c = self._clip(sp["order"])
+        if sp["k"] == 0:
+            o = self._clip(sp["owner"])
+            return "gap after {}".format(o.label if o else "")
+        return "silence before region {} of {}".format(
+            sp["k"] + 1, c.label if c else "")
 
     def _trimmed(self, d, dt):
         """The pull's segments with one edge moved by dt seconds, held
@@ -1474,22 +1709,24 @@ class AssemblyWindow(object):
             return
         if not d.get("moved") or "value" not in d:
             if d["mode"] == "gap" and d.get("grabbed") is not None:
-                c = self._clip(d["grabbed"])
-                if c is not None:
-                    self.set_insert(c.start)
+                o, k = d["grabbed"]
+                c = self._clip(o)
+                if c is not None and k < len(c.pieces):
+                    self.set_insert(c.pieces[k][0])
             elif d["mode"] == "gap" and "t" in d:
                 self.set_insert(d["t"])
             return
         if d["mode"] == "marker":
             self._move_marker(d["key"], d["value"])
             return
-        self._range = None
+        if d.get("grabbed") is None:
+            self._range = None           # a moved region stays selected
         if d["mode"] == "gap":
-            self.app._assembly_set_gap(d["target"], d["value"])
+            self._commit_space(d["space"], d["value"])
         else:
-            segs = _tidy(d["value"])
-            if segs and segs != _tidy(d["segs0"]):
-                self.app._assembly_set_segments(d["order"], segs)
+            segs, gaps = _tidy(d["value"], d["gaps0"])
+            if segs and (segs, gaps) != _tidy(d["segs0"], d["gaps0"]):
+                self.app._assembly_set_segments(d["order"], segs, gaps)
         self.refresh()
         self._park_at_edit(d)
 
@@ -1497,10 +1734,10 @@ class AssemblyWindow(object):
         """After an edit the insertion point sits on the new seam, so
         play (with pre-roll) runs straight into it."""
         if d["mode"] == "gap":
-            i = next((n for n, c in enumerate(self.clips)
-                      if c.order == d["target"]), None)
-            if i is not None and i + 1 < len(self.clips):
-                self.set_insert(self.clips[i + 1].start)
+            sp = d["space"]
+            c = self._clip(sp["order"]) if sp else None
+            if c is not None and sp["k"] < len(c.pieces):
+                self.set_insert(c.pieces[sp["k"]][0])
             return
         c = self._clip(d["order"])
         if c is None or not c.pieces:
@@ -1510,10 +1747,9 @@ class AssemblyWindow(object):
 
     def _status_drag(self, d):
         if d["mode"] == "gap":
-            o = self._clip(d["target"])
-            self.status.config(fg=TEXT, text="gap after {}:  {:.3f}s   ({:+.3f}s)"
-                               .format(o.label if o else "", d["value"],
-                                       d["value"] - d["gap0"]))
+            sp = d["space"]
+            self.status.config(fg=TEXT, text="{}:  {:.3f}s   ({:+.3f}s)".format(
+                self._space_name(sp), d["value"], d["value"] - sp["value"]))
             return
         seg0, seg = d["segs0"][d["k"]], d["value"][d["k"]]
         i = 0 if d["mode"] == "in" else 1
@@ -1526,10 +1762,16 @@ class AssemblyWindow(object):
         o, a, b = self._range
         c = self._clip(o)
         whole = c is not None and abs(b - a) >= c.end - c.start - MIN_SEG_S
-        self.status.config(fg=TEXT, text="{}   {:.2f}s selected   ·   "
-                           "Space plays it   ·   Delete takes it out{}".format(
-                               c.label if c else "", abs(b - a),
-                               " (the whole pull: IGNOREs it)" if whole else ""))
+        reg = self.sel_region
+        self.status.config(fg=TEXT, text="{}{}   {:.2f}s selected   ·   "
+                           "Space plays it   ·   Delete takes it out{}{}".format(
+                               c.label if c else "",
+                               "  region {} of {}".format(reg[1] + 1, len(c.pieces))
+                               if reg and c and len(c.pieces) > 1 else "",
+                               abs(b - a),
+                               " (the whole pull: IGNOREs it)" if whole else "",
+                               "   ·   , . nudge it" if reg else
+                               "   ·   B splits at both ends"))
 
     def delete_range(self):
         if self._range is None:
@@ -1537,17 +1779,91 @@ class AssemblyWindow(object):
         o, a, b = self._range
         a, b = min(a, b), max(a, b)
         c = self._clip(o)
-        self._range = None
+        self._range = self.sel_region = None
         if c is None or b - a < MIN_SEG_S:
             self.redraw()
             return
-        segs = _segments_without(c, a, b)
+        segs, gaps = _segments_without(c, a, b)
         if segs:
-            self.app._assembly_set_segments(o, segs)
+            self.app._assembly_set_segments(o, segs, gaps)
         else:
             self.app._assembly_ignore(o)
         self.refresh()
         self.set_insert(a)
+
+    def split(self):
+        """Split the region under the insertion point (the playhead, while
+        the cut plays) in two there -- or at both ends of a highlighted
+        span, which becomes a region of its own.  The same audio, butted:
+        two regions that trim and move on their own, two clips in the AAF.
+        The region after the split is selected, ready to nudge."""
+        r = self._range
+        if r is not None and self.sel_region is None and \
+                abs(r[2] - r[1]) >= MIN_SEG_S:
+            c, points = self._clip(r[0]), sorted(r[1:])
+        else:
+            t = self.playhead if self._playing else self.insert
+            c, points = self._clip_at(t), [t]
+        if c is None:
+            self.status.config(fg=SUB, text="Nothing to split here: put the "
+                               "insertion point inside a pull.")
+            return
+        segs, gaps, first = list(c.segments), list(c.seg_gaps), None
+        for t in sorted(points, reverse=True):   # later first: indices hold
+            k = c.piece_at(t)
+            if k is None:
+                continue
+            tl, du, _si = c.pieces[k]
+            if t - tl < MIN_SEG_S or tl + du - t < MIN_SEG_S:
+                continue                       # already a region edge
+            s, e = segs[k]
+            cut = s + (t - tl)
+            segs[k:k + 1] = [(s, cut), (cut, e)]
+            gaps.insert(k, 0.0)
+            first = k
+        if first is None:
+            self.status.config(fg=SUB, text="{}   ·   already a region edge "
+                               "here".format(c.label))
+            return
+        self._range = None
+        self.app._assembly_set_segments(c.order, segs, gaps)
+        self.refresh()
+        self._select_region(c.order, first + 1)
+        self.redraw()
+        self._update_status()
+
+    def nudge(self, frames):
+        """Move the selected region -- or the selected pull -- and
+        everything after it `frames` earlier or later: the silence in
+        front of it shrinks or grows.  It stops once it butts against
+        what plays before it."""
+        key = self.sel_region or (
+            (self.sel_order, 0) if self.sel_order is not None else None)
+        if key is None:
+            self.status.config(fg=SUB, text="Select a region to nudge: click "
+                               "the bottom half of it.")
+            return
+        sp = self._space(*key)
+        c = self._clip(key[0])
+        if sp is None:
+            self.status.config(fg=SUB, text="{}   ·   the start of the cut: "
+                               "nothing in front of it to move".format(
+                                   c.label if c else ""))
+            return
+        fps = float(getattr(self.app, "_seq_fps", 24.0) or 24.0)
+        value = round(max(0.0, sp["value"] + frames / fps), 4)   # as stored
+        if abs(value - sp["value"]) < 1e-6:
+            self.status.config(fg=SUB, text="{}   ·   already butted against "
+                               "what plays before it -- trim to tighten "
+                               "further".format(c.label if c else ""))
+            return
+        self._commit_space(sp, value)
+        self.refresh()
+        c = self._clip(key[0])
+        if c is not None and key[1] < len(c.pieces):
+            self.set_insert(c.pieces[key[1]][0])
+        self.status.config(fg=TEXT, text="{}:  {:.3f}s   ({:+.3f}s)".format(
+            self._space_name(sp), value, value - sp["value"]))
 
     def _delete_key(self):
         if self.sel_marker is not None:
@@ -1570,6 +1886,8 @@ class AssemblyWindow(object):
         self.app._assembly_set_reading(
             o, ((c.res.get("best_take_index") or 0) + d) % n)
         self.sel_order = o
+        if self.sel_region is not None:
+            self.sel_region = self._range = None   # the reading's own regions
         self.refresh()
 
     def open_selected(self):
@@ -1590,6 +1908,8 @@ class AssemblyWindow(object):
         c = self._clip_at(t)
         if c is not None:
             src = c.src_at(t)
+            if src is None:              # silence inside it: where audio resumes
+                src = next((si for tl, _du, si in c.pieces if tl > t), None)
             if src is not None:
                 return c.order, {"src": round(src, 4)}
         i = bisect.bisect_right(self._starts, t) - 1
@@ -1605,7 +1925,8 @@ class AssemblyWindow(object):
 
     def drop_marker(self, kind):
         """A mark at the playhead -- the spotting keys, so it works while
-        the cut plays."""
+        the cut plays.  An SFX spot opens straight into naming it: Enter
+        keeps the name, Esc leaves it as its count (SFX 7)."""
         order, anchor = self._anchor_at(self.playhead)
         if order is None:
             return
@@ -1614,10 +1935,12 @@ class AssemblyWindow(object):
         self.app._assembly_set_markers({order: marks})
         self.sel_marker = (order, len(marks) - 1)
         self.refresh()
+        if kind == "sfx":
+            self._begin_rename(self.sel_marker)
 
     def select_marker(self, key):
         self.sel_marker = key
-        self.sel_order = None
+        self.sel_order = self.sel_region = None
         self._mark_selected_in_script()
         self.redraw()
         self._update_status()
@@ -1682,9 +2005,20 @@ class AssemblyWindow(object):
                          insertbackground=TEXT, relief="flat", width=28,
                          highlightthickness=1, highlightbackground=ACCENT)
         entry.insert(0, m["name"])
-        entry.bind("<Return>", lambda e: self._end_rename(commit=True))
-        entry.bind("<Escape>", lambda e: self._end_rename(commit=False))
+
+        # "break": the key is the field's alone.  Without it the same
+        # Enter reaches the window's own Enter (open in the editor) once
+        # the field has closed itself.
+        def _done(commit):
+            self._end_rename(commit=commit)
+            return "break"
+        entry.bind("<Return>", lambda e: _done(True))
+        entry.bind("<KP_Enter>", lambda e: _done(True))
+        entry.bind("<Escape>", lambda e: _done(False))
         self._rename = (entry, key)
+        x = self._x(m["t"])
+        if not 0 <= x <= max(1, self.cv.winfo_width()) - 220:
+            self.view0 = m["t"] - self._span() * 0.3   # bring the field into view
         self.redraw()
         entry.focus_set()
         entry.select_range(0, "end")
@@ -1705,16 +2039,6 @@ class AssemblyWindow(object):
         else:
             self.redraw()
         self.cv.focus_set()
-
-    def nudge_gap(self, frames):
-        """Move the selected pull (and everything after it) by frames."""
-        c = self._clip(self.sel_order)
-        prev = self._prev_clip(c) if c is not None else None
-        if prev is None:
-            return
-        fps = float(getattr(self.app, "_seq_fps", 24.0) or 24.0)
-        self.app._assembly_set_gap(prev.order, max(0.0, prev.gap + frames / fps))
-        self.refresh()
 
     def _on_wheel(self, e):
         notches = e.delta / 120.0
@@ -1900,8 +2224,11 @@ class AssemblyWindow(object):
 
     # ── Keys ─────────────────────────────────────────────────────────────
     def _on_key(self, e):
-        if isinstance(e.widget, tk.Entry):
-            return "break"                   # typing a mark's name
+        if isinstance(e.widget, tk.Entry) or not isinstance(e.widget, tk.Misc):
+            # Typing a mark's name -- or the key that just closed the
+            # field, which can still arrive here once it is gone (e.widget
+            # is then only its name).  Never a shortcut.
+            return "break"
         k = e.keysym
         ctrl = bool(e.state & 0x0004)
         if k == "space":
@@ -1916,7 +2243,7 @@ class AssemblyWindow(object):
             self.zoom(1 / 1.5)
         elif k == "Home":
             self.seek(0.0)
-            self._range = None
+            self._range = self.sel_region = None
         elif k == "End":
             self.seek(self.total_s)
         elif k == "Right":
@@ -1944,10 +2271,12 @@ class AssemblyWindow(object):
         elif not ctrl and k.lower() in ("i", "o", "m"):
             self.drop_marker({"i": "music_in", "o": "music_out",
                               "m": "sfx"}[k.lower()])
+        elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
+            self.split()                     # Pro Tools: B, or Ctrl+E
         elif k in ("comma", "period"):
-            self.nudge_gap(-1 if k == "comma" else 1)
+            self.nudge(-1 if k == "comma" else 1)
         elif k in ("less", "greater"):
-            self.nudge_gap(-10 if k == "less" else 10)
+            self.nudge(-10 if k == "less" else 10)
         elif ctrl and k.lower() == "z":
             # Step 4's own history: edits here and on the cards share it.
             (self.app._s4_redo if e.state & 0x0001 else self.app._s4_undo)()
@@ -1958,7 +2287,7 @@ class AssemblyWindow(object):
         elif k.lower() == "f" and not ctrl:
             self.fit()
         elif k == "Escape":
-            self._range = None
+            self._range = self.sel_region = None
             self.sel_marker = None
             self.redraw()
             self._update_status()

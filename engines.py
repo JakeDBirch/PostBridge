@@ -4233,6 +4233,15 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     for _pi in _vo_orders_by_part:
         _vo_orders_by_part[_pi].sort()
 
+    def _join_gaps_fr(res, segs):
+        """Frames of silence before each of `segs` -- the pull's seg_gaps
+        (see kept_segments), when `segs` are the pull's own segments."""
+        joins = res.get("seg_gaps") or []
+        own   = [tuple(s) for s in (res.get("segments") or [])]
+        if len(joins) != len(segs) - 1 or [tuple(s) for s in segs] != own:
+            return [0] * len(segs)
+        return [0] + [round(max(0.0, float(g)) * fps) for g in joins]
+
     def _vo_fallback_span(pi, order, vb):
         orders = _vo_orders_by_part.get(pi, [])
         try:   i2 = orders.index(order)
@@ -4304,7 +4313,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 total_fr = sum(
                     f2fr(e, fps) - f2fr(s, fps)
                     for s, e in td_segs if e > s
-                )
+                ) + sum(_join_gaps_fr(res, td_segs))
                 max_dur_fr = max(max_dur_fr, total_fr)
 
             if max_dur_fr == 0:
@@ -4326,9 +4335,12 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 v_off   = td.get("v_offset", 0.0)
 
                 take_cursor = cursor
+                gaps_fr, pend = _join_gaps_fr(res, td_segs), 0
 
                 for si, (seg_in_s, seg_out_s) in enumerate(td_segs):
+                    pend += gaps_fr[si]
                     if seg_in_s >= seg_out_s: continue
+                    take_cursor += pend; pend = 0
                     seg_in_fr  = f2fr(seg_in_s, fps)
                     seg_out_fr = f2fr(seg_out_s, fps)
                     dur        = seg_out_fr - seg_in_fr
@@ -4421,8 +4433,11 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             if pi not in part_start:
                 part_start[pi] = cursor
 
+            gaps_fr, pend = _join_gaps_fr(res, segments), 0
             for si, (seg_in_s, seg_out_s) in enumerate(segments):
+                pend += gaps_fr[si]
                 if seg_in_s >= seg_out_s: continue
+                cursor += pend; pend = 0
 
                 seg_in_fr  = f2fr(seg_in_s,  fps)
                 seg_out_fr = f2fr(seg_out_s, fps)
@@ -5372,6 +5387,58 @@ def interview_export_paths(res, int_assets):
     return apaths
 
 
+def kept_segments(segments, seg_gaps=None):
+    """A pull's segments, as placed, and the silence in front of each.
+
+    segments : [(src_in, src_out)] in timeline order.
+    seg_gaps : the pull's res["seg_gaps"] -- the silence the timeline leaves
+               at each join, one per join, in seconds: where a region split
+               off on the Assembly track was moved later.  Missing, or not
+               one per join (the segments changed under it), and they butt.
+
+    Returns (segments, gaps): the segments with empty ones dropped, and
+    gaps[k] the seconds of silence before segments[k] (gaps[0] is 0).  An
+    empty segment's silence passes to the one after it, so nothing after
+    it moves.
+    """
+    joins = list(seg_gaps or ())
+    if len(joins) != max(0, len(segments) - 1):
+        joins = [0.0] * max(0, len(segments) - 1)
+    segs, gaps, carry = [], [], 0.0
+    for k, (s, e) in enumerate(segments):
+        if k:
+            carry += max(0.0, float(joins[k - 1]))
+        if s < e:
+            gaps.append(carry if segs else 0.0)
+            segs.append((s, e))
+            carry = 0.0
+    return segs, gaps
+
+
+def realign_seg_gaps(old_segments, seg_gaps, new_segments):
+    """A pull's join silences (res["seg_gaps"]) carried onto segments
+    edited elsewhere -- Step 4's waveform editor knows nothing of them.
+    With as many segments as before (a trim) every join keeps its silence;
+    otherwise a join keeps it when either side of it is unchanged.
+    Returns the new list, or None when no silence is left."""
+    joins = list(seg_gaps or ())
+    if not joins or len(joins) != len(old_segments) - 1:
+        return None
+    if len(new_segments) == len(old_segments):
+        out = [float(g) for g in joins]
+    else:
+        def _near(a, b):
+            return abs(float(a) - float(b)) < 1e-3
+        out = []
+        for j in range(len(new_segments) - 1):
+            out.append(next(
+                (float(joins[k]) for k in range(len(joins))
+                 if _near(old_segments[k][1], new_segments[j][1])
+                 or _near(old_segments[k + 1][0], new_segments[j + 1][0])),
+                0.0))
+    return out if any(g > 0 for g in out) else None
+
+
 def layout_timeline(results, gap_secs, sr, int_assets,
                     progress_cb=None, check_cancel=None):
     """Where every pull lands on the sequence timeline, in samples at `sr`.
@@ -5381,15 +5448,18 @@ def layout_timeline(results, gap_secs, sr, int_assets,
     same numbers, so what is heard there is what Pro Tools opens.
 
     A pull's segments butt together (the cuts between them are excised
-    tape); its gap -- gap_after_s, else the sequence default -- follows
-    the whole pull.
+    tape), except where seg_gaps holds silence at a join (see
+    kept_segments); its gap -- gap_after_s, else the sequence default --
+    follows the whole pull.  Every segment is its own clip in the AAF.
 
     Returns (placed, skipped, part_starts):
-      placed      : [{"res", "segments", "paths", "pieces", "start", "end",
-                      "gap"}] in timeline order.  "res" is the caller's own
-                      dict; "segments" may be capped (see below); "pieces"
-                      is [(tl_start_sa, dur_sa, src_in_sa)] per segment;
-                      "end" is where the pull's audio stops, before its gap.
+      placed      : [{"res", "segments", "seg_gaps", "paths", "pieces",
+                      "start", "end", "gap"}] in timeline order.  "res" is
+                      the caller's own dict; "segments" may be capped (see
+                      below); "seg_gaps" is the silence (s) at each of
+                      their joins; "pieces" is [(tl_start_sa, dur_sa,
+                      src_in_sa)] per segment; "end" is where the pull's
+                      audio stops, before its gap.
       skipped     : results with nothing to place.
       part_starts : part_index -> sample position of that part's first pull.
     """
@@ -5408,11 +5478,12 @@ def layout_timeline(results, gap_secs, sr, int_assets,
             check_cancel()
         is_vo    = res.get("is_vo", False)
         st       = res.get("status", "")
-        segments = res.get("segments") or []
+        raw_segs = res.get("segments") or []
+        segments, seg_gaps = kept_segments(raw_segs, res.get("seg_gaps"))
 
         if st in _TERMINAL_SKIP_STATUSES:
             skipped.append(res); continue
-        if not is_vo and not segments:
+        if not is_vo and not raw_segs:
             skipped.append(res); continue
 
         # ── Guard: cap clips whose source range is unreasonably long ──────────
@@ -5460,12 +5531,17 @@ def layout_timeline(results, gap_secs, sr, int_assets,
             # original Whisper output and would override manual adjustments.
             # VO_TAIL_SECS is already baked into top-level segments at reconcile
             # time, so no additional buffer is added here.
-            td_segs = segments or td.get("segments") or []
+            if segments:
+                td_segs, td_gaps = segments, seg_gaps
+            else:
+                td_segs, td_gaps = kept_segments(td.get("segments") or [])
             ap      = td.get("apath")
-            entry["segments"] = [(s, e) for s, e in td_segs if s < e]
+            entry["segments"] = td_segs
+            entry["seg_gaps"] = td_gaps[1:]
             entry["paths"]    = [ap] if ap else []
             if ap:
-                for seg_in_s, seg_out_s in entry["segments"]:
+                for (seg_in_s, seg_out_s), before in zip(td_segs, td_gaps):
+                    cursor += s2sa(before)
                     dur_sa = s2sa(seg_out_s - seg_in_s)
                     entry["pieces"].append((cursor, dur_sa, s2sa(seg_in_s)))
                     cursor += dur_sa
@@ -5475,9 +5551,11 @@ def layout_timeline(results, gap_secs, sr, int_assets,
             apaths = interview_export_paths(res, int_assets)
             if not apaths:
                 skipped.append(res); continue
-            entry["segments"] = [(s, e) for s, e in segments if s < e]
+            entry["segments"] = segments
+            entry["seg_gaps"] = seg_gaps[1:]
             entry["paths"]    = apaths
-            for seg_in_s, seg_out_s in entry["segments"]:
+            for (seg_in_s, seg_out_s), before in zip(segments, seg_gaps):
+                cursor += s2sa(before)
                 dur_sa = s2sa(seg_out_s - seg_in_s)
                 entry["pieces"].append((cursor, dur_sa, s2sa(seg_in_s)))
                 cursor += dur_sa
