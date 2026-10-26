@@ -602,8 +602,10 @@ class AssemblyWindow(object):
         self.joints  = self._find_joints(clips)
         self.total_s = clips[-1].end if clips else 0.0
         names = {p.get("index"): p.get("name", "") for p in (app.parts or [])}
-        self.part_marks = sorted((sa / float(LAYOUT_SR), names.get(pi, ""))
-                                 for pi, sa in part_starts.items())
+        # A plain (monolog) script has no parts, so nothing to flag.
+        self.part_marks = [] if app._monolog else sorted(
+            (sa / float(LAYOUT_SR), names.get(pi, ""))
+            for pi, sa in part_starts.items())
         self.audio.set_clips(clips, self.total_s)
         self.markers = [dict(m, t=m["pos"] / float(LAYOUT_SR))
                         for m in engines.place_markers(placed, LAYOUT_SR)]
@@ -818,7 +820,7 @@ class AssemblyWindow(object):
         cur_part = object()
         for r in sorted(self.app.results, key=lambda r: r.get("order", 0)):
             pi = r.get("part_index")
-            if pi != cur_part:
+            if pi != cur_part and not self.app._monolog:
                 cur_part = pi
                 t.insert("end", (names.get(pi) or "Part {}".format(pi)) + "\n",
                          ("part",))

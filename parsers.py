@@ -351,8 +351,9 @@ def parse_script(text):
 #
 # A finished narration script with none of the markers above -- the way a
 # Gunfighters script arrives: a title line, then paragraphs, with a rule of
-# underscores between sections.  Every paragraph becomes a VO block and every
-# section a part; the whole read is matched against it by monolog.py.
+# underscores between sections.  Every paragraph becomes a VO block, matched
+# against the whole read by monolog.py.  It has no parts: the cut goes out as
+# the VO track alone, with no PARTS markers, so a rule is only a break.
 
 # A section rule: a line of nothing but underscores, dashes, asterisks...
 _PLAIN_RULE_RE = re.compile(r"^[_\-*=~#—–\s]{3,}$")
@@ -376,8 +377,9 @@ def parse_plain_script(text):
 
     Same return shape as parse_script.  The first line is the title (not
     read); each later paragraph is one VO block, every block flagged
-    "plain".  A paragraph is a line of its own (a Google Docs export) or
-    several hard-wrapped lines run together; a rule line starts a new part.
+    "plain", all in part 1 with no parts listed (so no part markers go
+    out).  A paragraph is a line of its own (a Google Docs export) or
+    several hard-wrapped lines run together; a rule line only ends one.
     """
     lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
     lines = [ln for ln in lines if not _PLAIN_COMMENT_RE.match(ln.strip())]
@@ -391,25 +393,20 @@ def parse_plain_script(text):
             body = lines[k + 1:]
             break
 
-    # Paragraphs, by part.  A line that does not finish a sentence and is
-    # followed by one starting in lower case is a hard wrap, not a break.
-    paras_by_part = [[]]
+    # Paragraphs.  A line that does not finish a sentence and is followed
+    # by one starting in lower case is a hard wrap, not a break.
+    paras = []
     cur = []
 
     def _flush():
         if cur:
-            paras_by_part[-1].append(" ".join(cur))
+            paras.append(" ".join(cur))
             cur[:] = []
 
     for k, raw in enumerate(body):
         s = _strip_comment(raw).strip()
-        if not s:
+        if not s or _PLAIN_RULE_RE.match(s):
             _flush()
-            continue
-        if _PLAIN_RULE_RE.match(s):
-            _flush()
-            if paras_by_part[-1]:
-                paras_by_part.append([])
             continue
         cur.append(s)
         nxt = body[k + 1].strip() if k + 1 < len(body) else ""
@@ -418,28 +415,19 @@ def parse_plain_script(text):
         if not wraps:
             _flush()
     _flush()
-    paras_by_part = [p for p in paras_by_part if p]
 
-    parts, vo_blocks = [], []
-    many = len(paras_by_part) > 1
-    order = 1
-    for pi, paras in enumerate(paras_by_part, 1):
-        parts.append({"index": pi,
-                      "name": "Part {}".format(pi) if many else "Episode VO"})
-        for para in paras:
-            vo_blocks.append({
-                "order":      order,
-                "id":         "P{:03d}".format(order),
-                "part_index": pi,
-                "text":       para,
-                "paragraphs": [para],
-                "gap_after":  True,
-                "plain":      True,
-            })
-            order += 1
+    vo_blocks = [{
+        "order":      n,
+        "id":         "P{:03d}".format(n),
+        "part_index": 1,
+        "text":       para,
+        "paragraphs": [para],
+        "gap_after":  True,
+        "plain":      True,
+    } for n, para in enumerate(paras, 1)]
 
     warnings = [] if vo_blocks else ["No script text found."]
-    return [], parts, [], vo_blocks, doc_title, warnings
+    return [], [], [], vo_blocks, doc_title, warnings
 
 
 # ── Pull Quotes session discovery ───────────────────────────────────────────────────────────────────

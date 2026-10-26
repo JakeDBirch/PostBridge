@@ -65,7 +65,7 @@ P2 = ("By the next year the town had become a boomtown with bars and dance "
 
 
 # ── The plain script ──────────────────────────────────────────────────────────
-def test_plain_script_parts_paragraphs_and_doc_comments():
+def test_plain_script_paragraphs_and_doc_comments_no_parts():
     text = ("John Wesley Hardin vs Wild Bill Hickok\n"
             "First paragraph, read aloud.\n"
             "Second paragraph that wraps\n"
@@ -76,12 +76,13 @@ def test_plain_script_parts_paragraphs_and_doc_comments():
     assert parsers.is_plain_script(text)
     tokens, parts, pulls, blocks, title, warnings = parsers.parse_plain_script(text)
     assert title == "John Wesley Hardin vs Wild Bill Hickok"
-    assert [p["name"] for p in parts] == ["Part 1", "Part 2"]
     assert [b["text"] for b in blocks] == [
         "First paragraph, read aloud.",
         "Second paragraph that wraps onto a second line.",
         "Third paragraph with a comment anchor gasped. The end."]
-    assert [b["part_index"] for b in blocks] == [1, 1, 2]
+    # The underscore rule only ends a paragraph: no parts, so the export
+    # carries no PARTS markers.
+    assert parts == [] and {b["part_index"] for b in blocks} == {1}
     assert all(b["plain"] for b in blocks) and not pulls and not warnings
 
 

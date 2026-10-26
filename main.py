@@ -1451,8 +1451,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
         if hasattr(self, "_s1") and self._monolog:
             self._s1.config(
-                text="✓  {}  ·  plain script, cut as a monolog  ·  {} paragraphs"
-                     "  ·  {} parts".format(doc_title, len(vo_blocks), len(parts)),
+                text="✓  {}  ·  plain script, cut as a monolog  ·  {} paragraphs".format(
+                    doc_title, len(vo_blocks)),
                 fg=SUCCESS)
         elif hasattr(self, "_s1"):
             self._s1.config(
@@ -7808,8 +7808,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 sl  = STATUS_LABEL.get(st, st)
                 pi  = res.get("part_index", 0)
 
-                # ── Part divider ───────────────────────────────────────────────────
-                if pi != _cur_part_idx:
+                # ── Part divider (a plain script has no parts) ─────────────────────
+                if pi != _cur_part_idx and not self._monolog:
                     _cur_part_idx = pi
                     part_name = next((p["name"] for p in self.parts
                                       if p["index"] == pi), "Part {}".format(pi))
