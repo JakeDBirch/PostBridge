@@ -66,7 +66,8 @@ SCRIPT_CONFORM_MERGE_GAP_S = 0.8   # merge segments whose inter-cut gap is
                                   # without merging real un-scripted asides.
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
-DEFAULT_GAP      = 0.6        # seconds between parts in the sequence
+DEFAULT_GAP      = 0.6        # silence after each pull, unless it has its own
+                              # (set in the Assembly view; saved as "gap")
 CACHE_VERSION    = 1          # bump to invalidate all cached transcripts
 HOST_NAME        = "jordan"   # host's Riverside display name (case-insensitive)
 CLIP_SRC_OFFSET  = 0.3        # seconds to shift source read-start for interview

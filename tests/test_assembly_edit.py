@@ -25,8 +25,9 @@ tk = pytest.importorskip("tkinter")
 FPS = 24.0
 WAV = os.path.join(ROOT, "tests", "_no_such_guest.wav")   # never loaded
 
-_APP_METHODS = ("_s4_snapshot", "_s4_apply_state", "_s4_apply_state_rows",
-                "_s4_push_undo", "_s4_undo", "_s4_redo",
+_APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
+                "_s4_apply_state_rows", "_s4_push_undo", "_s4_undo", "_s4_redo",
+                "_assembly_set_default_gap",
                 "_assembly_set_segments", "_assembly_set_gap",
                 "_assembly_set_markers", "_assembly_set_reading",
                 "_collect_export_inputs")
@@ -453,3 +454,66 @@ def test_editor_accept_edits_its_own_card(tmp_path):
         assert segs[3] == [[20.0, 22.0]]
     finally:
         app.destroy()
+
+
+def test_default_gap_is_set_in_the_assembly(view):
+    app, win = view
+    _res(app, 2)["gap_after_s"] = 1.0       # a gap set by hand
+    app.results.append(dict(order=3, token="GUEST", status="ok", part_index=0,
+                            segments=[(30.0, 31.0)], quote_text="Then quiet."))
+    win.refresh()
+    assert win._clip(2).start == pytest.approx(4.5)
+    win._gap_box.delete(0, "end")
+    win._gap_box.insert(0, "0.25")
+    win._gap_from_box()
+    assert app.gap_var.get() == 0.25
+    assert win._clip(2).start == pytest.approx(4.25)    # the default moved it
+    assert win._clip(3).start - win._clip(2).end == pytest.approx(1.0)  # by hand
+    app._s4_undo()                                       # one undo step
+    win.refresh()
+    assert app.gap_var.get() == 0.5 and win._gap_box.get() == "0.50"
+    assert win._clip(2).start == pytest.approx(4.5)
+
+
+def _settle(app, secs=0.4):
+    import time
+    end = time.time() + secs
+    while time.time() < end:
+        app.update()
+        time.sleep(0.01)
+
+
+def test_script_follows_the_lit_word_and_holds_off_after_a_scroll(view):
+    import assembly_view
+    app, win = view
+    text = " ".join("word{}".format(i) for i in range(40))
+    app.results = [dict(order=o, token="GUEST", status="ok", part_index=0,
+                        segments=[(10.0 * o, 10.0 * o + 4.0)], quote_text=text)
+                   for o in range(1, 41)]
+    app._rv = []
+    for r in app.results:
+        e = {"res": r, "skip_var": _Var(False), "accepted_flag": [False]}
+        e["accept_fn"] = _accept_for(app, e)
+        app._rv.append(e)
+    win.refresh()
+    app.update()
+    last = win.clips[20]                   # mid-script: room to scroll
+    last.words = [(last.start + 0.1 * i, last.start + 0.1 * i + 0.08,
+                   "word{}".format(i)) for i in range(40)]
+    t = win.text
+    t.yview_moveto(0.0)
+    win._touched_at = 0.0
+    win.set_insert(last.start + 0.05)
+    _settle(app)
+    box = t.bbox(win._lit_range[0])
+    h = t.winfo_height()
+    assert box is not None
+    assert assembly_view.SCRIPT_BAND[0] * h <= box[1] <= assembly_view.SCRIPT_BAND[1] * h
+    # Scrolled by hand: the script stays where it was put.
+    t.yview_moveto(0.0)
+    t.event_generate("<MouseWheel>", delta=120)
+    app.update()
+    y0 = t.yview()[0]
+    win.set_insert(last.start + 2.05)
+    _settle(app)
+    assert t.yview()[0] == y0

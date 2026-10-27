@@ -65,6 +65,7 @@ import math
 import os
 import re
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 
@@ -89,6 +90,9 @@ MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
 CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
 WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
+SCRIPT_HOLD_S = 4.0   # the script stops following this long after you scroll it
+SCRIPT_BAND = (0.12, 0.7)   # the lit word may sit anywhere in this band of
+SCRIPT_AT   = 0.3           # the pane; outside it, it is scrolled back to here
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -112,7 +116,7 @@ _C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
 
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": True, "preroll_on": False, "preroll_s": 2.0,
-            "return_on": False}
+            "return_on": False, "script": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -447,6 +451,8 @@ class AssemblyWindow(object):
         self._karaoke   = {}             # order -> (words, (starts, spans))
         self._lit_script = None          # (order, char_start, char_end) lit
         self._lit_range = None           # its Text indices
+        self._touched_at = 0.0           # when the script was last scrolled
+        self._scroll_after = None        # a smooth script scroll under way
         self._env       = {}             # order -> (t0, envelope float32)
         self._env_scale = 0.25           # amplitude that fills the lane
         self._loading   = set()
@@ -507,6 +513,11 @@ class AssemblyWindow(object):
                             insertwidth=0, yscrollcommand=sb.set, width=40)
         self.text.pack(side="left", fill="both", expand=True)
         sb.config(command=self.text.yview)
+        # Scrolling the script yourself holds its follow off a while.
+        for w in (self.text, sb):
+            w.bind("<MouseWheel>", self._script_touched, add="+")
+        sb.bind("<Button-1>", self._script_touched, add="+")
+        sb.bind("<B1-Motion>", self._script_touched, add="+")
         self.text.tag_config("part", font=FBT, foreground=_C_PART,
                              spacing1=16, spacing3=6)
         self.text.tag_config("tok", font=_MONO, foreground=SUB)
@@ -610,6 +621,8 @@ class AssemblyWindow(object):
                               self.toggle_return, toggle=True)
         self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
                               toggle=True)
+        self.script_key = key(p, "Script follows words", "Shift+S",
+                              self.toggle_script_follow, toggle=True)
 
         p = self._panel("EDIT")
         key(p, "Delete selection", "Del", self._delete_key)
@@ -619,6 +632,21 @@ class AssemblyWindow(object):
         key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
         key(p, "Open in editor", "Enter", self.open_selected)
+        gap = tk.Frame(p, bg=SURF)
+        tk.Label(gap, text="Default gap", font=(FB[0], 10), bg=SURF,
+                 fg=TEXT).pack(side="left", padx=(0, 4))
+        self._gap_box = tk.Spinbox(
+            gap, from_=0.0, to=60.0, increment=0.05, format="%.2f", width=5,
+            font=(FB[0], 10), bg=SURF2, fg=TEXT, buttonbackground=SURF3,
+            insertbackground=TEXT, relief="flat", command=self._gap_from_box)
+        self._gap_box.pack(side="left")
+        tk.Label(gap, text="s  (every gap you haven't set)", font=(FB[0], 9),
+                 bg=SURF, fg=SUB).pack(side="left", padx=(4, 0))
+        self._gap_box.bind("<Return>", self._gap_from_box)
+        self._gap_box.bind("<KP_Enter>", self._gap_from_box)
+        self._gap_box.bind("<FocusOut>", self._gap_from_box)
+        p.add(gap)
+        self._show_default_gap()
         if any(res.get("monolog") for res in (self.app.results or ())):
             key(p, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
 
@@ -773,6 +801,7 @@ class AssemblyWindow(object):
         if self._range is not None and self._clip(self._range[0]) is None:
             self._range = None
         self._sync_region_range()
+        self._show_default_gap()
         self._render_script()
         self._queue_loads()
         self.redraw()
@@ -1124,7 +1153,84 @@ class AssemblyWindow(object):
         if rng:
             t.tag_add("cur", rng[0], rng[-1])
             if see:
-                t.see(rng[-1]); t.see(rng[0])
+                self._follow_script(rng[0])
+
+    def _script_touched(self, _e=None):
+        self._touched_at = time.monotonic()
+        if self._scroll_after is not None:
+            try:
+                self.win.after_cancel(self._scroll_after)
+            except tk.TclError:
+                pass
+            self._scroll_after = None
+
+    def _follow_script(self, index):
+        """Keep the script on the words being said: when `index` leaves
+        the middle band of the pane, glide it back to a third of the way
+        down -- unless the script was scrolled by hand a moment ago.
+        Costs one bbox while the word is in the band."""
+        if not _MONITOR["script"] or \
+                time.monotonic() - self._touched_at < SCRIPT_HOLD_S:
+            return
+        t = self.text
+        h = t.winfo_height()
+        if h < 40:
+            return
+        box = t.bbox(index)
+        if box is not None and SCRIPT_BAND[0] * h <= box[1] <= SCRIPT_BAND[1] * h:
+            return
+        try:
+            dy = t.count("@0,0", index, "ypixels")
+        except tk.TclError:
+            return
+        dy = (dy[0] if isinstance(dy, tuple) else dy) or 0
+        shift = int(dy - SCRIPT_AT * h)
+        if self._scroll_after is not None:
+            try:
+                self.win.after_cancel(self._scroll_after)
+            except tk.TclError:
+                pass
+            self._scroll_after = None
+        if abs(shift) > 1.5 * h:         # a jump (a seek): no glide
+            t.yview_scroll(shift, "pixels")
+            return
+        steps = 6
+
+        def _step(n=steps, left=shift):
+            self._scroll_after = None
+            d = int(round(left / float(n)))
+            if d:
+                t.yview_scroll(d, "pixels")
+            if n > 1 and left - d:
+                self._scroll_after = self.win.after(
+                    25, lambda: _step(n - 1, left - d))
+        _step()
+
+    def _gap_from_box(self, _e=None):
+        try:
+            value = float(self._gap_box.get())
+        except (ValueError, tk.TclError):
+            self._show_default_gap()
+            return "break"
+        self.app._assembly_set_default_gap(value)
+        self.refresh()
+        self._show_default_gap()
+        return "break"
+
+    def _show_default_gap(self):
+        """The default gap as the app holds it (an undo can change it)."""
+        try:
+            if self.win.focus_get() is self._gap_box:
+                return                   # being typed in
+        except (KeyError, tk.TclError):
+            pass
+        try:
+            v = "{:.2f}".format(float(self.app.gap_var.get()))
+            if self._gap_box.get() != v:
+                self._gap_box.delete(0, "end")
+                self._gap_box.insert(0, v)
+        except (tk.TclError, AttributeError, ValueError):
+            pass
 
     def _mark_selected_in_script(self):
         t = self.text
@@ -1176,8 +1282,7 @@ class AssemblyWindow(object):
             return
         t.tag_add("word", a, b)
         self._lit_range = (a, b)
-        if _MONITOR["follow"] and t.bbox(a) is None:
-            t.see(a)                     # a long line runs off the pane
+        self._follow_script(a)
 
     # ── Geometry ─────────────────────────────────────────────────────────
     def _span(self):
@@ -1310,8 +1415,10 @@ class AssemblyWindow(object):
                 gx0, gx1 = xe, self._x(c.end + c.gap)
                 txt = "{:.2f}s".format(c.gap)
                 if self._fits(txt, gx1 - gx0 + 20):
+                    # A gap set by hand reads bright; the default, dim.
                     cv.create_text((gx0 + gx1) / 2.0, y1 + self._gap_h / 2.0,
-                                   text=txt, font=self._font, fill=SUB)
+                                   text=txt, font=self._font,
+                                   fill=TEXT if "gap_after_s" in c.res else SUB)
 
         # Where the cut skips tape: a tick on the track, and a badge under
         # it when there is room (hover one for what was taken out).
@@ -2369,6 +2476,14 @@ class AssemblyWindow(object):
         _MONITOR["follow"] = not _MONITOR["follow"]
         self._show_monitor()
 
+    def toggle_script_follow(self):
+        _MONITOR["script"] = not _MONITOR["script"]
+        self._show_monitor()
+        if _MONITOR["script"]:
+            self._touched_at = 0.0
+            if self._lit_range is not None:
+                self._follow_script(self._lit_range[0])
+
     def toggle_preroll(self):
         _MONITOR["preroll_on"] = not _MONITOR["preroll_on"]
         self._show_monitor()
@@ -2389,6 +2504,7 @@ class AssemblyWindow(object):
         self.preroll_key.set_on(_MONITOR["preroll_on"])
         self.return_key.set_on(_MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
+        self.script_key.set_on(_MONITOR["script"])
 
     def step_rate(self, d):
         rates = match_review._PLAY_RATES
@@ -2407,7 +2523,8 @@ class AssemblyWindow(object):
 
     # ── Keys ─────────────────────────────────────────────────────────────
     def _on_key(self, e):
-        if isinstance(e.widget, tk.Entry) or not isinstance(e.widget, tk.Misc):
+        if isinstance(e.widget, (tk.Entry, tk.Spinbox)) or \
+                not isinstance(e.widget, tk.Misc):
             # Typing a mark's name -- or the key that just closed the
             # field, which can still arrive here once it is gone (e.widget
             # is then only its name).  Never a shortcut.
@@ -2445,6 +2562,8 @@ class AssemblyWindow(object):
             self.toggle_preroll()
         elif not ctrl and k.lower() == "n":
             self.toggle_return()
+        elif not ctrl and k == "S":
+            self.toggle_script_follow()
         elif not ctrl and k.lower() == "s":
             self.toggle_follow()
         elif not ctrl and k.lower() == "r":

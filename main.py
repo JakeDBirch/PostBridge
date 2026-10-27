@@ -2497,6 +2497,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         otherwise a single Ctrl+Z over a 212-row list runs a full
         unpack/re-sort/repack/flush cycle per changed row.
         """
+        if "_default_gap" in snap:
+            self.gap_var.set(snap["_default_gap"])
         inc = getattr(self, "_s4_increment_confirmed", lambda s="": None)
         dec = getattr(self, "_s4_decrement_confirmed", lambda s="": None)
         _was_building     = getattr(self, "_s4_building", False)
@@ -2569,6 +2571,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 e.get("set_normal_fn", lambda: None)()
                 dec(r.get("status", ""))
 
+    def _s4_undo_snapshot(self):
+        """A snapshot for the undo history: the cards, plus the cut's
+        default gap (set from the Assembly view), which isn't any one
+        card's.  Kept out of _s4_snapshot itself -- its other readers (the
+        state sidecar, the edits diff) expect one entry per pull."""
+        snap = dict(self._s4_snapshot())
+        snap["_default_gap"] = float(self.gap_var.get())
+        return snap
+
     def _s4_push_undo(self):
         """Save current state onto the undo stack before a mutation."""
         stack = getattr(self, "_s4_undo_stack", None)
@@ -2576,7 +2587,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             self._s4_undo_stack = []
             self._s4_redo_stack = []
             stack = self._s4_undo_stack
-        stack.append(self._s4_snapshot())
+        stack.append(self._s4_undo_snapshot())
         self._s4_redo_stack.clear()
         # Keep undo history bounded
         if len(stack) > 80:
@@ -2586,7 +2597,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         stack = getattr(self, "_s4_undo_stack", [])
         if not stack:
             return
-        self._s4_redo_stack.append(self._s4_snapshot())
+        self._s4_redo_stack.append(self._s4_undo_snapshot())
         self._s4_apply_state(stack.pop())
         self._s4_save()
 
@@ -2594,7 +2605,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         stack = getattr(self, "_s4_redo_stack", [])
         if not stack:
             return
-        self._s4_undo_stack.append(self._s4_snapshot())
+        self._s4_undo_stack.append(self._s4_undo_snapshot())
         self._s4_apply_state(stack.pop())
         self._s4_save()
 
@@ -8738,6 +8749,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 r.pop("markers", None)
         self._s4_save()
 
+    def _assembly_set_default_gap(self, gap_s):
+        """The cut's default gap -- the silence after every pull whose own
+        gap hasn't been set (gap_after_s) -- set from the Assembly view,
+        as one undo step.  Saved with the session as "gap"."""
+        gap_s = round(max(0.0, float(gap_s)), 4)
+        if abs(gap_s - float(self.gap_var.get())) < 1e-6:
+            return
+        self._s4_push_undo()
+        self.gap_var.set(gap_s)
+        self._s4_save()
+
     def _assembly_set_gap(self, order, gap_s):
         """The silence after a pull, set from the Assembly track.  Lives on
         the result as gap_after_s, which the build and Step 4's undo
@@ -9262,14 +9284,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
              lambda r,v: tk.Entry(r, textvariable=v, font=FB,
                                   bg=SURF2, fg=TEXT, insertbackground=TEXT,
                                   relief="flat", bd=6, width=40)),
-            ("GAP BETWEEN PARTS (s)",
-             self.gap_var,
-             lambda r,v: tk.Spinbox(r, from_=0.0, to=60.0,
-                                    increment=0.1,
-                                    format="%.1f",
-                                    textvariable=v,
-                                    font=FB, bg=SURF2, fg=TEXT,
-                                    relief="flat", bd=6, width=6)),
         ]:
             row = tk.Frame(self.body, bg=BG); row.pack(fill="x", pady=(0,8))
             tk.Label(row, text=lbl, font=FL, bg=BG, fg=SUB,

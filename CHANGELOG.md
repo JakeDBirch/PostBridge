@@ -2,6 +2,12 @@
 
 ---
 
+## October 27, 2026
+
+### Assembly view: the default gap lives with the cut; the script follows the words
+- **The default gap is set in the Assembly view, not at export.** Step 5's "GAP BETWEEN PARTS" was never a gap between parts: it is the silence after every pull whose own gap you haven't set. It applied to the AAF and to the Assembly alike, so changing it on Step 5 after assembling re-spaced the cut without your hearing it. It is now **Default gap** in the Assembly's Edit panel. The cut redraws as you change it, gaps you set by hand stay as they are, and it is one Ctrl+Z like any edit. It is still saved with the session. The field is gone from Step 5. Under the track, a gap set by hand reads bright and a default one dim.
+- **The script scrolls with the words being said.** When the lit word leaves the middle of the pane, the script glides it back to about a third of the way down; a seek jumps straight there. Scroll the script yourself and it stays put for four seconds. **Script follows words** (Shift+S) turns it off, separately from Follow playhead (S). On the Chai Vang session the lit word stayed in view for all 250 samples of a 12-second play that started with the script scrolled to the top.
+
 ## October 26, 2026
 
 ### Waveform editor edits stick again; Assembly layout, inflections and notes
