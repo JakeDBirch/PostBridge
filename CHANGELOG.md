@@ -4,6 +4,19 @@
 
 ## October 30, 2026
 
+### Assembly view: the text is just the text; spotting, nudge and marker changes
+- **The text shows the words of the cut and nothing else.** Excised words, handles, marker labels and the `#003 TOKEN` headers are gone. A plain narration script reads as paragraphs. On an interview, the speaker's name appears only where the speaker changes, and part headings stay.
+- **It reads as the script, and only differences are marked.** Where a word was said as written, you see the script's wording, with its punctuation and spelling. Script wording that wasn't said is struck through. Words said that aren't in the script are tinted, because there is nothing to strike for them. A word you delete from the script therefore shows struck, and a false start the cut removed doesn't show at all. Casing, punctuation and hyphenation don't count as differences, and neither does Whisper's spelling of a capitalised name ("Hardin" / "Harden"). A different word form does ("killings" / "killing").
+- **While tiny's words are still in place, differences aren't marked.** They are probably tiny mishearing. Those words just read faded, and differences appear once the better model has heard them.
+- **A line out of the cut is struck through.** That covers a line never found in the read and a pull you deleted whole. Right-click a deleted pull for **Bring back into the cut**; Enter opens a line that was never found in the waveform editor.
+- **Retired with the cut words:** Restore (H, Ctrl+H), Show cut words (Shift+W) and the Script / Transcript switch (W). Undo, the track's trims and the waveform editor bring tape back.
+- **Spotting is Music inflection (M), SFX (X) and Note (N).** Music in and out are gone from the palette and the keys. Marks already saved in a session still show and still export, and can be deleted. **Return to start on stop** moved to Shift+N.
+- **Nudge is in time, not frames.** It defaults to 100 ms and can be set to 10 ms, 500 ms or 1 s in the Edit panel, and the choice is kept. `,` and `.` nudge by that amount. `/` is a big nudge later and Shift+`/` a big nudge earlier, by the next value up (at 1 s it stays 1 s). `<` and `>` are gone.
+- **Playback isn't held in by a highlight.** Selecting still leaves the insertion point at its start, but Space plays on past the end and the highlight stays. (This reverses the Assembly's earlier play-only-the-selection behaviour.)
+- **Ctrl+click deletes a mark on the ruler, and right-clicking one offers Name and Delete.** Both are one undo step.
+- **Pick the model right beside Refine.** The TRANSCRIPT panel has the same model picker as Step 2, next to **Refine with `<model>`**.
+- **You can see it running.** While a pass runs, the button reads **Refining…** and lights up, a bar fills across the panel, and the line under the track shows "Refining with small  34%", so it stays in view even with the panel squeezed.
+
 ### Plain scripts: a continuous read stays in one piece
 - **A read that carries on across a paragraph is one region.** Every paragraph used to start a new pull, so a straight read was chopped into clips with nothing removed between them. On Ep 10, 44 of the 115 joins removed nothing. On Ep 6, 34 of 40 such joins sat inside one continuous region of the finished edit. A new pull now starts only where the tape breaks, so a pull can cover several paragraphs.
 - **A cut has to be earned by a retake.** A line reworded as it was read was being cut out of the middle of its sentence. Ep 10's script says "a memoir from 1912" and the narrator read "a memoir he published years later in 1912", which came out as "a memoir he Siringo claimed". Now a short removal (6 s and 12 words at most) goes back in unless its words are said again right beside it, or the narrator stopped before saying them. "[That fall, he complained,] that fall, he complained to the mayor" is still cut.

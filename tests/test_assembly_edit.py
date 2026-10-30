@@ -122,6 +122,7 @@ def view(monkeypatch):
         e["accept_fn"] = _accept_for(app, e)
         app._rv.append(e)
 
+    monkeypatch.setitem(assembly_view._MONITOR, "nudge_s", 0.1)
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
     win = assembly_view.AssemblyWindow(app)
     app._assembly = win
@@ -152,8 +153,8 @@ def test_split_makes_two_regions_and_nudge_moves_the_second(view):
     assert win.sel_region == (1, 1)        # the second half, ready to nudge
     assert _pieces_s(win, 1) == [(0.0, 1.5), (1.5, 2.5)]
 
-    win.nudge(1)                           # a frame later
-    fr = round(1 / FPS, 4)
+    win.nudge(1)                           # 100 ms later
+    fr = 0.1
     assert r1["seg_gaps"] == [fr]
     assert _pieces_s(win, 1) == [(0.0, 1.5), (round(1.5 + fr, 4), 2.5)]
     assert round(win._clip(2).start, 4) == round(4.5 + fr, 4)   # all after moves
@@ -180,8 +181,8 @@ def test_split_and_nudge_reach_the_export_and_survive_reopening(view):
     app, win = view
     win.set_insert(1.5)
     win.split()
-    win.nudge(10)
-    gap = round(10 / FPS, 4)
+    win.nudge(1)
+    gap = 0.1
     edited, int_assets = app._collect_export_inputs()[:2]
     placed, _, _ = engines.layout_timeline(edited, 0.5, 48000, int_assets)
     sa = 48000
@@ -211,8 +212,8 @@ def test_nudging_a_whole_pull_moves_the_gap_in_front_of_it(view):
     win.split()                             # region 2 of pull 1 selected
     win.select(2)
     assert win._range is None               # its highlight goes with it
-    win.nudge(2)
-    assert _res(app, 1)["gap_after_s"] == round(0.5 + 2 / FPS, 4)
+    win.nudge(1)
+    assert _res(app, 1)["gap_after_s"] == 0.6
     assert "seg_gaps" not in _res(app, 2)
 
 
@@ -220,7 +221,7 @@ def test_silence_inside_a_pull_drags_like_a_gap(view):
     app, win = view
     win.set_insert(1.5)
     win.split()
-    win.nudge(12)                           # half a second of silence
+    win.nudge(1, big=True)                  # half a second of silence
     win.redraw()
     app.update()
     y0, y1 = win._track_box()
@@ -305,19 +306,6 @@ def test_script_lights_the_word_being_said(view):
     assert lit() is None
 
 
-def test_script_timing_spreads_words_the_transcript_says_differently():
-    from assembly_view import _script_timing
-    body = "I'm gonna go there now."
-    words = [(0.0, 0.2, "I'm"), (0.2, 0.4, "going"), (0.4, 0.6, "to"),
-             (0.6, 0.8, "go"), (0.8, 1.0, "there"), (1.0, 1.2, "now.")]
-    spans = _script_timing(body, words)
-    got = [(body[cs:ce], round(t0, 3), round(t1, 3)) for t0, t1, cs, ce in spans]
-    assert got == [("I'm", 0.0, 0.2), ("gonna", 0.2, 0.6), ("go", 0.6, 0.8),
-                   ("there", 0.8, 1.0), ("now.", 1.0, 1.2)]
-    assert _script_timing(body, []) == []
-    assert _script_timing("Nothing alike", [(0, 1, "different")]) == []
-
-
 def _key(app, widget, keysym, state=0):
     widget.focus_force()
     app.update()
@@ -328,10 +316,10 @@ def _key(app, widget, keysym, state=0):
 def test_inflection_and_notes(view):
     app, win = view
     win.set_insert(0.5)
-    _key(app, win.cv, "u")                  # inflection: no name field
+    _key(app, win.cv, "m")                  # inflection: no name field
     assert win._rename is None
     win.set_insert(1.5)
-    _key(app, win.cv, "k")                  # a note opens for naming
+    _key(app, win.cv, "n")                  # a note opens for naming
     assert win._rename is not None
     win._rename[0].insert(0, "check the date")
     _key(app, win._rename[0], "Return")
@@ -495,11 +483,12 @@ def test_script_follows_the_lit_word_and_holds_off_after_a_scroll(view):
         e = {"res": r, "skip_var": _Var(False), "accepted_flag": [False]}
         e["accept_fn"] = _accept_for(app, e)
         app._rv.append(e)
+    app.results[20]["words"] = [
+        {"word": "word{}".format(i), "start": 210.0 + 0.1 * i,
+         "end": 210.0 + 0.1 * i + 0.08} for i in range(40)]
     win.refresh()
     app.update()
     last = win.clips[20]                   # mid-script: room to scroll
-    last.words = [(last.start + 0.1 * i, last.start + 0.1 * i + 0.08,
-                   "word{}".format(i)) for i in range(40)]
     t = win.text
     t.yview_moveto(0.0)
     win._touched_at = 0.0
@@ -689,3 +678,182 @@ def test_the_shared_snap_keeps_the_editors_rules():
     assert mr.snap_to_boundary(1.05, b, 0.1, 1.04, 0.2) == 1.04   # nearer wins
     assert mr.snap_to_boundary(1.05, [], 0.1, 1.1, 0.2) == 1.1
     assert mr.snap_to_boundary(1.05, b, 0.1, None, 0.2) == 1.0
+
+
+def test_nudge_values_and_the_big_nudge(view):
+    import assembly_view
+    app, win = view
+    win.select(2)
+    gap = lambda: _res(app, 1).get("gap_after_s", 0.5)
+    win.nudge(1)
+    assert gap() == pytest.approx(0.6)        # 100 ms to start with
+    win.nudge(-1)
+    assert gap() == pytest.approx(0.5)
+
+    win.nudge(1, big=True)                    # the next value up: 500 ms
+    assert gap() == pytest.approx(1.0)
+    win.nudge(-1, big=True)
+    assert gap() == pytest.approx(0.5)
+
+    win.set_nudge(0.01)
+    assert app._prefs["assembly_nudge"] == 0.01
+    assert win.nudge_keys[0.01].on and not win.nudge_keys[0.1].on
+    win.nudge(1, big=True)                    # at 10 ms, a big nudge is 100 ms
+    assert gap() == pytest.approx(0.6)
+    win.nudge(1)
+    assert gap() == pytest.approx(0.61)
+
+    win.set_nudge(1.0)
+    win.nudge(1, big=True)                    # at the top it stays 1 s
+    assert gap() == pytest.approx(1.61)
+    assert set(assembly_view.NUDGES) == {0.01, 0.1, 0.5, 1.0}
+
+
+def test_slash_is_the_big_nudge_and_angle_brackets_are_gone(view):
+    app, win = view
+    win.select(2)
+    gap = lambda: _res(app, 1).get("gap_after_s", 0.5)
+    _key(app, win.cv, "slash")
+    assert gap() == pytest.approx(1.0)
+    _key(app, win.cv, "question", state=0x0001)   # Shift+/
+    assert gap() == pytest.approx(0.5)
+    _key(app, win.cv, "greater", state=0x0001)
+    assert gap() == pytest.approx(0.5)
+
+
+def test_the_spotting_keys(view):
+    app, win = view
+    win.set_insert(0.5)
+    _key(app, win.cv, "m")
+    assert [m["kind"] for m in win.markers] == ["music_inflection"]
+    assert win.markers[0]["label"].startswith("Inflection")
+    for k in ("i", "o", "u", "k"):             # the old ones do nothing
+        _key(app, win.cv, k)
+    assert len(win.markers) == 1
+
+    win.set_insert(1.0)
+    _key(app, win.cv, "x")
+    assert win._rename is not None
+    _key(app, win._rename[0], "Escape")
+    win.set_insert(1.5)
+    _key(app, win.cv, "n")
+    assert win._rename is not None
+    _key(app, win._rename[0], "Escape")
+    assert [m["kind"] for m in win.markers] == ["music_inflection", "sfx", "note"]
+
+
+def test_x_stays_in_this_window(view):
+    app, win = view
+    fired = []
+    app.bind_all("<x>", lambda e: fired.append(e))
+    win.set_insert(1.0)
+    _key(app, win.cv, "x")
+    _key(app, win._rename[0], "Escape")
+    assert not fired
+    app.unbind_all("<x>")
+
+
+def test_shift_n_is_return_to_start_now(view):
+    import assembly_view
+    app, win = view
+    was = assembly_view._MONITOR["return_on"]
+    _key(app, win.cv, "N", state=0x0001)
+    assert assembly_view._MONITOR["return_on"] is (not was)
+    assert not win.markers
+    win.toggle_return()
+    assert assembly_view._MONITOR["return_on"] is was
+
+
+def test_marks_saved_with_in_and_out_still_show_and_can_go(view):
+    app, win = view
+    _res(app, 1)["markers"] = [{"kind": "music_in", "src": 11.0, "name": ""},
+                               {"kind": "music_out", "src": 12.0, "name": ""}]
+    win.refresh()
+    assert [m["kind"] for m in win.markers] == ["music_in", "music_out"]
+    edited, assets = app._collect_export_inputs()[:2]
+    placed, _s, _p = engines.layout_timeline(edited, 0.5, 48000, assets)
+    assert [m["kind"] for m in engines.place_markers(placed, 48000)] == \
+        ["music_in", "music_out"]
+
+
+def _flag_at(win, m):
+    top, bot = win._marker_row(win._lane(m))
+    return _Ev(win._x(m["t"]) + 3, (top + bot) / 2.0)
+
+
+def test_ctrl_click_deletes_a_mark(view):
+    app, win = view
+    win.set_insert(0.5)
+    win.drop_marker("music_inflection")
+    win.redraw()
+    app.update()
+    ev = _flag_at(win, win.markers[0])
+    win._on_track_press(_Ev(ev.x, ev.y, 0x0004))
+    assert win.markers == [] and win._drag is None
+    assert "markers" not in _res(app, 1)
+    app._s4_undo()
+    win.refresh()
+    assert len(win.markers) == 1               # one undo step
+
+
+def test_right_click_on_a_mark_offers_delete(view, monkeypatch):
+    app, win = view
+    win.set_insert(0.5)
+    win.drop_marker("music_inflection")
+    win.redraw()
+    app.update()
+    menus = []
+
+    def _popup(self, x, y):
+        menus.append(self)
+    monkeypatch.setattr(tk.Menu, "tk_popup", _popup)
+    ev = _flag_at(win, win.markers[0])
+    ev.x_root, ev.y_root = 0, 0
+    win._on_track_menu(ev)
+    m = menus[0]
+    labels = [m.entrycget(i, "label") for i in range(m.index("end") + 1)]
+    assert "Delete marker" in labels
+    m.invoke(labels.index("Delete marker"))
+    assert win.markers == []
+    # Off a flag there is no menu.
+    y0, _y1 = win._track_box()
+    e = _Ev(win._x(1.0), y0 + 4)
+    e.x_root, e.y_root = 0, 0
+    win._on_track_menu(e)
+    assert len(menus) == 1
+
+
+def test_playback_is_not_held_in_by_a_highlight(view):
+    import assembly_view
+    app, win = view
+
+    class _Player(object):
+        def __init__(self):
+            self.calls = []
+
+        def set_rate(self, r):
+            pass
+
+        def play(self, start_s=None, end_s=None):
+            self.calls.append((start_s, end_s))
+            return True
+
+        def stop(self):
+            pass
+
+        def is_playing(self):
+            return False
+
+        def position(self):
+            return 0.0
+
+        def close(self):
+            pass
+    win.player = _Player()
+    win._range = (1, 1.0, 2.0)
+    win.insert = 1.0
+    win.play()
+    assert win.player.calls[0][1] is None      # no end
+    win.stop()
+    assert win._range == (1, 1.0, 2.0)         # the highlight stays
+    assert "plays it" not in win.status.cget("text")

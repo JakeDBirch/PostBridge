@@ -18,7 +18,7 @@ The mouse works like Pro Tools' Smart Tool: on a pull, the top half is
 the selector (click places the insertion point, drag highlights a span) and
 the bottom half the grabber (click selects the region, drag moves it,
 double-click opens the waveform editor); the edges trim.  Every action is
-also a button with its key in the panels beside the script, which are the
+also a button with its key in the panels beside the text, which are the
 window's key.
 
 The track is also the editor.  Every edit is the same edit Step 4 makes, committed through the card's own
@@ -36,33 +36,34 @@ AAF:
   * drag a region, or the gap in front of it, to change that gap -- the
     gap after the pull before it, or inside a pull, the silence at that
     join;
-  * , and . nudge the selected region (or pull) a frame earlier or later
-    the same way (< > by ten), for pacing;
+  * , and . nudge the selected region (or pull) earlier or later the same
+    way, by the nudge value chosen in the Edit panel; / and Shift+/ nudge it
+    later and earlier by the next value up, for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
   * double-click a pull with the grabber (or Enter) to open Step 4's
     waveform editor on it, for hunting the right edit in audio outside the
     pull; double-click with the selector takes the whole region.
 
-It is also where the cut gets spotted.  I and O drop a music cue's in and
-out, U a music inflection (a moment the music should answer, in or out to
-be decided), M an SFX spot and K a note, at the playhead -- while it plays,
-too.  Music and SFX share a lane on the ruler, notes have their own.  Each
-mark lives on the pull it lands on (engines.place_markers), so it rides
-with that audio through any retiming, and the AAF carries them as the
-MUSIC, SFX and NOTES marker tracks beside PARTS.  Drag a flag to move it,
-double-click to name it, Delete to remove it; an SFX spot or a note opens
-for naming as it lands.
+It is also where the cut gets spotted.  M drops a music inflection (a moment
+the music should answer), X an SFX spot and N a note, at the playhead -- while
+it plays, too.  Music and SFX share a lane on the ruler, notes have their own.
+Each mark lives on the pull it lands on (engines.place_markers), so it rides
+with that audio through any retiming, and the AAF carries them as the MUSIC,
+SFX and NOTES marker tracks beside PARTS.  Drag a flag to move it, double-click
+to name it; Delete, Ctrl+click or its right-click menu removes it.  An SFX spot
+or a note opens for naming as it lands.  Music in and out marks from earlier
+sessions still show and still export.
 
-The text beside the controls is the transcript of the cut, and it edits like
-the track.  Highlight words and they are the selection, on the track too, for
-Space, Delete, B, the spotting keys or the right-click menu, across as many
-pulls as you like (one undo step).  Tape that is out of the cut stays in the
-text, struck through -- what went from inside a pull, and a little either side
-of it -- and H puts highlighted words back, as Pro Tools' heal does.  W swaps
-the transcript for the script, which highlights the same way wherever its
-words are matched to the audio.  Words from the tiny first pass read faded
-while the chosen model works through them (refine.py), and firm up in place.
+The text beside the controls is the cut as words, and nothing else: the
+script's own wording where it was said.  Only a difference gets a mark: script
+wording that wasn't said is struck through, and words said that aren't in the
+script are tinted.  It edits like the track.  Highlight words and they are the
+selection, on the track too, for Delete, B, the spotting keys or the right-click
+menu, across as many pulls as you like (one undo step).  A highlight doesn't
+hold playback in: the two are separate.  Words from the tiny first pass read
+faded while the chosen model works through them (refine.py), and differences
+are only noted once a better model has heard them.
 
 While the cut plays, the text lights each word as it is said.
 
@@ -86,9 +87,11 @@ import numpy as np
 
 import engines
 import match_review
+import monolog
 import playback
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     WARN, ERR, FB, FBT, HOST_NAME)
+from gui_components import _FlatProgressBar
 from utils import secs_tc
 
 PLAY_SR     = 32000   # playback / display rate -- the whole cut is held in
@@ -108,12 +111,11 @@ SCRIPT_BAND = (0.12, 0.7)   # the lit word may sit anywhere in this band of
 SCRIPT_AT   = 0.3           # the pane; outside it, it is scrolled back to here
 SEL_PAD     = 0.15    # a highlight's edge sits at most this far outside its word
                       # (halfway to the next word, if that is nearer)
-TX_HANDLE_S = 2.0     # tape shown struck through either side of a pull
-TX_CUT_MAX  = 30      # a longer run of cut words shows only its ends...
-TX_CUT_ENDS = 6       # ...this many at each, and a count for the rest
-TX_PARA_CHARS = 600   # a pull's transcript starts a new paragraph after this much,
+TX_PARA_CHARS = 600   # a pull with no script starts a new paragraph after this much,
 TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without one
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
+NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds; / nudges by the next one up
+LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -132,7 +134,8 @@ _C_CLIP_BG  = SURF
 _C_MUSIC    = "#4f9be0"   # music cue in / out
 _C_SFX      = "#e0609a"   # SFX spot
 _C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
-_C_CUT      = "#6a6a6a"   # words out of the cut, in the text
+_C_STRUCK   = "#8a8a8a"   # script wording that wasn't said
+_C_SAID     = "#e8c98a"   # words said that aren't in the script
 _C_TXSEL    = "#35597a"   # highlighted words
 _C_SNAP_TICK = "#556070"  # where an edge will snap, as in the waveform editor
 _C_SNAPPED  = "#ffaa00"   # an edge that has snapped
@@ -142,8 +145,7 @@ SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too clos
 
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
-            "return_on": True, "script": True,
-            "transcript": True, "cut_words": True}
+            "return_on": True, "script": True, "nudge_s": 0.1}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -286,10 +288,6 @@ class _Clip(object):
         k = self.piece_at(t)
         return None if k is None else self.pieces[k][2] + (t - self.pieces[k][0])
 
-    def keeps(self, src):
-        """Is source time `src` in the cut, in this pull?"""
-        return any(si <= src < si + du for _tl, du, si in self.pieces)
-
     def piece_at(self, t):
         """Index of the region (segment) under timeline time t, or None."""
         for k, (tl, du, _si) in enumerate(self.pieces):
@@ -345,21 +343,6 @@ def _silence_edges(pcm, t0):
         samples = samples / peak * 0.85
     return match_review.MatchReviewDialog._compute_silence_boundaries_arrays(
         samples, PLAY_SR, t0)[2]
-
-
-def _segments_with(segments, spans):
-    """A pull's segments with source spans put back.  A span that meets a
-    segment heals into it; the others stay as they were, butted or not."""
-    out = [(float(a), float(b)) for a, b in segments]
-    for a, b in spans:
-        rest = []
-        for s, e in out:
-            if s <= b + 1e-3 and a <= e + 1e-3:
-                a, b = min(a, s), max(b, e)
-            else:
-                rest.append((s, e))
-        out = sorted(rest + [(a, b)])
-    return out
 
 
 _SENT_END_RE = re.compile(r"[.!?][\"'”’)\]]*$")
@@ -426,101 +409,13 @@ class _Line(object):
     """One pull's words in the text: the line, its words, and the runs of it
     that take a style (the whole pane is one insert per pull, no tag a word)."""
 
-    def __init__(self, body, tokens, chunks=None, script=False, words=None):
+    def __init__(self, body, tokens, chunks=None):
         self.body = body
         self.tokens = tokens
         self.chunks = chunks if chunks is not None else [(body, None)]
-        self.script = script             # the script's words, not the transcript's
-        self.words = words               # the clip's words it was timed against
         self.starts = [t.cs for t in tokens]
         self.kept = [t for t in tokens if t.kept]
         self.kept_t0 = [t.t0 for t in self.kept]
-
-
-def _transcript_line(c, words, neighbours=(), show_cut=True, fade=False):
-    """The pull as its transcript reads, or None when it holds no word of
-    what is in the cut.  With show_cut, the tape it leaves out -- inside it,
-    and TX_HANDLE_S either side unless a neighbouring pull plays that -- is
-    there too, as words that aren't kept.  fade: the draft's words read dim."""
-    ordered, starts = _indexed(words)
-    if not ordered or not c.pieces:
-        return None
-    reach = TX_HANDLE_S if show_cut else 0.0
-    i = bisect.bisect_left(starts, c.src_lo - reach - MAX_WORD_S)
-    units, any_kept = [], False
-    while i < len(ordered) and starts[i] < c.src_hi + reach:
-        for s0, s1, text, glued, src in _word_units(ordered[i]):
-            at = _word_point(s0, s1)
-            k = next((n for n, (_tl, du, si) in enumerate(c.pieces)
-                      if si <= at < si + du), None)
-            if k is None:
-                if not show_cut or not c.src_lo - reach <= at < c.src_hi + reach:
-                    continue
-                if (at < c.src_lo or at >= c.src_hi) and \
-                        any(n.keeps(at) for n in neighbours):
-                    continue
-            else:
-                any_kept = True
-            units.append((s0, s1, text, glued, src, k))
-        i += 1
-    if not any_kept:
-        return None
-
-    # A long run of cut tape reads as its two ends and a count.
-    shown, j = [], 0
-    while j < len(units):
-        if units[j][5] is not None:
-            shown.append(units[j])
-            j += 1
-            continue
-        e = j
-        while e < len(units) and units[e][5] is None:
-            e += 1
-        run = units[j:e]
-        if len(run) > TX_CUT_MAX:
-            mid = run[TX_CUT_ENDS:-TX_CUT_ENDS]
-            shown.extend(run[:TX_CUT_ENDS])
-            shown.append((mid[0][0], mid[-1][1], "[{} words]".format(len(mid)),
-                          False, None, None))
-            shown.extend(run[-TX_CUT_ENDS:])
-        else:
-            shown.extend(run)
-        j = e
-
-    tokens, chunks, pos, prev_style, prev_text = [], [], 0, None, ""
-    para = 0                             # characters in the paragraph so far
-
-    def emit(text, style):
-        if chunks and chunks[-1][1] == style:
-            chunks[-1][0] += text
-        else:
-            chunks.append([text, style])
-
-    for s0, s1, text, glued, src, k in shown:
-        style = "txcut" if k is None else (
-            "txdraft" if fade and src == engines.DRAFT_MODEL else None)
-        if tokens and not glued:
-            if para >= TX_PARA_CHARS and (
-                    s0 - tokens[-1].s1 >= TX_PARA_PAUSE_S
-                    or _SENT_END_RE.search(prev_text)):
-                emit("\n", None)
-                para = 0
-            else:
-                emit(" ", style if style == prev_style else None)
-            pos += 1
-        emit(text, style)
-        para += len(text) + 1
-        if k is None:
-            t0 = t1 = None
-        else:
-            tl, du, si = c.pieces[k]
-            t0 = max(tl, tl + s0 - si)
-            t1 = max(t0, min(tl + du, tl + s1 - si))
-        tokens.append(_Tok(pos, pos + len(text), t0, t1, s0, s1, k is not None, k))
-        pos += len(text)
-        prev_style, prev_text = style, text
-    return _Line("".join(x[0] for x in chunks), tokens,
-                 [tuple(x) for x in chunks])
 
 
 _WORD_RE = re.compile(r"\S+")
@@ -530,54 +425,171 @@ def _norm_word(w):
     return re.sub(r"[^0-9a-z]", "", w.lower())
 
 
-def _script_timing(body, words):
-    """When each word of a pull's script line is said.
-
-    body  : the line as the script pane shows it.
-    words : the pull's transcript words on the timeline, [(t0, t1, text)].
-
-    The line's words are matched to the transcript's in order (difflib); a
-    run the transcript has differently ("gonna" for "going to") shares out
-    the time between its matched neighbours.  Returns [(t0, t1, char_start,
-    char_end)] in order -- empty when nothing matches."""
-    toks = [(m.start(), m.end(), _norm_word(m.group()))
-            for m in _WORD_RE.finditer(body or "")]
-    toks = [x for x in toks if x[2]]
-    if not toks or not words:
-        return []
-    sm = difflib.SequenceMatcher(None, [x[2] for x in toks],
-                                 [_norm_word(w[2]) for w in words],
-                                 autojunk=False)
-    times = [None] * len(toks)
-    for i, j, n in sm.get_matching_blocks():
-        for d in range(n):
-            times[i + d] = (words[j + d][0], words[j + d][1])
-    if not any(times):
-        return []
-    i = 0
-    while i < len(toks):
-        if times[i] is not None:
+def _kept_units(c, words):
+    """The transcript words the pull's segments keep (_word_point), in the
+    order they play: [(t0, t1, s0, s1, text, glued, model, region)].  Looked up
+    by time: a whole file's words, many pulls."""
+    ordered, starts = _indexed(words)
+    out = []
+    for k, (tl, du, si) in enumerate(c.pieces):
+        i = bisect.bisect_left(starts, si - MAX_WORD_S)
+        while i < len(ordered) and starts[i] < si + du:
+            for s0, s1, text, glued, src in _word_units(ordered[i]):
+                if si <= _word_point(s0, s1) < si + du:
+                    t0 = max(tl, tl + s0 - si)
+                    out.append((t0, max(t0, min(tl + du, tl + s1 - si)), s0, s1,
+                                text, glued, src, k))
             i += 1
+    out.sort(key=lambda u: u[0])
+    return out
+
+
+class _LineMaker(object):
+    """Builds a _Line a piece at a time."""
+
+    def __init__(self):
+        self.chunks, self.tokens, self.pos = [], [], 0
+        self.last = ""
+
+    def text(self, text, style=None):
+        if not text:
+            return
+        if self.chunks and self.chunks[-1][1] == style:
+            self.chunks[-1][0] += text
+        else:
+            self.chunks.append([text, style])
+        self.pos += len(text)
+        self.last = text[-1]
+
+    def gap(self, text, style=None):
+        """What lies between two words.  A space adds nothing to a space."""
+        if "\n" not in text and not text.strip() and (not self.pos or self.last.isspace()):
+            return
+        self.text(text, style)
+
+    def said(self, text, unit, style=None):
+        """A word in the cut, timed from a transcript word."""
+        self.tokens.append(_Tok(self.pos, self.pos + len(text), unit[0], unit[1],
+                                unit[2], unit[3], True, unit[7]))
+        self.text(text, style)
+
+    def struck(self, text):
+        """Script wording that wasn't said: in the line, not in the cut."""
+        self.tokens.append(_Tok(self.pos, self.pos + len(text), None, None, None,
+                                None, False, None))
+        self.text(text, "txstruck")
+
+    def line(self):
+        return _Line("".join(x[0] for x in self.chunks), self.tokens,
+                     [tuple(x) for x in self.chunks])
+
+
+def _plain_line(units, fade=False):
+    """A pull with no script to compare: what was said, in paragraphs."""
+    m, para, prev = _LineMaker(), 0, None
+    for u in units:
+        if prev is not None and not u[5]:
+            if para >= TX_PARA_CHARS and (
+                    u[2] - prev[3] >= TX_PARA_PAUSE_S or _SENT_END_RE.search(prev[4])):
+                m.text("\n")
+                para = 0
+            else:
+                m.text(" ")
+        m.said(u[4], u, "txdraft" if fade and u[6] == engines.DRAFT_MODEL else None)
+        para += len(u[4]) + 1
+        prev = u
+    return m.line()
+
+
+def _script_words(script):
+    """[(char start, char end, match form)] for the script's words; a dash on
+    its own is not one."""
+    out = []
+    for w in _WORD_RE.finditer(script or ""):
+        n = _norm_word(w.group())
+        if n:
+            out.append((w.start(), w.end(), n))
+    return out
+
+
+def _script_ops(script, said):
+    """How a pull's script lines up with what its cut says (`said`: the match
+    forms of its words): difflib's opcodes, with what is the same word left
+    out of the differences.  "hyper-violent" / "hyper violent" is one word to
+    the eye, and "Hardin" / "Harden" is Whisper's spelling of a name, not a
+    change.  Only a name gets that much slack: "killings" / "killing" and
+    "rode" / "ride" are differences worth noting."""
+    found = _script_words(script)
+    words = [w[2] for w in found]
+    said = list(said)
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, words, said, autojunk=False).get_opcodes():
+        if tag != "replace":
+            out.append((tag, i1, i2, j1, j2))
+        elif "".join(words[i1:i2]) == "".join(said[j1:j2]):
+            out.append(("equal", i1, i2, j1, j2))
+        elif i2 - i1 == j2 - j1:
+            for d in range(i2 - i1):
+                a, b = words[i1 + d], said[j1 + d]
+                same = (script[found[i1 + d][0]].isupper() and len(a) >= 4
+                        and monolog._key(a) == monolog._key(b))
+                out.append(("equal" if same else "replace",
+                            i1 + d, i1 + d + 1, j1 + d, j1 + d + 1))
+        else:
+            out.append((tag, i1, i2, j1, j2))
+    return out
+
+
+def _text_line(script, units, ops, fade=False):
+    """The pull as it reads in the text: the script's words where they were
+    said, timed from the transcript, so it reads as written.  Script wording
+    that wasn't said is struck through; words said that aren't in the script
+    are tinted.  In what only the draft has heard (fade), a difference is
+    likely the draft's own mishearing, so what it heard just reads faded."""
+    words = _script_words(script)
+    m = _LineMaker()
+    cursor = 0
+
+    def faded(u):
+        return "txdraft" if fade and u[6] == engines.DRAFT_MODEL else None
+
+    def said(u, style):
+        if m.pos and not m.last.isspace() and not u[5]:
+            m.text(" ", style if m.chunks[-1][1] == style else None)
+        m.said(u[4], u, style)
+
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            n, k = i2 - i1, j2 - j1
+            for d in range(n):
+                a, b = words[i1 + d][:2]
+                m.gap(script[cursor:a])
+                first = units[j1 + d * k // n]
+                last = units[j1 + ((d + 1) * k - 1) // n]
+                m.said(script[a:b],
+                       (first[0], last[1], first[2], last[3], "", False, None, first[7]),
+                       faded(first))
+                cursor = b
             continue
-        j = i
-        while j < len(toks) and times[j] is None:
-            j += 1
-        if i > 0 and j < len(toks):
-            lo, hi = times[i - 1][1], times[j][0]
-            if hi - lo >= 0.05 * (j - i):    # else the words were cut out
-                step = (hi - lo) / (j - i)
-                for n in range(i, j):
-                    times[n] = (lo + (n - i) * step, lo + (n - i + 1) * step)
-        i = j
-    return [(tm[0], tm[1], cs, ce)
-            for (cs, ce, _k), tm in zip(toks, times) if tm is not None]
-
-
-def _script_line(body, c):
-    """The pull's script line, with its words timed from the transcript."""
-    tokens = [_Tok(cs, ce, t0, t1, None, None, True, c.piece_at(t0))
-              for t0, t1, cs, ce in _script_timing(body, c.words or [])]
-    return _Line(body, tokens, script=True, words=c.words)
+        near = units[max(0, j1 - 1):j2 + 1]
+        if fade and any(u[6] == engines.DRAFT_MODEL for u in near):
+            if i2 > i1:
+                m.gap(script[cursor:words[i1][0]])
+                cursor = words[i2 - 1][1]
+            for u in units[j1:j2]:
+                said(u, "txdraft")
+            continue
+        for i in range(i1, i2):
+            a, b = words[i][:2]
+            between = script[cursor:a]
+            m.gap(between, "txstruck" if i > i1 and "\n" not in between else None)
+            m.struck(script[a:b])
+            cursor = b
+        for u in units[j1:j2]:
+            said(u, "txsaid")
+    m.gap(script[cursor:])
+    return m.line()
 
 
 class _AssemblyAudio(object):
@@ -692,7 +704,7 @@ class AssemblyWindow(object):
         self._words_lock = threading.Lock()
         self._words_queued = set()
         self._tx_lines  = {}             # order -> its _Line in the text
-        self._script_memo = {}           # order -> its script line, once timed
+        self._align_memo = {}            # order -> (script, said, _script_ops)
         self._tx_order  = []             # the orders down the text
         self._tx_seq    = {}             # order -> its place in that
         self._tx_anchor = None           # highlighted words: (order, word) where
@@ -714,6 +726,10 @@ class AssemblyWindow(object):
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=LOAD_WORKERS, thread_name_prefix="pb_assembly")
 
+        saved = (self._layout_prefs() or {}).get("assembly_nudge")
+        if saved in NUDGES:
+            _MONITOR["nudge_s"] = saved
+
         self.audio  = _AssemblyAudio(PLAY_SR)
         self.player = None
         if playback.available():
@@ -730,6 +746,7 @@ class AssemblyWindow(object):
         self._gap_h   = self._ls + 6           # gap lengths under the track
 
         self._build_ui()
+        self.show_refine_status()
         self.refresh()
         self.win.after(60, self._fit_initial)
 
@@ -763,14 +780,11 @@ class AssemblyWindow(object):
         self.text.tag_config("part", font=FBT, foreground=_C_PART,
                              spacing1=16, spacing3=6)
         self.text.tag_config("tok", font=_MONO, foreground=SUB)
-        self.text.tag_config("out", foreground="#6a6a6a")
         self.text.tag_config("cur", background=SURF3)
-        self.text.tag_config("mk_music", foreground=_C_MUSIC, font=_SMALL)
-        self.text.tag_config("mk_sfx", foreground=_C_SFX, font=_SMALL)
-        self.text.tag_config("mk_note", foreground=_C_NOTE, font=_SMALL)
         self.text.tag_config("sel_pull", background=SURF2)
         self.text.tag_config("txdraft", foreground=SUB)
-        self.text.tag_config("txcut", foreground=_C_CUT, overstrike=True)
+        self.text.tag_config("txstruck", foreground=_C_STRUCK, overstrike=True)
+        self.text.tag_config("txsaid", foreground=_C_SAID)
         self.text.tag_config("txsel", background=_C_TXSEL)
         self.text.tag_config("word", background=ACCENT, foreground=TEXT)
         self.text.tag_raise("cur")
@@ -823,6 +837,7 @@ class AssemblyWindow(object):
         self.cv.bind("<ButtonRelease-1>", self._on_track_release)
         self.cv.bind("<Motion>", self._on_motion)
         self.cv.bind("<Double-Button-1>", self._on_track_double)
+        self.cv.bind("<Button-3>", self._on_track_menu)
         self.cv.bind("<MouseWheel>", self._on_wheel)
         self.ov.bind("<Button-1>", self._on_overview)
         self.ov.bind("<B1-Motion>", self._on_overview)
@@ -875,7 +890,7 @@ class AssemblyWindow(object):
         self.preroll_key = key(p, "", "P", self.toggle_preroll, toggle=True)
         key(p, "−", "", lambda: self.step_preroll(-1))
         key(p, "+", "", lambda: self.step_preroll(1))
-        self.return_key = key(p, "Return to start on stop", "N",
+        self.return_key = key(p, "Return to start on stop", "Shift+N",
                               self.toggle_return, toggle=True)
         self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
                               toggle=True)
@@ -889,6 +904,19 @@ class AssemblyWindow(object):
         key(p, "Split", "B", self.split)
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
+        key(p, "Big nudge earlier", "Shift+/", lambda: self.nudge(-1, big=True))
+        key(p, "Big nudge later", "/", lambda: self.nudge(1, big=True))
+        amount = tk.Frame(p, bg=SURF)
+        tk.Label(amount, text="Nudge by", font=(FB[0], 10), bg=SURF,
+                 fg=TEXT).pack(side="left", padx=(0, 4))
+        self.nudge_keys = {}
+        for v in NUDGES:
+            b = _KeyButton(amount, "{:g} s".format(v) if v >= 1 else
+                           "{:g} ms".format(v * 1000), "",
+                           lambda v=v: self.set_nudge(v), toggle=True)
+            b.pack(side="left", padx=(0, 2))
+            self.nudge_keys[v] = b
+        p.add(amount)
         key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
         key(p, "Open in editor", "Enter", self.open_selected)
@@ -911,22 +939,26 @@ class AssemblyWindow(object):
 
         p = self._panel("TRANSCRIPT")
         self.tx_flow = p
-        self.tx_key = key(p, "Transcript", "W", self.toggle_transcript, toggle=True)
-        self.cut_key = key(p, "Show cut words", "Shift+W", self.toggle_cut_words,
-                           toggle=True)
-        key(p, "Restore", "H", self.restore)
+        picker = getattr(self.app, "_build_model_picker", None)
+        if picker is not None:
+            p.add(picker(p, bg=SURF))
         self.refine_key = key(p, "", "", self._refine_again)
         self.recut_key = None
+        # On the panel's title row: it still shows in a panel squeezed thin,
+        # and the panel doesn't change height when a pass starts.
+        title = p.master.winfo_children()[0]
+        x = tkfont.Font(font=title.cget("font")).measure("TRANSCRIPT") + 20
+        self.refine_bar = _FlatProgressBar(p.master, height=6, bg=SURF)
+        self.refine_bar.place(in_=title, x=x, rely=0.5, anchor="w",
+                              relwidth=1.0, width=-(x + 8), height=6)
         self.tx_status = tk.Label(p, font=(FB[0], 10), bg=SURF, fg=SUB,
                                   justify="left", anchor="w")
         p.add(self.tx_status, fill=True)
 
         p = self._panel("SPOT")
-        key(p, "Music in", "I", lambda: self.drop_marker("music_in"))
-        key(p, "Inflection", "U", lambda: self.drop_marker("music_inflection"))
-        key(p, "Music out", "O", lambda: self.drop_marker("music_out"))
-        key(p, "SFX", "M", lambda: self.drop_marker("sfx"))
-        key(p, "Note", "K", lambda: self.drop_marker("note"))
+        key(p, "Music inflection", "M", lambda: self.drop_marker("music_inflection"))
+        key(p, "SFX", "X", lambda: self.drop_marker("sfx"))
+        key(p, "Note", "N", lambda: self.drop_marker("note"))
 
         p = self._panel("VIEW")
         key(p, "Zoom out", "R  −", lambda: self.zoom(1 / 1.5))
@@ -941,7 +973,8 @@ class AssemblyWindow(object):
             "Top half of a region: select (click = insertion point, drag = "
             "highlight).  Bottom half: grab (click = region, drag = move, "
             "double-click = waveform editor).  Edge: trim.  Gap: drag to "
-            "retime.  Flag: drag, or double-click to name.  "
+            "retime.  Flag: drag, double-click to name, Ctrl+click or "
+            "right-click to delete.  "
             "Edges and highlights snap to speech starts and stops; hold Ctrl "
             "to place one freely.  Ctrl+wheel: zoom.  In the text: drag to "
             "highlight, double-click "
@@ -951,7 +984,6 @@ class AssemblyWindow(object):
         self._legend_items = []
         self._show_rate()
         self._show_monitor()
-        self.show_refine_status()
 
     def _show_legend(self):
         """Swatches for the speakers on the track, refreshed as they change."""
@@ -991,7 +1023,8 @@ class AssemblyWindow(object):
             self.win.update_idletasks()
             sh = max(1, self._side.winfo_height())
             panels = lay.get("panels") or []
-            if len(panels) != len(self._side.panes()) - 1:
+            if len(panels) != len(self._side.panes()) - 1 \
+                    or lay.get("v") != LAYOUT_V:
                 self._fit_panels()
                 return
             for i, f in enumerate(panels):
@@ -1020,6 +1053,7 @@ class AssemblyWindow(object):
             sh = max(1, self._side.winfo_height())
             n = len(self._side.panes())
             prefs["assembly_layout"] = {
+                "v":      LAYOUT_V,
                 "track":  self._outer.sash_coord(0)[1] / float(h),
                 "script": self._top.sash_coord(0)[0] / float(w),
                 "panels": [self._side.sash_coord(i)[1] / float(sh)
@@ -1317,23 +1351,11 @@ class AssemblyWindow(object):
         return (pq or {}).get("transcript") or []
 
     def _map_words(self, c, load=True):
-        """Transcript words the pull's segments keep (_word_point), moved onto
-        the timeline.  Looked up by time: a whole file's words, many pulls."""
+        """The transcript words the pull keeps, on the timeline."""
         words = self._raw_words(c, load)
         if words is None:
             return None
-        ordered, starts = _indexed(words)
-        out = []
-        for tl, du, si in c.pieces:
-            i = bisect.bisect_left(starts, si - MAX_WORD_S)
-            while i < len(ordered) and starts[i] < si + du:
-                for ws, we, text, _glued, _src in _word_units(ordered[i]):
-                    if si <= _word_point(ws, we) < si + du:
-                        t0 = max(tl, tl + ws - si)
-                        out.append((t0, max(t0, min(tl + du, tl + we - si)), text))
-                i += 1
-        out.sort()
-        return out
+        return [(u[0], u[1], u[4]) for u in _kept_units(c, words)]
 
     def _queue_words(self):
         """Parse each file's transcript ahead of the audio, so the text is
@@ -1374,7 +1396,8 @@ class AssemblyWindow(object):
         self._queue_words()
 
     def show_refine_status(self):
-        """The TRANSCRIPT panel, as the second pass stands."""
+        """The TRANSCRIPT panel, as the second pass stands: the button, a bar
+        while it runs, and the line under the track that is always in view."""
         if self._closed:
             return
         app = self.app
@@ -1384,10 +1407,18 @@ class AssemblyWindow(object):
         held = held() if held is not None else False
         running = getattr(app, "_refine_running", None)
         running = running() if running is not None else False
+        fn = getattr(app, "_refine_progress", None)
+        frac = fn() if fn is not None else None
         changed = False
         try:
-            self.refine_key.set_text(
-                "Refine with {}".format(engines.get_active_model_size()))
+            label = "Refining…" if running else \
+                "Refine with {}".format(engines.get_active_model_size())
+            if label != self.refine_key.lbl.cget("text"):
+                self.refine_key.set_text(label)
+                changed = True
+            self.refine_key.set_on(running)
+            self.refine_bar.set(frac or 0.0 if running else 0.0, 1.0)
+            self.tx_status.config(fg=TEXT if running or held else SUB)
             if text != self.tx_status.cget("text"):
                 self.tx_status.config(text=text)
                 changed = True
@@ -1403,6 +1434,7 @@ class AssemblyWindow(object):
                 changed = True
             if changed:
                 self.tx_flow._reflow()
+            self._show_loading()
         except tk.TclError:
             return
         if running != self._tx_fading:
@@ -1514,38 +1546,35 @@ class AssemblyWindow(object):
 
     def _show_loading(self):
         n = len(self._loading)
-        self.load_lbl.config(
-            text="Loading audio … {} pulls to go".format(n) if n else "")
+        fn = getattr(self.app, "_refine_short", None)
+        refine = fn() if fn is not None else ""
+        bits = (["Loading audio … {} pulls to go".format(n)] if n else []) + \
+            ([refine] if refine else [])
+        self.load_lbl.config(text="   ·   ".join(bits),
+                             fg=ACCENT if refine else SUB)
 
     # ── Script pane ──────────────────────────────────────────────────────
-    def _build_line(self, r, c, neighbours, fade):
-        body = (r.get("quote_text") or "").strip()
-        if c is None:
-            body += "   (not in the cut)"
-            return _Line(body, [_Tok(0, len(body), None, None, None, None, False, None)])
-        if _MONITOR["transcript"]:
-            words = self._raw_words(c, load=False)
-            if words:
-                line = _transcript_line(c, words, neighbours,
-                                        _MONITOR["cut_words"], fade)
-                if line is not None:
-                    return line
-        return _Line(body, [], script=True, words=False)     # timed by _line
+    def _build_line(self, r, c, fade):
+        script = (r.get("quote_text") or "").strip()
+        if c is None:                    # in the script, not in the cut
+            tok = _Tok(0, len(script), None, None, None, None, False, None)
+            return _Line(script, [tok] if script else [], [(script, "txstruck")])
+        words = self._raw_words(c, load=False)
+        units = _kept_units(c, words) if words else []
+        if not units:
+            return _Line(script, [])     # nothing heard yet to set it against
+        if not script:
+            return _plain_line(units, fade)
+        # Lining them up is the only dear part, and most pulls are the same
+        # as last time: whichever word just came in, one pull has changed.
+        said = tuple(_norm_word(u[4]) for u in units)
+        memo = self._align_memo.get(c.order)
+        if memo is None or memo[0] != script or memo[1] != said:
+            memo = self._align_memo[c.order] = (script, said, _script_ops(script, said))
+        return _text_line(script, units, memo[2], fade)
 
     def _line(self, order):
-        """A pull's line.  A script line is timed when first asked for, and
-        again when its clip's words change: on a long pull that takes tens of
-        milliseconds, too many for every pull on every redraw."""
-        line = self._tx_lines.get(order)
-        if line is not None and line.script:
-            c = self._clip(order)
-            if c is not None and line.words is not c.words:
-                memo = self._script_memo.get(order)
-                if memo is None or memo.words is not c.words \
-                        or memo.body != line.body:
-                    memo = self._script_memo[order] = _script_line(line.body, c)
-                line = self._tx_lines[order] = memo
-        return line
+        return self._tx_lines.get(order)
 
     def _text_top(self):
         """(pull, characters into it) at the top of the pane."""
@@ -1573,47 +1602,37 @@ class AssemblyWindow(object):
         t.delete("1.0", "end")
         placed = {c.order: c for c in self.clips}
         names  = {p.get("index"): p.get("name", "") for p in (self.app.parts or [])}
-        marks = {}
-        for m in self.markers:
-            marks.setdefault(m["order"], []).append(m)
-        near = {}
-        for a, b in zip(self.clips, self.clips[1:]):
-            if a.play_path == b.play_path:
-                near.setdefault(a.order, []).append(b)
-                near.setdefault(b.order, []).append(a)
         running = getattr(self.app, "_refine_running", None)
         self._tx_fading = fade = bool(running()) if running is not None else False
         self._tx_lines, self._tx_order, self._tx_seq = {}, [], {}
-        cur_part = object()
+        solo = bool(self.app._monolog)   # one narrator: nobody to name
+        cur_part, speaker = object(), None
         for r in sorted(self.app.results, key=lambda r: r.get("order", 0)):
             pi = r.get("part_index")
-            if pi != cur_part and not self.app._monolog:
-                cur_part = pi
+            if pi != cur_part and not solo:
+                cur_part, speaker = pi, None
                 t.insert("end", (names.get(pi) or "Part {}".format(pi)) + "\n",
                          ("part",))
             o   = r.get("order")
             tag = "o{}".format(o)
-            out = () if o in placed else ("out",)
-            tok = r.get("token", "")
-            t.insert("end", "#{:03d} {}   ".format(o, tok), ("tok", tag) + out)
-            line = self._build_line(r, placed.get(o), near.get(o, ()), fade)
+            line = self._build_line(r, placed.get(o), fade)
             self._tx_seq[o] = len(self._tx_order)
             self._tx_order.append(o)
             self._tx_lines[o] = line
+            if not line.body:
+                continue
+            who = "VO" if r.get("is_vo") else r.get("token", "")
+            if not solo and who and who != speaker:
+                t.insert("end", who + "\n", ("tok", tag))
+                speaker = who
             # b<order>: where the line starts, for finding its words.
             args = []
             for text, style in line.chunks:
                 if text:
-                    args += [text, (tag, "b{}".format(o)) + out
+                    args += [text, (tag, "b{}".format(o))
                              + ((style,) if style else ())]
-            if args:
-                t.insert("end", *args)
-            for m in marks.get(o, ()):
-                t.insert("end", "   [{}]".format(m["label"]),
-                         (tag, {"sfx": "mk_sfx", "note": "mk_note"}.get(
-                             m["kind"], "mk_music"),
-                          "mk{}_{}".format(o, m["index"])))
-            t.insert("end", "\n", (tag,) + out)
+            t.insert("end", *args)
+            t.insert("end", "\n", (tag,))
         t.config(state="disabled")
         t.yview_moveto(y0)
         if top is not None:
@@ -1642,8 +1661,7 @@ class AssemblyWindow(object):
         if self._tdrag is not None:
             self._tx_render_after = self.win.after(300, self._tx_render_now)
             return
-        if _MONITOR["transcript"]:
-            self._render_script()
+        self._render_script()
         self.redraw()
 
     # ── Highlighting the text ────────────────────────────────────────────
@@ -1657,8 +1675,10 @@ class AssemblyWindow(object):
             line = self._tx_lines.get(o)
             if line is None or not line.tokens:
                 return None
-            tok = line.tokens[min(i, len(line.tokens) - 1)]
-            out.append((o, tok.s0 if tok.s0 is not None else tok.t0))
+            i = min(i, len(line.tokens) - 1)
+            near = [t for t in line.tokens[i:] + line.tokens[:i][::-1]
+                    if t.s0 is not None]
+            out.append((o, near[0].s0 if near else None))
         return out
 
     def _tx_restore(self, kept):
@@ -1671,13 +1691,9 @@ class AssemblyWindow(object):
             if line is None or not line.tokens:
                 self._tx_anchor = self._tx_head = None
                 return
-            if at is None:
-                ends.append((o, 0))
-                continue
-            ends.append((o, min(
-                range(len(line.tokens)),
-                key=lambda n: abs((line.tokens[n].s0 if line.tokens[n].s0 is not None
-                                   else (line.tokens[n].t0 or 0.0)) - at))))
+            timed = [n for n, t in enumerate(line.tokens) if t.s0 is not None]
+            ends.append((o, min(timed, key=lambda n: abs(line.tokens[n].s0 - at))
+                         if timed and at is not None else 0))
         self._tx_anchor, self._tx_head = ends
 
     def _tx_clear(self):
@@ -1761,11 +1777,13 @@ class AssemblyWindow(object):
         if self._range is not None:
             self._status_range()
             return
-        n = sum(1 for _o, c, line, i0, i1 in self._tx_selected()
-                for tok in line.tokens[i0:i1 + 1] if not tok.kept)
-        if n:
-            self.status.config(fg=TEXT, text="{} word{} out of the cut highlighted"
-                               "   ·   H puts them back".format(n, "" if n == 1 else "s"))
+        sel = self._tx_selected()
+        if any(c is None for _o, c, _l, _a, _b in sel):
+            self.status.config(fg=TEXT, text="Not in the cut   ·   "
+                               "right-click to bring it back")
+        elif sel:
+            self.status.config(fg=TEXT, text="In the script, but not said in the "
+                               "cut: there is no audio here to edit")
 
     def _tx_sel_ends(self):
         """The highlight as ((order, first char), (order, end char)) -- the
@@ -1829,23 +1847,12 @@ class AssemblyWindow(object):
         self._end_rename(commit=True)
         self._script_touched()
         self._tdrag = None
-        idx = t.index("@{},{}".format(e.x, e.y))
-        for tag in t.tag_names(idx):
-            if tag.startswith("mk") and "_" in tag:
-                o, i = (int(v) for v in tag[2:].split("_"))
-                m = self._marker((o, i))
-                if m is not None:
-                    self._range = None
-                    self._tx_clear()
-                    self.select_marker((o, i))
-                    self.seek(m["t"], center=True)
-                    return "break"
         hit = self._tx_hit(e.x, e.y)
         if hit is None:
             return "break"
         o, i, head = hit
         if head or i is None:
-            # The pull's number: the whole pull, for the track and the keys.
+            # The speaker's name: the whole pull, for the track and the keys.
             self._range = None
             self._tx_clear()
             c = self._clip(o)
@@ -1935,10 +1942,13 @@ class AssemblyWindow(object):
         self._tx_clear()
         c = self._clip(o)
         if c is None:
-            self.sel_order = None
+            self.sel_order = o
             self._mark_selected_in_script()
-            self.status.config(fg=SUB, text="#{:03d} is not in the cut   ·   "
-                               "triple-click it and press H to bring it back".format(o))
+            self.status.config(fg=SUB, text=(
+                "Not in the cut   ·   right-click to bring it back"
+                if self._is_ignored(o) else
+                "No audio was found for these lines   ·   Enter opens the "
+                "waveform editor to look for it"))
             self.redraw()
             return
         line = self._line(o)
@@ -1954,15 +1964,8 @@ class AssemblyWindow(object):
         self.redraw()
 
     def _on_text_double(self, e):
-        """Double-click: the word (or name a mark)."""
+        """Double-click: the word."""
         self._tdrag = None
-        idx = self.text.index("@{},{}".format(e.x, e.y))
-        for tag in self.text.tag_names(idx):
-            if tag.startswith("mk") and "_" in tag:
-                o, i = (int(v) for v in tag[2:].split("_"))
-                if self._marker((o, i)) is not None:
-                    self._begin_rename((o, i))
-                    return "break"
         hit = self._tx_hit(e.x, e.y)
         if hit is None or hit[1] is None:
             return "break"
@@ -2012,27 +2015,27 @@ class AssemblyWindow(object):
             self._tx_anchor = self._tx_head = hit[:2]
             self._tx_apply()
             self._tx_settle()
+        order = hit[0] if hit is not None else None
+        if order is not None and self._clip(order) is None:
+            self.sel_order = order
         has = self._range is not None
-        can_heal = any(not tok.kept for _o, _c, line, i0, i1 in self._tx_selected()
-                       for tok in line.tokens[i0:i1 + 1])
         on = lambda ok: "normal" if ok else "disabled"
         m = tk.Menu(self.text, tearoff=0, bg=SURF2, fg=TEXT,
                     activebackground=ACCENT, activeforeground=TEXT, bd=0)
-        m.add_command(label="Play selection (Space)", command=self.toggle_play,
-                      state=on(has))
+        if order is not None and self._is_ignored(order):
+            m.add_command(label="Bring back into the cut",
+                          command=lambda: self.bring_back(order))
+            m.add_separator()
+        m.add_command(label="Play from here (Space)", command=self.toggle_play)
         m.add_command(label="Delete (Del)", command=self.delete_range, state=on(has))
-        m.add_command(label="Restore (H)", command=self.restore, state=on(can_heal))
         m.add_command(label="Split (B)", command=self.split)
         m.add_separator()
-        m.add_command(label="Music in (I)", command=lambda: self.drop_marker("music_in"))
-        m.add_command(label="Music out (O)", command=lambda: self.drop_marker("music_out"))
-        m.add_command(label="Inflection (U)",
+        m.add_command(label="Music inflection (M)",
                       command=lambda: self.drop_marker("music_inflection"))
-        m.add_command(label="SFX (M)", command=lambda: self.drop_marker("sfx"))
-        m.add_command(label="Note (K)", command=lambda: self.drop_marker("note"))
+        m.add_command(label="SFX (X)", command=lambda: self.drop_marker("sfx"))
+        m.add_command(label="Note (N)", command=lambda: self.drop_marker("note"))
         m.add_separator()
-        m.add_command(label="Copy (Ctrl+C)", command=self.copy_words,
-                      state=on(has or can_heal))
+        m.add_command(label="Copy (Ctrl+C)", command=self.copy_words, state=on(has))
         m.add_command(label="Open in editor (Enter)", command=self.open_selected)
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -2073,78 +2076,16 @@ class AssemblyWindow(object):
             self.status.config(fg=SUB, text="Copied {} word{}".format(
                 len(text.split()), "" if len(text.split()) == 1 else "s"))
 
-    def _cut_spans(self, c, line, i0, i1):
-        """The source tape behind the cut words among i0..i1, one span a run:
-        each end meets the kept tape it borders, else stops just short of the
-        next word left out."""
-        toks, out, i = line.tokens, [], i0
-        while i <= i1:
-            if toks[i].kept or toks[i].s0 is None:
-                i += 1
-                continue
-            j = i
-            while j < i1 and not toks[j + 1].kept:
-                j += 1
-            a, b = toks[i].s0, toks[j].s1
-            p = toks[i - 1] if i > 0 else None
-            n = toks[j + 1] if j + 1 < len(toks) else None
-            if p is None:
-                a -= SEL_PAD
-            elif p.kept:
-                a = c.segments[p.k][1]
-            else:
-                a = max((p.s1 + a) / 2.0, a - SEL_PAD)
-            if n is None:
-                b += SEL_PAD
-            elif n.kept:
-                b = c.segments[n.k][0]
-            else:
-                b = min((b + n.s0) / 2.0, b + SEL_PAD)
-            b = min(b, self._file_end.get(c.play_path, float("inf")))
-            if b > a:
-                out.append((max(0.0, a), b))
-            i = j + 1
-        return out
+    def _is_ignored(self, order):
+        return any(e["res"].get("order") == order and e["skip_var"].get()
+                   for e in getattr(self.app, "_rv", ()))
 
-    def restore(self):
-        """Put the highlighted words that are out of the cut back into it, as
-        Pro Tools' heal does; a pull IGNOREd out of the cut comes back whole."""
-        edits, back, lost = {}, [], False
-        for o, c, line, i0, i1 in self._tx_selected():
-            if c is None:
-                if any(e["res"].get("order") == o and e["skip_var"].get()
-                       for e in getattr(self.app, "_rv", ())):
-                    back.append(o)
-                else:
-                    lost = True
-                continue
-            spans = self._cut_spans(c, line, i0, i1)
-            if spans:
-                edits[o] = (_segments_with(c.segments, spans), None)
-        if not edits and not back:
-            self.status.config(fg=SUB, text=(
-                "No audio was found for these lines: Enter opens the waveform "
-                "editor to look for it." if lost else
-                "Highlight words that are struck through to put them back."))
-            return
+    def bring_back(self, order):
+        """A pull IGNOREd out of the cut goes back in, whole."""
         self._range = self.sel_region = None
         self._tx_clear()
-        self.app._assembly_edit_many(edits, (), back)
+        self.app._assembly_edit_many({}, (), [order])
         self.refresh()
-
-    def toggle_transcript(self):
-        _MONITOR["transcript"] = not _MONITOR["transcript"]
-        self._tx_clear()
-        self._show_monitor()
-        self._render_script()
-        self.redraw()
-
-    def toggle_cut_words(self):
-        _MONITOR["cut_words"] = not _MONITOR["cut_words"]
-        self._show_monitor()
-        if _MONITOR["transcript"]:
-            self._render_script()
-            self.redraw()
 
     def _highlight_script(self, order, see=True):
         if order == self._cur_order:
@@ -2674,7 +2615,7 @@ class AssemblyWindow(object):
             self.status.config(fg=SUB, text="   ·   ".join((
                 m["label"], kind, _fmt_tc(m["t"]),
                 "on " + (c.label if c else "?"),
-                "drag to move, double-click to name, Delete to remove")))
+                "drag to move, double-click to name, Ctrl+click or Delete to remove")))
             return
         c = self._clip(self.sel_order) or self._clip(self._order_at(self.playhead))
         if c is None:
@@ -2857,6 +2798,9 @@ class AssemblyWindow(object):
         if kind == "marker":
             self._range = None
             self.select_marker((c["order"], c["index"]))
+            if e.state & 0x0004:             # Ctrl+click deletes it
+                self.delete_marker()
+                return
             self._drag = {"mode": "marker", "x0": e.x, "t0": c["t"],
                           "key": (c["order"], c["index"]), "moved": False}
             return
@@ -3139,14 +3083,14 @@ class AssemblyWindow(object):
         hit = self._clips_in(*sorted((a, b)))
         if len(hit) > 1:
             self.status.config(fg=TEXT, text="{} pulls   {:.2f}s selected   ·   "
-                               "Space plays it   ·   Delete takes it out   ·   "
+                               "Delete takes it out   ·   "
                                "B splits at both ends".format(len(hit), abs(b - a)))
             return
         c = self._clip(o)
         whole = c is not None and abs(b - a) >= c.end - c.start - MIN_SEG_S
         reg = self.sel_region
         self.status.config(fg=TEXT, text="{}{}   {:.2f}s selected   ·   "
-                           "Space plays it   ·   Delete takes it out{}{}".format(
+                           "Delete takes it out{}{}".format(
                                c.label if c else "",
                                "  region {} of {}".format(reg[1] + 1, len(c.pieces))
                                if reg and c and len(c.pieces) > 1 else "",
@@ -3233,11 +3177,26 @@ class AssemblyWindow(object):
         self.redraw()
         self._update_status()
 
-    def nudge(self, frames):
-        """Move the selected region -- or the selected pull -- and
-        everything after it `frames` earlier or later: the silence in
-        front of it shrinks or grows.  It stops once it butts against
-        what plays before it."""
+    def set_nudge(self, seconds):
+        """The nudge value, kept for next time."""
+        _MONITOR["nudge_s"] = seconds
+        prefs = self._layout_prefs()
+        if prefs is not None:
+            prefs["assembly_nudge"] = seconds
+            save = getattr(self.app, "_save_prefs", None)
+            if callable(save):
+                save()
+        self._show_monitor()
+
+    def _nudge_step(self, big):
+        v = _MONITOR["nudge_s"]
+        return NUDGES[min(NUDGES.index(v) + 1, len(NUDGES) - 1)] if big else v
+
+    def nudge(self, direction, big=False):
+        """Move the selected region -- or the selected pull -- and everything
+        after it earlier (-1) or later (1), by the nudge value or with `big`
+        the next one up: the silence in front of it shrinks or grows.  It
+        stops once it butts against what plays before it."""
         key = self.sel_region or (
             (self.sel_order, 0) if self.sel_order is not None else None)
         if key is None:
@@ -3251,8 +3210,8 @@ class AssemblyWindow(object):
                                "nothing in front of it to move".format(
                                    c.label if c else ""))
             return
-        fps = float(getattr(self.app, "_seq_fps", 24.0) or 24.0)
-        value = round(max(0.0, sp["value"] + frames / fps), 4)   # as stored
+        step = self._nudge_step(big)
+        value = round(max(0.0, sp["value"] + direction * step), 4)   # as stored
         if abs(value - sp["value"]) < 1e-6:
             self.status.config(fg=SUB, text="{}   ·   already butted against "
                                "what plays before it -- trim to tighten "
@@ -3328,13 +3287,11 @@ class AssemblyWindow(object):
         """A mark at the playhead -- the spotting keys, so it works while
         the cut plays.  An SFX spot opens straight into naming it: Enter
         keeps the name, Esc leaves it as its count (SFX 7).  With words or
-        audio highlighted it goes on the highlight: a music out at its end,
-        anything else at its start."""
+        audio highlighted it goes at the start of the highlight."""
         at = self.playhead
         if self._range is not None and not self._playing \
                 and abs(self._range[2] - self._range[1]) > 1e-3:
-            a, b = sorted(self._range[1:])
-            at = b if kind == "music_out" else a
+            at = min(self._range[1:])
         order, anchor = self._anchor_at(at)
         if order is None:
             return
@@ -3386,6 +3343,22 @@ class AssemblyWindow(object):
             del marks[idx]
             self.app._assembly_set_markers({order: marks})
         self.refresh()
+
+    def _on_track_menu(self, e):
+        """Right-click on a flag: what can be done to it."""
+        kind, hit, _k = self._hit(e.x, e.y)
+        if kind != "marker":
+            return
+        key = (hit["order"], hit["index"])
+        self.select_marker(key)
+        m = tk.Menu(self.cv, tearoff=0, bg=SURF2, fg=TEXT,
+                    activebackground=ACCENT, activeforeground=TEXT, bd=0)
+        m.add_command(label="Name…", command=lambda: self._begin_rename(key))
+        m.add_command(label="Delete marker", command=self.delete_marker)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     def _on_track_double(self, e):
         kind, hit, _k = self._hit(e.x, e.y)
@@ -3528,23 +3501,20 @@ class AssemblyWindow(object):
             self.play()
 
     def play(self):
-        """Play from the insertion point -- or the highlighted span, and
-        only that -- with the pre-roll in front of it."""
+        """Play from the insertion point, with the pre-roll in front of it,
+        and on from there.  A highlight leaves the insertion point at its
+        start, but doesn't hold playback in: the two are separate."""
         if self.player is None:
             self.status.config(text="Playback needs the sounddevice package "
                                     "(pip install sounddevice).", fg=ERR)
             return
-        end = None
-        if self._range is not None and abs(self._range[2] - self._range[1]) > 1e-3:
-            origin, end = sorted(self._range[1:])
-        else:
-            origin = self.insert
-            if origin >= self.total_s - 0.05:
-                origin = self.insert = 0.0
+        origin = self.insert
+        if origin >= self.total_s - 0.05:
+            origin = self.insert = 0.0
         self._play_origin = origin
         start = origin - (_MONITOR["preroll_s"] if _MONITOR["preroll_on"] else 0.0)
         self.player.set_rate(self._rate)
-        if not self.player.play(start_s=max(0.0, start), end_s=end):
+        if not self.player.play(start_s=max(0.0, start)):
             self.status.config(text="Couldn't open the audio device.", fg=ERR)
             return
         self._playing = True
@@ -3643,9 +3613,8 @@ class AssemblyWindow(object):
         self.return_key.set_on(_MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
-        self.tx_key.set_text("Transcript" if _MONITOR["transcript"] else "Script")
-        self.tx_key.set_on(_MONITOR["transcript"])
-        self.cut_key.set_on(_MONITOR["cut_words"])
+        for v, b in self.nudge_keys.items():
+            b.set_on(v == _MONITOR["nudge_s"])
 
     def step_rate(self, d):
         rates = match_review._PLAY_RATES
@@ -3672,6 +3641,7 @@ class AssemblyWindow(object):
             return "break"
         k = e.keysym
         ctrl = bool(e.state & 0x0004)
+        shift = bool(e.state & 0x0001)
         if k == "space":
             self.toggle_play()
         elif k == "bracketleft":
@@ -3701,7 +3671,10 @@ class AssemblyWindow(object):
         elif not ctrl and k.lower() == "p":
             self.toggle_preroll()
         elif not ctrl and k.lower() == "n":
-            self.toggle_return()
+            if shift:
+                self.toggle_return()
+            else:
+                self.drop_marker("note")
         elif not ctrl and k == "S":
             self.toggle_script_follow()
         elif not ctrl and k.lower() == "s":
@@ -3710,10 +3683,10 @@ class AssemblyWindow(object):
             self.zoom(1 / 1.5)               # Pro Tools: R out, T in
         elif not ctrl and k.lower() == "t":
             self.zoom(1.5)
-        elif not ctrl and k.lower() in ("i", "o", "u", "m", "k"):
-            self.drop_marker({"i": "music_in", "o": "music_out",
-                              "u": "music_inflection", "m": "sfx",
-                              "k": "note"}[k.lower()])
+        elif not ctrl and k.lower() == "m":
+            self.drop_marker("music_inflection")
+        elif not ctrl and k.lower() == "x":
+            self.drop_marker("sfx")
         elif ctrl and k in ("equal", "plus"):
             self.to_step4()                  # Pro Tools' Edit / Mix toggle
         elif ctrl and k.lower() == "s":
@@ -3722,8 +3695,10 @@ class AssemblyWindow(object):
             self.split()                     # Pro Tools: B, or Ctrl+E
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
-        elif k in ("less", "greater"):
-            self.nudge(-10 if k == "less" else 10)
+        elif k == "question" or (k == "slash" and shift):
+            self.nudge(-1, big=True)
+        elif k == "slash":
+            self.nudge(1, big=True)
         elif ctrl and k.lower() == "z":
             # Step 4's own history: edits here and on the cards share it.
             (self.app._s4_redo if e.state & 0x0001 else self.app._s4_undo)()
@@ -3731,12 +3706,6 @@ class AssemblyWindow(object):
             self.app._s4_redo()
         elif ctrl and k.lower() == "c":
             self.copy_words()
-        elif k.lower() == "h":
-            self.restore()                   # Pro Tools' heal is Ctrl+H
-        elif not ctrl and k == "W":
-            self.toggle_cut_words()
-        elif not ctrl and k.lower() == "w":
-            self.toggle_transcript()
         elif k.lower() == "f" and not ctrl:
             self.fit()
         elif k == "Escape":

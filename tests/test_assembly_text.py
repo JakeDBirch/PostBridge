@@ -1,4 +1,4 @@
-"""The Assembly's text pane: highlight the transcript, edit the audio.
+"""The Assembly's text pane: the cut as words, highlight them to edit the audio.
 
 The same set-up as test_assembly_edit: a real window on main.App's own commit
 and undo methods.  Mouse gestures go in through the pane's own handlers, at
@@ -134,9 +134,7 @@ def view(monkeypatch):
     app.words = _file_words()
     app._refine_words = lambda path: app.words
 
-    # Monitoring choices are kept for the run; each test starts from the default.
-    monkeypatch.setitem(assembly_view._MONITOR, "transcript", True)
-    monkeypatch.setitem(assembly_view._MONITOR, "cut_words", True)
+    monkeypatch.setitem(assembly_view._MONITOR, "nudge_s", 0.1)
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
     monkeypatch.setattr(os.path, "isfile",
                         lambda p, _f=os.path.isfile: p == WAV or _f(p))
@@ -171,11 +169,19 @@ def _body(win, order):
     return t.get(a, b)
 
 
+def _all_text(win):
+    return win.text.get("1.0", "end")
+
+
 def _at(win, order, word):
     """The pixel of a word in the text."""
     line = win._line(order)
     tok = next(k for k in line.tokens if line.body[k.cs:k.ce] == word)
-    idx = "b{}.first + {} chars".format(order, tok.cs + 1)
+    return _pixel(win, order, tok.cs)
+
+
+def _pixel(win, order, cs):
+    idx = "b{}.first + {} chars".format(order, cs + 1)
     win.text.see(idx)
     win.text.update_idletasks()
     x, y, _w_, h = win.text.bbox(idx)
@@ -196,90 +202,230 @@ def _highlighted(win):
     return win.text.get(*rng) if rng else None
 
 
+def _tagged(win, tag):
+    rng = win.text.tag_ranges(tag)
+    return [win.text.get(a, b) for a, b in zip(rng[::2], rng[1::2])]
+
+
 def _kept_words(win, order):
     line = win._line(order)
     return [line.body[k.cs:k.ce] for k in line.kept]
 
 
-# ── The text ─────────────────────────────────────────────────────────────
-def test_the_text_is_the_transcript_with_the_cut_tape_struck_through(view):
+# ── What the text shows ──────────────────────────────────────────────────
+def test_the_text_is_only_the_cut(view):
     _app, win = view
-    assert _body(win, 1) == "Before that, We walked the ridge before dawn. Anyway,"
-    assert _kept_words(win, 1) == ["We", "walked", "the", "ridge", "before", "dawn."]
-    struck = win.text.tag_ranges("txcut")
-    got = [win.text.get(a, b) for a, b in zip(struck[::2], struck[1::2])]
-    assert "Before that," in got and "Anyway," in got
+    assert _body(win, 1) == "We walked the ridge before dawn."
+    text = _all_text(win)
+    assert "Before that," not in text and "Anyway," not in text   # cut tape
+    assert "#001" not in text
+    assert not _tagged(win, "txstruck")
+
+
+def test_marks_are_not_in_the_text(view):
+    app, win = view
+    win.set_insert(1.0)
+    win.drop_marker("music_inflection")
+    win.refresh()
+    assert len(win.markers) == 1
+    assert "Inflection" not in _all_text(win)
 
 
 def test_a_pull_with_no_words_reads_as_its_script(view):
     _app, win = view
     assert _body(win, 3) == "The last line of the script."
+    assert not win._line(3).tokens
 
 
-def test_w_swaps_the_script_in_and_shift_w_hides_the_cut_words(view):
+def test_a_speaker_is_named_where_the_speaker_changes(view):
+    app, win = view
+    _res(app, 2)["token"] = "HOST"
+    win.refresh()
+    assert _all_text(win).split("\n")[1:3] == ["GUEST", "We walked the ridge before dawn."]
+    assert "HOST\nNothing moved then." in _all_text(win)
+    assert "GUEST\nThe last line" in _all_text(win)      # back again
+    # The same speaker on: not named twice.
+    _res(app, 2)["token"] = "GUEST"
+    win.refresh()
+    assert _all_text(win).count("GUEST") == 1
+
+
+def test_a_narration_has_no_names_or_headings(view):
+    app, win = view
+    app._monolog = True
+    win.refresh()
+    assert _all_text(win).split("\n")[0] == "We walked the ridge before dawn."
+    assert "GUEST" not in _all_text(win) and "Part" not in _all_text(win)
+
+
+def _line_from(script, *said, fade=False):
+    from assembly_view import _norm_word, _script_ops, _text_line
+    units = []
+    t = 0.0
+    for text in said:
+        src = None
+        if isinstance(text, tuple):
+            text, src = text
+        units.append((t, t + 0.3, t, t + 0.3, text, False, src, 0))
+        t += 0.4
+    ops = _script_ops(script, [_norm_word(u[4]) for u in units])
+    return _text_line(script, units, ops, fade)
+
+
+def _read(line):
+    """The line with its marks spelled out: ~~struck~~ and {tinted}."""
+    out = ""
+    for text, style in line.chunks:
+        out += {"txstruck": "~~{}~~", "txsaid": "{{{}}}", "txdraft": "<{}>"}.get(
+            style, "{}").format(text)
+    return out
+
+
+def test_script_wording_not_said_is_struck_and_said_wording_tinted():
+    line = _line_from("We are going to walk the ridge.",
+                      "We're", "gonna", "walk", "the", "ridge.")
+    assert _read(line) == "~~We are going to~~ {We're gonna} walk the ridge."
+    kept = [line.body[t.cs:t.ce] for t in line.kept]
+    assert kept == ["We're", "gonna", "walk", "the", "ridge."]
+    struck = [t for t in line.tokens if not t.kept]
+    assert [line.body[t.cs:t.ce] for t in struck] == ["We", "are", "going", "to"]
+    assert all(t.t0 is None and t.s0 is None for t in struck)
+
+
+def test_a_word_left_out_and_a_word_added():
+    assert _read(_line_from("He rode on alone.", "He", "rode", "alone.")) == \
+        "He rode ~~on~~ alone."
+    assert _read(_line_from("He rode alone.", "He", "rode", "um", "alone.")) == \
+        "He rode {um} alone."
+
+
+def test_the_same_words_are_not_a_difference():
+    # Casing and punctuation.
+    assert _read(_line_from("He rode, alone.", "he", "rode", "alone")) == "He rode, alone."
+    # Whisper's spelling of a name: the script's stands.
+    assert _read(_line_from("Hardin rode on.", "harden", "rode", "on")) == "Hardin rode on."
+    # That slack is for names.  A word said differently is a difference.
+    assert _read(_line_from("The killings stopped.", "the", "killing", "stopped")) == \
+        "The ~~killings~~ {killing} stopped."
+    assert _read(_line_from("He will ride on.", "he", "will", "rode", "on")) == \
+        "He will ~~ride~~ {rode} on."
+    # One word or two.
+    line = _line_from("A hyper-violent man.", "a", "hyper", "violent", "man")
+    assert _read(line) == "A hyper-violent man."
+    assert [line.body[t.cs:t.ce] for t in line.kept] == ["A", "hyper-violent", "man."]
+    # ...and the other way about, each word with the time they share.
+    line = _line_from("He was hyper violent.", "he", "was", "hyper-violent")
+    assert _read(line) == "He was hyper violent."
+    assert line.kept[2].t0 == line.kept[3].t0 and line.kept[2].t1 == line.kept[3].t1
+
+
+def test_the_scripts_paragraphs_and_dashes_stand():
+    line = _line_from("One two three.\nFour — five.", "one", "two", "three", "four", "five")
+    assert _read(line) == "One two three.\nFour — five."
+
+
+def test_differences_wait_for_a_better_model_than_the_draft():
+    tiny = lambda w: (w, "tiny")
+    line = _line_from("We walked the ridge.",
+                      tiny("We"), tiny("marched"), tiny("the"), tiny("rich"), fade=True)
+    assert _read(line) == "<We> <marched> <the> <rich>"
+    # Once the better model has heard it, the same difference gets noted.
+    line = _line_from("We walked the ridge.", "We", "marched", "the", "rich", fade=True)
+    assert _read(line) == "We ~~walked~~ {marched} the ~~ridge.~~ {rich}"
+    # With tiny the model chosen, nothing is coming: it is noted.
+    line = _line_from("We walked the ridge.",
+                      tiny("We"), tiny("marched"), tiny("the"), tiny("rich"), fade=False)
+    assert _read(line) == "We ~~walked~~ {marched} the ~~ridge.~~ {rich}"
+
+
+def test_figures_are_in_the_comparison(view):
+    from assembly_view import _word_units
+    w = dict(_w("In", 1.0, 1.2), extras=[{"text": " 1876,", "start": 1.3, "end": 1.9}])
+    assert [u[2] for u in _word_units(w)] == ["In", "1876,"]
+    assert _read(_line_from("In 1876, he.", "In", "1876,", "he")) == "In 1876, he."
+
+
+def test_a_pull_with_no_script_reads_as_said_in_paragraphs():
+    from assembly_view import TX_PARA_CHARS, _plain_line
+    units = [(i * 0.4, i * 0.4 + 0.3, i * 0.4, i * 0.4 + 0.3,
+              "sentence{}.".format(i) if i % 10 == 9 else "word{}".format(i),
+              False, None, 0) for i in range(400)]
+    line = _plain_line(units)
+    paras = line.body.split("\n")
+    assert len(paras) > 2
+    for p in paras[:-1]:
+        assert len(p) >= TX_PARA_CHARS and p.endswith(".")
+    assert line.body[line.tokens[-1].cs:line.tokens[-1].ce] == "sentence399."
+
+
+def test_a_line_not_in_the_cut_is_struck(view):
+    app, win = view
+    app._rv[1]["skip_var"].set(True)
+    win.refresh()
+    assert _tagged(win, "txstruck") == ["Nothing moved then."]
+    assert "(not in the cut)" not in _all_text(win)
+    # ...a line never found, too: script wording that wasn't said.
+    _res(app, 3)["status"] = "no_match"
+    _res(app, 3)["segments"] = []
+    win.refresh()
+    assert "The last line of the script." in _tagged(win, "txstruck")
+
+
+def test_deleting_a_word_of_the_script_strikes_it(view):
+    app, win = view
+    win._on_text_double(_E(*_at(win, 1, "ridge")))
+    win.delete_range()
+    win.refresh()
+    assert _kept_words(win, 1) == ["We", "walked", "the", "before", "dawn."]
+    assert _tagged(win, "txstruck") == ["ridge"]
+    assert len(_segs(app, 1)) == 2
+    app._s4_undo()
+    win.refresh()
+    assert not _tagged(win, "txstruck")
+    assert _segs(app, 1) == [(10.0, 14.0)]
+
+
+def test_deleting_a_word_not_in_the_script_makes_it_go(view):
+    app, win = view
+    _res(app, 1)["quote_text"] = "We walked the before dawn."
+    win.refresh()
+    assert _tagged(win, "txsaid") == ["ridge"]
+    win._on_text_double(_E(*_at(win, 1, "ridge")))
+    win.delete_range()
+    win.refresh()
+    assert "ridge" not in _all_text(win)
+    assert not _tagged(win, "txsaid")
+
+
+def test_a_redraw_only_lines_up_the_pull_that_changed(view, monkeypatch):
     import assembly_view
     app, win = view
-    win.win.focus_force()
-    win.text.focus_force()
-    app.update()
-    win.text.event_generate("<KeyPress>", keysym="W", when="now")
-    app.update()
-    assert not assembly_view._MONITOR["cut_words"]
-    assert _body(win, 1) == "We walked the ridge before dawn."
-    win.text.event_generate("<KeyPress>", keysym="W", when="now")
-    win.text.event_generate("<KeyPress>", keysym="w", when="now")
-    app.update()
-    assert not assembly_view._MONITOR["transcript"]
-    assert win.tx_key.lbl.cget("text") == "Script"
-    assert _body(win, 2) == "Nothing moved then."
-    assert win._line(1).script
+    calls = []
+    real = assembly_view._script_ops
+    monkeypatch.setattr(assembly_view, "_script_ops",
+                        lambda s, w: (calls.append(s), real(s, w))[1])
+    win._render_script()
+    assert not calls                           # nothing has changed
+    app.words = [dict(w, word="changed", text=" changed") if w["word"] == "ridge" else w
+                 for w in app.words]
+    win._render_script()
+    assert calls == ["We walked the ridge before dawn."]
 
 
-def test_figures_ride_on_the_word_before_and_read_in_place():
-    from assembly_view import _Clip, _transcript_line
-    words = [dict(_w("In", 1.0, 1.2), extras=[{"text": " 1876,", "start": 1.3, "end": 1.9}]),
-             _w("he", 2.0, 2.2)]
-    c = _Clip({"start": 0, "end": 48000 * 3, "gap": 0, "segments": [(0.5, 3.5)],
-               "pieces": [(0, 48000 * 3, 24000)]},
-              {"order": 1}, 48000, "int", False, None)
-    line = _transcript_line(c, words)
-    assert line.body == "In 1876, he"
-    assert [round(k.t0, 2) for k in line.kept] == [0.5, 0.8, 1.5]
-
-
-def test_a_long_run_of_cut_tape_shows_its_ends_and_a_count():
-    import assembly_view
-    from assembly_view import _Clip, _transcript_line
-    words = [_w("keep", 0.0, 0.2)] + [
-        _w("w{}".format(i), 1.0 + i * 0.3, 1.2 + i * 0.3) for i in range(40)
-    ] + [_w("again", 20.0, 20.2)]
-    c = _Clip({"start": 0, "end": 48000, "gap": 0,
-               "segments": [(0.0, 0.5), (19.9, 20.4)],
-               "pieces": [(0, 24000, 0), (24000, 24000, 19.9 * 48000)]},
-              {"order": 1}, 48000, "int", False, None)
-    line = _transcript_line(c, words)
-    cut = [t for t in line.tokens if not t.kept]
-    n = assembly_view.TX_CUT_ENDS
-    assert len(cut) == 2 * n + 1
-    middle = cut[n]
-    assert line.body[middle.cs:middle.ce] == "[{} words]".format(40 - 2 * n)
-    assert middle.s0 == pytest.approx(1.0 + n * 0.3)
-    assert middle.s1 == pytest.approx(1.2 + (39 - n) * 0.3)
-
-
-def test_a_neighbouring_pull_keeps_its_own_words_out_of_the_handle():
-    from assembly_view import _Clip, _transcript_line
-
-    def clip(order, a, b, tl):
-        sr = 48000
-        return _Clip({"start": int(tl * sr), "end": int((tl + b - a) * sr), "gap": 0,
-                      "segments": [(a, b)],
-                      "pieces": [(int(tl * sr), int((b - a) * sr), int(a * sr))]},
-                     {"order": order}, sr, "vo", False, "same.wav")
-    words = [_w("one", 1.0, 1.4), _w("two", 2.1, 2.5)]
-    first, second = clip(1, 0.5, 2.0, 0.0), clip(2, 2.0, 3.0, 1.5)
-    assert _transcript_line(first, words, [second]).body == "one"
-    assert _transcript_line(first, words).body == "one two"
+def test_other_reading_shows_only_when_a_pull_has_one(view):
+    app, win = view
+    assert win.reading_key is None
+    _res(app, 1)["monolog"] = True
+    _res(app, 1)["takes_data"] = [{"segments": [(10.0, 14.0)], "apath": WAV}]
+    win.refresh()
+    assert win.reading_key is None             # a monolog with only the one
+    _res(app, 1)["takes_data"].append({"segments": [(40.0, 44.0)], "apath": WAV})
+    win.refresh()
+    assert win.reading_key is not None
+    assert win.reading_key.frame.winfo_exists()
+    _res(app, 1)["takes_data"].pop()           # a re-cut changes the answer
+    win.refresh()
+    assert win.reading_key is None
 
 
 # ── Highlighting ─────────────────────────────────────────────────────────
@@ -292,7 +438,7 @@ def test_dragging_over_words_selects_them_on_the_track(view):
     # Halfway to the word either side, or SEL_PAD at most.
     assert a == pytest.approx(1.0 - 0.05)     # "walked" ends 0.9, "the" starts 1.0
     assert b == pytest.approx(2.4 + 0.1)      # "before" ends 2.4, "dawn." starts 2.6
-    assert win.insert == pytest.approx(a)     # play starts at the highlight
+    assert win.insert == pytest.approx(a)     # the insertion point goes to its start
     assert win.sel_order == 1
 
 
@@ -308,7 +454,6 @@ def test_selection_edges_stop_short_and_reach_the_region_edge(view):
     app.words[7]["start"] = 13.0
     app.words[7]["end"] = 13.5
     win.refresh()
-    _drag(app, win, 1, "ridge", 1, "ridge")
     win._on_text_double(_E(*_at(win, 1, "before")))
     assert win._range[2] == pytest.approx(2.4 + 0.15)
 
@@ -345,6 +490,25 @@ def test_shift_click_extends_from_the_last_click(view):
     win._on_text_release(_E(x, y, state=0x0001))
     app.update()
     assert _highlighted(win) == "walked the ridge"
+
+
+def test_a_highlight_goes_across_struck_words(view):
+    app, win = view
+    _res(app, 1)["quote_text"] = "We walked over the ridge before dawn."
+    win.refresh()
+    assert _tagged(win, "txstruck") == ["over"]
+    _drag(app, win, 1, "walked", 1, "the")
+    assert _highlighted(win) == "walked over the"
+    assert win._range[2] == pytest.approx(1.15)
+    # A struck word alone has no audio: nothing on the track.
+    win._on_text_double(_E(*_at(win, 1, "over")))
+    assert win._range is None
+    assert "not said" in win.status.cget("text")
+    # Clicking one goes to where the audio resumes.
+    x, y = _at(win, 1, "over")
+    win._on_text_press(_E(x, y))
+    win._on_text_release(_E(x, y))
+    assert win.insert == pytest.approx(0.95)
 
 
 def test_the_track_selection_lights_the_words_and_back(view):
@@ -387,7 +551,12 @@ def test_delete_across_pulls_is_one_undo_step(view):
     assert _segs(app, 2) == [(20.0, 22.0)]
 
 
-def test_delete_of_every_word_of_a_pull_ignores_it(view):
+def _labels(menu):
+    return [menu.type(i) == "command" and menu.entrycget(i, "label")
+            for i in range(menu.index("end") + 1)]
+
+
+def test_delete_of_every_word_of_a_pull_ignores_it_and_it_can_come_back(view, monkeypatch):
     app, win = view
     win._on_text_triple(_E(*_at(win, 2, "moved")))
     win.delete_range()
@@ -395,49 +564,34 @@ def test_delete_of_every_word_of_a_pull_ignores_it(view):
     assert app._rv[1]["skip_var"].get()
     assert win._clip(2) is None
     win.refresh()
-    assert _body(win, 2).endswith("(not in the cut)")
-    # ...and highlighting that line and pressing H brings it back.
-    win._on_text_triple(_E(*_at_ghost(win, 2)))
-    win.restore()
-    win.refresh()
+    assert _tagged(win, "txstruck") == ["Nothing moved then."]
+
+    menus = []
+    monkeypatch.setattr(tk.Menu, "tk_popup", lambda self, x, y: menus.append(self))
+    win._on_text_menu(_E(*_pixel(win, 2, 2)))
+    m = menus[0]
+    m.invoke(_labels(m).index("Bring back into the cut"))
     assert not app._rv[1]["skip_var"].get()
     assert win._clip(2) is not None
+    assert not _tagged(win, "txstruck")
 
 
-def _at_ghost(win, order):
-    idx = "b{}.first + 2 chars".format(order)
-    win.text.see(idx)
-    win.text.update_idletasks()
-    x, y, _w_, h = win.text.bbox(idx)
-    return x, y + h // 2
-
-
-def test_a_deleted_word_stays_struck_through_and_h_puts_it_back(view):
+def test_a_line_never_found_offers_no_bring_back(view, monkeypatch):
     app, win = view
-    win._on_text_double(_E(*_at(win, 1, "ridge")))
-    win.delete_range()
+    _res(app, 3)["status"] = "no_match"
+    _res(app, 3)["segments"] = []
     win.refresh()
-    assert _kept_words(win, 1) == ["We", "walked", "the", "before", "dawn."]
-    assert "ridge" in _body(win, 1)
-    assert len(_segs(app, 1)) == 2
-
-    win._on_text_double(_E(*_at(win, 1, "ridge")))
-    assert win._range is None                  # nothing of it on the track
-    assert "H puts them back" in win.status.cget("text")
-    win.restore()
-    win.refresh()
-    assert _segs(app, 1) == [(10.0, 14.0)]     # healed: one region again
-    assert _kept_words(win, 1) == ["We", "walked", "the", "ridge", "before", "dawn."]
-
-
-def test_h_on_the_handle_opens_the_pull_up(view):
-    app, win = view
-    win._on_text_double(_E(*_at(win, 1, "Anyway,")))
-    win.restore()
-    win.refresh()
-    segs = _segs(app, 1)
-    assert segs[0][0] == 10.0 and segs[-1][1] == pytest.approx(14.9 + 0.15)
-    assert "Anyway," in _kept_words(win, 1)
+    x, y = _pixel(win, 3, 2)
+    win._on_text_press(_E(x, y))
+    win._on_text_release(_E(x, y))
+    assert "No audio was found" in win.status.cget("text")
+    assert win.sel_order == 3
+    win.open_selected()
+    assert app.opened == [3]
+    menus = []
+    monkeypatch.setattr(tk.Menu, "tk_popup", lambda self, x, y: menus.append(self))
+    win._on_text_menu(_E(x, y))
+    assert "Bring back into the cut" not in _labels(menus[0])
 
 
 def test_split_across_pulls_is_one_undo_step(view):
@@ -460,15 +614,12 @@ def test_split_at_a_clicked_word_cuts_in_the_gap_before_it(view):
     assert win.sel_region == (1, 1)
 
 
-def test_music_marks_land_on_the_ends_of_the_highlight(view):
+def test_a_mark_lands_at_the_start_of_the_highlight(view):
     app, win = view
     _drag(app, win, 1, "the", 1, "before")
-    a, b = sorted(win._range[1:])
-    win.drop_marker("music_in")
-    win.drop_marker("music_out")
-    got = {m["kind"]: m["t"] for m in win.markers}
-    assert got["music_in"] == pytest.approx(a, abs=1e-3)
-    assert got["music_out"] == pytest.approx(b, abs=1e-3)
+    a = min(win._range[1:])
+    win.drop_marker("music_inflection")
+    assert win.markers[0]["t"] == pytest.approx(a, abs=1e-3)
 
 
 def test_copy_takes_the_highlighted_words(view):
@@ -478,16 +629,15 @@ def test_copy_takes_the_highlighted_words(view):
     assert win.win.clipboard_get() == "the ridge before dawn.\nNothing"
 
 
-def test_the_script_view_highlights_through_its_timing(view):
-    import assembly_view
+def test_a_script_of_several_paragraphs_highlights_across_them(view):
     app, win = view
-    win.toggle_transcript()
-    c = win._clip(1)
-    c.words = win._map_words(c)
-    assert not assembly_view._MONITOR["transcript"]
-    _drag(app, win, 1, "the", 1, "ridge")
-    assert _highlighted(win) == "the ridge"
-    assert win._range[1] == pytest.approx(0.95)
+    _res(app, 1)["quote_text"] = "We walked the ridge.\nBefore dawn."
+    win.refresh()
+    assert _body(win, 1) == "We walked the ridge.\nBefore dawn."
+    _drag(app, win, 1, "ridge.", 1, "Before")
+    assert _highlighted(win) == "ridge.\nBefore"
+    assert win._range[1] == pytest.approx(1.15)
+    assert win._range[2] == pytest.approx(2.5)
     win.delete_range()
     assert len(_segs(app, 1)) == 2
 
@@ -502,17 +652,18 @@ def test_right_click_selects_the_word_and_offers_the_operations(view, monkeypatc
     monkeypatch.setattr(tk.Menu, "tk_popup", _popup)
     win._on_text_menu(_E(*_at(win, 1, "ridge")))
     assert _highlighted(win) == "ridge"
-    for want in ("Play selection (Space)", "Delete (Del)", "Restore (H)", "Split (B)",
-                 "Music in (I)", "Music out (O)", "Inflection (U)", "SFX (M)",
-                 "Note (K)", "Copy (Ctrl+C)", "Open in editor (Enter)"):
+    for want in ("Play from here (Space)", "Delete (Del)", "Split (B)",
+                 "Music inflection (M)", "SFX (X)", "Note (N)",
+                 "Copy (Ctrl+C)", "Open in editor (Enter)"):
         assert want in seen
+    assert not any("Restore" in s or "Music in " in s for s in seen)
     # Right-clicking inside a highlight keeps it.
     _drag(app, win, 1, "walked", 1, "before")
     win._on_text_menu(_E(*_at(win, 1, "ridge")))
     assert _highlighted(win) == "walked the ridge before"
 
 
-def test_karaoke_lights_the_transcript(view):
+def test_karaoke_lights_the_word(view):
     app, win = view
 
     def lit():
@@ -522,19 +673,35 @@ def test_karaoke_lights_the_transcript(view):
     assert lit() == "ridge"
 
 
+def test_the_retired_keys_do_nothing(view):
+    app, win = view
+    win._on_text_double(_E(*_at(win, 1, "ridge")))
+    win.delete_range()
+    win.refresh()
+    before = _all_text(win), _segs(app, 1)
+    win.win.focus_force()
+    win.text.focus_force()
+    app.update()
+    for k in ("h", "w", "W"):
+        win.text.event_generate("<KeyPress>", keysym=k, when="now")
+    app.update()
+    assert (_all_text(win), _segs(app, 1)) == before
+
+
 # ── Words arriving ───────────────────────────────────────────────────────
-def test_refined_words_come_in_under_the_highlight_and_the_scroll(view):
+def test_refined_words_come_in_under_the_highlight(view):
     app, win = view
     win._on_text_double(_E(*_at(win, 1, "ridge")))
     before = win._range
-    # The refine hears the ridge better, and a word in front of it.
+    # The refine hears something else at the ridge.
     app.words = [w for w in app.words if w["start"] < 11.0 or w["start"] > 11.8]
-    app.words += [_w("craggy", 11.05, 11.15), _w("ridgeline", 11.2, 11.7)]
+    app.words += [_w("the", 11.0, 11.1), _w("ridgeline", 11.2, 11.7)]
     app.words.sort(key=lambda w: w["start"])
     win.transcript_changed(WAV)
     win._tx_render_now()
     app.update()
-    assert "ridgeline" in _body(win, 1)
+    assert _tagged(win, "txstruck") == ["ridge"]
+    assert _tagged(win, "txsaid") == ["ridgeline"]
     assert win._range == before
     assert _highlighted(win) == "ridgeline"
 
@@ -543,7 +710,8 @@ def test_a_render_waits_for_a_highlight_being_dragged(view):
     app, win = view
     x, y = _at(win, 1, "the")
     win._on_text_press(_E(x, y))
-    app.words = [dict(w, text=" CHANGED") if w["word"] == "ridge" else w for w in app.words]
+    app.words = [dict(w, word="changed", text=" CHANGED") if w["word"] == "ridge" else w
+                 for w in app.words]
     win.transcript_changed(WAV)
     win._tx_render_now()
     assert "CHANGED" not in _body(win, 1)
@@ -557,24 +725,46 @@ def test_draft_words_read_faded_while_the_pass_runs(view):
     app.words = [dict(w, _src="tiny") for w in app.words]
     app._refine_running = lambda: True
     win.refresh()
-    faded = win.text.tag_ranges("txdraft")
-    got = " ".join(win.text.get(a, b) for a, b in zip(faded[::2], faded[1::2]))
-    assert "We walked the ridge before dawn." in got
+    assert "We walked the ridge before dawn." in " ".join(_tagged(win, "txdraft"))
     app._refine_running = lambda: False
     win.show_refine_status()
     win._tx_render_now()
-    assert not win.text.tag_ranges("txdraft")
+    assert not _tagged(win, "txdraft")
 
 
-def test_the_panel_says_where_the_pass_is_and_offers_the_new_cut(view):
+# ── The second pass, on screen ───────────────────────────────────────────
+def test_the_panel_shows_the_pass_running(view):
     app, win = view
+    app._refine_running = lambda: True
     app._refine_status = lambda: "Refining with medium: 40%"
-    app._refine_held = lambda: True
+    app._refine_progress = lambda: 0.4
+    app._refine_short = lambda: "Refining with medium  40%"
     win.show_refine_status()
     app.update()
     assert win.tx_status.cget("text") == "Refining with medium: 40%"
+    assert win.refine_key.lbl.cget("text") == "Refining…"
+    assert win.refine_key.on
+    assert win.refine_bar._pct == pytest.approx(0.4)
+    assert "40%" in win.load_lbl.cget("text")          # always in view
+
+
+def test_the_panel_settles_when_it_finishes_and_offers_the_new_cut(view):
+    app, win = view
+    app._refine_running = lambda: True
+    app._refine_progress = lambda: 0.4
+    win.show_refine_status()
+    app._refine_running = lambda: False
+    app._refine_progress = lambda: None
+    app._refine_short = lambda: ""
+    app._refine_held = lambda: True
+    win.show_refine_status()
+    app.update()
+    assert win.refine_key.lbl.cget("text") == "Refine with {}".format(
+        engines.get_active_model_size())
+    assert not win.refine_key.on
+    assert win.refine_bar._pct == 0.0
+    assert "Refining" not in win.load_lbl.cget("text")
     assert win.recut_key is not None
-    assert win.refine_key.lbl.cget("text").startswith("Refine with ")
     app._refine_held = lambda: False
     win.show_refine_status()
     assert win.recut_key is None
@@ -604,101 +794,3 @@ def test_busy_while_listening_or_mid_gesture(view):
     assert win.busy()
     win._on_text_release(_E(x, y))
     assert not win.busy()
-
-
-# ── Long pulls ───────────────────────────────────────────────────────────
-def _long_clip(n_words):
-    from assembly_view import _Clip
-    sr = 48000
-    dur = n_words * 0.4 + 1.0
-    return _Clip({"start": 0, "end": int(dur * sr), "gap": 0, "segments": [(0.0, dur)],
-                  "pieces": [(0, int(dur * sr), 0)]},
-                 {"order": 1}, sr, "vo", False, None)
-
-
-def test_a_long_pull_reads_in_paragraphs_at_sentence_ends():
-    from assembly_view import TX_PARA_CHARS, _transcript_line
-    words = []
-    for i in range(400):
-        text = "sentence{}.".format(i) if i % 10 == 9 else "word{}".format(i)
-        words.append(_w(text, i * 0.4, i * 0.4 + 0.3))
-    line = _transcript_line(_long_clip(400), words)
-    paras = line.body.split("\n")
-    assert len(paras) > 2
-    for p in paras[:-1]:
-        assert len(p) >= TX_PARA_CHARS and p.endswith(".")
-    # The words still sit where their tokens say.
-    for tok in line.tokens[::37]:
-        assert " " not in line.body[tok.cs:tok.ce]
-        assert "\n" not in line.body[tok.cs:tok.ce]
-    assert line.body[line.tokens[-1].cs:line.tokens[-1].ce] == "sentence399."
-
-
-def test_a_transcript_with_no_punctuation_breaks_at_a_pause():
-    from assembly_view import _transcript_line
-    words = [{"word": "word{}".format(i), "start": i * 0.4, "end": i * 0.4 + 0.3}
-             for i in range(200)]
-    for w in words[150:]:
-        w["start"] += 2.0
-        w["end"] += 2.0
-    line = _transcript_line(_long_clip(205), words)
-    assert line.body.count("\n") == 1
-    assert line.body.split("\n")[1].startswith("word150")
-
-
-def test_a_short_pull_stays_one_paragraph(view):
-    _app, win = view
-    assert "\n" not in _body(win, 1)
-
-
-def test_a_script_of_several_paragraphs_highlights_across_them(view):
-    app, win = view
-    _res(app, 1)["quote_text"] = "We walked the ridge.\nBefore dawn."
-    win.toggle_transcript()
-    c = win._clip(1)
-    c.words = win._map_words(c)
-    win.refresh()
-    assert _body(win, 1) == "We walked the ridge.\nBefore dawn."
-    _drag(app, win, 1, "ridge.", 1, "Before")
-    assert _highlighted(win) == "ridge.\nBefore"
-    assert win._range[1] == pytest.approx(1.15)
-    assert win._range[2] == pytest.approx(2.5)
-    win.delete_range()
-    assert len(_segs(app, 1)) == 2
-
-
-def test_a_redraw_does_not_time_every_script_line(view, monkeypatch):
-    import assembly_view
-    app, win = view
-    win.toggle_transcript()
-    for c in win.clips:
-        c.words = win._map_words(c)
-    calls = []
-    real = assembly_view._script_timing
-    monkeypatch.setattr(assembly_view, "_script_timing",
-                        lambda body, words: (calls.append(body), real(body, words))[1])
-    win._render_script()
-    win.redraw()
-    win.set_insert(1.4)                        # only the pull under the playhead
-    assert len(set(calls)) == 1
-    first = len(calls)
-    win._render_script()
-    win.redraw()
-    assert len(calls) == first                 # its timing is kept
-    assert win._line(1).kept
-
-
-def test_other_reading_shows_only_when_a_pull_has_one(view):
-    app, win = view
-    assert win.reading_key is None
-    _res(app, 1)["monolog"] = True
-    _res(app, 1)["takes_data"] = [{"segments": [(10.0, 14.0)], "apath": WAV}]
-    win.refresh()
-    assert win.reading_key is None             # a monolog with only the one
-    _res(app, 1)["takes_data"].append({"segments": [(40.0, 44.0)], "apath": WAV})
-    win.refresh()
-    assert win.reading_key is not None
-    assert win.reading_key.frame.winfo_exists()
-    _res(app, 1)["takes_data"].pop()           # a re-cut changes the answer
-    win.refresh()
-    assert win.reading_key is None

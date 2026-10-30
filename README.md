@@ -280,11 +280,13 @@ Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`�
 
 ### The Assembly's text
 
-The text beside the Assembly's controls is the transcript of the cut, and highlighting it selects the audio. Drag across words, double-click a word, triple-click a pull, Shift-click to extend; a selection can run across pulls. Space plays it, Delete takes it out, B splits at both ends, I / O / U / M / K spot on it, Ctrl+C copies the words, and right-click offers all of these. Deleting or splitting across pulls is one undo step. It edits the audio, not the words: there is no typing corrections into the transcript.
+The text beside the Assembly's controls is the cut as words: the script's wording where it was said, with nothing else in the way. Only a difference gets a mark. Script wording that wasn't said is struck through, and words said that aren't in the script are tinted. An interview names its speaker where the speaker changes.
 
-Tape out of the cut stays in the text, struck through: what went from inside a pull, and about 2 s either side. **H** (or Ctrl+H) puts highlighted words back. **W** swaps in the script, **Shift+W** hides the struck words. **Refine with `<model>`** in the TRANSCRIPT panel transcribes the cut's files again with the model now chosen.
+Highlighting the text selects the audio. Drag across words, double-click a word, triple-click a pull, Shift-click to extend; a selection can run across pulls. Delete takes it out, B splits at both ends, M / X / N spot at its start, Ctrl+C copies the words, and right-click offers all of these. Deleting or splitting across pulls is one undo step. Playback isn't held in by a highlight: Space plays from its start and on past its end. The text edits the audio, not the words: there is no typing corrections into it.
 
-On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the whole cut. Dragged edges and track highlights snap to where speech starts and stops, as in the waveform editor, and the ticks on the track show where; hold Ctrl to place one freely. Return to start on stop and a 2 s pre-roll are on by default, and Follow playhead is off.
+**Refine with `<model>`** in the TRANSCRIPT panel, beside its model picker, transcribes the cut's files again with the model chosen. While a pass runs, the button, a bar across the panel and the line under the track all show how far it has got.
+
+On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the whole cut. Dragged edges and track highlights snap to where speech starts and stops, as in the waveform editor, and the ticks on the track show where; hold Ctrl to place one freely. `,` and `.` nudge a region by the amount set in the Edit panel (100 ms to start with), and `/` and Shift+`/` by the next amount up. Ctrl+click or right-click deletes a mark on the ruler. Return to start on stop (Shift+N) and a 2 s pre-roll are on by default, and Follow playhead is off.
 
 ### Step 5 — Export
 

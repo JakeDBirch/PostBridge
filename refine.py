@@ -135,6 +135,29 @@ class RefineMixin(object):
     def _refine_held(self):
         return self._rf().held is not None
 
+    def _refine_progress(self):
+        """How far through its file the pass is, 0 to 1; None when it isn't
+        running."""
+        st = self._rf()
+        with st.lock:
+            job = st.current
+            live = st.live.get(job["path"]) if job else None
+            if job is None:
+                return 0.0 if st.jobs else None
+            if job["kind"] == "pulls":
+                return job.get("done", 0) / float(max(1, len(job["pulls"])))
+            if live is not None and live.total > 0:
+                return min(1.0, live.frontier / live.total)
+            return 0.0
+
+    def _refine_short(self):
+        """A few words for the line under the track; empty when not running."""
+        frac = self._refine_progress()
+        if frac is None:
+            return ""
+        return "Refining with {}  {:.0f}%".format(
+            engines.get_active_model_size(), frac * 100.0)
+
     def _refine_status(self):
         """One line for the Assembly's panel."""
         st = self._rf()
@@ -149,8 +172,9 @@ class RefineMixin(object):
         name = os.path.basename(job["path"])
         tail = "   ·   {} more".format(more) if more else ""
         if job["kind"] == "pulls":
-            return "Refining {} pull{} of {}{}".format(
-                len(job["pulls"]), "" if len(job["pulls"]) == 1 else "s", name, tail)
+            return "Refining pull {} of {} from {}{}".format(
+                min(job.get("done", 0) + 1, len(job["pulls"])), len(job["pulls"]),
+                name, tail)
         if live is None:
             return "Refining {}{}".format(name, tail)
         if live.note:
@@ -309,6 +333,7 @@ class RefineMixin(object):
         """A new model was picked: what is still a draft gets it."""
         if self._s4_is_live():
             self._refine_resume()
+        self._refine_show()
 
     # ── The worker ───────────────────────────────────────────────────────
     def _refine_worker(self, cancel):
@@ -395,7 +420,9 @@ class RefineMixin(object):
             if r.get("status") in ("ok", "low_confidence", "snapped") \
                     and r.get("rec_out_s", 0.0) > 0.0:
                 cursor = max(cursor, r["rec_out_s"])
+            job["done"] = job.get("done", 0) + 1
             self._ui(lambda b=[r], p=job["path"]: self._refine_apply(b, p))
+            self._refine_show()
         st = self._rf()
         with st.lock:
             st.done[job["path"]] = engines.get_active_model_size()
