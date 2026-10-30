@@ -138,6 +138,72 @@ def test_plain_script_has_nothing_to_report():
     assert any("obsolete" in f.title for f in run_checks("Episode 9\n@VO PART_1\nWords.\n"))
 
 
+def _applied(lines, reqs):
+    """The Doc's lines after *reqs*, applied in order as the Docs API would."""
+    text = "\n".join(lines) + "\n"
+    for r in reqs:
+        if "deleteContentRange" in r:
+            rg = r["deleteContentRange"]["range"]
+            assert rg["endIndex"] <= len(text)       # never the final newline
+            text = text[:rg["startIndex"] - 1] + text[rg["endIndex"] - 1:]
+        else:
+            i = r["insertText"]["location"]["index"] - 1
+            text = text[:i] + r["insertText"]["text"] + text[i:]
+    return text
+
+
+@pytest.mark.parametrize("old,new", [
+    (["Title", "Part 1", "Words.", "---", "More."], ["Title", "[PART Part 1]", "Words.", "More."]),
+    (["Title", "Words."], ["Title", "[VO A]", "Words."]),
+    (["Title", "Words."], ["Title", "Words.", "[VO A]", "End."]),      # past the last line
+    (["Title", "Words.", "---"], ["Title", "Words."]),                 # the last line goes
+    (["Title", "Part 1"], ["Title", "[PART Part 1]"]),                 # the last line changes
+    (["Title", "Words.", "", ""], ["Title", "[VO A]", "Words."]),      # blanks at the end stay
+    (["Title", "", "Words."], ["Title", "", "", "Words."]),            # a blank line is a line
+])
+def test_text_edits_reach_the_new_script(old, new):
+    reqs = gdocs.plan_text_edits(_doc(old), "\n".join(new) + "\n")
+    assert _applied(old, reqs).rstrip("\n").split("\n") == new
+
+
+def test_text_edits_leave_matching_lines_alone():
+    old = ["Title", "Part 1", "Words.", "More words.  "]     # trailing spaces are no change
+    reqs = gdocs.plan_text_edits(_doc(old), "Title\n[PART Part 1]\nWords.\nMore words.\n")
+    para = gdocs.paragraphs(_doc(old))[1]
+    assert reqs == [
+        {"deleteContentRange": {"range": {"startIndex": para[1], "endIndex": para[2]}}},
+        {"insertText": {"location": {"index": para[1]}, "text": "[PART Part 1]\n"}}]
+
+
+def test_soft_line_breaks_are_lines():
+    # Like the plain-text export, so a header held by a soft break is found.
+    doc = _doc(["Title", "Part 1\x0bWords."])
+    assert [t for t, _s, _e in gdocs.script_lines(doc)] == ["Title", "Part 1", "Words."]
+    reqs = gdocs.plan_text_edits(doc, "Title\n[PART Part 1]\nWords.\n")
+    assert _applied(["Title", "Part 1\x0bWords."], reqs).rstrip("\n").split("\n") == [
+        "Title", "[PART Part 1]", "Words."]
+    # A length that doesn't add up (an inline image, an emoji): left whole.
+    doc["body"]["content"][1]["endIndex"] += 1
+    assert len(gdocs.script_lines(doc)) == 2
+
+
+def test_fix_format_clears_notes_then_repairs_the_structure():
+    lines = ["Ep 7", "Part 1: Open", "[VO PART_1_NARRATOR]", "A quiet morning.", "---",
+             "[BUTLER 00:00:05-00:00:20]", "“We went out at four.”", "He came back alone."]
+    docs = _Docs(_doc(lines, named={"pbnote:old": (1, 6)}))
+    changes = gdocs.fix_format(None, "doc1", docs=docs)
+    assert changes
+    assert len(docs.batches) == 2
+    assert "deleteContentRange" in docs.batches[0]["requests"][0]
+    assert docs.batches[1]["writeControl"] == {"requiredRevisionId": "r1"}
+    fixed = _applied(lines, docs.batches[1]["requests"])
+    assert "[PART Part 1: Open]" in fixed and "\n---\n" not in fixed
+    # Nothing the narrator or a speaker says has moved or changed.
+    for words in lines[3:4] + lines[6:]:
+        assert words in fixed
+    assert not [f for f in run_checks(fixed) if f.severity == ERROR]
+
+
 def test_append_after_marker_or_at_end():
     doc = _doc(SCRIPT)
     reqs = gdocs.plan_append(doc, "[BUTLER 00:00:30-00:00:40]\nAnd then.\n", after_marker="[PART Open]")

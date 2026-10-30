@@ -361,6 +361,54 @@ def _click(app, win, text):
     return False
 
 
+def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch, project):
+    import gdocs
+    from tkinter import messagebox as ew_messagebox
+    _open_fresh(app, monkeypatch, project)
+    broken = ("Ep 7\nPart 1\n[VO PART_1_NARRATOR]\nA quiet morning.\n---\n"
+              "[BUTLER 00:00:05-00:00:20]\n“We went out.”\n")
+    fixed = "Ep 7\n[PART Part 1]\n[VO PART_1_NARRATOR]\nA quiet morning.\n" \
+            "[BUTLER 00:00:05-00:00:20]\n“We went out.”\n"
+    doc = {"text": broken}
+    calls = []
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id: (
+        doc["text"], {"name": "Ep 7 script", "version": "3", "modifiedTime": "t"}))
+
+    def _fix(creds, doc_id, title=None, docs=None):
+        calls.append((doc_id, title))
+        doc["text"] = fixed
+        return ["Removed 1 divider line"]
+    monkeypatch.setattr(gdocs, "fix_format", _fix)
+    app._ep["links"]["gdoc"] = {"id": "doc123", "name": "Ep 7 script"}
+
+    # Saying no leaves the Doc alone.
+    monkeypatch.setattr(ew_messagebox, "askyesno", lambda *a, **k: False)
+    app._ep_gdoc_fetch()
+    assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
+    _pump(app, 3)
+    first = app._ep_findings_win
+    assert _click(app, first, "FIX FORMAT IN DOC")
+    _pump(app, 3)
+    assert not calls
+
+    # Saying yes fixes it, then fetches and checks again in a new window,
+    # which has nothing left to fix.
+    monkeypatch.setattr(ew_messagebox, "askyesno", lambda *a, **k: True)
+    assert _click(app, first, "FIX FORMAT IN DOC")
+    assert _wait(app, lambda: app._ep_findings_win is not first
+                 and app._ep_findings_win.winfo_exists(), secs=10)
+    _pump(app, 3)
+    assert calls == [("doc123", "Ep 7 script")]
+    assert not first.winfo_exists()
+    assert not _click(app, app._ep_findings_win, "FIX FORMAT IN DOC")
+    assert open(os.path.join(project, "Ep 7 script.txt"), encoding="utf-8").read() == fixed
+    _click(app, app._ep_findings_win, "CLOSE")
+    app._ep_findings_win = None
+    assert not app._errors, "\n".join(app._errors)
+
+
 def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     import gdocs
     _open_fresh(app, monkeypatch, project)

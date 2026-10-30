@@ -15,6 +15,8 @@ What this gives the episode:
   cannot make *suggestions*; these are ordinary edits, attributed to the
   account that signed in.)
 * **Send to script** -- a pull block appended to the Doc from Pull Quotes.
+* **Fix format** -- Fix Format's structure repairs made in the Doc, line by
+  line.  Wording and timecodes stay; Docs' version history can undo it.
 
 Scope is ``drive.file`` only: PostBridge can reach the Docs a person picks
 through Google's picker (or ones it created), never the rest of Drive.
@@ -25,6 +27,7 @@ Everything that talks to Google takes a *creds* object and is thin; the
 planning of edits (``plan_notes``, ``findings_to_notes``, ``paragraphs``)
 is pure and tested without a network.
 """
+import difflib
 import hashlib
 import html
 import http.server
@@ -391,6 +394,57 @@ def plan_append(doc, text, after_marker=None):
     return [{"insertText": {"endOfSegmentLocation": {}, "text": "\n" + body.rstrip("\n")}}]
 
 
+def script_lines(doc):
+    """[(text, start, end)] for every line of the script in *doc*.  A soft
+    line break counts as a line end, as it does in the plain-text export.
+    Indexes count UTF-16 units and inline objects, so a paragraph whose
+    length doesn't add up stays whole rather than risk a wrong index."""
+    out = []
+    for t, s, e in paragraphs(doc):
+        if "\x0b" not in t or e - s != len(t) + 1:
+            out.append((t, s, e))
+            continue
+        pos = s
+        for part in t.split("\x0b"):
+            out.append((part, pos, pos + len(part) + 1))
+            pos += len(part) + 1
+    return out
+
+
+def plan_text_edits(doc, new_text):
+    """Requests turning the script in *doc* into *new_text*, touching only
+    the lines that differ, so formatting and comments elsewhere survive.
+    Highest index first, so no edit shifts one still to come."""
+    lines = script_lines(doc)
+    old = [t.rstrip() for t, _s, _e in lines]
+    new = [ln.rstrip() for ln in normalize_text(new_text).split("\n")]
+    while old and not old[-1]:
+        old.pop()
+    while new and not new[-1]:
+        new.pop()
+    reqs = []
+    ops = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+    for tag, i1, i2, j1, j2 in reversed(ops):
+        if tag == "equal":
+            continue
+        added = "\n".join(new[j1:j2])
+        if i1 == len(lines):
+            # Past the last line: a new paragraph inside the final newline.
+            reqs.append({"insertText": {"location": {"index": lines[-1][2] - 1},
+                                        "text": "\n" + added}})
+            continue
+        start = lines[i1][1]
+        if i2 > i1:
+            # The Doc's final newline can't be deleted.
+            end = lines[i2 - 1][2] - (1 if i2 == len(lines) else 0)
+            if end > start:
+                reqs.append({"deleteContentRange": {"range": {"startIndex": start, "endIndex": end}}})
+        body = added + ("" if i2 == len(lines) else "\n") if j2 > j1 else ""
+        if body:
+            reqs.append({"insertText": {"location": {"index": start}, "text": body}})
+    return reqs
+
+
 # ── Writing ───────────────────────────────────────────────────────────────
 
 def _batch(docs, doc_id, reqs, revision_id=None):
@@ -429,6 +483,28 @@ def clear_notes(creds, doc_id, docs=None):
     reqs = plan_delete_notes(doc)
     _batch(docs, doc_id, reqs, doc.get("revisionId"))
     return len(reqs)
+
+
+def fix_format(creds, doc_id, title=None, docs=None):
+    """Run Fix Format on the Doc itself.  Returns what it changed, in plain
+    words.  PostBridge's notes go first: they describe the script as it was."""
+    import script_normalize
+    if docs is None:
+        _drive, docs = services(creds)
+    for attempt in range(3):
+        doc = docs.documents().get(documentId=doc_id).execute()
+        try:
+            _batch(docs, doc_id, plan_delete_notes(doc), doc.get("revisionId"))
+            doc = docs.documents().get(documentId=doc_id).execute()
+            text = "\n".join(t for t, _s, _e in script_lines(doc))
+            new, changes = script_normalize.normalize(text, title=title)
+            if changes:
+                _batch(docs, doc_id, plan_text_edits(doc, new), doc.get("revisionId"))
+            return changes
+        except Exception as e:
+            if attempt == 2 or "revision" not in str(e).lower():
+                raise
+    return []
 
 
 def append_block(creds, doc_id, text, after_marker=None, docs=None):

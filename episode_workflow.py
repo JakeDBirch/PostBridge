@@ -18,6 +18,7 @@ from config import _SANS
 from gui_components import _FlatDropdown
 import episode as EP
 import gdocs
+import script_normalize
 
 
 class EpisodeWorkflowMixin:
@@ -789,6 +790,26 @@ class EpisodeWorkflowMixin:
             self._ep_gdoc_bg(_work, lambda n: messagebox.showinfo(
                 "Google Docs", "{} note{} removed from the Doc.".format(n, "" if n == 1 else "s")))
 
+        def _fix():
+            title = meta.get("name")
+            changes = script_normalize.normalize(text, title=title)[1]
+            if not messagebox.askyesno("Fix format in the Doc", "\n".join(
+                    ["This changes the Google Doc for everyone who has it open:", ""]
+                    + ["\u2022 " + c for c in changes]
+                    + ["\u2022 Removes PostBridge's notes", "",
+                       "Wording and timecodes stay as they are. "
+                       "File \u2192 Version history in the Doc can undo it."])):
+                return
+            def _work():
+                return gdocs.fix_format(gdocs.get_credentials(), gd["id"], title=title)
+            def _done(_changes):
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                self._ep_gdoc_fetch(then)     # check what the Doc says now
+            self._ep_gdoc_bg(_work, _done)
+
         def _continue():
             try:
                 win.destroy()
@@ -804,6 +825,9 @@ class EpisodeWorkflowMixin:
         self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
         if findings:
             self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
+                      ).pack(side="left", padx=(8, 0))
+        if script_normalize.normalize(text, title=meta.get("name"))[1]:
+            self._btn(nav, "FIX FORMAT IN DOC", _fix, small=True, color=ACCENT
                       ).pack(side="left", padx=(8, 0))
         self._center_dialog(win, min_w=760, min_h=420)
 
