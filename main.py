@@ -64,6 +64,7 @@ from sync_preview import SyncPreviewDialog
 from match_review import MatchReviewDialog
 from aaf_workflow import AafWorkflowMixin
 from pq_workflow import PqWorkflowMixin
+from episode import read_pq_session
 from episode_workflow import EpisodeWorkflowMixin
 
 
@@ -456,6 +457,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # commit point.
         try:
             self._s4_save_flush()
+            self._ep_save_flush()
         except Exception:
             pass
         # The Assembly view is a view of Step 4's cards, which go with
@@ -799,6 +801,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         self._show_model_help()
 
     def _home(self):
+        # A stage of the open episode keeps what was done on it.
+        self._ep_amend_stage()
         # Reset session-specific state so a new workflow starts clean.
         # Halt any Pull Quotes playback before tearing down.
         try:
@@ -3682,7 +3686,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 data = {
                     "title": proj.get("title", ""),
                     "sessions": sorted(
-                        s.get("_file_path", "")
+                        s.get("_file_path") or s.get("id") or s.get("token", "")
                         for s in proj.get("sessions", [])),
                     "file_path": proj.get("file_path"),
                 }
@@ -3720,6 +3724,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # they close within the debounce window.
         try:
             self._s4_save_flush()
+            self._ep_save_flush()
         except Exception:
             pass
         # In-flight work guard.  Transcription / reconcile run on worker
@@ -3799,6 +3804,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         if getattr(self, 'workflow', None) == 'episode':
             self._ep_save(prompt=True)
             return
+        # A stage of the open episode is part of that one file.
+        if self._ep_stage_showing():
+            if self._ep_store_stage():
+                self._ep_save(prompt=True)
+            return
         if getattr(self, 'workflow', None) == 'aaf_xml':
             self._aaf_save_setup()
             return
@@ -3827,7 +3837,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._current_session_file = path
             self._mark_saved()
-            self._ep_absorb_s2s(path)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -3859,6 +3868,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
         if getattr(self, 'workflow', None) == 'episode':
             if self._ep_save():
+                _flash_saved()
+            return
+        # A stage of the open episode saves into the episode file: the
+        # project's one file, with no dialog and no file of its own.
+        self._ep_find_for_stage()
+        if self._ep_stage_showing():
+            if self._ep_store_stage():
                 _flash_saved()
             return
         if getattr(self, 'workflow', None) == 'aaf_xml':
@@ -3898,7 +3914,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 json.dump(self._build_full_session_data(), f,
                           cls=self._numpy_safe_encoder(), indent=2)
             self._mark_saved()
-            self._ep_absorb_s2s(self._current_session_file)
             _flash_saved()
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
@@ -4182,7 +4197,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
             return
+        self._open_session_data(data, path)
 
+    def _open_session_data(self, data, path=None):
+        """Open saved work: a file's contents (*path*), or with no path a
+        stage's own state from the open episode, whose saves go back there."""
         # ── Episode file — the hub for every workflow ─────────────────────
         if data.get("workflow") == "episode":
             self._ep_open_file(path)
@@ -5930,8 +5949,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 self._log_line("  ! " + _w, WARN)
             for _tok, _sp in pq_session_map.items():
                 try:
-                    with open(_sp, encoding="utf-8") as _f:
-                        _data = json.load(_f)
+                    # A .pb_session.json, or a session in the episode file.
+                    _data = read_pq_session(_sp)
                     if (_data.get("workflow") == "interview_session"
                             and _data.get("transcript")):
                         _data["_file_path"] = _sp
@@ -7210,6 +7229,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             self._write_conform_baseline()
         except Exception:
             pass
+        if _live:
+            self._ep_amend_stage()
         # Still on Step 3: normal transition.  Already on Step 4 via
         # → REVIEW NOW: rows were updated in place — no rebuild, so scroll
         # position, an open editor and undo history all survive.
@@ -8566,6 +8587,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             if getattr(self, "_pending_mark_saved", False):
                 self._pending_mark_saved = False
                 self._mark_saved()
+            # ...unless this is a stage of the open episode: a finished
+            # reconcile goes straight into the episode file.
+            elif not getattr(self, "_bg_reconcile_active", False):
+                self._ep_amend_stage()
 
         # Force the chrome (header, filter tabs, scroll frame, nav bar)
         # to paint NOW, before scheduling the ~5 s card build.  Windows

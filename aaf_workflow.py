@@ -5014,7 +5014,6 @@ class AafWorkflowMixin:
                 with open(saved, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 self._mark_saved()
-                self._ep_absorb_aaf(saved)
                 return True
             except Exception as e:
                 messagebox.showerror("Save failed", str(e))
@@ -5041,7 +5040,6 @@ class AafWorkflowMixin:
                 json.dump(data, f, indent=2)
             self._aaf_saved_path = path   # future quick-saves go here
             self._mark_saved()
-            self._ep_absorb_aaf(path)
             return True
         except Exception as e:
             messagebox.showerror("Save failed", str(e))

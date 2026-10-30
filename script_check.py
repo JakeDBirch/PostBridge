@@ -16,6 +16,7 @@ them; it does not decide what is wrong.
 import os
 import re
 
+from episode import read_pq_session
 from parsers import parse_script, discover_pq_sessions, _HEADER_RE
 
 # Severity ordering is also the display ordering.
@@ -466,10 +467,8 @@ def _check_transcript_quality(found, pulls, out):
 
 
 def _load_session(path):
-    import json
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+        return read_pq_session(path)
     except Exception:
         return None
 

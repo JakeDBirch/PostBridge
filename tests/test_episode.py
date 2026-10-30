@@ -131,7 +131,10 @@ def test_episode_round_trip_is_relative(project, tmp_path):
     assert path == os.path.join(project, "Ep 7" + episode.EPISODE_EXT)
     raw = json.load(open(path, encoding="utf-8"))
     assert raw["workflow"] == "episode" and raw["links"]["mix"].startswith("03_AUDIO/")
-    assert all(not os.path.isabs(p) for p in raw["sessions"])
+    assert "sessions" not in raw
+    held = list(raw["stages"][episode.STAGE_PQ]["sessions"].values())
+    assert [s["token"] for s in held] == ["BUTLER"]
+    assert all(m.startswith("$EP/") for m in held[0]["media"])
     assert "\\" not in json.dumps(raw["media"])
 
     # Move the whole folder: everything still resolves.
@@ -140,7 +143,8 @@ def test_episode_round_trip_is_relative(project, tmp_path):
     ep2 = episode.load(os.path.join(moved, "Ep 7" + episode.EPISODE_EXT))
     assert ep2["root"] == moved
     assert os.path.isfile(episode.absp(ep2, ep2["links"]["mix"]))
-    assert ep2["sessions"] == [os.path.join(moved, "03_AUDIO", "00_RAW AUDIO", "BUTLER.pb_session.json")]
+    media = episode.pq_session_list(ep2)[0]["media"]
+    assert media and all(m.startswith(moved) and os.path.isfile(m) for m in media)
     assert episode.find_episode_file(moved) == os.path.join(moved, "Ep 7" + episode.EPISODE_EXT)
     sm = episode.summary(ep2)
     assert sm["sources"] == 3 and sm["audio"] == 4

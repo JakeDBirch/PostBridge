@@ -5,9 +5,16 @@ An episode lives at the root of a show's project folder as
 ``<Title>.pb_episode.json`` and holds what the three workflows used to each
 keep for themselves: which files are the interview recordings and the
 camera footage, which recordings belong together as one *source* (a
-speaker, a narrator session), which footage covers each source, and where
-the script, the reconcile state and the AAF setup live.  Every path is
-stored relative to the root, so the folder can move between machines.
+speaker, a narrator session), which footage covers each source, where the
+script and the AAF are -- and, under ``stages``, each workflow's own saved
+work: the Script -> Session reconcile, the AAF -> XML setup and the Pull
+Quotes sessions with their transcripts.  It is the one file a project is
+saved to.  Every path is stored relative to the root, so the folder can
+move between machines.
+
+Episodes from before ``stages`` kept that work in files of their own and
+linked to them.  ``load`` reads those files in and leaves them where they
+are, unused; nothing writes to them again.
 
 Discovery (``scan``) looks through the chosen folder once and sorts what it
 finds.  Project folders are noisy: Pro Tools keeps its own copies of every
@@ -25,13 +32,25 @@ import hashlib
 import json
 import os
 import re
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from utils import is_audio, is_video, is_media
 
 EPISODE_EXT     = ".pb_episode.json"
-EPISODE_VERSION = 2
+EPISODE_VERSION = 3
 WORKFLOW        = "episode"
+
+# What each workflow saves into the episode, under "stages".
+STAGE_S2S = "script_session"     # setup + results + Step 4 state
+STAGE_AAF = "aaf_xml"            # setup
+STAGE_PQ  = "pull_quotes"        # {"sessions": {session id: session}}
+
+# A path under the root, inside stage data on disk.
+_ROOT_MARK = "$EP/"
+# Word lists: long, and never a path.
+_NO_PATH_KEYS = frozenset(("transcript", "words"))
 
 # Recordings and footage shorter than this are effects, stings, idents or
 # test clips, not sources.  Reviewable: a short file can be included by hand.
@@ -80,10 +99,9 @@ def new_episode(root, title=None):
         "sources":  {},
         # rel paths the user put aside by hand (survives a rescan)
         "excluded": [],
-        "links":    {"script": None, "s2s_session": None,
-                     "aaf": None, "aaf_setup": None, "mix": None},
-        # Pull Quotes reads this list of absolute session paths.
-        "sessions": [],
+        "links":    {"script": None, "aaf": None, "mix": None},
+        # Each workflow's saved work (see STAGE_*).
+        "stages":   {},
     }
 
 
@@ -110,6 +128,20 @@ def find_episode_file(root):
     return None
 
 
+def find_episode_above(path, levels=6):
+    """The episode file of the project *path* sits in, or None."""
+    d = os.path.dirname(os.path.abspath(path))
+    for _ in range(levels):
+        found = find_episode_file(d)
+        if found:
+            return found
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
 def rel(ep, path):
     """Path relative to the episode root, forward slashes."""
     if not path:
@@ -129,6 +161,196 @@ def absp(ep, r):
     return os.path.normpath(os.path.join(ep["root"], r))
 
 
+def inside(ep, path):
+    """True when *path* is somewhere under the episode's folder."""
+    if not path:
+        return False
+    try:
+        r = os.path.relpath(os.path.abspath(path), ep["root"])
+    except ValueError:            # different drive
+        return False
+    return not (r == os.pardir or r.startswith(os.pardir + os.sep))
+
+
+def _map_paths(obj, fn):
+    """A copy of stage data with *fn* applied to every string but the word
+    lists: a stage's paths sit in values and in keys (a setup's assignments),
+    and each workflow has its own shape, so none of them is named here."""
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, dict):
+        return {(fn(k) if isinstance(k, str) else k):
+                (v if k in _NO_PATH_KEYS else _map_paths(v, fn))
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_map_paths(v, fn) for v in obj]
+    return obj
+
+
+def _rooted(ep):
+    """fn for _map_paths: an absolute path under the root -> root-relative."""
+    prefix = ep["root"].replace("\\", "/").rstrip("/").lower() + "/"
+    n = len(prefix)
+
+    def fn(s):
+        if len(s) > n and s[:n].replace("\\", "/").lower() == prefix:
+            return _ROOT_MARK + s[n:].replace("\\", "/")
+        return s
+    return fn
+
+
+def _unrooted(ep):
+    """fn for _map_paths: the reverse of _rooted, at wherever the root is now."""
+    root = ep["root"]
+
+    def fn(s):
+        if s.startswith(_ROOT_MARK):
+            return os.path.normpath(os.path.join(root, s[len(_ROOT_MARK):]))
+        return s
+    return fn
+
+
+def _plain(obj):
+    """json default: numpy scalars and arrays, which reconcile results hold."""
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    raise TypeError("{} is not JSON serialisable".format(type(obj).__name__))
+
+
+def _copied(data):
+    return json.loads(json.dumps(data, default=_plain))
+
+
+def set_stage(ep, stage, data):
+    """Take a copy of a workflow's saved state: what is in the episode is what
+    was saved, whatever is edited on screen after it."""
+    ep.setdefault("stages", {})[stage] = _copied(data)
+
+
+def get_stage(ep, stage):
+    """A copy of a workflow's saved state, for it to work on, or None."""
+    data = ep.get("stages", {}).get(stage)
+    return _copied(data) if data else None
+
+
+def pq_sessions(ep):
+    """Pull Quotes' interview sessions, by session id (the live dict)."""
+    return ep.setdefault("stages", {}).setdefault(
+        STAGE_PQ, {}).setdefault("sessions", {})
+
+
+def pq_session_list(ep):
+    """Copies of the interview sessions, for Pull Quotes to work on."""
+    held = ep.get("stages", {}).get(STAGE_PQ, {}).get("sessions", {})
+    return [_copied(s) for s in held.values()]
+
+
+def session_ref(ep_path, token):
+    """What discovery names a session by when it lives in an episode file."""
+    return "{}#{}".format(ep_path, token)
+
+
+def read_pq_session(ref):
+    """The interview session a discovery entry names: a .pb_session.json, or
+    a session_ref into an episode.  Raises if it can't be read."""
+    i = ref.rfind(EPISODE_EXT + "#")
+    if i < 0:
+        with open(ref, encoding="utf-8") as f:
+            return json.load(f)
+    path, token = ref[:i + len(EPISODE_EXT)], ref[i + len(EPISODE_EXT) + 1:]
+    for s in pq_session_list(load(path)):
+        if s.get("token") == token:
+            return s
+    raise ValueError("no session for {} in {}".format(token, path))
+
+
+def _new_session_id():
+    return "ses_" + uuid.uuid4().hex[:12]
+
+
+def absorb_session_file(ep, path):
+    """A .pb_session.json read into the episode.  A session already in the
+    episode for that token stands.  Returns the session's id, or None when
+    the file is not one."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("workflow") != "interview_session":
+        return None
+    sessions = pq_sessions(ep)
+    token = data.get("token")
+    for sid, s in sessions.items():
+        if s.get("token") == token:
+            return sid
+    media = data.get("media") or []
+    data = _rebased(ep, data, media[0] if media else None)
+    data.setdefault("id", _new_session_id())
+    sessions[data["id"]] = data
+    return data["id"]
+
+
+def _rebased(ep, data, probe):
+    """An old stage file holds absolute paths, which still name wherever the
+    project was when it was written.  When *probe*, a file it names, is gone
+    but its tail is under the root, the project has moved: every path that
+    began where that one did now begins at the root."""
+    if not probe or os.path.isfile(probe):
+        return data
+    parts = probe.replace("\\", "/").split("/")
+    for i in range(1, len(parts)):
+        if os.path.isfile(os.path.join(ep["root"], *parts[i:])):
+            old = "/".join(parts[:i]).lower() + "/"
+            n = len(old)
+
+            def fn(s):
+                if len(s) > n and s[:n].replace("\\", "/").lower() == old:
+                    return os.path.normpath(os.path.join(ep["root"], s[n:]))
+                return s
+            return _map_paths(data, fn)
+    return data
+
+
+def _absorb_stage_files(ep):
+    """Read in the files an older episode linked to.  True if anything
+    moved.  The files stay on disk; a link whose file is unreadable stays too,
+    rather than quietly forgetting the work behind it."""
+    links = ep["links"]
+    changed = False
+    for key, stage, name in (("s2s_session", STAGE_S2S, "script"),
+                             ("aaf_setup", STAGE_AAF, "aaf")):
+        p = absp(ep, links.get(key))
+        if not p:
+            changed = links.pop(key, None) is not None or changed
+            continue
+        if stage not in ep["stages"] and os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            data = _rebased(ep, data, data.get(name))
+            ep["stages"][stage] = data
+            # The stage opens from what it saved, so the link follows it --
+            # but not to a file that isn't there.
+            if os.path.isfile(data.get(name) or ""):
+                links[name] = rel(ep, data[name])
+        del links[key]
+        changed = True
+    if "sessions" in ep:
+        ids = {}
+        for r in ep.pop("sessions") or []:
+            sid = absorb_session_file(ep, absp(ep, r))
+            if sid:
+                ids[rel(ep, absp(ep, r))] = sid
+        for src in ep["sources"].values():
+            if src.get("session"):
+                src["session"] = ids.get(src["session"], src["session"])
+        changed = True
+    return changed
+
+
 def load(path):
     with open(path, encoding="utf-8") as f:
         ep = json.load(f)
@@ -139,27 +361,59 @@ def load(path):
     ep["file_path"] = os.path.abspath(path)
     ep.setdefault("media", {}); ep.setdefault("sources", {})
     ep.setdefault("excluded", []); ep.setdefault("links", {})
-    ep["sessions"] = [absp(ep, s) for s in ep.get("sessions", []) if s]
+    ep["stages"] = _map_paths(ep.get("stages") or {}, _unrooted(ep))
+    # True until saved: the file on disk is still the old shape.
+    ep["_absorbed"] = _absorb_stage_files(ep)
     return ep
 
 
 def disk_form(ep):
-    """The episode exactly as save() writes it."""
-    out = {k: v for k, v in ep.items() if k != "file_path"}
-    # Sessions are kept relative on disk like everything else; load()
-    # makes them absolute for Pull Quotes.
-    out["sessions"] = [rel(ep, s) for s in sorted(
-        {absp(ep, src.get("session")) for src in ep["sources"].values()
-         if src.get("session")} | {absp(ep, s) for s in ep.get("sessions", []) if s})]
+    """The episode exactly as save() writes it, but for its stages: those
+    run to megabytes of transcript, and are only ever changed by being
+    written, so nothing needs to compare them."""
+    out = {k: v for k, v in ep.items()
+           if k not in ("file_path", "stages", "_absorbed")}
+    out["version"] = EPISODE_VERSION
     return out
+
+
+def _replace(tmp, path, tries=10):
+    """Put the finished file in place.  Dropbox and virus scanners hold a file
+    for a moment after it changes, which Windows refuses to replace."""
+    for i in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.1)
 
 
 def save(ep, path=None):
     path = path or ep.get("file_path") or episode_file_for(ep["root"], ep.get("title"))
-    out = disk_form(ep)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+    text = json.dumps(disk_form(ep), indent=2)
+    stages = ep.get("stages")
+    if stages:
+        # Compact, and written after the readable part: the pure-Python
+        # encoder behind indent= takes seconds over a few transcripts.
+        text = text[:-2] + ',\n  "stages": ' + json.dumps(
+            _map_paths(stages, _rooted(ep)), separators=(",", ":"),
+            default=_plain) + "\n}"
+    # All of a project is in this file: never leave half of it behind.
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        _replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     ep["file_path"] = os.path.abspath(path)
+    ep.pop("_absorbed", None)
     return ep["file_path"]
 
 
@@ -553,8 +807,16 @@ def apply_scan(ep, result):
     ep.setdefault("links", {})
     if result.get("mix") and not ep["links"].get("mix"):
         ep["links"]["mix"] = result["mix"]
-    ep["sessions"] = sorted({absp(ep, s["path"]) for s in result["sessions"].values()}
-                            | {absp(ep, s) for s in ep.get("sessions", []) if s})
+    # Session files the scan found come into the episode, and their sources
+    # then name the session by id.
+    ids = {}
+    for info in result["sessions"].values():
+        sid = absorb_session_file(ep, absp(ep, info["path"]))
+        if sid:
+            ids[info["path"]] = sid
+    for src in ep["sources"].values():
+        if src.get("session"):
+            src["session"] = ids.get(src["session"], src["session"])
     return ep
 
 

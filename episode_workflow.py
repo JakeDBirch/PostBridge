@@ -26,6 +26,7 @@ class EpisodeWorkflowMixin:
 
     def _ep_enter(self):
         """Home card: continue the open episode, else choose a folder."""
+        self._ep_amend_stage()
         if getattr(self, "_ep", None):
             self.workflow = "episode"
             self._ep_view()
@@ -52,6 +53,13 @@ class EpisodeWorkflowMixin:
         except Exception as e:
             messagebox.showerror("Open episode failed", str(e))
             return
+        # An older episode's stage files were just read in: the episode is
+        # the one file from here on.  They stay on disk, untouched.
+        if self._ep.get("_absorbed"):
+            try:
+                EP.save(self._ep)
+            except Exception as e:
+                messagebox.showerror("Save episode failed", str(e))
         self.workflow = "episode"
         self._ep_view()
         self._mark_saved()
@@ -60,6 +68,7 @@ class EpisodeWorkflowMixin:
         ep = getattr(self, "_ep", None)
         if not ep:
             return False
+        self._ep_save_flush()
         path = ep.get("file_path")
         if not path and not prompt:
             # The episode file lives at the project root; no dialog needed.
@@ -77,6 +86,10 @@ class EpisodeWorkflowMixin:
         except Exception as e:
             messagebox.showerror("Save episode failed", str(e))
             return False
+        # Saved under a new name: Pull Quotes follows the episode there.
+        proj = getattr(self, "_pq_project", None)
+        if prompt and proj and proj.get("episode_file"):
+            proj["episode_file"] = ep["file_path"]
         # The baseline belongs to the active workflow: saving the episode
         # from under a stage (closing from it) must not mark that stage's
         # own unsaved work clean.
@@ -88,8 +101,10 @@ class EpisodeWorkflowMixin:
     def _ep_comparable(data):
         """What decides whether an episode is saved: everything save()
         writes but its root, which load() takes from where the file now is
-        (a moved folder is not an unsaved change)."""
-        return {k: v for k, v in data.items() if k not in ("root", "file_path")}
+        (a moved folder is not an unsaved change), and its stages, which only
+        change by being written (_ep_store_stage)."""
+        return {k: v for k, v in data.items()
+                if k not in ("root", "file_path", "stages")}
 
     def _ep_saved_form(self):
         """The open episode as it would be saved, for _state_signature."""
@@ -116,25 +131,131 @@ class EpisodeWorkflowMixin:
             return False
         return self._signature_of(self._ep_saved_form()) != self._ep_file_signature()
 
-    def _ep_note_link(self, key, path, owner=None):
-        """A workflow launched from this episode saved its own file: remember
-        it so the next visit opens it instead of starting from the sources.
-        *owner* = (link key, absolute path) names the file the workflow was
-        opened with; the link is only taken when it is the episode's own
-        (the same script, the same AAF), never from unrelated work."""
+    # ── Stages save into the episode ─────────────────────────────────────
+
+    def _ep_holds(self, ep, key, path):
+        """*path* is the episode's script or AAF: linked, or in its folder.
+        One from anywhere else is unrelated work, with a file of its own."""
+        return bool(path) and (self._ep_owns(ep, key, path) or EP.inside(ep, path))
+
+    def _ep_stage_showing(self):
+        """The stage of the open episode on screen (EP.STAGE_*), or None when
+        the screen is the episode's own, or work that isn't this episode's."""
         ep = getattr(self, "_ep", None)
-        if not ep or not path:
+        if not ep:
+            return None
+        wf = getattr(self, "workflow", None)
+        if wf == "pull_quotes":
+            f = (getattr(self, "_pq_project", None) or {}).get("episode_file")
+            mine = ep.get("file_path")
+            if f and mine and os.path.normcase(f) == os.path.normcase(mine):
+                return EP.STAGE_PQ
+            return None
+        if wf == "aaf_xml":
+            aaf = getattr(self, "_aaf_path", None)
+            return EP.STAGE_AAF if self._ep_holds(ep, "aaf", aaf) else None
+        if wf in ("script_session", "script_aaf", "script_xml"):
+            script = getattr(self, "_script_path", None)
+            return EP.STAGE_S2S if self._ep_holds(ep, "script", script) else None
+        return None
+
+    def _ep_find_for_stage(self):
+        """No episode open, and a first save of a script or AAF about to ask
+        where to put it: when the project it sits in has an episode, that is
+        where it goes."""
+        if getattr(self, "_ep", None):
             return
-        if owner is not None:
-            okey, opath = owner
-            if not opath or ep.get("links", {}).get(okey) != EP.rel(ep, opath):
-                return
-        ep.setdefault("links", {})[key] = EP.rel(ep, path)
-        if ep.get("file_path"):
+        wf = getattr(self, "workflow", None)
+        if wf == "aaf_xml":
+            path = None if getattr(self, "_aaf_saved_path", None) \
+                else getattr(self, "_aaf_path", None)
+        elif wf in ("script_session", "script_aaf", "script_xml"):
+            path = None if getattr(self, "_current_session_file", None) \
+                else getattr(self, "_script_path", None)
+        else:
+            path = None
+        found = EP.find_episode_above(path) if path else None
+        if found:
             try:
-                EP.save(ep)
+                self._ep = EP.load(found)
+            except Exception:
+                self._ep = None
+
+    def _ep_store_stage(self, quiet=False):
+        """Amend the episode file with the stage on screen -- the one place a
+        stage launched from an episode saves to.  True when it was written."""
+        stage = self._ep_stage_showing()
+        if stage is None:
+            return False
+        ep = self._ep
+        try:
+            if stage == EP.STAGE_PQ:
+                return bool(self._pq_save_episode_project(prompt_path=False))
+            if stage == EP.STAGE_AAF:
+                data = self._aaf_build_setup_data()
+                ep.setdefault("links", {})["aaf"] = EP.rel(ep, self._aaf_path)
+                self._ep_absorb_aaf(data)
+            else:
+                data = self._build_full_session_data()
+                ep.setdefault("links", {})["script"] = EP.rel(ep, self._script_path)
+                self._ep_absorb_s2s()
+            EP.set_stage(ep, stage, data)
+            EP.save(ep)
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("Save episode failed", str(e))
+            return False
+        self._mark_saved()
+        return True
+
+    def _ep_amend_stage(self):
+        """Stepping on from a stage (back to the episode, to Home, a reconcile
+        landing): its work goes into the episode without being asked for."""
+        try:
+            if self._ep_stage_showing() and self._is_dirty():
+                self._ep_store_stage(quiet=True)
+        except Exception:
+            pass
+
+    def _ep_embed_session(self, session, payload):
+        """Pull Quotes saved an interview session: it goes into the episode,
+        and the file follows shortly -- sessions save on every edit, and a
+        transcript pass saves from its worker thread."""
+        if threading.current_thread() is not threading.main_thread():
+            self._ui(lambda: self._ep_embed_session(session, payload))
+            return
+        proj = getattr(self, "_pq_project", None) or {}
+        ep = self._ep_bound(proj.get("episode_file"))
+        if not ep:
+            return
+        EP.pq_sessions(ep)[payload["id"]] = payload
+        session.pop("_file_path", None)   # an added file now lives in here
+        try:
+            self._ep_register_session(session)
+        except Exception:
+            pass
+        self._ep_save_pending = ep
+        pending = getattr(self, "_ep_save_after", None)
+        if pending is not None:
+            self.after_cancel(pending)
+        self._ep_save_after = self.after(800, self._ep_save_flush)
+
+    def _ep_save_flush(self):
+        """Write a pending session save now.  Safe when nothing is pending."""
+        pending = getattr(self, "_ep_save_after", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
             except Exception:
                 pass
+            self._ep_save_after = None
+        ep = getattr(self, "_ep_save_pending", None)
+        self._ep_save_pending = None
+        if ep:
+            try:
+                EP.save(ep)
+            except Exception as e:
+                messagebox.showerror("Save episode failed", str(e))
 
     # ── Discovery ────────────────────────────────────────────────────────
 
@@ -241,16 +362,17 @@ class EpisodeWorkflowMixin:
         body = self._ep_card(parent, "STAGES",
                              "each one opens already linked to the sources below")
         links = ep.get("links", {})
+        n_sessions = len(EP.pq_session_list(ep))
         rows = [
             ("PULL QUOTES", "{} interview session{}".format(
-                len(ep.get("sessions", [])), "" if len(ep.get("sessions", [])) == 1 else "s"),
+                n_sessions, "" if n_sessions == 1 else "s"),
              self._ep_launch_pq),
             ("SCRIPT → SESSION",
-             os.path.basename(links.get("s2s_session") or links.get("script") or "")
+             os.path.basename(links.get("script") or "")
              or "choose the script when you open it",
              self._ep_launch_s2s),
             ("AAF → XML",
-             os.path.basename(links.get("aaf_setup") or links.get("aaf") or "")
+             os.path.basename(links.get("aaf") or "")
              or "choose the AAF when you open it",
              self._ep_launch_aaf),
         ]
@@ -734,7 +856,6 @@ class EpisodeWorkflowMixin:
             return
         token = session["token"]
         media = [EP.rel(ep, m) for m in session.get("media", []) if m]
-        sess  = EP.rel(ep, session.get("_file_path"))
         name  = self._ep_source_for(ep, media)
         if name is None:
             for n, src in ep["sources"].items():
@@ -749,31 +870,19 @@ class EpisodeWorkflowMixin:
                                    "session": None, "user_made": True}
         src = ep["sources"][name]
         src["token"] = token
-        src["session"] = sess
+        src["session"] = session.get("id")
         for m in media:
             self._ep_ensure_media(ep, m, "audio")
             if m not in src["audio"]:
                 src["audio"].append(m)
         src["audio"].sort()
-        if session.get("_file_path"):
-            ap = os.path.abspath(session["_file_path"])
-            if ap not in ep.setdefault("sessions", []):
-                ep["sessions"].append(ap)
-        try:
-            EP.save(ep)
-        except Exception:
-            pass
 
-    def _ep_absorb_s2s(self, session_path):
-        """Script -> Session saved: remember the session, and take the pool's
-        token assignments into the sources -- a camera assigned to a token
-        joins that token's source (leaving any other), a recording assigned
-        to a token gives its source that token."""
-        ep = getattr(self, "_ep", None)
-        script = getattr(self, "_script_path", None)
-        if not ep or not self._ep_owns(ep, "script", script):
-            return
-        ep.setdefault("links", {})["s2s_session"] = EP.rel(ep, session_path)
+    def _ep_absorb_s2s(self):
+        """Script -> Session saving into the episode: take the pool's token
+        assignments into the sources -- a camera assigned to a token joins
+        that token's source (leaving any other), a recording assigned to a
+        token gives its source that token."""
+        ep = self._ep
         pool = getattr(self, "_pool", None)
         rows = [(r["path"], r["var"].get()) for r in getattr(pool, "_rows", [])]
         from utils import is_video
@@ -843,71 +952,54 @@ class EpisodeWorkflowMixin:
                 src[kind].append(r)
                 src[kind].sort()
                 src["user_made"] = True         # the user placed it: a rescan keeps it
-        try:
-            EP.save(ep)
-        except Exception:
-            pass
 
-    def _ep_absorb_aaf(self, setup_path):
-        """AAF setup saved: remember it, and keep each source's cameras,
-        sync and track row in the episode so a fresh AAF export of the
-        same session opens synced even without the setup file."""
-        ep = getattr(self, "_ep", None)
-        aaf = getattr(self, "_aaf_path", None)
-        if not ep or not self._ep_owns(ep, "aaf", aaf):
-            return
-        ep.setdefault("links", {})["aaf_setup"] = EP.rel(ep, setup_path)
-        try:
-            data = self._aaf_build_setup_data()
-        except Exception:
-            data = None
-        if data:
-            by_label = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
-            by_stem = {}
-            for name, src in ep["sources"].items():
-                for a in src.get("audio", []):
-                    by_stem[EP._stem_key(a)] = name
-            for base in getattr(self, "_aaf_sources", []):
-                name = by_stem.get(EP._stem_key(base + ".x"))
-                if name is None:
-                    continue
-                src = ep["sources"][name]
-                labels = [data["assignments"].get(base)] + list(
-                    data.get("extra_assignments", {}).get(base, []))
-                vids = [EP.rel(ep, by_label[l]) for l in labels if l in by_label]
-                if vids:
-                    for v in vids:
-                        self._ep_ensure_media(ep, v, "video")
-                    if set(vids) != set(src.get("video", [])):
-                        # The user picked these cameras in Step 2: they
-                        # leave any other source, and a rescan keeps them.
-                        for other_name, other in ep["sources"].items():
-                            if other_name != name:
-                                other["video"] = [v for v in other.get("video", [])
-                                                  if v not in vids]
-                        src["user_made"] = True
-                    src["video"] = vids
-                sd = data.get("sync", {}).get(base, {})
-                src["aaf_sync"] = {
-                    "video":      vids[0] if vids else None,
-                    "audio":      EP.rel(ep, sd.get("audio_path")) if sd.get("audio_path") else None,
-                    "offset":     sd.get("offset", "0.000"),
-                    "enabled":    sd.get("enabled", False),
-                    "state":      sd.get("state", ""),
-                    "locked":     sd.get("locked", False),
-                    "label":      sd.get("label", ""),
-                    "needs_sync": sd.get("needs_sync", False),
-                    "drift":      sd.get("drift"),
-                }
-                tm = data.get("track_map", {}).get(base)
-                if tm:
-                    src["track_map"] = tm
-            if data.get("mix_path"):
-                ep["links"]["mix"] = EP.rel(ep, data["mix_path"])
-        try:
-            EP.save(ep)
-        except Exception:
-            pass
+    def _ep_absorb_aaf(self, data):
+        """AAF -> XML saving into the episode: keep each source's cameras,
+        sync and track row with the source, so a fresh AAF export of the same
+        session opens synced.  *data* is the setup being saved."""
+        ep = self._ep
+        by_label = {self._aaf_vid_label(p): p for p in self._aaf_video_paths}
+        by_stem = {}
+        for name, src in ep["sources"].items():
+            for a in src.get("audio", []):
+                by_stem[EP._stem_key(a)] = name
+        for base in getattr(self, "_aaf_sources", []):
+            name = by_stem.get(EP._stem_key(base + ".x"))
+            if name is None:
+                continue
+            src = ep["sources"][name]
+            labels = [data["assignments"].get(base)] + list(
+                data.get("extra_assignments", {}).get(base, []))
+            vids = [EP.rel(ep, by_label[l]) for l in labels if l in by_label]
+            if vids:
+                for v in vids:
+                    self._ep_ensure_media(ep, v, "video")
+                if set(vids) != set(src.get("video", [])):
+                    # The user picked these cameras in Step 2: they
+                    # leave any other source, and a rescan keeps them.
+                    for other_name, other in ep["sources"].items():
+                        if other_name != name:
+                            other["video"] = [v for v in other.get("video", [])
+                                              if v not in vids]
+                    src["user_made"] = True
+                src["video"] = vids
+            sd = data.get("sync", {}).get(base, {})
+            src["aaf_sync"] = {
+                "video":      vids[0] if vids else None,
+                "audio":      EP.rel(ep, sd.get("audio_path")) if sd.get("audio_path") else None,
+                "offset":     sd.get("offset", "0.000"),
+                "enabled":    sd.get("enabled", False),
+                "state":      sd.get("state", ""),
+                "locked":     sd.get("locked", False),
+                "label":      sd.get("label", ""),
+                "needs_sync": sd.get("needs_sync", False),
+                "drift":      sd.get("drift"),
+            }
+            tm = data.get("track_map", {}).get(base)
+            if tm:
+                src["track_map"] = tm
+        if data.get("mix_path"):
+            ep["links"]["mix"] = EP.rel(ep, data["mix_path"])
 
     # ── Stage launchers ───────────────────────────────────────────────────
 
@@ -925,19 +1017,20 @@ class EpisodeWorkflowMixin:
             return
         ep = self._ep
         self.workflow = "pull_quotes"
-        self._pq_load_project({"title": ep["title"], "sessions": list(ep.get("sessions", []))},
-                              None)
-        # Saves go back into the episode file (sessions + title), not over it.
-        self._pq_project["episode_file"] = ep["file_path"]
+        # Saves go back into the episode file, not over it.
+        self._pq_load_project({"title": ep["title"], "episode_file": ep["file_path"],
+                               "sessions": EP.pq_session_list(ep)}, None)
 
     def _ep_launch_s2s(self):
         if not self._ep_ready():
             return
         ep = self._ep
         links = ep.setdefault("links", {})
-        sess = EP.absp(ep, links.get("s2s_session"))
-        if sess and os.path.isfile(sess):
-            self._open_session(sess)
+        saved = EP.get_stage(ep, EP.STAGE_S2S)
+        script = (saved or {}).get("script") or ""
+        if saved and (os.path.isfile(script)
+                      or self._is_foreign_platform_path(script)):
+            self._open_session_data(saved)
             return
         # A linked Google Doc is fetched (and checked) first, so the script
         # that reconciles is the one Jordan has now.
@@ -1001,9 +1094,9 @@ class EpisodeWorkflowMixin:
             return
         ep = self._ep
         links = ep.setdefault("links", {})
-        setup = EP.absp(ep, links.get("aaf_setup"))
-        if setup and os.path.isfile(setup):
-            self._open_session(setup)
+        saved = EP.get_stage(ep, EP.STAGE_AAF)
+        if saved and os.path.isfile(saved.get("aaf") or ""):
+            self._open_session_data(saved)
             return
         aaf = EP.absp(ep, links.get("aaf"))
         if not (aaf and os.path.isfile(aaf)):

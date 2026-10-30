@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import json
 from utils import tc_secs, basename, run_hidden
+from episode import session_ref
 
 
 def _ffmpeg_cmd():
@@ -531,6 +532,12 @@ def discover_pq_sessions(script_path, max_walk_up=6):
                     "Episode session not found (nor relocatable): {}".format(sp))
                 continue
             _register(_cand, "episode")
+        # Sessions kept in the episode file itself.  These are the live ones:
+        # a .pb_session.json left beside them is what they were read in from.
+        _held = (ep.get("stages") or {}).get("pull_quotes") or {}
+        for s in (_held.get("sessions") or {}).values():
+            if s.get("token"):
+                result[s["token"]] = session_ref(ep_path, s["token"])
 
     if warnings:
         result["__warnings__"] = warnings

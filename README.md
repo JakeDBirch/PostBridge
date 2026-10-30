@@ -92,11 +92,19 @@ Every decision is shown for review. Each source has its token, its recordings an
 
 The **STAGES** card opens each workflow already linked:
 
-- **Pull Quotes** opens the episode's interview sessions, with **← EPISODE** to return. **+ FROM EPISODE SOURCE** lists the recordings the episode knows that have no session yet, each with a suggested token, so a session is one click rather than a file dialog. Saving a session registers its token and recordings as a source (or updates the source that already owns those recordings); saving the project writes the session list back into the episode file.
-- **Script → Session** asks for the script the first time, then opens Step 2 with every source's recordings and cameras in the pool, assigned to the source's token where the script uses it. Narrator recordings — sources with no token and no transcript — open assigned to `VO: <part>` when the script narrates a single part, and to whichever part they were given last time once that has been saved. Saving writes the pool's assignments back: a camera assigned to a token joins that token's source, a recording assigned to a token gives its source the token, and a `VO:` assignment is remembered on the source as its narrated part. The session file is remembered and reopened next time.
-- **AAF → XML** asks for the AAF the first time, then opens Step 2 with the video pool, the per-source camera assignments and slot counts, each source's reference audio and the stereo mix already in place — only SYNC remains. Saving the setup writes each source's cameras, sync (offset, state, lock, drift) and track row into the episode as well as remembering the setup file. A later AAF export of the same session — a re-cut, or a fresh file on another machine with no setup file — opens with those syncs in place, as long as the same camera and recording are still in play.
+- **Pull Quotes** opens the episode's interview sessions, with **← EPISODE** to return. **+ FROM EPISODE SOURCE** lists the recordings the episode knows that have no session yet, each with a suggested token, so a session is one click rather than a file dialog. Saving a session puts it in the episode file and registers its token and recordings as a source (or updates the source that already owns those recordings).
+- **Script → Session** asks for the script the first time, then opens Step 2 with every source's recordings and cameras in the pool, assigned to the source's token where the script uses it. Narrator recordings — sources with no token and no transcript — open assigned to `VO: <part>` when the script narrates a single part, and to whichever part they were given last time once that has been saved. Saving writes the pool's assignments back: a camera assigned to a token joins that token's source, a recording assigned to a token gives its source the token, and a `VO:` assignment is remembered on the source as its narrated part. The whole reconcile is saved in the episode file and reopens from there next time.
+- **AAF → XML** asks for the AAF the first time, then opens Step 2 with the video pool, the per-source camera assignments and slot counts, each source's reference audio and the stereo mix already in place — only SYNC remains. Saving writes the setup into the episode file, and each source's cameras, sync (offset, state, lock, drift) and track row with the source. A later AAF export of the same session — a re-cut, or a fresh file on another machine — opens with those syncs in place, as long as the same camera and recording are still in play.
 
-Existing per-workflow files (`*_session.json`, `*_setup.json`, the old Pull Quotes `.pb_episode.json`) keep working exactly as before; episodes are for new work.
+### One file
+
+The episode file is the project. **SAVE** (Ctrl+S) on any stage opened from an episode amends `<Title>.pb_episode.json`: no dialog, and no other JSON of its own. **SAVE AS** saves the whole episode under a new name. A stage also goes in by itself when you step back to the episode or Home, and when a reconcile finishes. Paths under the project folder are stored relative to it, so the folder can move between machines.
+
+A script or AAF counts as the episode's when the episode links to it or it sits inside the episode's folder, including one opened from Home: a first save finds the project's episode without it being open. Work from outside the folder keeps a file of its own.
+
+An episode saved before this reads the `session.json`, `*_setup.json` and `.pb_session.json` files it linked to into itself the first time it opens, following the project if it has moved since. Those files are left on disk, unused, and safe to delete. `.pb_transcript.json` sidecars (transcript caches, next to the audio) and the `.pb_cache` folder (per-edit recovery and telemetry) are still written: they are caches, not the project.
+
+Per-workflow files (`*_session.json`, `*_setup.json`, the old Pull Quotes `.pb_episode.json`) keep working as before when opened with no episode in the project.
 
 ### Google Docs
 
@@ -392,9 +400,10 @@ All human-readable JSON:
 
 | File | Contents | Lives in |
 |---|---|---|
-| `*_session.json` | Script→Session state: assignments, reconciliation results, Step 4 edits | Wherever you saved it |
-| `*_setup.json` | AAF → XML setup: AAF path, pool files, assignments, sync offsets and locks, sequence settings | Wherever you saved it (suggested: next to the AAF) |
-| `<TOKEN>.pb_session.json` | Pull Quotes session: media list, transcript, notes, speaker labels | `<project>/03_AUDIO/00_RAW AUDIO/` |
+| `<Title>.pb_episode.json` | The whole project: sources and media, and every stage below | The project folder's root |
+| `*_session.json` | Script→Session state: assignments, reconciliation results, Step 4 edits. In an episode, kept inside the episode file | Wherever you saved it |
+| `*_setup.json` | AAF → XML setup: AAF path, pool files, assignments, sync offsets and locks, sequence settings. In an episode, kept inside the episode file | Wherever you saved it (suggested: next to the AAF) |
+| `<TOKEN>.pb_session.json` | Pull Quotes session: media list, transcript, notes, speaker labels. In an episode, kept inside the episode file | `<project>/03_AUDIO/00_RAW AUDIO/` |
 | `<media>.pb_transcript.json` | Cached transcript word list + audio signature | Next to the source audio |
 
 The `.pb_transcript.json` sidecars are shared between workflows: transcribing in Pull Quotes populates them; reconcile in Script→Session reads them.

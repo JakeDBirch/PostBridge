@@ -100,7 +100,8 @@ class PqWorkflowMixin:
         """Load an Episode Project JSON (already-parsed dict)."""
         sessions, missing = [], []
         for sp in data.get("sessions", []) or []:
-            loaded = self._pq_load_session_file(sp)
+            # A path, or from an episode the session itself.
+            loaded = sp if isinstance(sp, dict) else self._pq_load_session_file(sp)
             if loaded is None:
                 missing.append(sp)
             else:
@@ -111,6 +112,8 @@ class PqWorkflowMixin:
             "sessions":  sessions,
             "file_path": file_path,
         }
+        if data.get("episode_file"):
+            self._pq_project["episode_file"] = data["episode_file"]
         if missing:
             messagebox.showwarning(
                 "Missing sessions",
@@ -149,10 +152,44 @@ class PqWorkflowMixin:
             return None
 
     def _pq_save_session_file(self, session):
-        """Write a session dict to its `_file_path`."""
+        """Save a session: into the episode when the project was opened from
+        one, else to its `_file_path`."""
+        in_episode = (getattr(self, "_pq_project", None) or {}).get("episode_file")
         path = session.get("_file_path")
-        if not path:
+        if not path and not in_episode:
             return False
+        payload = self._pq_session_payload(session)
+        if in_episode:
+            self._pq_mirror_transcript(session)
+            self._ep_embed_session(session, payload)
+            return True
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            self._pq_mirror_transcript(session)
+            return True
+        except Exception as e:
+            messagebox.showerror("Save Session failed", str(e))
+            return False
+
+    @staticmethod
+    def _pq_mirror_transcript(session):
+        """Mirror the word list as a .pb_transcript.json sidecar next to each
+        source audio file so the Script→Session reconcile workflow can re-use
+        this transcript without re-running Whisper.  No-op if the transcript
+        is empty."""
+        words = session.get("transcript") or []
+        if words:
+            for media_path in session.get("media", []):
+                try:
+                    if os.path.isfile(media_path):
+                        engines.pb_transcript_save(media_path, words)
+                except Exception:
+                    pass
+
+    def _pq_session_payload(self, session):
+        """What is saved of a session."""
         # Stable session ID — generated once per session, future-proof
         # against ambiguous tokens across projects.
         if not session.get("id"):
@@ -164,7 +201,7 @@ class PqWorkflowMixin:
             "id":          session["id"],
             "token":       session.get("token", ""),
             "media":       list(session.get("media", [])),
-            "transcript":  session.get("transcript", []),
+            "transcript":  list(session.get("transcript") or []),
         }
         # Path to the playback cache (mix-of-all-sources WAV) is persisted
         # only when it actually exists on disk.
@@ -197,32 +234,7 @@ class PqWorkflowMixin:
         notes = session.get("notes")
         if notes:
             payload["notes"] = list(notes)
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-            # Mirror the word list as a .pb_transcript.json sidecar next
-            # to each source audio file so the Script→Session reconcile
-            # workflow can re-use this transcript without re-running
-            # Whisper.  No-op if the transcript is empty.
-            words = session.get("transcript") or []
-            if words:
-                for media_path in session.get("media", []):
-                    try:
-                        if os.path.isfile(media_path):
-                            engines.pb_transcript_save(media_path, words)
-                    except Exception:
-                        pass
-            # Opened from an episode: the token and its recordings become
-            # (or update) one of the episode's sources.
-            try:
-                self._ep_register_session(session)
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            messagebox.showerror("Save Session failed", str(e))
-            return False
+        return payload
 
     def _pq_default_session_path(self, token, media_paths):
         """Pick the canonical save path for a session JSON.
@@ -262,32 +274,40 @@ class PqWorkflowMixin:
         project = getattr(self, "_pq_project", None)
         if not project:
             return False
-        # Refuse to save until the project actually has sessions on disk.
-        if not project["sessions"]:
-            messagebox.showinfo("Nothing to save",
-                "Add at least one Interview Session before saving the project.")
-            return False
         # Opened from an episode: the episode file is the project.  Write
-        # the title and session list into it and leave the rest -- sources,
+        # the title and sessions into it and leave the rest -- sources,
         # media, links -- exactly as the episode screens keep them.
         ep_file = project.get("episode_file")
         if ep_file and not prompt_path:
             try:
                 import episode as _EP
-                ep = _EP.load(ep_file)
+                ep = self._ep_bound(ep_file)
+                if ep is None:
+                    raise ValueError("episode file not found: " + ep_file)
                 ep["title"] = project.get("title") or ep.get("title")
-                ep["sessions"] = sorted({os.path.abspath(s["_file_path"])
-                                         for s in project["sessions"] if s.get("_file_path")})
+                held = _EP.pq_sessions(ep)
+                for s in project["sessions"]:
+                    if s.get("id") not in held:
+                        self._ep_embed_session(s, self._pq_session_payload(s))
+                # A session taken out of the project goes from the episode.
+                keep = {s.get("id") for s in project["sessions"]}
+                for sid in [sid for sid in held if sid not in keep]:
+                    del held[sid]
+                    for src in ep["sources"].values():
+                        if src.get("session") == sid:
+                            src["session"] = None
                 _EP.save(ep, ep_file)
-                if getattr(self, "_ep", None) and self._ep.get("file_path") == ep_file:
-                    self._ep["title"] = ep["title"]
-                    self._ep["sessions"] = ep["sessions"]
                 self._mark_saved()
                 self._pq_render_project_view()
                 return True
             except Exception as e:
                 messagebox.showerror("Save episode failed", str(e))
                 return False
+        # Refuse to save until the project actually has sessions on disk.
+        if not project["sessions"]:
+            messagebox.showinfo("Nothing to save",
+                "Add at least one Interview Session before saving the project.")
+            return False
         path = project.get("file_path")
         if prompt_path or not path:
             suggested = re.sub(r"[^A-Za-z0-9_\- ]+", "_",
@@ -899,19 +919,21 @@ class PqWorkflowMixin:
         """Make a new interview session for *token* over *media_paths*,
         write its empty shell, add it to the project.  None on failure
         (a dialog says why)."""
-        session_path = self._pq_default_session_path(token, media_paths)
-        if not session_path:
-            messagebox.showerror("Save path",
-                "Could not derive a session save path.", parent=parent)
-            return None
         session = {
             "version":    1,
             "workflow":   "interview_session",
             "token":      token,
             "media":      list(media_paths),
             "transcript": [],
-            "_file_path": session_path,
         }
+        # From an episode it lives in the episode file; on its own, in a file.
+        if not self._pq_project.get("episode_file"):
+            session_path = self._pq_default_session_path(token, media_paths)
+            if not session_path:
+                messagebox.showerror("Save path",
+                    "Could not derive a session save path.", parent=parent)
+                return None
+            session["_file_path"] = session_path
         self._pq_project["sessions"].append(session)
         self._pq_save_session_file(session)   # write empty-transcript shell
         return session
@@ -1136,7 +1158,9 @@ class PqWorkflowMixin:
         tk.Label(inner, text="FILE", font=FL,
                  bg=SURF, fg=SUB, width=10,
                  anchor="nw").grid(row=2, column=0, sticky="nw", pady=(8, 0))
-        tk.Label(inner, text=session.get("_file_path", "(unsaved)"),
+        tk.Label(inner, text=session.get("_file_path")
+                 or (getattr(self, "_pq_project", None) or {}).get("episode_file")
+                 or "(unsaved)",
                  font=FB, bg=SURF, fg=SUB,
                  anchor="w").grid(row=2, column=1, sticky="w", pady=(8, 0))
 

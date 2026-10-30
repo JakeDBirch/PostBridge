@@ -2,6 +2,18 @@
 
 ---
 
+## October 30, 2026
+
+### Episodes: the episode file is the project's one file
+- **Every stage saves into `<Title>.pb_episode.json`.** Script → Session and AAF → XML each asked for a JSON of their own on the first save, and Pull Quotes wrote a `.pb_session.json` for every interview. From an episode, SAVE (Ctrl+S) now amends the episode file, with no dialog and no other project file. SAVE AS saves the whole episode under a new name.
+- **Stepping through keeps it up to date.** Going back to the episode or to Home puts a stage's work in without being asked, and so does a finished reconcile. Pull Quotes sessions save themselves as before, now into the episode, within a second of an edit.
+- **Each stage reopens from that file**: Script → Session at Step 4 with its results and Step 4 state, AAF → XML with its setup and syncs, Pull Quotes with its transcripts. Transcript checks and reconcile find sessions in the episode too.
+- **Older episodes convert when opened.** The `session.json`, `*_setup.json` and `.pb_session.json` files they linked to are read in and left on disk, unused and safe to delete. Paths follow a project that has moved since those files were written. Bill Richardson's session still named `F:\Blood Trails\…` after the project moved into Dropbox, so opening it stopped at "Script not found". It now opens at Step 4 with all 181 pulls and all 11 audio files found. Ctrl+S takes 34 ms, and the episode file is 0.47 MB (the session file alone was 0.81 MB).
+- **The folder can move.** Paths under the project folder are stored relative to it, for the stages as they already were for sources.
+- **A failed save can't damage the project.** The file is written beside itself and swapped in only once complete.
+- **A script or AAF belongs to the episode** when the episode links to it or it sits inside the episode's folder. That includes one opened from Home with no episode open: its first save finds the project's episode instead of asking. Work from outside the folder keeps a file of its own.
+- Still written: `.pb_transcript.json` beside the audio and the `.pb_cache` folder. These are transcript caches and per-edit recovery, not project state.
+
 ## October 27, 2026
 
 ### Assembly view: the default gap lives with the cut; the script follows the words

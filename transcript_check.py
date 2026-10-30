@@ -13,6 +13,7 @@ media at all) starts being reused.
 import os, json, re
 
 import engines
+from episode import read_pq_session
 from utils import is_video
 
 # Suffixes we recognise as "a transcript for this media".
@@ -73,8 +74,7 @@ def pq_session_status(session_path, quick=False):
     fallback, so a session this reports OK is one reconcile will accept.
     """
     try:
-        with open(session_path, encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_pq_session(session_path)
     except Exception as e:
         return False, 0, "unreadable ({})".format(e)
 

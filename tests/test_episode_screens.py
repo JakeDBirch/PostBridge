@@ -144,32 +144,37 @@ def test_pull_quotes_session_registers_a_source(app, monkeypatch, project):
     assert app.workflow == "pull_quotes"
     assert app._pq_project["episode_file"] == os.path.join(project, "Ep 7" + EP.EPISODE_EXT)
     # Jordan makes a session for the narrator recording.
-    sess_path = os.path.join(project, "03_AUDIO", "01_VO", "NARR1.pb_session.json")
-    session = {"token": "NARR1", "_file_path": sess_path,
+    session = {"token": "NARR1",
                "media": [os.path.join(project, "03_AUDIO", "01_VO", "Ep 7 pt 1.wav")],
                "transcript": []}
+    app._pq_project["sessions"].append(session)
     assert app._pq_save_session_file(session)
+    app._ep_save_flush()
     saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
     src = saved["sources"]["Ep 7 pt 1"]
-    assert src["token"] == "NARR1" and src["session"] == "03_AUDIO/01_VO/NARR1.pb_session.json"
-    assert sess_path in saved["sessions"]
+    assert src["token"] == "NARR1" and src["session"] == session["id"]
+    assert EP.pq_sessions(saved)[session["id"]]["token"] == "NARR1"
     # The open episode saw it too.
     assert app._ep["sources"]["Ep 7 pt 1"]["token"] == "NARR1"
     # A session for a recording no source owns makes a new source.
-    other = {"token": "CORY", "_file_path": os.path.join(project, "03_AUDIO", "CORY.pb_session.json"),
+    other = {"token": "CORY",
              "media": [os.path.join(project, "03_AUDIO", "sting.wav")], "transcript": []}
+    app._pq_project["sessions"].append(other)
     assert app._pq_save_session_file(other)
+    app._ep_save_flush()
     saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
     assert saved["sources"]["CORY"]["audio"] == ["03_AUDIO/sting.wav"]
     # And the project save merges into the episode file instead of replacing it.
-    app._pq_project["sessions"] = [dict(session), dict(other)]
     assert app._pq_save_episode_project(prompt_path=False)
     saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
     assert saved["workflow"] == "episode" and len(saved["sources"]) == 4
+    assert {s["token"] for s in EP.pq_session_list(saved)} >= {"NARR1", "CORY"}
     assert not app._errors, "\n".join(app._errors)
 
     # Sessions straight from the episode's sources: Ep 7 pt 1 is covered
-    # already; pt 2 and the Butler interview (token known) are offered.
+    # already; pt 2 and, its session taken out of the project, the Butler
+    # interview (token known) are offered.
+    app._pq_project["sessions"] = [session, other]
     app._pq_render_project_view(); _pump(app, 3)
     offered = {n: tok for n, tok, _m in app._pq_episode_sources_without_session()}
     assert set(offered) == {"Ep 7 pt 2", "Butler Interview"}
@@ -177,7 +182,8 @@ def test_pull_quotes_session_registers_a_source(app, monkeypatch, project):
     made = app._pq_create_session_from_source("Ep 7 pt 2", "narr 2", open_view=False)
     assert made and made["token"] == "NARR_2"
     assert [os.path.basename(m) for m in made["media"]] == ["Ep 7 pt 2.wav"]
-    assert os.path.isfile(made["_file_path"])
+    assert "_file_path" not in made          # no file of its own: it's in the episode
+    app._ep_save_flush()
     saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
     assert saved["sources"]["Ep 7 pt 2"]["token"] == "NARR_2"
     assert "Ep 7 pt 2" not in {n for n, _t, _m in app._pq_episode_sources_without_session()}
@@ -305,25 +311,27 @@ def test_launch_aaf_prefills_setup(app, monkeypatch, project):
     assert app._aaf_group_var.get() == "custom"
     assert not app._errors, "\n".join(app._errors)
 
-    # Sync a source, save the setup: the episode remembers the setup file
-    # AND the sync itself.
+    # Sync a source, save: the episode holds the setup AND the sync itself,
+    # with no setup file and no dialog.
     app._aaf_source_offset_vars["Ep 7 pt 1"].set("1.234")
     app._aaf_source_sync_vars["Ep 7 pt 1"].set(True)
     app._aaf_sync_state_vars["Ep 7 pt 1"].set("manual")
     app._aaf_sync_locked_vars["Ep 7 pt 1"].set(True)
     app._aaf_set_drift("Ep 7 pt 1", {"ppm": 8.4, "t_ref": 50.0})
-    app._aaf_saved_path = os.path.join(project, "01_PROJECT FILES", "Ep 7_setup.json")
-    assert app._aaf_save_setup(prompt=False)
+    app._quick_save()
+    assert not app._errors, "\n".join(app._errors)
     saved = EP.load(os.path.join(project, "Ep 7" + EP.EPISODE_EXT))
-    assert saved["links"]["aaf_setup"] == "01_PROJECT FILES/Ep 7_setup.json"
+    assert EP.get_stage(saved, EP.STAGE_AAF)["sync"]["Ep 7 pt 1"]["offset"] == "1.234"
+    assert not os.path.exists(os.path.join(project, "01_PROJECT FILES", "Ep 7_setup.json"))
     st = saved["sources"]["Ep 7 pt 1"]["aaf_sync"]
     assert st["offset"] == "1.234" and st["state"] == "manual" and st["locked"]
     assert st["video"] == "02_MEDIA/RAW/Ep 7 CAM 1 01.mp4" and st["audio"] == "03_AUDIO/01_VO/Ep 7 pt 1.wav"
     assert st["drift"]["ppm"] == 8.4
 
-    # A fresh AAF of the same session, with no setup file: opens synced.
-    app._ep["links"].pop("aaf_setup", None)
+    # A fresh AAF of the same session, with no saved setup: opens synced.
+    app._ep["stages"].pop(EP.STAGE_AAF, None)
     app._ep_save()
+    app.workflow = "episode"
     app._home(); _pump(app, 3)
     app._ep_launch_aaf()
     assert _wait(app, lambda: app.workflow == "aaf_xml"
