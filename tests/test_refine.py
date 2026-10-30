@@ -673,6 +673,77 @@ def test_a_draft_is_found_and_refined_with_the_words_streaming_in(media, monkeyp
     assert "refined with medium" in app._refine_status()
 
 
+def test_cancel_stops_the_pass_and_it_stays_stopped_until_asked(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    view = app._assembly = _View()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    stream.feed.put([_word("we", 1.0, 1.2), _word("walked", 1.3, 1.6)])
+    assert _pump(app, lambda: app._refine_words(media)[1]["word"] == "walked")
+
+    app._refine_cancel()
+    stream.feed.put([_word("the", 1.7, 1.8)])       # the worker notices here
+    assert not app._refine_running()
+    assert "cancelled" in app._refine_status()
+    # Back to what is saved, on screen and on disk.
+    assert app._refine_words(media) is None
+    assert media in view.changed
+    assert engines.transcript_model(media) == "tiny"
+
+    # Coming back to Step 4 doesn't start it again, nor does a new model.
+    app._refine_resume()
+    app._refine_enqueue([{"kind": "file", "path": media, "draft": True}], False,
+                        "medium", "script.txt")     # a look begun before the cancel
+    monkeypatch.setattr(engines, "_active_model_override", "large-v3")
+    app._refine_model_changed()
+    _pump(app, lambda: False, secs=0.2)
+    assert stream.sizes == ["medium"] and not app._refine_running()
+    assert "cancelled" in app._refine_status()
+
+    # The button does.
+    app._refine_again()
+    assert _pump(app, lambda: len(stream.sizes) == 2)
+    assert stream.sizes[1] == "large-v3" and app._refine_running()
+    app._refine_stop()
+    stream.feed.put(None)
+
+
+def test_cancel_leaves_a_new_cut_waiting_and_another_script_runs(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    st = app._rf()
+    st.held = ["takes"]
+    app._refine_cancel()
+    assert app._refine_held()
+    app._script_path = "another.txt"
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    app._refine_stop()
+    stream.feed.put(None)
+
+
+def test_a_failure_after_cancel_does_not_say_it_failed(media, monkeypatch):
+    began, go = threading.Event(), threading.Event()
+
+    def _fails(*a, **k):
+        began.set()
+        go.wait(5)
+        raise RuntimeError("the decoder went away")
+    monkeypatch.setattr(engines, "transcribe_file", _fails)
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    assert _pump(app, began.is_set)
+    thread = app._rf().thread
+    app._refine_cancel()
+    go.set()
+    thread.join(5)
+    assert "cancelled" in app._refine_status()
+
+
 def test_nothing_runs_when_tiny_is_the_model_chosen(media, monkeypatch):
     stream = _Stream(monkeypatch)
     monkeypatch.setattr(engines, "_active_model_override", "tiny")

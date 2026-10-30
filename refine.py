@@ -170,6 +170,7 @@ class _State(object):
         self.script = None
         self.bins = {}            # the pool's VO parts, when vo_bins is empty
         self.strip = None         # Step 4's line about it: (frame, label)
+        self.halted = None        # (script,): cancelled, and stays so until asked
 
 
 class RefineMixin(object):
@@ -340,13 +341,31 @@ class RefineMixin(object):
             return
         if engines.draft_model() is None:
             return                       # tiny is the model chosen
+        if self._refine_halted():
+            return
         self._refine_queue(force=False)
 
     def _refine_again(self):
         """Transcribe the cut's files again with the model now chosen, Pull
         Quotes' RE-TRANSCRIBE: for after picking a better one."""
         if not getattr(self, "_reconcile_busy", False):
+            self._rf().halted = None
             self._refine_queue(force=True)
+
+    def _refine_halted(self):
+        return self._rf().halted == (getattr(self, "_script_path", None),)
+
+    def _refine_cancel(self):
+        """The Cancel button: stop the pass and leave it stopped, until Refine
+        is pressed or the script is reconciled again.  What the pass had heard
+        of the file it was on goes; files it finished keep their new words."""
+        st = self._rf()
+        held = st.held                   # a new cut waiting is no part of this
+        self._refine_stop()
+        st.held = held
+        st.halted = (getattr(self, "_script_path", None),)
+        st.note = "Refining cancelled.  Anything it hadn't finished stays on its draft."
+        self._refine_show()
 
     def _refine_queue(self, force):
         rows = list(getattr(self, "results", None) or [])
@@ -426,7 +445,7 @@ class RefineMixin(object):
 
     def _refine_enqueue(self, jobs, force, target, script):
         st = self._rf()
-        if script != getattr(self, "_script_path", None):
+        if script != getattr(self, "_script_path", None) or self._refine_halted():
             return
         try:
             pad = float(self.pad_var.get())
@@ -472,6 +491,7 @@ class RefineMixin(object):
             st.held = None
             st.note = ""
             st.done = {}
+            st.halted = None
             stopped = [p for p, lv in st.live.items() if lv.final is None]
             for p in stopped:
                 del st.live[p]
@@ -509,6 +529,8 @@ class RefineMixin(object):
             except engines.TranscriptionCancelled:
                 return
             except Exception as exc:
+                if cancel.is_set():
+                    return
                 print("Refine failed on {}: {}".format(job["path"], exc),
                       file=sys.stderr)
                 with st.lock:

@@ -4,6 +4,9 @@
 
 ## October 30, 2026
 
+### Assembly view: cancel the transcript refinement
+- **The Refine button becomes Cancel refining while a pass runs.** The pass stops at its next segment and stays stopped, including when you come back to Step 4 or pick another model, until you press Refine or reconcile the script again. What it had heard of the file it was on is dropped, so that file goes back to its draft; files it had finished keep their new words.
+
 ### Waveform editor: opens full screen, zoom keys centre on the cursor
 - **The waveform editor opens full screen,** on the monitor the app is on.
 - **R, T, + and - now centre the view on the cursor.** They used to hold the middle of the view, wherever the cursor was. While audio plays they use where you clicked, not the moving playhead. At the very start or end of the file the view stops at the edge. The scroll wheel still zooms around the mouse pointer.

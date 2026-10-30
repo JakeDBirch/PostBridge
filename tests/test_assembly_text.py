@@ -742,10 +742,22 @@ def test_the_panel_shows_the_pass_running(view):
     win.show_refine_status()
     app.update()
     assert win.tx_status.cget("text") == "Refining with medium: 40%"
-    assert win.refine_key.lbl.cget("text") == "Refining…"
+    assert win.refine_key.lbl.cget("text") == "Cancel refining"
     assert win.refine_key.on
     assert win.refine_bar._pct == pytest.approx(0.4)
     assert "40%" in win.load_lbl.cget("text")          # always in view
+
+
+def test_the_panels_button_starts_a_pass_and_cancels_a_running_one(view):
+    app, win = view
+    calls = []
+    app._refine_again = lambda: calls.append("again")
+    app._refine_cancel = lambda: calls.append("cancel")
+    app._refine_running = lambda: False
+    win._refine_again()
+    app._refine_running = lambda: True
+    win._refine_again()
+    assert calls == ["again", "cancel"]
 
 
 def test_the_panel_settles_when_it_finishes_and_offers_the_new_cut(view):

@@ -1416,7 +1416,7 @@ class AssemblyWindow(object):
         frac = fn() if fn is not None else None
         changed = False
         try:
-            label = "Refining…" if running else \
+            label = "Cancel refining" if running else \
                 "Refine with {}".format(engines.get_active_model_size())
             if label != self.refine_key.lbl.cget("text"):
                 self.refine_key.set_text(label)
@@ -1446,7 +1446,10 @@ class AssemblyWindow(object):
             self._schedule_tx_render()
 
     def _refine_again(self):
-        fn = getattr(self.app, "_refine_again", None)
+        """The TRANSCRIPT panel's button: start a pass, or cancel the one running."""
+        running = getattr(self.app, "_refine_running", None)
+        fn = getattr(self.app, "_refine_cancel" if running and running()
+                     else "_refine_again", None)
         if fn is not None:
             fn()
 
