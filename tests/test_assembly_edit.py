@@ -972,10 +972,23 @@ def test_slash_is_the_big_nudge_and_angle_brackets_are_gone(view):
     gap = lambda: _res(app, 1).get("gap_after_s", 0.5)
     _key(app, win.cv, "slash")
     assert gap() == pytest.approx(1.0)
-    _key(app, win.cv, "question", state=0x0001)   # Shift+/
-    assert gap() == pytest.approx(0.5)
+    _key(app, win.cv, "question", state=0x0001)   # Shift+/ does nothing
+    assert gap() == pytest.approx(1.0)
     _key(app, win.cv, "greater", state=0x0001)
-    assert gap() == pytest.approx(0.5)
+    assert gap() == pytest.approx(1.0)
+
+
+def test_the_edit_panel_offers_one_big_nudge(view):
+    app, win = view
+
+    def labels(w):
+        out = [w.cget("text")] if isinstance(w, tk.Label) else []
+        for c in w.winfo_children():
+            out += labels(c)
+        return out
+    shown = labels(win.edit_flow)
+    assert "Big nudge later" in shown and "Big nudge earlier" not in shown
+    assert "Shift+/" not in shown
 
 
 def test_the_spotting_keys(view):

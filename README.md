@@ -286,7 +286,7 @@ Highlighting the text selects the audio. Drag across words, double-click a word,
 
 **Refine with `<model>`** in the TRANSCRIPT panel, beside its model picker, transcribes the cut's files again with the model chosen. While a pass runs, the button, a bar across the panel and the line under the track all show how far it has got.
 
-On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the whole cut. Dragged edges and track highlights snap to where speech starts and stops, as in the waveform editor, and the ticks on the track show where; hold Ctrl to place one freely. `,` and `.` nudge a region by the amount set in the Edit panel (100 ms to start with), and `/` and Shift+`/` by the next amount up. Ctrl+click or right-click deletes a mark on the ruler. Return to start on stop (Shift+N) and a 2 s pre-roll are on by default, and Follow playhead is off.
+On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the whole cut. Dragged edges and track highlights snap to where speech starts and stops, as in the waveform editor, and the ticks on the track show where; hold Ctrl to place one freely. `,` and `.` nudge a region by the amount set in the Edit panel (100 ms to start with), and `/` nudges later by the next amount up. Ctrl+click or right-click deletes a mark on the ruler. Return to start on stop (Shift+N) and a 2 s pre-roll are on by default, and Follow playhead is off.
 
 ### Step 5 — Export
 

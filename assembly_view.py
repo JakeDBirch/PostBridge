@@ -37,8 +37,8 @@ AAF:
     gap after the pull before it, or inside a pull, the silence at that
     join;
   * , and . nudge the selected region (or pull) earlier or later the same
-    way, by the nudge value chosen in the Edit panel; / and Shift+/ nudge it
-    later and earlier by the next value up, for pacing;
+    way, by the nudge value chosen in the Edit panel; / nudges it later by
+    the next value up, for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
   * double-click a pull with the grabber (or Enter) to open Step 4's
@@ -910,7 +910,6 @@ class AssemblyWindow(object):
         key(p, "Split", "B", self.split)
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
-        key(p, "Big nudge earlier", "Shift+/", lambda: self.nudge(-1, big=True))
         key(p, "Big nudge later", "/", lambda: self.nudge(1, big=True))
         amount = tk.Frame(p, bg=SURF)
         tk.Label(amount, text="Nudge by", font=(FB[0], 10), bg=SURF,
@@ -3767,8 +3766,6 @@ class AssemblyWindow(object):
             self.split()                     # Pro Tools: B, or Ctrl+E
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
-        elif k == "question" or (k == "slash" and shift):
-            self.nudge(-1, big=True)
         elif k == "slash":
             self.nudge(1, big=True)
         elif ctrl and k.lower() == "z":
