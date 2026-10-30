@@ -1567,6 +1567,8 @@ class AssemblyWindow(object):
     def _build_line(self, r, c, fade):
         script = (r.get("quote_text") or "").strip()
         if c is None:                    # in the script, not in the cut
+            if r.get("status") in ("not_run", "provisional"):
+                return _Line(script, [])  # the first pass hasn't got to it
             tok = _Tok(0, len(script), None, None, None, None, False, None)
             return _Line(script, [tok] if script else [], [(script, "txstruck")])
         words = self._raw_words(c, load=False)

@@ -115,6 +115,24 @@ def draft_model():
     return None if get_active_model_size() == DRAFT_MODEL else DRAFT_MODEL
 
 
+def words_model(words):
+    """The Whisper size that heard most of `words`, going by each word's
+    "_src"; None when they don't say.  What keeps a transcript's label true
+    when it is saved again on a machine with another model chosen."""
+    tally = {}
+    for w in words or ():
+        src = w.get("_src")
+        if src and src != "user":
+            tally[src] = tally.get(src, 0) + 1
+    return max(tally, key=tally.get) if tally else None
+
+
+def session_model(session):
+    """The Whisper size behind a Pull Quotes session's transcript.  Sessions
+    saved before they were labelled still say so word by word."""
+    return session.get("model") or words_model(session.get("transcript"))
+
+
 def is_cuda_available():
     """Return True if a CUDA-enabled PyTorch build is installed and the
     current machine actually has a usable GPU.  Used by the Pull Quotes
@@ -819,7 +837,7 @@ def cache_save(media_path, words, blobs=None, model=None):
     try:
         os.makedirs(os.path.dirname(cp), exist_ok=True)
         meta = _cache_key_meta(media_path)
-        meta["model"] = model or get_active_model_size()
+        meta["model"] = model or words_model(words) or get_active_model_size()
         meta["words"] = words
         if blobs is not None:
             meta["blobs"] = blobs
@@ -893,10 +911,12 @@ def pb_transcript_load(media_path):
 
 def pb_transcript_save(media_path, words, blobs=None, model=None):
     """Write a .pb_transcript.json alongside media_path.  `model` is the
-    Whisper size that made these words (the active one when not given)."""
+    Whisper size that made these words: when not given, what the words
+    themselves say, else the active one."""
     p = pb_transcript_path(media_path)
     mtime = _safe_getmtime(media_path)
-    data = {"version": 1, "model": model or get_active_model_size(),
+    data = {"version": 1,
+            "model": model or words_model(words) or get_active_model_size(),
             "mtime": mtime, "words": words}
     if blobs is not None:
         data["blobs"] = blobs

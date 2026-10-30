@@ -1,11 +1,14 @@
-"""The second transcription pass -- Script -> Session's answer to Pull Quotes'
+"""The two transcription passes -- Script -> Session's answer to Pull Quotes'
 draft and refine.
 
-Step 3 transcribes anything new with the tiny model, so the cut is there to
-work on in a moment.  From then on this runs behind the screen: one file at a
-time with the model the user chose, its words streamed over the draft's as
-they are decoded (PqWorkflowMixin._pq_merge_streams, with the same throttle),
-so the Assembly's transcript firms up from the top down while you work in it.
+Step 3 transcribes anything new with the tiny model, one file at a time in the
+order the script comes to them (DraftLine), and each line lands as the pass
+gets past it (_draft_listen), so the top of the script is there to work on
+while the rest is still to come.  Then the second pass runs behind the screen:
+the same order, with the model the user chose, its words streamed over the
+draft's as they are decoded (PqWorkflowMixin._pq_merge_streams, with the same
+throttle), so the Assembly's transcript firms up from the top down while you
+work in it.
 
 When a file is done its transcript is saved, labelled with the model that made
 it, and everything that stands on it is matched again:
@@ -38,9 +41,74 @@ from utils import secs_tc, is_video
 TICK_S = 1.2            # between redraws as words stream in, as Pull Quotes
 DONE_NOTE_MS = 10000    # how long Step 4 says the pass has finished
 RETRY_MS = 500          # a merge held back while the Assembly is in use waits this
+LAND_EVERY_S = 3.0      # how often a first pass looks for lines it has got past
+LAND_MARGIN_S = 5.0     # how far past a line, so it isn't taken mid-sentence
+LAND_AHEAD = 3          # VO lines looked for at a time past the last one found
 
 # What the user set on a pull that a new match must not take with it.
 _KEEP_KEYS = ("markers", "gap_after", "gap_after_s")
+
+
+class DraftLine(object):
+    """Step 3's Whisper work, taking turns in script order.
+
+    Every file's work has a key that sorts by where the script first needs it.
+    Work that needs Whisper waits here until its key is among the first
+    `width` not yet done; work that doesn't (a saved transcript) just says
+    done, and holds nobody up."""
+
+    def __init__(self, keys, width=1):
+        self.waiting = set(keys)
+        self.width = max(1, width)
+        self.cond = threading.Condition()
+
+    def wait(self, key, cancel, tick=None):
+        with self.cond:
+            while (key in self.waiting and not cancel.is_set()
+                   and key not in sorted(self.waiting)[:self.width]):
+                self.cond.wait(0.25)
+                if tick is not None:
+                    tick()
+
+    def done(self, key):
+        with self.cond:
+            self.waiting.discard(key)
+            self.cond.notify_all()
+
+
+def lines_past(blocks, takes, path, frontier, landed):
+    """VO lines a first pass has got far enough past to trust: fresh matches
+    for `blocks` against the takes so far, where `path` is the one still coming
+    in, heard as far as `frontier`.  Only the next few are looked for, so the
+    cost stays with where the read has got to."""
+    blocks = sorted(blocks, key=lambda b: b["order"])
+    found = [i for i, b in enumerate(blocks) if b["order"] in landed]
+    upto = (found[-1] + 1 if found else 0) + LAND_AHEAD
+    out = []
+    for r in engines.reconcile_vo_part(blocks[:upto], takes):
+        segs = r.get("segments") or []
+        if r["order"] in landed or r.get("status") != "ok" or not segs:
+            continue
+        if r.get("source_audio") == path and segs[-1][1] + LAND_MARGIN_S > frontier:
+            continue
+        out.append(r)
+    return out
+
+
+def pulls_past(pulls, data, frontier, landed):
+    """Interview pulls a first pass has got past.  `data` is its transcript so
+    far, in reconcile_pull_from_session's shape.  One the script has no sound
+    timecodes for has to wait: it can only be searched for in the whole
+    transcript."""
+    out = []
+    for pull in pulls:
+        a, b = pull.get("in_seconds", 0.0), pull.get("out_seconds", 0.0)
+        if pull["order"] in landed or b <= a or b + LAND_MARGIN_S > frontier:
+            continue
+        r = engines.reconcile_pull_from_session(pull, data)
+        if r.get("status") in ("ok", "low_confidence", "snapped"):
+            out.append(r)
+    return out
 
 
 class _Live(object):
@@ -92,6 +160,7 @@ class _State(object):
         self.jobs = []
         self.current = None
         self.live = {}            # path -> _Live
+        self.draft = None         # the file Step 3's first pass is on
         self.done = {}            # path -> the model it was last refined with
         self.last_tick = 0.0
         self.tick_pending = False
@@ -155,6 +224,12 @@ class RefineMixin(object):
         """A few words for the line under the track; empty when not running."""
         frac = self._refine_progress()
         if frac is None:
+            st = self._rf()
+            with st.lock:
+                live = st.live.get(st.draft)
+            if live is not None and live.total > 0:
+                return "First pass with {}  {:.0f}%".format(
+                    live.model, min(100.0, live.frontier * 100.0 / live.total))
             return ""
         return "Refining with {}  {:.0f}%".format(
             engines.get_active_model_size(), frac * 100.0)
@@ -165,7 +240,13 @@ class RefineMixin(object):
         with st.lock:
             job, more = st.current, len(st.jobs)
             live = st.live.get(job["path"]) if job else None
+            draft = st.live.get(st.draft) if st.draft else None
         if job is None:
+            if draft is not None and draft.total > 0:
+                return "First pass with {}: {:.0f}%  ({} of {})   ·   {}".format(
+                    draft.model, min(100.0, draft.frontier * 100.0 / draft.total),
+                    secs_tc(draft.frontier).split(".")[0],
+                    secs_tc(draft.total).split(".")[0], os.path.basename(st.draft))
             if st.held is not None:
                 return ("Refined.  You have worked on this cut, so it stays "
                         "as it is until you update it.")
@@ -189,6 +270,67 @@ class RefineMixin(object):
 
     def _refine_vo_bins(self):
         return getattr(self, "vo_bins", None) or self._rf().bins
+
+    # ── The first pass ───────────────────────────────────────────────────
+    def _draft_listen(self, path, model, land=None):
+        """Worker: Step 3 starts transcribing `path`.  Returns what to hand each
+        decoded segment's words: they show in the Assembly as the second
+        pass's do, and every so often `land(words, frontier)` gets to pick out
+        the lines they have got past."""
+        st = self._rf()
+        try:
+            total = float(engines.get_media_duration(path) or 0.0)
+        except Exception:
+            total = 0.0
+        live = _Live([], model, total)
+        with st.lock:
+            st.live[path] = live
+            st.draft = path
+        last = [time.perf_counter()]
+
+        def _heard(new):
+            with st.lock:
+                live.add(new)
+                heard, frontier = list(live.heard), live.frontier
+            self._refine_tick(path)
+            now = time.perf_counter()
+            if land is not None and now - last[0] >= LAND_EVERY_S:
+                last[0] = now
+                land(heard, frontier)
+                self._refine_show()
+        return _heard
+
+    def _draft_finish(self, path):
+        """Worker: that file's first pass is over; what's saved speaks for it."""
+        st = self._rf()
+        with st.lock:
+            st.live.pop(path, None)
+            if st.draft == path:
+                st.draft = None
+        self._refine_show(path)
+
+    def _draft_land(self, batch, path=None, more_to_come=True):
+        """Worker: lines reached by the first pass, for Step 4, which they open
+        if they are the first real matches and there's a wait for the rest."""
+        if batch and getattr(self, "_bg_reconcile_active", False):
+            review = more_to_come and any(r.get("segments") for r in batch)
+
+            def _go(b=list(batch)):
+                self._refine_apply(b, path, refined=False)
+                if review:
+                    self._draft_to_review()
+            self._ui(_go)
+
+    def _draft_to_review(self):
+        """Main thread: the first of the script is in, so over to Step 4 -- if
+        Step 3 is still what is showing."""
+        log = getattr(self, "_log", None)
+        try:
+            if (log is not None and log.winfo_exists()
+                    and getattr(self, "_bg_reconcile_active", False)):
+                self._step4()
+        except tk.TclError:
+            pass
 
     # ── Starting and stopping ────────────────────────────────────────────
     def _refine_resume(self):
@@ -221,15 +363,16 @@ class RefineMixin(object):
                 st.bins = {pi: _Takes(d) for pi, d in self._pool.get_vo_assets().items()}
             except Exception:
                 pass
-        paths, windows = self._refine_sources(rows)
+        paths, windows, first = self._refine_sources(rows)
         threading.Thread(target=self._refine_scan, daemon=True,
-                         args=(paths, windows, force, script)).start()
+                         args=(paths, windows, first, force, script)).start()
 
     def _refine_sources(self, rows):
-        """Every file the cut's rows stand on, first needed first, and the
-        rows matched from their own windows -- those have no file transcript
-        to refine, only pulls to run again: {(token, file): [(model, pull)]}."""
-        paths, windows = [], {}
+        """Every file the cut's rows stand on, first needed first; the rows
+        matched from their own windows -- those have no file transcript to
+        refine, only pulls to run again: {(token, file): [(model, pull)]}; and
+        where the script first comes to each file."""
+        paths, windows, first = [], {}, {}
         pulls = {p.get("order"): p for p in (getattr(self, "pulls", None) or [])}
         vo_paths = {}
         for pi, vb in self._refine_vo_bins().items():
@@ -245,22 +388,27 @@ class RefineMixin(object):
                 found = vo_paths.get(pi) or []
                 if monolog_row:
                     found = [p for v in vo_paths.values() for p in v]
+                if r.get("_s4_reassigned") and not is_video(r.get("source_audio") or ""):
+                    found = [r.get("source_audio")]
                 for p in found or [r.get("source_audio")]:
                     if p and p not in paths:
                         paths.append(p)
+                        first.setdefault(p, r.get("order", 0))
                 continue
             src = r.get("source_audio")
             if not src or is_video(src):
                 continue
+            first.setdefault(src, r.get("order", 0))
             if r.get("_tx_model") and r.get("order") in pulls:
                 windows.setdefault((r.get("token"), src), []).append(
                     (r["_tx_model"], pulls[r["order"]]))
             elif src not in paths:
                 paths.append(src)
-        return paths, windows
+        return paths, windows, first
 
-    def _refine_scan(self, paths, windows, force, script):
-        """Worker: which of them want a pass."""
+    def _refine_scan(self, paths, windows, first, force, script):
+        """Worker: which of them want a pass, in the order the script needs
+        them."""
         target = engines.get_active_model_size()
         draft = engines.DRAFT_MODEL
 
@@ -273,6 +421,7 @@ class RefineMixin(object):
             if todo:
                 jobs.append({"kind": "pulls", "path": src, "token": token,
                              "pulls": todo, "draft": not force})
+        jobs.sort(key=lambda j: first.get(j["path"], 0))
         self._ui(lambda: self._refine_enqueue(jobs, force, target, script))
 
     def _refine_enqueue(self, jobs, force, target, script):
@@ -545,6 +694,10 @@ class RefineMixin(object):
                       if b.get("part_index") == pi]
             batch.extend(engines.reconcile_vo_part(blocks, takes))
         rows = list(getattr(self, "results", None) or [])
+        moved = [r for r in rows if r.get("is_vo") and r.get("_s4_reassigned")
+                 and r.get("source_audio") == path and not r.get("_s4_accepted")]
+        if moved and not cancel.is_set():
+            self._ui(lambda: self._refine_reassigned(moved, path))
         tokens = {r.get("token") for r in rows
                   if not r.get("is_vo") and r.get("source_audio") == path}
         if tokens:
@@ -558,21 +711,41 @@ class RefineMixin(object):
         if batch and not cancel.is_set():
             self._ui(lambda: self._refine_apply(batch, path, takes_by_part))
 
-    def _refine_apply(self, batch, path=None, takes_by_part=None):
-        """Main thread: fold new matches into the rows.  A new match can
-        change where everything after it falls, so it waits while the
-        Assembly is being played or dragged in; only the words move then."""
+    def _refine_reassigned(self, rows, path):
+        """Main thread: VO lines moved to `path` by hand take its better words.
+        A second pass's merge leaves them alone, since it matches against the
+        files the script's parts were given."""
         a = getattr(self, "_assembly", None)
         if a is not None and a.busy():
-            self.after(RETRY_MS, lambda: self._refine_apply(batch, path, takes_by_part))
+            self.after(RETRY_MS, lambda: self._refine_reassigned(rows, path))
+            return
+        words, blobs = self._refine_words(path), engines.cache_load_blobs(path)
+        for r in rows:
+            if words and not r.get("_s4_accepted"):
+                self._s4_reconcile_vo_row(r, path, words, blobs)
+        self._s4_save()
+        if a is not None:
+            a.refresh()
+
+    def _refine_apply(self, batch, path=None, takes_by_part=None, refined=True):
+        """Main thread: fold new matches into the rows.  A new match can
+        change where everything after it falls, so it waits while the
+        Assembly is being played or dragged in; only the words move then.
+        `refined` is False for a first pass's, which take a row's first match
+        through the usual door."""
+        a = getattr(self, "_assembly", None)
+        if a is not None and a.busy():
+            self.after(RETRY_MS, lambda: self._refine_apply(batch, path, takes_by_part,
+                                                            refined))
             return
         if takes_by_part:
             self.__dict__.setdefault("_vo_takes_by_part", {}).update(takes_by_part)
         place = a.capture_place() if a is not None else None
         known = {r.get("order") for r in getattr(self, "results", None) or []}
         batch = [fresh for fresh in batch if fresh.get("order") in known]
-        for fresh in batch:
-            fresh["_refined"] = True
+        if refined:
+            for fresh in batch:
+                fresh["_refined"] = True
         self._bg_apply_batch(batch)
         st = self._rf()
         if st.rebase:

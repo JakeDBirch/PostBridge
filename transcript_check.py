@@ -79,6 +79,7 @@ def pq_session_status(session_path, quick=False):
         return False, 0, "unreadable ({})".format(e)
 
     nw    = len(data.get("transcript") or [])
+    model = engines.session_model(data) or "?"
     sigs  = data.get("audio_signatures") or {}
     media = [m for m in (data.get("media") or []) if m]
     if data.get("audio_cache"):
@@ -109,9 +110,9 @@ def pq_session_status(session_path, quick=False):
     if bad:
         return False, nw, "signature mismatch - {}".format(" | ".join(bad))
     if missing:
-        return True, nw, "{} words (unresolved media: {})".format(
-            nw, ", ".join(missing))
-    return True, nw, "{} words".format(nw)
+        return True, nw, "{} words (model {}, unresolved media: {})".format(
+            nw, model, ", ".join(missing))
+    return True, nw, "{} words (model {})".format(nw, model)
 
 
 def token_forecast(n_pulls, audio_paths, has_pq, covered, full_threshold,

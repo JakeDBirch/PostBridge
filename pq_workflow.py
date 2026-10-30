@@ -188,7 +188,8 @@ class PqWorkflowMixin:
             for media_path in session.get("media", []):
                 try:
                     if os.path.isfile(media_path):
-                        engines.pb_transcript_save(media_path, words)
+                        engines.pb_transcript_save(
+                            media_path, words, model=engines.session_model(session))
                 except Exception:
                     pass
 
@@ -207,6 +208,10 @@ class PqWorkflowMixin:
             "media":       list(session.get("media", [])),
             "transcript":  list(session.get("transcript") or []),
         }
+        # The Whisper size that made the words, for whoever opens this next.
+        model = engines.session_model(session)
+        if model:
+            payload["model"] = model
         # Path to the playback cache (mix-of-all-sources WAV) is persisted
         # only when it actually exists on disk.
         ac = session.get("audio_cache")
@@ -609,7 +614,8 @@ class PqWorkflowMixin:
             return "no media", WARN
         if n_words == 0:
             return "needs transcription", WARN
-        return "✓ transcribed", SUCCESS
+        model = engines.session_model(session)
+        return "✓ transcribed{}".format(" · " + model if model else ""), SUCCESS
 
     def _pq_render_session_row(self, parent, session):
         """Render one row in the project's session list, storing widget
@@ -3679,8 +3685,9 @@ class PqWorkflowMixin:
         h = int(dur_s // 3600)
         m = int((dur_s % 3600) // 60)
         s = int(dur_s % 60)
-        lbl.config(text="{:,} words · {:02d}:{:02d}:{:02d}".format(
-                       n_words, h, m, s), fg=SUB)
+        model = engines.session_model(session)
+        lbl.config(text="{:,} words · {:02d}:{:02d}:{:02d}{}".format(
+                       n_words, h, m, s, " · " + model if model else ""), fg=SUB)
 
     def _pq_remove_session(self, session):
         in_episode = self._pq_project.get("episode_file")
@@ -4307,6 +4314,8 @@ class PqWorkflowMixin:
                     words, _ = engines.pb_transcript_load(src)
                     if words:
                         session["transcript"] = list(words)
+                        session["model"] = (engines.transcript_model(src)
+                                            or engines.words_model(words))
                         self._pq_save_session_file(session)
                         if (getattr(self, "_pq_current_session", None)
                                 is session):
@@ -4518,43 +4527,40 @@ class PqWorkflowMixin:
 
                     def _do_stream_render(s=session):
                         streaming_render_pending[0] = False
-                        # Only render if this session is still on screen
-                        # AND no full transcript has overwritten the
-                        # streaming buffer (which would happen at the
-                        # very end of the pass when the worker assigns
-                        # the final word list).
+                        # Three-way merge: tiny draft + configured
+                        # main + user edits already in the session.
+                        # User edits always survive; main wins over
+                        # tiny for any region the main pass has
+                        # reached; tiny shows ahead of the main
+                        # frontier so the user sees a moving
+                        # boundary instead of nothing.  Off screen too:
+                        # a session opened part way shows what has been
+                        # heard so far.
+                        current = s.get("transcript") or []
+                        cur_user = sum(1 for w in current
+                                       if w.get("_src") == "user")
+                        cur_nonuser = sum(1 for w in current
+                                          if (w.get("_src") != "user"
+                                              and not w.get("break")))
+                        tiny_snap = list(streaming_words)
+                        main_snap = list(streaming_main_words)
+                        merged = PqWorkflowMixin._pq_merge_streams(
+                            tiny_snap, main_snap, current)
+                        streaming_tick[0] += 1
+                        _pq_stream_log("render",
+                            tick=streaming_tick[0],
+                            tiny_buf=len(tiny_snap),
+                            main_buf=len(main_snap),
+                            cur_total=len(current),
+                            cur_user=cur_user,
+                            cur_nonuser=cur_nonuser,
+                            merged=len(merged),
+                            merged_user=sum(
+                                1 for w in merged
+                                if w.get("_src") == "user"))
+                        s["transcript"] = merged
                         if getattr(self, "_pq_current_session",
                                    None) is s:
-                            # Three-way merge: tiny draft + configured
-                            # main + user edits already in the session.
-                            # User edits always survive; main wins over
-                            # tiny for any region the main pass has
-                            # reached; tiny shows ahead of the main
-                            # frontier so the user sees a moving
-                            # boundary instead of nothing.
-                            current = s.get("transcript") or []
-                            cur_user = sum(1 for w in current
-                                           if w.get("_src") == "user")
-                            cur_nonuser = sum(1 for w in current
-                                              if (w.get("_src") != "user"
-                                                  and not w.get("break")))
-                            tiny_snap = list(streaming_words)
-                            main_snap = list(streaming_main_words)
-                            merged = PqWorkflowMixin._pq_merge_streams(
-                                tiny_snap, main_snap, current)
-                            streaming_tick[0] += 1
-                            _pq_stream_log("render",
-                                tick=streaming_tick[0],
-                                tiny_buf=len(tiny_snap),
-                                main_buf=len(main_snap),
-                                cur_total=len(current),
-                                cur_user=cur_user,
-                                cur_nonuser=cur_nonuser,
-                                merged=len(merged),
-                                merged_user=sum(
-                                    1 for w in merged
-                                    if w.get("_src") == "user"))
-                            s["transcript"] = merged
                             # Streaming frontier — the further-along of
                             # {main, tiny}.  Hides preserved user
                             # edits past this point at render time so
@@ -4624,15 +4630,12 @@ class PqWorkflowMixin:
                         streaming_main_words.extend(seg_words)
                         _schedule_stream_render()
 
-                    # ── Decide whether (and how) to run a tiny draft pass
-                    # When the user is actively viewing this session and
-                    # their configured model isn't already 'tiny', do a
-                    # fast tiny pass first so they see SOMETHING within
-                    # ~30 s instead of waiting minutes for the full
-                    # configured model.  Audio extraction takes a few
-                    # seconds so the "is the user viewing?" check
-                    # naturally functions as a dwell filter — drive-by
-                    # transcribe-then-leave doesn't pay the tiny cost.
+                    # ── Decide how to run the tiny draft pass
+                    # Unless the configured model is 'tiny' already, a
+                    # fast tiny pass comes first so there is SOMETHING
+                    # within ~30 s instead of waiting minutes for the
+                    # full configured model, on screen or not: the
+                    # session may be opened at any moment.
                     #
                     # On GPU we run tiny IN PARALLEL with the configured
                     # model (two CTranslate2 instances, separate threads).
@@ -4642,19 +4645,16 @@ class PqWorkflowMixin:
                     # contending for the same cores would slow each
                     # other down and the gain disappears.
                     configured_size = engines.get_active_model_size()
-                    is_viewing_now = (getattr(self, "_pq_current_session",
-                                               None) is session)
                     # Progressive (tiny draft → configured refine) runs
-                    # any time the user is viewing AND the configured
-                    # model is bigger than tiny.  We used to skip it
+                    # any time the configured model is bigger than
+                    # tiny.  We used to skip it
                     # when an existing transcript was present so a
                     # re-transcribe wouldn't downgrade quality before
                     # the configured pass caught up — but Jordan
                     # explicitly wanted a draft ASAP on re-transcribe
                     # too, and the merge keeps the prior content as
                     # backdrop / user edits as sacred regardless.
-                    do_progressive = (is_viewing_now
-                                       and configured_size != "tiny")
+                    do_progressive = configured_size != "tiny"
                     parallel_ok = engines.is_cuda_available()
 
                     # Per-pass thread storage when running parallel.
@@ -4683,9 +4683,7 @@ class PqWorkflowMixin:
                                     model_size="tiny",
                                     segment_cb=_stream_seg_cb_tiny)
                             tiny_words_box[0] = tw
-                            if tw and getattr(
-                                    self, "_pq_current_session", None
-                                    ) is session:
+                            if tw:
                                 # Final render with the complete tiny
                                 # output (streaming may have rendered a
                                 # slightly stale view at last throttle).
@@ -4877,6 +4875,7 @@ class PqWorkflowMixin:
                     words = PqWorkflowMixin._pq_merge_refine(_latest, words)
 
                 session["transcript"] = list(words or [])
+                session["model"] = configured_size
                 session.pop("_streaming", None)
                 self._pq_save_session_file(session)
 

@@ -129,6 +129,372 @@ def test_a_draft_pull_is_labelled_and_not_cached(whisper, tmp_path, monkeypatch)
     assert saved
 
 
+def test_a_transcript_keeps_its_label_on_a_machine_with_another_model(tmp_path, monkeypatch):
+    """Jordan's words, saved again here with something else chosen."""
+    wav = tmp_path / "read.wav"
+    wav.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setattr(engines, "_active_model_override", "large-v3")
+    words = [_word("we", 0.0, 0.1, "small"), _word("rode", 0.2, 0.3, "small"),
+             _word("West", 0.4, 0.5, "user")]
+    engines.pb_transcript_save(str(wav), words)
+    assert engines.transcript_model(str(wav)) == "small"
+    os.remove(engines.pb_transcript_path(str(wav)))
+    engines.cache_save(str(wav), words)
+    assert engines.transcript_model(str(wav)) == "small"
+
+
+def test_a_session_says_which_model_made_it(tmp_path, monkeypatch):
+    from pq_workflow import PqWorkflowMixin
+    monkeypatch.setattr(engines, "_active_model_override", "large-v3")
+    wav = tmp_path / "read.wav"
+    wav.write_bytes(b"\x00" * 64)
+    # Saved before sessions were labelled: the words still say.
+    old = {"media": [str(wav)], "transcript": [_word("we", 0.0, 0.1, "base")]}
+    assert engines.session_model(old) == "base"
+    assert PqWorkflowMixin._pq_session_payload(None, old)["model"] == "base"
+    PqWorkflowMixin._pq_mirror_transcript(old)
+    assert engines.transcript_model(str(wav)) == "base"
+    # What the run said beats what the words say.
+    old["model"] = "small"
+    assert PqWorkflowMixin._pq_session_payload(None, old)["model"] == "small"
+    assert "model" not in PqWorkflowMixin._pq_session_payload(None, {"media": []})
+
+
+def test_the_check_reports_a_sessions_model(tmp_path):
+    import transcript_check
+    p = tmp_path / "G.pb_session.json"
+    p.write_text(json.dumps({"workflow": "interview_session", "model": "base",
+                             "transcript": [_word("we", 0.0, 0.1, "base")]}))
+    assert transcript_check.pq_session_status(str(p), quick=True) == (
+        True, 1, "1 words (model base)")
+
+
+def test_pull_quotes_drafts_off_screen_and_labels_what_it_saves(tmp_path, monkeypatch):
+    tk = pytest.importorskip("tkinter")
+    import main
+    try:
+        app = main.App()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        app.withdraw()
+        app._preflight_memory_check = lambda: True
+        monkeypatch.setattr(engines, "_active_model_override", "medium")
+        monkeypatch.setattr(engines, "get_model", lambda size=None: None)
+        monkeypatch.setattr(engines, "_is_model_cached", lambda s: True)
+        monkeypatch.setattr(engines, "is_cuda_available", lambda: False)
+        monkeypatch.setattr(engines, "get_media_duration", lambda p: 10.0)
+        monkeypatch.setattr(engines, "extract_window", lambda *a, **k: (True, ""))
+        seen_draft = threading.Event()
+        sizes = []
+
+        def _verbatim(path, progress_cb=None, cancel_event=None, model_size=None,
+                      segment_cb=None):
+            sizes.append(model_size)
+            size = model_size or "medium"
+            words = [_word("we", 1.0, 1.2, size),
+                     _word("rode" if model_size else "walked", 1.3, 1.6, size)]
+            segment_cb(words)
+            if model_size is None:
+                assert seen_draft.wait(5)
+            return words
+        monkeypatch.setattr(engines, "transcribe_clip_verbatim", _verbatim)
+
+        wav = tmp_path / "guest.wav"
+        wav.write_bytes(b"\x00" * 64)
+        path = tmp_path / "GUEST.pb_session.json"
+        session = {"token": "GUEST", "media": [str(wav)], "transcript": [],
+                   "_file_path": str(path)}
+        app._pq_current_session = None        # not on screen at any point
+        app._pq_run_transcription(session)
+        end = time.time() + 8
+        while session["_progress"]["active"] and time.time() < end:
+            app.update()
+            time.sleep(0.01)
+            if any(w["word"] == "rode" for w in session.get("transcript") or []):
+                seen_draft.set()
+        assert not session["_progress"]["active"]
+        assert sizes == ["tiny", None]        # tiny first, then the chosen one
+        assert seen_draft.is_set()            # and its words were there meanwhile
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["model"] == "medium"
+        assert [w["word"] for w in saved["transcript"]] == ["we", "walked"]
+        assert engines.transcript_model(str(wav)) == "medium"
+        assert app._pq_status_for(session)[0] == "✓ transcribed · medium"
+    finally:
+        app.destroy()
+
+
+# ── First pass: script order ─────────────────────────────────────────────
+def test_the_draft_line_goes_in_script_order():
+    from refine import DraftLine
+    keys = [(3, "vo", 1), (9, "token", "G"), (20, "vo", 2)]
+    line = DraftLine(keys)
+    ran = []
+    stop = threading.Event()
+
+    def _work(key):
+        line.wait(key, stop)
+        ran.append(key[0])
+        line.done(key)
+    threads = [threading.Thread(target=_work, args=(k,), daemon=True)
+               for k in reversed(keys)]
+    for t in threads:
+        t.start()
+        time.sleep(0.05)
+    for t in threads:
+        t.join(3)
+    assert ran == [3, 9, 20]
+
+
+def test_saved_work_holds_nobody_up_and_cancel_lets_everyone_go():
+    from refine import DraftLine
+    stop = threading.Event()
+    line = DraftLine([1, 2, 3])
+    line.done(1)                     # the first file had a transcript
+    line.wait(2, stop)               # so this needn't wait
+    ticks = []
+    t = threading.Thread(target=line.wait, args=(3, stop, lambda: ticks.append(1)),
+                         daemon=True)
+    t.start()
+    t.join(0.6)
+    assert t.is_alive() and ticks    # waiting ticks, for the stall watchdog
+    stop.set()
+    t.join(2)
+    assert not t.is_alive()
+
+
+def test_a_wider_line_still_starts_first_things_first():
+    from refine import DraftLine
+    stop = threading.Event()
+    line = DraftLine([1, 2, 3], width=2)
+    line.wait(2, stop)
+    t = threading.Thread(target=line.wait, args=(3, stop), daemon=True)
+    t.start()
+    t.join(0.4)
+    assert t.is_alive()
+    line.done(1)
+    t.join(2)
+    assert not t.is_alive()
+
+
+# ── First pass: lines land as it gets past them ──────────────────────────
+def test_a_line_not_reached_yet_is_not_struck_as_never_said():
+    from assembly_view import AssemblyWindow
+    pending = AssemblyWindow._build_line(None, {"quote_text": "We rode.", "status": "not_run"},
+                                         None, False)
+    assert not pending.tokens
+    missing = AssemblyWindow._build_line(None, {"quote_text": "We rode.", "status": "no_match"},
+                                         None, False)
+    assert missing.tokens
+
+
+def _vo(order, text):
+    return {"order": order, "id": "V{}".format(order), "part_index": 1, "text": text,
+            "gap_after": True}
+
+
+def _spoken(text, start, src="tiny"):
+    out, t = [], start
+    for w in text.split():
+        out.append({"word": w.lower(), "text": " " + w, "start": t, "end": t + 0.3,
+                    "_src": src})
+        t += 0.4
+    return out
+
+
+_INTRO = "in the spring of that year the riders came down from the northern hills"
+_NEXT = "nobody in the valley had seen so many horses since before the long war"
+_LAST = "by the end of summer every one of those men was dead or gone for good"
+
+
+def test_a_vo_line_lands_once_the_pass_is_past_it():
+    from refine import lines_past
+    blocks = [_vo(1, _INTRO), _vo(2, _NEXT), _vo(3, _LAST)]
+    heard = _spoken(_INTRO, 0.0)
+    end = heard[-1]["end"]
+    # Only just heard: it could still be going on.
+    assert lines_past(blocks, [(heard, 0.0, None, "a.wav", None)], "a.wav", end, set()) == []
+    heard = heard + _spoken(_NEXT, end + 1.0)
+    front = heard[-1]["end"]
+    got = lines_past(blocks, [(heard, 0.0, None, "a.wav", None)], "a.wav", front, set())
+    assert [r["order"] for r in got] == [1]
+    assert got[0]["segments"][0][0] == pytest.approx(0.0, abs=0.3)
+    # Nothing lands twice, and the next comes when its time comes.
+    heard = heard + _spoken(_LAST, front + 1.0)
+    front = heard[-1]["end"]
+    got = lines_past(blocks, [(heard, 0.0, None, "a.wav", None)], "a.wav", front, {1})
+    assert [r["order"] for r in got] == [2]
+
+
+def test_only_the_next_few_vo_lines_are_looked_for(monkeypatch):
+    from refine import lines_past, LAND_AHEAD
+    asked = []
+
+    def _rec(blocks, takes):
+        asked.append([b["order"] for b in blocks])
+        return []
+    monkeypatch.setattr(engines, "reconcile_vo_part", _rec)
+    blocks = [_vo(n, "line") for n in range(1, 21)]
+    lines_past(blocks, [], "a.wav", 0.0, {1, 2})
+    assert asked[0] == list(range(1, 3 + LAND_AHEAD))
+
+
+def test_a_line_found_in_a_finished_take_needs_no_margin():
+    from refine import lines_past
+    done = _spoken(_INTRO, 0.0)
+    got = lines_past([_vo(1, _INTRO)],
+                     [(done, 0.0, None, "take1.wav", None),
+                      (_spoken("something else", 0.0), 0.0, None, "take2.wav", None)],
+                     "take2.wav", 1.0, set())
+    assert [r["source_audio"] for r in got] == ["take1.wav"]
+
+
+def test_an_interview_pull_lands_once_the_pass_is_past_it():
+    from refine import pulls_past
+    words = _spoken(_INTRO + " " + _NEXT, 10.0)
+    end = words[-1]["end"]
+    data = {"transcript": words, "audio_cache": "", "media": [], "id": "G"}
+    p1 = _pull(1, 10.0, 15.0, _INTRO)
+    p2 = _pull(2, end - 2.0, end, "before the long war")
+    bad = _pull(3, 20.0, 20.0, _NEXT)         # no sound timecodes
+    got = pulls_past([p1, p2, bad], data, end, set())
+    assert [r["order"] for r in got] == [1]
+    assert pulls_past([p1, p2, bad], data, end, {1}) == []
+    assert [r["order"] for r in pulls_past([p1, p2, bad], data, end + 6.0, {1})] == [2]
+
+
+def test_the_first_pass_streams_and_then_leaves_it_to_what_is_saved(media):
+    app = _make_app()
+    view = app._assembly = _View()
+    landed = []
+    heard = app._draft_listen(media, "tiny", lambda w, f: landed.append((len(w), f)))
+    assert app._refine_words(media) == []
+    heard([_word("we", 1.0, 1.2, "tiny")])
+    assert [w["word"] for w in app._refine_words(media)] == ["we"]
+    assert "First pass with tiny: 12%" in app._refine_status()
+    assert "First pass with tiny  12%" in app._refine_short()
+    assert not landed                    # not time to look yet
+    app._draft_finish(media)
+    _pump(app, lambda: media in view.changed)
+    assert app._refine_words(media) is None
+    assert media in view.changed
+    assert app._refine_status() == ""
+
+
+def test_the_first_pass_looks_for_lines_every_so_often(media, monkeypatch):
+    import refine
+    monkeypatch.setattr(refine, "LAND_EVERY_S", 0.0)
+    app = _make_app()
+    landed = []
+    heard = app._draft_listen(media, "tiny", lambda w, f: landed.append((len(w), f)))
+    heard([_word("we", 1.0, 1.2, "tiny")])
+    heard([_word("rode", 2.0, 2.4, "tiny")])
+    assert landed == [(1, 1.2), (2, 2.4)]
+
+
+def test_a_landed_line_is_a_rows_first_match_then_the_whole_transcript_has_its_say(media):
+    app = _make_app()
+    app._bg_reconcile_active = True
+    app._draft_to_review = lambda: None
+    row = dict(_row(1, 0.0, 0.0, media), status="not_run", segments=[])
+    app.results = [row]
+    early = dict(_row(1, 1.0, 2.0, media), confidence=0.9)
+    app._draft_land([early], media)
+    _pump(app, lambda: row.get("_bg_matched"))
+    assert row["segments"] == [(1.0, 2.0)] and row["_bg_matched"]
+    # The file's finished: the same row, a better idea.
+    late = dict(_row(1, 1.0, 2.5, media), confidence=0.95, _refined=True)
+    app._draft_land([late], media, more_to_come=False)
+    _pump(app, lambda: row["segments"] == [(1.0, 2.5)])
+    assert row["segments"] == [(1.0, 2.5)]
+    assert "_refined" not in row
+    # And the end of the run's own copy doesn't undo anything.
+    app._bg_apply_batch([dict(_row(1, 7.0, 8.0, media))])
+    assert row["segments"] == [(1.0, 2.5)]
+
+
+def test_a_landed_line_never_overrides_your_edit(media):
+    app = _make_app()
+    app._bg_reconcile_active = True
+    app._draft_to_review = lambda: None
+    row = dict(_row(1, 1.0, 2.0, media), status="not_run", _bg_matched=True,
+               _s4_accepted=True)
+    app.results = [row]
+    app._draft_land([dict(_row(1, 5.0, 6.0, media), _refined=True)], media)
+    _pump(app, lambda: not app.q.qsize())
+    assert row["segments"] == [(1.0, 2.0)]
+
+
+def test_step_3_goes_to_step_4_only_for_a_real_match_with_more_to_come(media):
+    app = _make_app()
+    app._bg_reconcile_active = True
+    went = []
+    app._draft_to_review = lambda: went.append(1)
+    app.results = [dict(_row(1, 0, 0, media), status="not_run", segments=[])]
+    app._draft_land([dict(_row(1, 0, 0, media), status="no_file", segments=[])])
+    _pump(app, lambda: not app.q.qsize())
+    assert not went
+    app._draft_land([_row(1, 1.0, 2.0, media)], more_to_come=False)
+    _pump(app, lambda: not app.q.qsize())
+    assert not went
+    app._draft_land([_row(1, 1.0, 2.0, media)])
+    _pump(app, lambda: bool(went))
+    assert went
+    # A monolog has no rows till it's all in.
+    went.clear()
+    app._bg_reconcile_active = False
+    app._draft_land([_row(1, 1.0, 2.0, media)])
+    _pump(app, lambda: not app.q.qsize())
+    assert not went
+
+
+def test_the_second_pass_goes_in_script_order_windows_included(media, tmp_path, monkeypatch):
+    other = tmp_path / "other.wav"
+    other.write_bytes(b"\x00" * 64)
+    engines.pb_transcript_save(str(other), _draft_words(), model="tiny")
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    app.pulls = [_pull(1, 1.0, 2.0, "x")]
+    app.results = [_row(1, 1.0, 2.0, str(other), _tx_model="tiny"),
+                   _row(2, 1.0, 2.5, media),
+                   _row(3, 1.0, 2.0, str(other))]
+    paths, windows, first = app._refine_sources(app.results)
+    assert first[str(other)] == 1 and first[media] == 2
+    jobs = []
+    app._refine_enqueue = lambda j, *a: jobs.extend(j)
+    app._refine_scan(paths, windows, first, False, "script.txt")
+    _pump(app, lambda: bool(jobs))
+    assert [(j["kind"], j["path"]) for j in jobs] == [("file", str(other)),
+                                                      ("pulls", str(other)),
+                                                      ("file", media)]
+
+
+def test_a_vo_line_moved_by_hand_gets_the_second_pass(media, tmp_path, monkeypatch):
+    moved = tmp_path / "pickup.wav"
+    moved.write_bytes(b"\x00" * 64)
+    engines.pb_transcript_save(str(moved), _draft_words(), model="tiny")
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    redone = []
+    app._s4_reconcile_vo_row = lambda r, p, w, b: redone.append((r["order"], p, len(w)))
+    saved = []
+    app._s4_save = lambda: saved.append(1)
+    app.results = [dict(_row(1, 0.0, 1.0, str(moved)), is_vo=True, part_index=1,
+                        _s4_reassigned=True),
+                   dict(_row(2, 0.0, 1.0, str(moved)), is_vo=True, part_index=1,
+                        _s4_reassigned=True, _s4_accepted=True)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    stream.feed.put([_word("we", 1.0, 1.2)])
+    stream.feed.put(None)
+    assert _pump(app, lambda: bool(redone))
+    assert redone == [(1, str(moved), 1)]    # your accepted one stays as it is
+    assert saved
+    assert engines.transcript_model(str(moved)) == "medium"
+
+
 # ── A stand-in app ───────────────────────────────────────────────────────
 class _Var(object):
     def __init__(self, v):

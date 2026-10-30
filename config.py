@@ -15,20 +15,18 @@ AUTO_FULL_TRANSCRIBE_THRESHOLD = 5  # if a token has this many pulls or more AND
                               # audio load), so full-audio almost always wins
                               # at 5+ pulls.  Set to a very high number to
                               # disable the auto-promotion.
-FULL_TRANSCRIBE_CONCURRENCY = 4  # how many auto-promoted full-audio transcribes
-                              # may run simultaneously.  faster-whisper shares
-                              # one global model and CTranslate2 serializes
-                              # internally — but on a modern GPU there's
-                              # plenty of headroom for several streams to
-                              # share it without thrashing.  4 is comfortable
-                              # on a mid-range NVIDIA (8 GB VRAM) with the
-                              # small model (~600 MB per instance ⇒ ~2.4 GB
-                              # used).  Set to 2 on a low-VRAM GPU or 1 on
-                              # CPU-only systems.  Monitor _debug_run.log
-                              # for [res] lines while a run is in flight —
-                              # GPU% pinned high + workers near the limit
-                              # means you're saturated; idle GPU and queued
-                              # tokens means you can bump this higher.
+FULL_TRANSCRIBE_CONCURRENCY = 1  # how many files Step 3 may transcribe at once,
+                              # taken in script order (refine.DraftLine).  1
+                              # means the script's first file is first in, so
+                              # work can start on it while the rest wait; more
+                              # finishes the whole pass sooner, but the first
+                              # file later.  4 is comfortable on a mid-range
+                              # NVIDIA (8 GB VRAM) with the small model
+                              # (~600 MB per instance ⇒ ~2.4 GB used).
+                              # Monitor _debug_run.log for [res] lines while a
+                              # run is in flight — GPU% pinned high + workers
+                              # near the limit means you're saturated; idle
+                              # GPU and queued tokens means you can bump this.
 
 WHISPER_NUM_WORKERS = 4       # CTranslate2 worker pool size for the shared
                               # WhisperModel.  Default of 1 makes concurrent

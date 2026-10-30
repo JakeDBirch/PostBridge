@@ -4,6 +4,16 @@
 
 ## October 30, 2026
 
+### Tiny first, top of the script first, and transcripts say which model made them
+- **Script → Session starts at the top of the script.** Files are transcribed one at a time in the order the script comes to them, so a VO intro goes before the interviews that follow it. A file that already has a transcript doesn't wait its turn, and a slow multi-track mix now waits for its turn too instead of holding everything up at the start. The second pass keeps the same order.
+- **Work starts on the first lines, not the whole file.** Lines land on Step 4 and the Assembly as tiny gets about 5 seconds past them, and Step 3 moves on to Step 4 by itself when the first real match is in. On a four-minute read, the first VO line was in about 5 seconds after Whisper started on it, and each interview pull followed as tiny reached it. Whatever you've accepted or edited stays yours. When a file finishes, its whole transcript corrects any line that landed early. Lines tiny hasn't reached read plain in the Assembly rather than struck through as never said.
+- **Pull Quotes always drafts with tiny first,** including a session you aren't looking at. It used to skip the draft unless the session was on screen. A session opened part way shows what has been heard so far.
+- **A VO line moved to a new file by hand** gets tiny, then the chosen model, rather than a long wait with the chosen model alone.
+- **Session files say which model made them.** `.pb_session.json` files and the sessions inside episode files now carry `"model"`, shown on the session's row and status line, and in CHECK TRANSCRIPTS. Older sessions go by the model recorded on each word.
+- **A transcript's label stays true across machines.** Re-saving Jordan's transcript here used to relabel it with whatever model you had chosen. It now keeps the model that actually made it. A session that's only a tiny draft gets a second pass here like any other draft; any other model is left as it is.
+- **Not yet covered:** a plain-script monolog still shows its cut once tiny has been through the whole read, because its pulls don't exist until then. Refine doesn't redo a Pull Quotes session made with another model; re-transcribe that in Pull Quotes.
+- **Whole-episode first pass may take longer.** `FULL_TRANSCRIBE_CONCURRENCY` in `config.py` is now 1, so the first file comes first. Raising it finishes the pass sooner but the first file later.
+
 ### Google Docs: plain scripts pass Script Check, and notes land by the pull they concern
 - **LINK GOOGLE DOC… now appears on the Stages card.** The Google Doc buttons on the Script → Session row were never drawn, so there was no way to link a Doc. The same mistake stopped the AAF → XML button from saying **OPENING AAF…** while a large AAF is read; it does now.
 - **A plain narration script no longer reports errors.** Script Check called a Gunfighters script broken ("No pulls and no VO blocks were parsed") even though it loads and cuts correctly, and **WRITE NOTES INTO DOC** would have written that into the Doc. It now reports nothing to fix.

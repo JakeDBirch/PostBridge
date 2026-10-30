@@ -68,7 +68,7 @@ from aaf_workflow import AafWorkflowMixin
 from pq_workflow import PqWorkflowMixin
 from episode import read_pq_session
 from episode_workflow import EpisodeWorkflowMixin
-from refine import RefineMixin
+from refine import RefineMixin, DraftLine, lines_past, pulls_past
 
 
 def _tx_count_chars(tx, a, b):
@@ -3558,9 +3558,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if not getattr(self, "_bg_reconcile_active", False):
             msg = "Matching finished"
         elif matched == 0:
-            msg = ("Transcribing in background — nothing matched yet.  Clips "
-                   "show script timecodes until their speaker or VO part "
-                   "finishes, then switch over a batch at a time.")
+            msg = ("Transcribing in background from the top of the script — "
+                   "nothing matched yet.  Clips show script timecodes until "
+                   "the first pass reaches them.")
         else:
             msg = ("Matching in background — {} of {} clips have real matches; "
                    "the rest still show script timecodes.".format(matched, total))
@@ -3683,7 +3683,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         it.  Runs off the main thread; all UI updates route through
         self._ui() so Tk stays single-threaded."""
         try:
-            words, blobs = engines.transcribe_file(audio_file)
+            # A first pass like any other: Step 4's next look at the session
+            # (_refine_resume) gives it the second.
+            words, blobs = engines.transcribe_file(
+                audio_file, model_size=engines.draft_model())
         except Exception:
             def _fail():
                 res["status"] = "error"
@@ -5216,9 +5219,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._section("STEP 3 — RECONCILING")
 
         _desc = tk.Label(self.body,
-                         text="Extracting and transcribing each interview pull, "
-                              "then matching to your script. "
-                              "May take several minutes — status updates as each clip finishes.",
+                         text=("Transcribing from the top of the script and matching "
+                               "as it goes. Step 4 opens as soon as the first lines "
+                               "are in; the rest arrive while you work."
+                               if not self._monolog else
+                               "Transcribing the read, then cutting it to your script. "
+                               "Step 4 opens when the cut is made."),
                          font=FB, bg=BG, fg=SUB, justify="left", anchor="w")
         _desc.pack(fill="x", pady=(0, 10))
         _desc.bind("<Configure>", lambda e: _desc.config(wraplength=e.width))
@@ -6174,9 +6180,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         pq_session_data[_tok] = _data
                         _reloc_note = ("  [{} paths relocated]".format(_relocs)
                                        if _relocs else "")
+                        _made_by = engines.session_model(_data)
                         self._log_line(
-                            "  [{}] using Pull Quotes transcript ({} words){}".format(
-                                _tok, len(_data["transcript"]), _reloc_note),
+                            "  [{}] using Pull Quotes transcript ({} words{}){}".format(
+                                _tok, len(_data["transcript"]),
+                                ", {}".format(_made_by) if _made_by else "",
+                                _reloc_note),
                             SUCCESS)
                 except Exception as _exc:
                     self._log_line(
@@ -6185,6 +6194,42 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._pq_session_data = pq_session_data   # used by process_token_pulls
 
         transcript_sources   = {}
+        _unmixed             = {}    # token -> its files: mixed when its turn comes
+
+        def _mix_now(tok, paths):
+            try:
+                # Peek at the content-addressed mix path BEFORE
+                # calling — if it already exists, mix_for_transcript
+                # will silently return it and we want the log to
+                # reflect a cache hit rather than pretending we
+                # just re-mixed.  Falls back to False when the
+                # cache dir isn't set, in which case the temp-file
+                # branch always runs the mix.
+                _mix_cache_p = None
+                try:
+                    _mix_cache_p = engines._stable_mix_cache_path(paths)
+                except Exception:
+                    _mix_cache_p = None
+                _was_cached = bool(
+                    _mix_cache_p and os.path.isfile(_mix_cache_p))
+                tmp = engines.mix_for_transcript(paths)
+                transcript_sources[tok] = tmp
+                self._temp_mix_files.append(tmp)
+                if _was_cached:
+                    self._log_line(
+                        "  [{}] mix cached ({} tracks) → {}".format(
+                            tok, len(paths), os.path.basename(tmp)),
+                        SUCCESS)
+                else:
+                    self._log_line(
+                        "  [{}] mixed {} tracks → {}".format(
+                            tok, len(paths), os.path.basename(tmp)), SUB)
+            except Exception as exc:
+                self._log_line(
+                    "  [{}] mix failed ({}); falling back to first track".format(
+                        tok, exc), WARN)
+                transcript_sources[tok] = paths[0]
+
         for tok, paths in token_audio_paths.items():
             # Pool-mix-wins rule: when the pool has >=2 audio files for
             # this token, the pool is the source of truth — remix + re-
@@ -6194,6 +6239,18 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # (0 or 1 pool files) fall back to the pq_session when one
             # exists, because there's nothing new to mix.
             _pool_audios = [p for p in (paths or []) if not is_video(p)]
+            # A session that's only a tiny draft gets a second pass like any
+            # other draft, and that starts from the file: its sidecar (the
+            # session's mirror, labelled tiny) or a new draft.
+            if (tok in pq_session_data and _pool_audios and engines.draft_model()
+                    and engines.session_model(pq_session_data[tok])
+                    == engines.DRAFT_MODEL):
+                pq_session_data.pop(tok, None)
+                self._log_line(
+                    "  [{}] Pull Quotes transcript is only a {} draft; {} refines "
+                    "the file after this run".format(
+                        tok, engines.DRAFT_MODEL, engines.get_active_model_size()),
+                    WARN)
             if tok in pq_session_data and len(_pool_audios) < 2:
                 transcript_sources[tok] = None
                 self._log_line(
@@ -6221,38 +6278,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     "  [{}] source: {}".format(
                         tok, os.path.basename(paths[0])), SUB)
             else:
+                # A new mix can take minutes, so it waits for its token's turn
+                # like Whisper does, and the top of the script isn't held up.
+                _p = None
                 try:
-                    # Peek at the content-addressed mix path BEFORE
-                    # calling — if it already exists, mix_for_transcript
-                    # will silently return it and we want the log to
-                    # reflect a cache hit rather than pretending we
-                    # just re-mixed.  Falls back to False when the
-                    # cache dir isn't set, in which case the temp-file
-                    # branch always runs the mix.
-                    _mix_cache_p = None
-                    try:
-                        _mix_cache_p = engines._stable_mix_cache_path(paths)
-                    except Exception:
-                        _mix_cache_p = None
-                    _was_cached = bool(
-                        _mix_cache_p and os.path.isfile(_mix_cache_p))
-                    tmp = engines.mix_for_transcript(paths)
-                    transcript_sources[tok] = tmp
-                    self._temp_mix_files.append(tmp)
-                    if _was_cached:
-                        self._log_line(
-                            "  [{}] mix cached ({} tracks) → {}".format(
-                                tok, len(paths), os.path.basename(tmp)),
-                            SUCCESS)
-                    else:
-                        self._log_line(
-                            "  [{}] mixed {} tracks → {}".format(
-                                tok, len(paths), os.path.basename(tmp)), SUB)
-                except Exception as exc:
-                    self._log_line(
-                        "  [{}] mix failed ({}); falling back to first track".format(
-                            tok, exc), WARN)
-                    transcript_sources[tok] = paths[0]
+                    _p = engines._stable_mix_cache_path(paths)
+                except Exception:
+                    pass
+                if _p and os.path.isfile(_p):
+                    _mix_now(tok, paths)
+                else:
+                    _unmixed[tok] = paths
         # Live concurrency control — shared with the UI toggle so Fast↔Background
         # switching takes effect immediately without restarting the run.
         _live_workers = getattr(self, "_reconcile_live_workers", None)
@@ -6466,6 +6502,31 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             pi, take_i + 1, "  ·  ".join(_why)),
                         WARN)
 
+                    _wait_turn(_line_keys["vo", pi])
+                    if self._cancel.is_set():
+                        break
+
+                    # This part's lines land as the pass gets past them.
+                    _blocks = _vo_by_part.get(pi, [])
+                    _carried = getattr(self, "_confirmed_carryover", None) or {}
+                    _landed = _vo_landed.setdefault(pi, set())
+
+                    def _land_vo(words, frontier, _vp=vp, _ap=ap, _sofar=part_takes):
+                        if self._monolog:
+                            return
+                        try:
+                            fresh = lines_past(
+                                _blocks, list(_sofar) + [(words, 0.0, _vp, _ap, None)],
+                                _ap, frontier, _landed | set(_carried))
+                        except Exception as exc:
+                            print("Landing VO lines failed: {}".format(exc),
+                                  file=sys.stderr)
+                            return
+                        _landed.update(r["order"] for r in fresh)
+                        self._draft_land(fresh, _ap)
+
+                    _heard = self._draft_listen(
+                        ap, _first or engines.get_active_model_size(), _land_vo)
                     _t0 = time.perf_counter()
                     if WAVEFORM_CONFORM:
                         chunks = engines.detect_silence_splits(ap)
@@ -6477,7 +6538,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                     pi, take_i + 1, len(chunks),
                                     "s" if len(chunks) != 1 else ""), INFO)
                             audio_words = engines.transcribe_in_chunks(
-                                ap, chunks, model_size=_first,
+                                ap, chunks, model_size=_first, segment_cb=_heard,
                                 cancel_event=self._cancel)
                             self._log_line(
                                 "  Part {} Take {}: chunked done in {:.1f}s "
@@ -6504,7 +6565,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                 self._log_line(msg, ERR)
                                 continue
                             audio_words = engines.transcribe_clip(
-                                tmp_a, model_size=_first,
+                                tmp_a, model_size=_first, segment_cb=_heard,
                                 cancel_event=self._cancel)
                             self._log_line(
                                 "  Part {} Take {}: full-file done in {:.1f}s "
@@ -6551,13 +6612,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                                    model=_first)
                     except Exception:
                         pass
+                    self._draft_finish(ap)
                     self._log_line(
                         "  Part {} Take {}: {} words  [saved to cache]".format(
                             pi, take_i + 1, len(audio_words)), INFO)
 
                 v_offset = 0.0
                 if vp and not self._is_aaf_mode():
-                    v_offset = engines.detect_av_offset(ap, vp)
+                    with _vo_sem:
+                        v_offset = engines.detect_av_offset(ap, vp)
                     self._log_line(
                         "  Part {} Take {}: {} words  video offset {:+.2f}s".format(
                             pi, take_i + 1, len(audio_words), v_offset), SUCCESS)
@@ -6585,14 +6648,42 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # making per-pull progress.  Mutable list so closures share the int.
         _pull_progress = [0]
 
-        # Auto-promoted full-audio transcribes need to be serialised: the
-        # shared WhisperModel + CTranslate2 GPU backend can only really run
-        # one transcription at a time, and dispatching 7+ in parallel just
-        # causes pathological contention (15+ min with no completions).
-        # Pair with the heartbeat thread inside process_token_pulls so
-        # tokens waiting on the semaphore don't trip the stall watchdog.
-        _full_transcribe_sem = threading.BoundedSemaphore(
-            max(1, FULL_TRANSCRIBE_CONCURRENCY))
+        # Whisper's work takes turns in script order, so the top of the script
+        # is first in and can be worked on while the rest comes.  Dispatching
+        # 7+ in parallel also just causes pathological contention on the shared
+        # WhisperModel (15+ min with no completions).  A token gives up its
+        # gate slot while it waits, or background mode's single slot could
+        # sit with a later token while an earlier one needs it; and waiting
+        # counts as alive for the stall watchdog.
+        _vo_by_part = {}
+        for vb in self.vo_blocks:
+            _vo_by_part.setdefault(vb["part_index"], []).append(vb)
+        if self._monolog:
+            _vo_by_part = {pi: list(self.vo_blocks) for pi in self.vo_bins}
+        _pulls_by_token = {}
+        for p in pulls:
+            _pulls_by_token.setdefault(p["token"], []).append(p)
+        for _tok in _pulls_by_token:
+            _pulls_by_token[_tok].sort(key=lambda p: p["order"])
+        _line_keys = {}
+        for _tok, _tp in _pulls_by_token.items():
+            _line_keys["token", _tok] = (_tp[0]["order"], "token", _tok)
+        for pi in self.vo_bins:
+            _orders = [b["order"] for b in _vo_by_part.get(pi, [])]
+            _line_keys["vo", pi] = (min(_orders) if _orders else float("inf"), "vo", pi)
+        _line = DraftLine(_line_keys.values(), width=FULL_TRANSCRIBE_CONCURRENCY)
+        _vo_landed = {}       # part -> orders its first pass has landed
+
+        def _wait_turn(key, gated=False):
+            def _alive():
+                _pull_progress[0] += 1
+            if gated:
+                _gate_out()
+            try:
+                _line.wait(key, self._cancel, tick=_alive)
+            finally:
+                if gated:
+                    _gate_in()
 
         _t_rec_start = time.perf_counter()
 
@@ -6600,12 +6691,18 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             """Process all pulls for a single token sequentially with a time cursor."""
             results = []
             cursor  = 0.0
+            _turn   = _line_keys["token", token]
+            if token in _unmixed and not self._cancel.is_set():
+                _wait_turn(_turn, gated=True)
+                if not self._cancel.is_set():
+                    _mix_now(token, _unmixed[token])
             tsrc    = transcript_sources.get(token)
             pad     = pad_secs
             # Pulls confirmed in the previous run are passed through as-is so
             # the user can fix problem tokens via ← BACK without re-running
             # work they've already approved.
             _carryover = getattr(self, "_confirmed_carryover", None) or {}
+            _landed_pulls = set()     # already on Step 4 from the first pass
 
             self._log_line(
                 "  [{}] starting {} pull(s)  src={}{}".format(
@@ -6650,7 +6747,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             # CHECK TRANSCRIPTS forecast) hit directly.
                             try:
                                 engines.pb_transcript_save(
-                                    tsrc, _pb_words, blobs=_pb_blobs)
+                                    tsrc, _pb_words, blobs=_pb_blobs,
+                                    model=engines.transcript_model(_pool_srcs[0]))
                             except Exception:
                                 pass
                             self._log_line(
@@ -6680,12 +6778,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         "audio once (much faster than {} per-pull calls)".format(
                             token, len(token_pulls), len(token_pulls)),
                         INFO)
-                    # Heartbeat: a full-audio transcribe can take 5-15 minutes,
-                    # AND tokens queued waiting on _full_transcribe_sem can sit
-                    # idle even longer.  Without a heartbeat the stall watchdog
-                    # would mark this future abandoned at the 300s timeout.
-                    # Bump _pull_progress every 30s so the watchdog sees the
-                    # future is alive (whether transcribing or queued).
+                    # Heartbeat: a full-audio transcribe can take 5-15 minutes.
+                    # Without a heartbeat the stall watchdog would mark this
+                    # future abandoned at the 300s timeout.  Bump _pull_progress
+                    # every 30s so the watchdog sees the future is alive.
                     _hb_stop = threading.Event()
                     def _heartbeat():
                         while not _hb_stop.wait(30.0):
@@ -6694,49 +6790,65 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         target=_heartbeat, daemon=True)
                     _hb_thread.start()
                     try:
-                        # Serialise full-audio transcribes: see comment on
-                        # _full_transcribe_sem above for why this matters.
                         _t_wait = time.perf_counter()
-                        with _full_transcribe_sem:
-                            _wait_s = time.perf_counter() - _t_wait
-                            if _wait_s > 5.0:
-                                self._log_line(
-                                    "  [{}] starting full transcribe after {:.0f}s "
-                                    "waiting in queue".format(token, _wait_s),
-                                    SUB)
-                            _t_full = time.perf_counter()
-                            # Throttled progress logger — every 10s emit a
-                            # progress line so the user sees "[TOKEN]
-                            # transcribing 5:23 of 32:45 (16%)" rather than
-                            # silence for 5+ minutes per token.
-                            _last_prog_log = [0.0]
-                            def _prog_cb(frac, msg, _tok=token):
-                                now = time.perf_counter()
-                                if now - _last_prog_log[0] < 10.0:
-                                    return
-                                _last_prog_log[0] = now
-                                self._log_line(
-                                    "  [{}] {}".format(_tok, msg), SUB)
-                            _full_words, _full_blobs = engines.transcribe_file(
-                                tsrc, progress_cb=_prog_cb, model_size=_first,
-                                cancel_event=self._cancel)
-                            if _full_words:
-                                engines.pb_transcript_save(
-                                    tsrc, _full_words, blobs=_full_blobs,
-                                    model=_first)
-                                _pq_data = {
-                                    "transcript":  _full_words,
-                                    "audio_cache": tsrc,
-                                    "media":       [tsrc],
-                                    "id":          token,
-                                    "_file_path":  tsrc,
-                                }
-                                self._log_line(
-                                    "  [{}] full transcript ready ({} words, "
-                                    "{:.1f}s) — cached as .pb_transcript.json".format(
-                                        token, len(_full_words),
-                                        time.perf_counter() - _t_full),
-                                    SUCCESS)
+                        _wait_turn(_turn, gated=True)
+                        _wait_s = time.perf_counter() - _t_wait
+                        if _wait_s > 5.0:
+                            self._log_line(
+                                "  [{}] starting full transcribe after {:.0f}s "
+                                "waiting in queue".format(token, _wait_s),
+                                SUB)
+                        _t_full = time.perf_counter()
+                        # Throttled progress logger — every 10s emit a
+                        # progress line so the user sees "[TOKEN]
+                        # transcribing 5:23 of 32:45 (16%)" rather than
+                        # silence for 5+ minutes per token.
+                        _last_prog_log = [0.0]
+                        def _prog_cb(frac, msg, _tok=token):
+                            now = time.perf_counter()
+                            if now - _last_prog_log[0] < 10.0:
+                                return
+                            _last_prog_log[0] = now
+                            self._log_line(
+                                "  [{}] {}".format(_tok, msg), SUB)
+
+                        def _land_pulls(words, frontier, _src=tsrc):
+                            try:
+                                fresh = pulls_past(
+                                    token_pulls,
+                                    {"transcript": words, "audio_cache": _src,
+                                     "media": [_src], "id": token, "_file_path": _src},
+                                    frontier, _landed_pulls | set(_carryover))
+                            except Exception as exc:
+                                print("Landing pulls failed: {}".format(exc),
+                                      file=sys.stderr)
+                                return
+                            _landed_pulls.update(r["order"] for r in fresh)
+                            self._draft_land(fresh, _src)
+
+                        _full_words, _full_blobs = engines.transcribe_file(
+                            tsrc, progress_cb=_prog_cb, model_size=_first,
+                            segment_cb=self._draft_listen(
+                                tsrc, _first or engines.get_active_model_size(),
+                                _land_pulls),
+                            cancel_event=self._cancel)
+                        if _full_words:
+                            engines.pb_transcript_save(
+                                tsrc, _full_words, blobs=_full_blobs,
+                                model=_first)
+                            _pq_data = {
+                                "transcript":  _full_words,
+                                "audio_cache": tsrc,
+                                "media":       [tsrc],
+                                "id":          token,
+                                "_file_path":  tsrc,
+                            }
+                            self._log_line(
+                                "  [{}] full transcript ready ({} words, "
+                                "{:.1f}s) — cached as .pb_transcript.json".format(
+                                    token, len(_full_words),
+                                    time.perf_counter() - _t_full),
+                                SUCCESS)
                     except engines.TranscriptionCancelled:
                         pass                  # the pull loop below marks them
                     except Exception as e:
@@ -6746,6 +6858,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             WARN)
                     finally:
                         _hb_stop.set()
+                        self._draft_finish(tsrc)
+
+            # Pulls left to Whisper's own windows go in turn too.
+            if _pq_data is None and tsrc and not self._cancel.is_set():
+                _wait_turn(_turn, gated=True)
 
             # Log pull result cache status for this token on first pull
             # (checked AFTER reconcile_interview_pull so we don't double-call
@@ -6786,11 +6903,16 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 # Whisper on a padded window.
                 if _pq_data is not None:
                     r = engines.reconcile_pull_from_session(pull, _pq_data)
+                    # The whole transcript has the last word on a pull that
+                    # landed early.
+                    if pull.get("order") in _landed_pulls:
+                        r["_refined"] = True
                 else:
                     r = engines.reconcile_interview_pull(
                         pull, tsrc, pad=pad,
                         min_start_s=_effective_cursor,
                         model_size=_first)
+                    self._draft_land([r], tsrc)
                 # source_audio is set to tsrc (the mix WAV) inside
                 # reconcile_interview_pull.  We keep it pointing there — the mix
                 # file stays alive through Step 4 so the waveform editor shows the
@@ -6864,6 +6986,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 # pass's confirmed rows cannot carry over by number.
                 return monolog.reconcile(blocks, takes)
             fresh = engines.reconcile_vo_part(blocks, takes)
+            # The whole transcript has the last word on a line that landed early.
+            for r in fresh:
+                if r.get("order") in _vo_landed.get(part_index, ()):
+                    r["_refined"] = True
             # Same order-keyed passthrough as process_token_pulls above:
             # a VO block the user already confirmed/ignored in a prior
             # Step 4 pass is returned as-is instead of overwriting the
@@ -6873,19 +6999,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             if not _carryover:
                 return fresh
             return [_carryover.get(r.get("order"), r) for r in fresh]
-
-        from collections import defaultdict as _dd
-        _vo_by_part = _dd(list)
-        for vb in self.vo_blocks:
-            _vo_by_part[vb["part_index"]].append(vb)
-        if self._monolog:
-            _vo_by_part = {pi: list(self.vo_blocks) for pi in self.vo_bins}
-
-        _pulls_by_token = _dd(list)
-        for p in pulls:
-            _pulls_by_token[p["token"]].append(p)
-        for _tok in _pulls_by_token:
-            _pulls_by_token[_tok].sort(key=lambda p: p["order"])
 
         # Total expected results (one per pull + one per individual VO block)
         total = len(pulls) + len(self.vo_blocks)
@@ -6911,6 +7024,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 return dispatch(item)
             finally:
                 _gate_out()
+                if item[0] == "pull_token":
+                    _line.done(_line_keys["token", item[1][0]])
 
         # ── Reconcile loop ─────────────────────────────────────────────────────
         # Pool is sized to hold all possible items; the gate controls concurrency.
@@ -6937,7 +7052,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         _vo_done_event = threading.Event()
 
         def _vo_thread(pi, vb):
-            _vo_sem.acquire()
             try:
                 part_takes = _transcribe_vo_part(pi, vb)
             except engines.TranscriptionCancelled:
@@ -6947,7 +7061,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     "VO Part {}: transcription error — {}".format(pi, e), ERR)
                 part_takes = []
             finally:
-                _vo_sem.release()
+                _line.done(_line_keys["vo", pi])
+                # A pass stopped part way: what it streamed is not the file's.
+                for _vp, _ap in engines.pair_takes(vb.get_paths()):
+                    if _ap and self._refine_words(_ap) is not None:
+                        self._draft_finish(_ap)
             if part_takes:
                 vo_takes_by_part[pi] = part_takes
             # Submit VO reconcile immediately — takes are populated above
@@ -7118,10 +7236,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                             status="error", matched_text=str(e))
                                         for b in blocks]
 
-                    if getattr(self, "_bg_reconcile_active", False) \
-                            and not self._cancel.is_set():
-                        self._ui(lambda b=list(res_list):
-                                 self._bg_apply_batch(b))
+                    if not self._cancel.is_set():
+                        self._draft_land(
+                            res_list, more_to_come=bool(pending)
+                            or not _vo_done_event.is_set())
 
                     for res in res_list:
                         results.append(res)
