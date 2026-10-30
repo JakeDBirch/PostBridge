@@ -369,8 +369,14 @@ class MatchReviewDialog:
         _sh = parent.winfo_screenheight()
         w = min(1600, _sw - 60)
         h = min(1200, _sh - 40)
-        self._win.geometry("{}x{}+{}+{}".format(
-            w, h, max(0, px + (pw - w) // 2), max(0, py + (ph - h) // 2)))
+        # Full screen, on the monitor the app is on: it fills whichever one
+        # holds the window when it is zoomed.
+        self._win.geometry("+{}+{}".format(px + 40, py + 40))
+        try:
+            self._win.state("zoomed")
+        except tk.TclError:
+            self._win.geometry("{}x{}+{}+{}".format(
+                w, h, max(0, px + (pw - w) // 2), max(0, py + (ph - h) // 2)))
 
         self._build_ui(quote_text, self._context_before, self._context_after,
                        self._scripted_tc)
@@ -601,8 +607,8 @@ class MatchReviewDialog:
         win.bind("<bracketleft>",  lambda e: self._cycle_rate(-1))
         win.bind("<bracketright>", lambda e: self._cycle_rate(1))
 
-        # + / - zoom in / out — viewport centre stays fixed
-        win.bind("<plus>",       lambda e: self._zoom_by(1.0/1.5))
+        # + / - zoom in / out — centred on the cursor
+        win.bind("<plus>",      lambda e: self._zoom_by(1.0/1.5))
         win.bind("<minus>",      lambda e: self._zoom_by(1.5))
         win.bind("<equal>",      lambda e: self._zoom_by(1.0/1.5))
         win.bind("<underscore>", lambda e: self._zoom_by(1.5))
@@ -614,7 +620,7 @@ class MatchReviewDialog:
         # C — insert a cut at the current playhead position (works during playback)
         win.bind("c", lambda e: self._add_cut())
 
-        # R / T — zoom out / in (Pro Tools convention) — viewport centre stays fixed
+        # R / T — zoom out / in (Pro Tools convention) — centred on the cursor
         win.bind("r", lambda e: self._zoom_by(1.5))
         win.bind("t", lambda e: self._zoom_by(1.0/1.5))
 
@@ -2133,12 +2139,15 @@ class MatchReviewDialog:
         if new == old:
             return
         max_vs = max(0, n - w * new)
-        # Always anchor on the explicit pixel passed in (scroll wheel uses the
-        # cursor, keyboard / buttons use the canvas centre so whatever is
-        # currently visible stays put).
-        anchor_px = mouse_x if mouse_x is not None else w / 2
-        anchor    = self._view_start + anchor_px * old
-        self._view_start = max(0, min(max_vs, int(anchor - anchor_px * new)))
+        # The wheel keeps what is under the mouse pointer where it is.  The keys
+        # put the cursor in the middle: where it was clicked, not where the
+        # playhead has got to while it plays.
+        if mouse_x is not None:
+            vs = self._view_start + mouse_x * old - mouse_x * new
+        else:
+            t  = self._playhead_s if self._pre_play_pos is None else self._pre_play_pos
+            vs = (t - self._ctx_start) * self._sr - w / 2 * new
+        self._view_start = max(0, min(max_vs, int(vs)))
         self._spp = new
         self._draw()
         self._check_and_expand()

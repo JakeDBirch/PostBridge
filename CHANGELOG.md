@@ -4,6 +4,10 @@
 
 ## October 30, 2026
 
+### Waveform editor: opens full screen, zoom keys centre on the cursor
+- **The waveform editor opens full screen,** on the monitor the app is on.
+- **R, T, + and - now centre the view on the cursor.** They used to hold the middle of the view, wherever the cursor was. While audio plays they use where you clicked, not the moving playhead. At the very start or end of the file the view stops at the edge. The scroll wheel still zooms around the mouse pointer.
+
 ### Tiny first, top of the script first, and transcripts say which model made them
 - **Script → Session starts at the top of the script.** Files are transcribed one at a time in the order the script comes to them, so a VO intro goes before the interviews that follow it. A file that already has a transcript doesn't wait its turn, and a slow multi-track mix now waits for its turn too instead of holding everything up at the start. The second pass keeps the same order.
 - **Work starts on the first lines, not the whole file.** Lines land on Step 4 and the Assembly as tiny gets about 5 seconds past them, and Step 3 moves on to Step 4 by itself when the first real match is in. On a four-minute read, the first VO line was in about 5 seconds after Whisper started on it, and each interview pull followed as tiny reached it. Whatever you've accepted or edited stays yours. When a file finishes, its whole transcript corrects any line that landed early. Lines tiny hasn't reached read plain in the Assembly rather than struck through as never said.
