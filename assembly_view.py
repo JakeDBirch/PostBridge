@@ -1453,11 +1453,16 @@ class AssemblyWindow(object):
 
     def update_the_cut(self):
         """Take the monolog's new cut, from the refined transcript."""
+        kept, rest = self.app._refine_cut_counts()
+        what = ("All {} pulls have been worked on, so they all stay as they "
+                "are.  This only adds any lines of the script not in the cut "
+                "yet.".format(kept) if not rest else
+                "The {} you have edited, accepted, marked or ignored stay exactly "
+                "as they are, and the other {} take the new cut.".format(kept, rest))
         if not messagebox.askyesno(
                 "Update the cut",
-                "Cut the read again from the refined transcript?\n\n"
-                "Pulls you have edited, marked or ignored stay as they are.  "
-                "The rest take the new cut, and the undo history starts over.",
+                "Cut the read again from the refined transcript?\n\n{}\n\n"
+                "The undo history starts over.".format(what),
                 parent=self.win):
             return
         self.app._refine_update_the_cut()
@@ -2359,7 +2364,8 @@ class AssemblyWindow(object):
                 g = c.seg_gaps[k - 1] if k - 1 < len(c.seg_gaps) else 0.0
                 if g > 0:              # a region moved later: open track
                     xg = self._x(tl - g)
-                    cv.create_rectangle(xg, y0 + 1, xc, y1 - 1, fill=BG,
+                    # Bare track, top to bottom: the pull's bar and edge too.
+                    cv.create_rectangle(xg, y0 - 1, xc, y1 + 1, fill=BG,
                                         outline="")
                     txt = "{:.2f}s".format(g)
                     if self._fits(txt, xc - xg + 20):
@@ -2507,32 +2513,33 @@ class AssemblyWindow(object):
             return
         if self.pps >= ENV_HZ and self._draw_samples(c, a, b, mid, half, col):
             return
-        px  = np.arange(a, b, dtype=np.float64)
-        tt  = self.view0 + px / self.pps
-        src = np.full(len(px), np.nan)
-        for tl, du, si in c.pieces:
-            m = (tt >= tl) & (tt < tl + du)
-            src[m] = si + (tt[m] - tl)
-        ok = ~np.isnan(src)
-        if not ok.any():
-            return
-        idx = np.clip(((src[ok] - e_t0) * ENV_HZ).astype(np.int64), 0, len(e) - 1)
+        # A region at a time: one shape across them all would bridge the
+        # silence between them, and the peak of a join's pixel would reach
+        # into the tape cut there.
         per = max(1, int(math.ceil(ENV_HZ / self.pps)))
-        if per > 1 and np.all(np.diff(idx) >= 0):
-            # Peak of every bin under each pixel, not one sample of it.
-            amp = np.maximum.reduceat(e, idx)
-            # reduceat runs each pixel up to the next pixel's bin; the last
-            # one would run to the end of the envelope -- trim it.
-            amp[-1] = e[idx[-1]:idx[-1] + per].max()
-        else:
-            amp = e[idx]
-        amp = np.minimum(amp / max(self._env_scale, 1e-4), 1.0) * half * 0.95
-        xs_ok = px[ok]
-        top = np.column_stack((xs_ok, mid - amp - 0.5)).ravel()
-        bot = np.column_stack((xs_ok[::-1], (mid + amp + 0.5)[::-1])).ravel()
-        pts = np.concatenate((top, bot)).tolist()
-        if len(pts) >= 6:
-            cv.create_polygon(pts, fill=col, outline="")
+        for tl, du, si in c.pieces:
+            pa = max(a, int(math.ceil(self._x(tl))))
+            pb = min(b, int(math.ceil(self._x(tl + du))))
+            if pb <= pa:
+                continue
+            px  = np.arange(pa, pb, dtype=np.float64)
+            src = si + (self.view0 + px / self.pps - tl)
+            idx = np.clip(((src - e_t0) * ENV_HZ).astype(np.int64), 0, len(e) - 1)
+            if per > 1:
+                # Peak of every bin under each pixel, not one sample of it.
+                amp = np.maximum.reduceat(e, idx)
+                # reduceat runs each pixel up to the next pixel's bin; the
+                # last one would run to the end of the envelope -- trim it.
+                amp[-1] = e[idx[-1]:idx[-1] + per].max()
+            else:
+                amp = e[idx]
+            amp = np.minimum(amp / max(self._env_scale, 1e-4), 1.0) * half * 0.95
+            if pb - pa < 2:              # a sliver: a shape needs some width
+                cv.create_line(pa, mid - amp[0] - 0.5, pa, mid + amp[0] + 0.5, fill=col)
+                continue
+            top = np.column_stack((px, mid - amp - 0.5)).ravel()
+            bot = np.column_stack((px[::-1], (mid + amp + 0.5)[::-1])).ravel()
+            cv.create_polygon(np.concatenate((top, bot)).tolist(), fill=col, outline="")
 
     def _draw_samples(self, c, a, b, mid, half, col):
         """Up close the envelope has no more detail to give: draw the audio

@@ -61,6 +61,7 @@ PAUSE_SIDE_S  = 0.5    # ...is cut down to this either side of it
 GUARD_S       = 0.05   # never reach this close to a word that is cut
 HEAL_MAX_S    = 6.0    # a removal from a reading this short or shorter...
 HEAL_MAX_WORDS = 12    # ...of this many words or fewer goes back in, unless retaken
+MIN_LEFT_S    = 0.2    # a new pull's tape, clear of a kept pull's, shorter than this goes
 
 _HYPHEN_RE = re.compile(r"(?<=[a-z])[-‐‑](?=[a-z])")
 _SENT_END_RE = re.compile(r"[.!?][\"'”’)\]]*$")
@@ -509,18 +510,23 @@ def _said_again(x, nearby):
     return sum(m.size for m in sm.get_matching_blocks()) * 2 > len(x)
 
 
-def _heal(pieces, dels, R):
+def _heal(pieces, dels, R, kept=frozenset()):
     """A cut is only earned by a retake.  Where a read runs on past the script
     -- reworded, or an ad-lib -- the matcher ends one stretch and starts the
     next, and cutting between them lost words nobody said twice ("a memoir he
     [published years later in 1912.] Siringo claimed").  So tape between two
     stretches goes back when it is short, was read straight on from the words
     before it, and is not said again beside them.  The two stretches are then
-    one, across a paragraph too: nothing was taken out, so nothing to mark."""
+    one, across a paragraph too: nothing was taken out, so nothing to mark.
+    Never across `kept` lines, which another pull answers for, nor over tape
+    another piece plays (a pickup of a later line): it would play twice."""
     T = R.tok
     for prev, pc in zip(pieces, pieces[1:]):
         if pc.joined or dels[prev.k].take != dels[pc.k].take \
-                or pc.i_a <= prev.i_b:
+                or pc.i_a <= prev.i_b or not kept.isdisjoint(range(prev.b + 1, pc.a)):
+            continue
+        if any(p.i_a < pc.i_a and p.i_b > prev.i_b
+               for p in pieces if p is not prev and p is not pc):
             continue
         x = [t for t in T[prev.i_b + 1:pc.i_a] if t is not None]
         span = R.word(pc.i_a)["start"] - R.word(prev.i_b)["end"]
@@ -690,12 +696,15 @@ def _join(segs):
     return out
 
 
-def reconcile(vo_blocks, takes):
+def reconcile(vo_blocks, takes, keep=()):
     """Cut the raw read down to the script.
 
     vo_blocks : the plain script's paragraphs (parsers.parse_plain_script).
     takes     : as for engines.reconcile_vo_part -- (words, v_offset,
                 vpath, apath[, blobs]) per recording, in recording order.
+    keep      : script token spans (first, last) that pulls already in the
+                cut answer for.  Those lines are left alone: no tape is cut
+                for them and they aren't reported missing.
 
     Returns VO results, one per kept stretch of tape (a paragraph read in
     one go is one pull) plus a no_match row for any part of the script that
@@ -712,8 +721,12 @@ def reconcile(vo_blocks, takes):
     dels = _deliveries(_read_path(_runs(S.tok, R.tok)), S.tok, R)
     _extend(dels, S, R)
     owner = _claims(dels, S)
+    kept = {j for a, b in keep for j in range(a, b + 1)}
+    for j in kept:
+        if j < len(owner):
+            owner[j] = None
     pieces = _pieces(dels, owner, S, R)
-    _heal(pieces, dels, R)
+    _heal(pieces, dels, R, kept)
 
     for pc in pieces:
         pc.segs = _edges(R, pc.i_a, pc.i_b, tk)
@@ -731,13 +744,14 @@ def reconcile(vo_blocks, takes):
         if pulls:
             last = pulls[-1][-1]
             if ((pc.joined or S.blk[pc.a] == S.blk[last.a])
+                    and kept.isdisjoint(range(last.b + 1, pc.a))
                     and dels[pc.k].take == dels[last.k].take
                     and pc.i_a > last.i_b):
                 pulls[-1].append(pc)
                 continue
         pulls.append([pc])
 
-    covered = set()
+    covered = set(kept)
     for pl in pulls:
         for pc in pl:
             covered.update(range(pc.a, pc.b + 1))
@@ -820,28 +834,76 @@ def reconcile(vo_blocks, takes):
     return results
 
 
-def merge_recut(old, fresh, touched):
-    """A new cut of the same script (from a better transcript), keeping the
-    pulls of the old one that touched(row) says were worked on.  Pulls are
+def locate_spans(vo_blocks, rows):
+    """Give script_span to pulls cut before spans were recorded: a pull's
+    quote_text is a slice of the script, found in order along it.  One that
+    can't be found (the script has changed since) is left without."""
+    tok = _Script(vo_blocks).tok
+    start = 0
+    for r in sorted(rows, key=lambda r: r.get("order", 0)):
+        if r.get("script_span"):
+            start = r["script_span"][1] + 1
+            continue
+        run = [t for w in (r.get("quote_text") or "").split() for t in _tokens(w)]
+        if not run:
+            continue
+        n = len(run)
+        at = next((i for i in list(range(start, len(tok) - n + 1)) + list(range(start))
+                   if tok[i:i + n] == run), None)
+        if at is not None:
+            r["script_span"] = (at, at + n - 1)
+            start = at + n
+
+
+def _clear_of(r, kept):
+    """Take from new pull r any tape a kept pull already plays: a kept pull can
+    hold more than its lines, an ad-lib say, and the new cut can't know.  False
+    when that leaves it nothing, unless it never had any (a line not found)."""
+    segs = [tuple(s) for s in r.get("segments") or []]
+    if not segs:
+        return True
+    for k in kept:
+        if k.get("source_audio") != r.get("source_audio"):
+            continue
+        for ka, kb in k.get("segments") or []:
+            left = []
+            for a, b in segs:
+                if b <= ka or a >= kb:
+                    left.append((a, b))
+                    continue
+                if a < ka:
+                    left.append((a, ka))
+                if b > kb:
+                    left.append((kb, b))
+            segs = left
+    segs = [s for s in segs if s[1] - s[0] >= MIN_LEFT_S]
+    if not segs:
+        return False
+    r["segments"] = segs
+    r["rec_in_s"], r["rec_out_s"] = segs[0][0], segs[-1][1]
+    r["rec_in_tc"] = r["in_tc"] = secs_tc(segs[0][0])
+    r["rec_out_tc"] = r["out_tc"] = secs_tc(segs[-1][1])
+    r["n_internal_cuts"] = len(segs) - 1
+    for td in r.get("takes_data") or []:
+        if td.get("kept"):
+            td["segments"] = list(segs)
+    return True
+
+
+def recut_around(vo_blocks, takes, old, touched):
+    """The read cut again, keeping exactly as they are the pulls of the old
+    cut that touched(row) says were worked on, and cutting new ones only for
+    the lines those don't answer for -- so nothing plays twice.  Pulls are
     numbered by the cut, so the rows come back renumbered.
 
-    A new pull wholly inside a kept one's lines goes.  One that reaches
-    beyond them stays, flagged for review: it repeats some words, but
-    dropping it would lose the rest without a word."""
-    kept = [r for r in old if r.get("script_span") and touched(r)]
-    spans = [tuple(r["script_span"]) for r in kept]
-    rows = list(kept)
-    for r in fresh:
-        a, b = r.get("script_span") or (0, -1)
-        over = [(x, y) for x, y in spans if x <= b and a <= y]
-        if not over:
-            rows.append(r)
-        elif any(x <= a and b <= y for x, y in over):
-            continue
-        else:
-            rows.append(dict(r, status="low_confidence",
-                             diag="overlaps a pull you edited -- check for "
-                                  "repeated words"))
+    Returns None, changing nothing, if a worked-on pull can't be placed against
+    the script: better no new cut than losing someone's work."""
+    locate_spans(vo_blocks, old)
+    kept = [r for r in old if touched(r)]
+    if any(not r.get("script_span") for r in kept):
+        return None
+    fresh = reconcile(vo_blocks, takes, keep=[tuple(r["script_span"]) for r in kept])
+    rows = kept + [r for r in fresh if _clear_of(r, kept)]
     rows.sort(key=lambda r: tuple(r.get("script_span") or (0, -1)))
     for n, r in enumerate(rows, 1):
         r["order"] = n

@@ -571,7 +571,7 @@ def _new_cut(wav):
 
 def test_an_untouched_monolog_takes_the_new_cut_at_once(media, monkeypatch):
     stream = _Stream(monkeypatch)
-    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes: _new_cut(media))
+    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes, keep=(): _new_cut(media))
     app = _monolog_app(media, monkeypatch)
     app.results = [_cut_row(1, (0, 29), 0.5, 6.0, media)]
     app._refine_resume()
@@ -584,7 +584,9 @@ def test_an_untouched_monolog_takes_the_new_cut_at_once(media, monkeypatch):
 
 def test_a_monolog_you_have_edited_waits_to_be_asked(media, monkeypatch):
     stream = _Stream(monkeypatch)
-    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes: _new_cut(media))
+    # The new cut leaves out the lines the edited pull answers for.
+    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes, keep=():
+                        [r for r in _new_cut(media) if tuple(r["script_span"]) not in keep])
     app = _monolog_app(media, monkeypatch)
     view = app._assembly = _View()
     view.pps, view.view0, view.playhead = 30.0, 0.0, 0.0
@@ -608,19 +610,106 @@ def test_a_monolog_you_have_edited_waits_to_be_asked(media, monkeypatch):
     assert [r["script_span"] for r in app.results] == [(0, 9), (10, 19), (20, 29)]
 
 
-def test_merge_recut_keeps_worked_on_pulls_and_flags_an_overlap():
-    old = [dict(order=1, script_span=(0, 9), marked=True, status="ok"),
-           dict(order=2, script_span=(10, 19), status="ok"),
-           dict(order=3, script_span=(20, 39), marked=True, status="ok")]
-    fresh = [dict(order=1, script_span=(0, 5), status="ok"),        # inside a kept one
-             dict(order=2, script_span=(6, 15), status="ok"),       # runs past one
-             dict(order=3, script_span=(16, 19), status="ok"),      # free
-             dict(order=4, script_span=(40, 49), status="ok")]      # free
-    rows = monolog.merge_recut(old, fresh, lambda r: r.get("marked"))
-    assert [r["script_span"] for r in rows] == [(0, 9), (6, 15), (16, 19), (20, 39), (40, 49)]
-    assert [r["order"] for r in rows] == [1, 2, 3, 4, 5]
-    assert rows[1]["status"] == "low_confidence" and "overlaps" in rows[1]["diag"]
-    assert rows[2]["status"] == "ok"
+# The read below is one take of these three paragraphs, straight through.
+_P = ("The first herds rumbled in during the spring and the Texans were amazed.",
+      "By the next year the town had become a boomtown with bars on every corner.",
+      "Nobody who lived through that season ever forgot how quickly it all ended.")
+
+
+def _read_of(*paras):
+    t, words = 0.0, []
+    for w in " ".join(paras).lower().replace(",", "").replace(".", "").split():
+        words.append({"word": w, "start": round(t, 3), "end": round(t + 0.3, 3)})
+        t += 0.4
+    return [(words, 0.0, None, "take.wav", None)]
+
+
+def _script_blocks(*paras):
+    import parsers
+    return parsers.parse_plain_script("Title\n" + "\n".join(paras))[3]
+
+
+def _played(rows, words):
+    out = []
+    for r in rows:
+        for a, b in r.get("segments") or []:
+            out += [w["word"] for w in words if a <= (w["start"] + w["end"]) / 2 <= b]
+    return out
+
+
+def test_update_keeps_a_pull_from_before_spans_existed():
+    """Episode 10: 67 pulls worked on, 27 with marks, cut before script_span.
+    They were all thrown away, and the dialog had said they would stay."""
+    blocks, takes = _script_blocks(*_P), _read_of(*_P)
+    old = [dict(order=n + 1, quote_text=p, status="ok", is_vo=True, source_audio="take.wav",
+                segments=[(n * 10.0, n * 10.0 + 3.0)], _s4_accepted=True,
+                markers=[{"kind": "sfx", "src": n * 10.0, "name": "gun"}])
+           for n, p in enumerate(_P)]
+    before = [dict(r) for r in old]
+    rows = monolog.recut_around(blocks, takes, old, lambda r: r.get("_s4_accepted"))
+    assert len(rows) == 3
+    for r, b in zip(rows, before):
+        assert r["segments"] == b["segments"] and r["markers"] == b["markers"]
+    assert [r["order"] for r in rows] == [1, 2, 3]
+
+
+def test_update_cuts_new_pulls_only_for_the_lines_left_so_nothing_plays_twice():
+    """A straight read is one new pull, so an edited pull in the middle of it
+    would have had the whole read added around it, repeating its lines."""
+    blocks, takes = _script_blocks(*_P), _read_of(*_P)
+    words = takes[0][0]
+    n0 = len(_P[0].split())
+    n1 = n0 + len(_P[1].split())
+    middle = dict(order=2, quote_text=_P[1], status="ok", is_vo=True,
+                  source_audio="take.wav", _s4_accepted=True,
+                  segments=[(words[n0]["start"], words[n1 - 1]["end"])])
+    old = [dict(order=1, quote_text=_P[0], status="ok", is_vo=True, source_audio="take.wav",
+                segments=[(0.0, words[n0 - 1]["end"])]),
+           middle,
+           dict(order=3, quote_text=_P[2], status="ok", is_vo=True, source_audio="take.wav",
+                segments=[(words[n1]["start"], words[-1]["end"])])]
+    rows = monolog.recut_around(blocks, takes, old, lambda r: r.get("_s4_accepted"))
+    assert rows[1] is middle and [r["order"] for r in rows] == [1, 2, 3]
+    assert not any(r["status"] == "no_match" for r in rows)
+    # Each word once, in order, none lost.
+    assert _played(rows, words) == [w["word"] for w in words]
+
+
+def test_update_changes_nothing_if_a_worked_on_pull_cant_be_placed():
+    """The script has changed since: losing the pull would be the worst answer."""
+    blocks, takes = _script_blocks(*_P), _read_of(*_P)
+    old = [dict(order=1, quote_text="words that are no longer in the script at all",
+                status="ok", _s4_accepted=True, segments=[(0.0, 2.0)])]
+    assert monolog.recut_around(blocks, takes, old, lambda r: r.get("_s4_accepted")) is None
+    assert old[0]["segments"] == [(0.0, 2.0)]
+
+
+def test_a_failed_update_leaves_the_cut_alone_and_says_why(media, monkeypatch):
+    import refine
+    said = []
+    monkeypatch.setattr(refine.messagebox, "showwarning", lambda t, m, **k: said.append(m))
+    monkeypatch.setattr(monolog, "recut_around", lambda *a: None)
+    app = _monolog_app(media, monkeypatch)
+    rows = [_cut_row(1, (0, 9), 0.5, 1.5, media, _s4_accepted=True)]
+    app.results = rows
+    app._rf().held = [("words", 0.0, None, media, None)]
+    app._s4_is_live = lambda: True
+    app._refine_update_the_cut()
+    assert app.results is rows and not app.built and said
+    assert app._refine_held()                    # still on offer
+
+
+def test_a_swapped_reading_counts_as_worked_on(media, monkeypatch):
+    app = _monolog_app(media, monkeypatch)
+    assert not app._refine_row_touched(_cut_row(1, (0, 9), 0.5, 1.5, media))
+    assert app._refine_row_touched(_cut_row(1, (0, 9), 0.5, 1.5, media, _reading_chosen=True))
+
+
+def test_the_question_counts_what_stays_and_what_changes(media, monkeypatch):
+    app = _monolog_app(media, monkeypatch)
+    app.results = [_cut_row(1, (0, 9), 0.5, 1.5, media, _s4_accepted=True),
+                   _cut_row(2, (10, 19), 3.0, 4.0, media)]
+    assert app._refine_cut_counts() == (1, 1)
 
 
 def test_monolog_results_say_which_script_they_cover():

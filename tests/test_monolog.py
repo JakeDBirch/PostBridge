@@ -175,6 +175,31 @@ def test_talk_after_a_stop_stays_out_however_short():
     assert "sorry" not in kept and "second" not in kept
 
 
+def _heal_case(*pieces_at):
+    """Pieces (script a, b, tape i_a, i_b) of one take of twenty words, as
+    _pieces would hand them to _heal, in script order."""
+    rd = Read().say("the first herds rumbled during spring while texans watched "
+                    "hotels rising beside dusty rail yards every morning until summer came")
+    words = [{"word": w["word"], "start": w["start"], "end": w["end"]} for w in rd.words]
+    R = monolog._Read([{"words": words}])
+    pieces = [monolog._Piece(0, a, b, i_a, i_b) for a, b, i_a, i_b in pieces_at]
+    dels = [type("D", (), {"take": 0})()]
+    monolog._heal(pieces, dels, R)
+    return pieces
+
+
+def test_short_tape_between_two_stretches_goes_back():
+    first, second = _heal_case((0, 5, 0, 5), (6, 13, 12, 19))
+    assert first.i_b == 11 and second.joined
+
+
+def test_tape_a_pickup_plays_is_not_put_back_as_well():
+    """Ep 10: a later line's reading sat in the gap, so "five of them decided"
+    went out twice, 3.67 s of it."""
+    first, second, pickup = _heal_case((0, 5, 0, 5), (6, 13, 12, 19), (14, 16, 7, 9))
+    assert first.i_b == 5 and not second.joined
+
+
 def test_only_a_long_pause_inside_a_reading_is_trimmed():
     para = ("The first herds rumbled in during the spring and the Texans were "
             "amazed to find a hotel waiting for them that first long season.")

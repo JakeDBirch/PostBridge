@@ -664,6 +664,62 @@ def test_up_close_a_cut_stays_out_of_the_drawing(view):
         assert max(ys) - min(ys) < 12      # only the quiet audio, in both
 
 
+@pytest.mark.parametrize("pps", [60.0, 100.0, 1000.0])
+def test_silence_between_regions_is_blank_at_every_zoom(view, pps):
+    """One shape across a pull's regions bridged the silence between them.
+    It has to look like what it is: nothing there."""
+    import numpy as np
+    from config import BG
+    app, win = view
+    app._assembly_set_segments(1, [(10.0, 11.0), (11.0, 14.0)], [1.0])
+    win.refresh()
+    pieces = win._clip(1).pieces
+    assert win._clip(1).seg_gaps == [1.0]
+    c = _load(win, 1, np.full(32000 * 6, 8000))
+    win._env[1] = (9.0, np.full(4000, 0.25, np.float32))
+    win.pps = pps
+    win.view0 = 0.0
+    win.redraw()
+    app.update()
+    gap_a, gap_b = win._x(pieces[0][1]), win._x(pieces[1][0])
+    shapes = _wave_items(win, c.colour(), "polygon")
+    assert len(shapes) == 2                # a region each
+    for s in shapes:
+        xs = win.cv.coords(s)[0::2]
+        assert max(xs) <= gap_a + 1 or min(xs) >= gap_b - 1, (min(xs), max(xs), gap_a, gap_b)
+    # Bare track, the height of the pull: its bar and edge don't cross it.
+    y0, y1 = win._track_box()
+    blank = [i for i in win.cv.find_all() if win.cv.type(i) == "rectangle"
+             and win.cv.itemcget(i, "fill") == BG
+             and win.cv.coords(i)[0] == pytest.approx(gap_a)
+             and win.cv.coords(i)[2] == pytest.approx(gap_b)]
+    assert blank
+    box = win.cv.coords(blank[0])
+    assert box[1] <= y0 and box[3] >= y1
+
+
+def test_loud_tape_cut_at_a_join_stays_out_of_a_zoomed_out_drawing(view):
+    """The join's pixel took its peak from the tape that was cut."""
+    import numpy as np
+    app, win = view
+    app._assembly_set_segments(1, [(10.0, 11.0), (12.0, 14.0)])
+    win.refresh()
+    c = win._clip(1)
+    env = np.full(2000, 0.02, np.float32)
+    env[int(2.0 * 400):int(3.0 * 400)] = 1.0          # source 11-12 s
+    win._env[1] = (9.0, env)
+    win._env_scale = 1.0
+    win.pps = 60.0
+    win.view0 = 0.0
+    win.redraw()
+    app.update()
+    shapes = _wave_items(win, c.colour(), "polygon")
+    assert len(shapes) == 2
+    for s in shapes:
+        ys = win.cv.coords(s)[1::2]
+        assert max(ys) - min(ys) < 40      # only the quiet audio, in both
+
+
 def test_up_close_falls_back_until_the_audio_is_there(view):
     import numpy as np
     app, win = view

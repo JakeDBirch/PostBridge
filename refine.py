@@ -27,6 +27,7 @@ import threading
 import time
 
 import tkinter as tk
+from tkinter import messagebox
 
 import engines
 import monolog
@@ -166,8 +167,8 @@ class RefineMixin(object):
             live = st.live.get(job["path"]) if job else None
         if job is None:
             if st.held is not None:
-                return ("Refined.  You have edited this cut, so it stays on "
-                        "the draft's matches until you update it.")
+                return ("Refined.  You have worked on this cut, so it stays "
+                        "as it is until you update it.")
             return st.note
         name = os.path.basename(job["path"])
         tail = "   ·   {} more".format(more) if more else ""
@@ -622,7 +623,8 @@ class RefineMixin(object):
     # ── A monolog's new cut ──────────────────────────────────────────────
     def _refine_row_touched(self, r):
         return bool(r.get("_s4_accepted") or r.get("_s4_ignored") or r.get("markers")
-                    or r.get("seg_gaps") or r.get("gap_after_s", 0.0))
+                    or r.get("seg_gaps") or r.get("gap_after_s", 0.0)
+                    or r.get("_reading_chosen"))
 
     def _refine_touched(self):
         """Has anything at all been done to this cut?"""
@@ -639,29 +641,51 @@ class RefineMixin(object):
             return
         self.__dict__.setdefault("_vo_takes_by_part", {}).update(takes_by_part)
         if self._refine_touched():
-            self._rf().held = fresh
+            # Only the words are held.  The new cut is made when it is asked
+            # for, around whatever has been worked on by then.
+            self._rf().held = next(iter(takes_by_part.values()))
             self._refine_show()
             return
-        self._refine_recut(fresh)
+        self._refine_take_cut(fresh)
 
-    def _refine_update_the_cut(self):
-        """The Update the cut button: take the held re-cut."""
-        fresh = self._rf().held
-        if fresh is not None:
-            self._refine_recut(fresh)
-
-    def _refine_recut(self, fresh):
-        """Main thread: the monolog's new cut in, around any pulls worked on.
-        Its pulls are numbered anew, so Step 4's cards are built again and
-        its undo history starts over."""
-        self._rf().held = None
+    def _refine_stamp_ignored(self):
         for e in getattr(self, "_rv", None) or []:
             if e["skip_var"].get():
                 e["res"]["_s4_ignored"] = True
+
+    def _refine_cut_counts(self):
+        """(pulls that have been worked on, pulls that haven't), for the
+        question Update the cut asks."""
+        self._refine_stamp_ignored()
+        rows = self.results or []
+        kept = sum(1 for r in rows if self._refine_row_touched(r))
+        return kept, len(rows) - kept
+
+    def _refine_update_the_cut(self):
+        """The Update the cut button: cut the read again, around every pull
+        that has been worked on."""
+        takes = self._rf().held
+        if takes is None:
+            return
+        self._refine_stamp_ignored()
+        rows = monolog.recut_around(list(self.vo_blocks), takes, self.results or [],
+                                    self._refine_row_touched)
+        if rows is None:
+            messagebox.showwarning(
+                "Update the cut",
+                "Some pulls you have worked on no longer match the script, so "
+                "the cut has been left exactly as it is.\n\nTo cut again from "
+                "the refined transcript, reconcile the script again.")
+            return
+        self._refine_take_cut(rows)
+
+    def _refine_take_cut(self, rows):
+        """Main thread: the monolog's new cut in.  Its pulls are numbered anew,
+        so Step 4's cards are built again and its undo history starts over."""
+        self._rf().held = None
         a = getattr(self, "_assembly", None)
         view = (a.pps, a.view0, a.playhead) if a is not None else None
-        self.results = monolog.merge_recut(self.results or [], fresh,
-                                           self._refine_row_touched)
+        self.results = rows
         try:
             self._write_conform_baseline()
         except Exception:

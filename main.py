@@ -8854,6 +8854,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if not segs:
             return
         self._s4_push_undo()
+        r["_reading_chosen"] = True      # worked on: a re-cut leaves it be
         r["best_take_index"] = index
         r["segments"]   = segs
         r.pop("seg_gaps", None)          # the other reading has its own joins

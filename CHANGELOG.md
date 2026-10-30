@@ -4,6 +4,13 @@
 
 ## October 30, 2026
 
+### Update the cut keeps your work, and silence looks like silence
+- **Update the cut keeps every pull you've worked on.** Its dialog promised that, but a pull cut before the app recorded its place in the script was thrown away, worked on or not. On Episode 10 that was all 67 pulls and their markers, and the result would then have gone into the episode file. A pull now finds its place from its own text. If one can't be placed, because the script has changed, the update is refused and the cut stays exactly as it was.
+- **New pulls cover only the lines you haven't worked on, so nothing plays twice.** One long new pull used to be added whole around any edited pull inside it. New pulls also give way to tape a kept pull already plays. The dialog now says how many pulls stay and how many change.
+- **Choosing another reading counts as working on a pull.**
+- **A continuous read could play tape twice.** The rule that puts short removals back could also put back tape a pickup was already playing: on Episode 10, 3.67 s of "five of them decided". It now leaves that tape out. Ep 6 scores the same: 73 regions, precision 98.6%, recall 99.4%.
+- **Silence between regions is blank.** Zoomed out, a pull's waveform was one shape that stretched across the silence between its regions, and a join could show the peak of the tape cut there. Each region is now drawn on its own, and the silence is bare track, without the pull's bar or edge.
+
 ### Assembly view: edits work from where you clicked
 - **While the cut plays, edits use the insertion point, not the moving playhead.** Split (B), zoom (R and T), Open in editor (Enter), Other reading, and an edge snapping as you drag all go by the dashed cursor that stays where you last clicked. Before, a split landed wherever playback had got to. When playback is stopped the two cursors are in the same place, so nothing changes.
 - **Spotting and pull navigation stay on the live cursor.** Music inflection (M), SFX (X) and Note (N) still drop where you are listening, as markers do in Pro Tools, and ← / → still move from there.
