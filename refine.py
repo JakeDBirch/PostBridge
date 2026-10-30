@@ -26,12 +26,16 @@ import sys
 import threading
 import time
 
+import tkinter as tk
+
 import engines
 import monolog
+from config import SURF, TEXT, INFO, SUCCESS, FB
 from pq_workflow import PqWorkflowMixin
 from utils import secs_tc, is_video
 
 TICK_S = 1.2            # between redraws as words stream in, as Pull Quotes
+DONE_NOTE_MS = 10000    # how long Step 4 says the pass has finished
 RETRY_MS = 500          # a merge held back while the Assembly is in use waits this
 
 # What the user set on a pull that a new match must not take with it.
@@ -95,6 +99,7 @@ class _State(object):
         self.rebase = {}          # order -> new match, for the conform baseline
         self.script = None
         self.bins = {}            # the pool's VO parts, when vo_bins is empty
+        self.strip = None         # Step 4's line about it: (frame, label)
 
 
 class RefineMixin(object):
@@ -236,13 +241,13 @@ class RefineMixin(object):
 
         def wanted(model):
             return (model is not None and model != target) if force else model == draft
-        jobs = [{"kind": "file", "path": p} for p in paths
+        jobs = [{"kind": "file", "path": p, "draft": not force} for p in paths
                 if wanted(engines.transcript_model(p))]
         for (token, src), items in windows.items():
             todo = [pull for model, pull in items if wanted(model)]
             if todo:
                 jobs.append({"kind": "pulls", "path": src, "token": token,
-                             "pulls": todo})
+                             "pulls": todo, "draft": not force})
         self._ui(lambda: self._refine_enqueue(jobs, force, target, script))
 
     def _refine_enqueue(self, jobs, force, target, script):
@@ -412,12 +417,52 @@ class RefineMixin(object):
         st = self._rf()
         if path is not None:
             st.tick_pending = False
+        self._refine_show_strip()
         a = getattr(self, "_assembly", None)
         if a is None:
             return
         a.show_refine_status()
         if path is not None:
             a.transcript_changed(path)
+
+    def _refine_show_strip(self):
+        """A line at the top of Step 4 while its matches stand on a draft, so
+        that isn't mistaken for the finished cut."""
+        st = self._rf()
+        with st.lock:
+            job = st.current
+        if job is not None:
+            text = self._refine_status()
+            if job.get("draft"):
+                text = "Working from a {} draft: matches can change when it " \
+                       "finishes.   {}".format(engines.DRAFT_MODEL, text)
+            colour = INFO
+        elif st.held is not None:
+            text, colour = self._refine_status(), INFO
+        elif st.strip is not None and st.note:
+            text, colour = st.note, SUCCESS
+        else:
+            return
+        try:
+            if not self._s4_is_live():
+                return
+            if st.strip is None or not st.strip[0].winfo_exists():
+                frame = tk.Frame(self.body, bg=SURF, highlightthickness=1,
+                                 highlightbackground=colour)
+                label = tk.Label(frame, font=FB, bg=SURF, fg=TEXT, anchor="w",
+                                 justify="left", padx=10, pady=6)
+                label.pack(fill="x")
+                under = self.body.pack_slaves()[1:2]     # below the title
+                frame.pack(fill="x", pady=(0, 8),
+                           **({"before": under[0]} if under else {}))
+                st.strip = (frame, label)
+            st.strip[0].config(highlightbackground=colour)
+            st.strip[1].config(text=text)
+            if colour == SUCCESS:
+                self.after(DONE_NOTE_MS, lambda f=st.strip[0]: f.winfo_exists()
+                           and not self._refine_running() and f.destroy())
+        except (tk.TclError, AttributeError):
+            pass
 
     # ── Matching again ───────────────────────────────────────────────────
     def _refine_pending(self, paths):

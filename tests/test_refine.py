@@ -649,3 +649,59 @@ def test_the_baseline_takes_the_new_match(tmp_path):
     snap = json.loads(path.read_text())
     assert snap["1"]["segments"] == [[1.0, 2.5]] and snap["1"]["accepted"] is False
     assert snap["2"]["segments"] == [[3.0, 4.0]]
+
+
+# ── Saying so ────────────────────────────────────────────────────────────
+def test_step_4_says_the_cut_stands_on_a_draft(media, monkeypatch):
+    tk = pytest.importorskip("tkinter")
+    stream = _Stream(monkeypatch)
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        root.withdraw()
+        app = _make_app()
+        app.body = tk.Frame(root)
+        tk.Label(app.body, text="STEP 4").pack()
+        tk.Label(app.body, text="cards").pack()
+        app._s4_is_live = lambda: True
+        app.results = [_row(1, 1.0, 2.5, media)]
+        app._refine_resume()
+        assert _pump(app, lambda: bool(stream.sizes))
+        strip = app._rf().strip
+        assert strip is not None
+        assert "tiny draft" in strip[1].cget("text")
+        assert "Refining with medium" in strip[1].cget("text")
+        # It sits under the title, above the cards.
+        assert app.body.pack_slaves()[1] is strip[0]
+        assert _finish(app, stream, [_word("we", 1.0, 1.2)])
+        assert "refined with medium" in strip[1].cget("text")
+    finally:
+        root.destroy()
+
+
+def test_refine_again_does_not_call_a_finished_transcript_a_draft(media, monkeypatch):
+    tk = pytest.importorskip("tkinter")
+    stream = _Stream(monkeypatch)
+    engines.pb_transcript_save(media, _draft_words(), model="small")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        root.withdraw()
+        app = _make_app()
+        app.body = tk.Frame(root)
+        tk.Label(app.body, text="STEP 4").pack()
+        app._s4_is_live = lambda: True
+        app.results = [_row(1, 1.0, 2.5, media)]
+        app._refine_again()
+        assert _pump(app, lambda: bool(stream.sizes))
+        assert "draft" not in app._rf().strip[1].cget("text")
+        stream.feed.put([_word("we", 1.0, 1.2)])
+        stream.feed.put(None)
+        assert _pump(app, lambda: not app._refine_running())
+        assert "refined with medium" in app._rf().strip[1].cget("text")
+    finally:
+        root.destroy()

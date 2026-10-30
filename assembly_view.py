@@ -30,7 +30,9 @@ AAF:
   * B splits the region under the insertion point in two there (or at
     both ends of a highlighted span): the same audio, two regions;
   * drag a pull's edge, or either side of a cut or split inside it, to
-    trim -- shuffle-style, so everything after it moves up or back;
+    trim -- shuffle-style, so everything after it moves up or back.  An edge
+    snaps to where speech starts and stops, and to the playhead, as in the
+    waveform editor (the ticks on the track); Ctrl places it freely;
   * drag a region, or the gap in front of it, to change that gap -- the
     gap after the pull before it, or inside a pull, the silence at that
     join;
@@ -130,12 +132,15 @@ _C_SFX      = "#e0609a"   # SFX spot
 _C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
 _C_CUT      = "#6a6a6a"   # words out of the cut, in the text
 _C_TXSEL    = "#35597a"   # highlighted words
+_C_SNAP_TICK = "#556070"  # where an edge will snap, as in the waveform editor
+_C_SNAPPED  = "#ffaa00"   # an edge that has snapped
+SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too closely
 
 
 
 # Monitoring choices, kept for the run like the playback speed.
-_MONITOR = {"follow": True, "preroll_on": False, "preroll_s": 2.0,
-            "return_on": False, "script": True,
+_MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
+            "return_on": True, "script": True,
             "transcript": True, "cut_words": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
@@ -325,6 +330,19 @@ def _segments_without(clip, a, b):
             before.append(pend)
             pend = 0.0
     return _tidy(segs, before[1:])
+
+
+def _silence_edges(pcm, t0):
+    """Where speech starts and stops in a pull's loaded audio, in source time:
+    the waveform editor's own snap points, on audio levelled as its is."""
+    if not len(pcm):
+        return []
+    samples = pcm.astype(np.float32) / 32768.0
+    peak = float(np.abs(samples).max())
+    if peak > 1e-6:
+        samples = samples / peak * 0.85
+    return match_review.MatchReviewDialog._compute_silence_boundaries_arrays(
+        samples, PLAY_SR, t0)[2]
 
 
 def _segments_with(segments, spans):
@@ -652,6 +670,7 @@ class AssemblyWindow(object):
         self._scroll_after = None        # a smooth script scroll under way
         self._env       = {}             # order -> (t0, envelope float32)
         self._env_scale = 0.25           # amplitude that fills the lane
+        self._sil       = {}             # order -> its audio's snap points
         self._loading   = set()
         self._dirty     = False          # a buffer landed; redraw pending
         self._refresh_after = None
@@ -799,6 +818,9 @@ class AssemblyWindow(object):
         # Ctrl+Z with bind_all, and those must not fire against a card
         # nobody is looking at while this window has focus.
         self.win.bind("<Key>", self._on_key)
+        # Pro Tools' Zoom to Session.
+        for seq in ("<Alt-a>", "<Alt-A>"):
+            self.win.bind(seq, lambda e: (self.fit(), "break")[1])
 
     def _panel(self, title):
         """One control panel: a title and its buttons, wrapping to the
@@ -829,6 +851,7 @@ class AssemblyWindow(object):
         self.tc_lbl = tk.Label(p, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
                                fg=TEXT, width=10, anchor="w")
         p.add(self.tc_lbl)
+        key(p, "|◂  Return to zero", "Home", self.return_to_zero)
         self.play_key = key(p, "▶  Play", "Space", self.toggle_play)
         key(p, "■  Stop  (again: back to start)", "0",
             lambda: self.stop(key=True))
@@ -895,7 +918,7 @@ class AssemblyWindow(object):
         p = self._panel("VIEW")
         key(p, "Zoom out", "R  −", lambda: self.zoom(1 / 1.5))
         key(p, "Zoom in", "T  +", lambda: self.zoom(1.5))
-        key(p, "Fit", "F", self.fit)
+        key(p, "Zoom out full", "Alt+A  F", self.fit)
         key(p, "Prev pull", "←", lambda: self._neighbour(-1))
         key(p, "Next pull", "→", lambda: self._neighbour(1))
 
@@ -906,7 +929,9 @@ class AssemblyWindow(object):
             "highlight).  Bottom half: grab (click = region, drag = move, "
             "double-click = waveform editor).  Edge: trim.  Gap: drag to "
             "retime.  Flag: drag, or double-click to name.  "
-            "Ctrl+wheel: zoom.  In the text: drag to highlight, double-click "
+            "Edges and highlights snap to speech starts and stops; hold Ctrl "
+            "to place one freely.  Ctrl+wheel: zoom.  In the text: drag to "
+            "highlight, double-click "
             "a word, triple-click its pull, right-click for everything.")),
             fill=True)
         self.legend = p
@@ -1031,8 +1056,8 @@ class AssemblyWindow(object):
         self._layout()
         clips = self.clips
         self.audio.keep_only({c.order for c in clips})
-        self._env = {o: v for o, v in self._env.items()
-                     if any(c.order == o for c in clips)}
+        self._env = {o: v for o, v in self._env.items() if o in self._by_order}
+        self._sil = {o: v for o, v in self._sil.items() if o in self._by_order}
         if self.sel_order is not None and \
                 not any(c.order == self.sel_order for c in clips):
             self.sel_order = None
@@ -1232,11 +1257,12 @@ class AssemblyWindow(object):
                    .astype(np.float32) / 32768.0) if n else \
                 np.zeros(1, np.float32)
             words = self._map_words(c)
+            sil = _silence_edges(pcm, t0)
         except Exception as exc:
             msg = str(exc).splitlines()[0] if str(exc) else repr(exc)
             self.app._ui(lambda: self._on_load_failed(c, msg))
             return
-        self.app._ui(lambda: self._on_loaded(c, path, t0, pcm, env, words))
+        self.app._ui(lambda: self._on_loaded(c, path, t0, pcm, env, words, sil))
 
     def _file_words(self, path, load=True):
         """A whole file's transcript: the second pass's as it comes in, else
@@ -1434,7 +1460,7 @@ class AssemblyWindow(object):
         self.playhead = self.insert = max(0.0, min(playhead, self.total_s))
         self.redraw()
 
-    def _on_loaded(self, c, path, t0, pcm, env, words):
+    def _on_loaded(self, c, path, t0, pcm, env, words, sil=()):
         self._loading.discard(c.order)
         if self._closed:
             return
@@ -1444,6 +1470,7 @@ class AssemblyWindow(object):
             return
         self.audio.put(c.order, path, t0, pcm)
         self._env[c.order] = (t0, env)
+        self._sil[c.order] = list(sil)
         live.words = words if live.pieces == c.pieces else None
         if live.words is None:
             live.words = self._map_words(live)
@@ -2361,6 +2388,7 @@ class AssemblyWindow(object):
                 cv.create_text(lx, y0 + 6, text=lbl, anchor="nw",
                                font=self._font, fill=_C_FLAG if c.flagged else SUB)
             self._draw_wave(c, xs, xe, lane_mid, lane_h, col, w)
+            self._draw_snap_ticks(c, lane_top, lane_bot, w)
             if c.load_error and xe - xs > 80:
                 cv.create_text(max(xs, 0) + 6, lane_mid, text=c.load_error[:120],
                                anchor="w", font=self._font, fill=ERR)
@@ -2517,6 +2545,21 @@ class AssemblyWindow(object):
         pts = np.concatenate((top, bot)).tolist()
         if len(pts) >= 6:
             cv.create_polygon(pts, fill=col, outline="")
+
+    def _draw_snap_ticks(self, c, top, bot, w):
+        """Where an edge will snap: short ticks top and bottom of the lane, as
+        the waveform editor draws them."""
+        sil = self._sil.get(c.order)
+        if not sil or self.pps < SNAP_TICKS_PPS:
+            return
+        h = self._ls
+        for tl, du, si in c.pieces:
+            lo, hi = bisect.bisect_left(sil, si), bisect.bisect_right(sil, si + du)
+            for b in sil[lo:hi]:
+                x = self._x(tl + b - si)
+                if 0 <= x < w:
+                    self.cv.create_line(x, top, x, top + h, fill=_C_SNAP_TICK)
+                    self.cv.create_line(x, bot - h, x, bot, fill=_C_SNAP_TICK)
 
     def _draw_words(self, c, xs, xe, y, w):
         """Transcript words along the bottom of the lane, each at its own
@@ -2789,9 +2832,15 @@ class AssemblyWindow(object):
             return
         if kind in ("in", "out"):
             self._range = None
+            # The playhead pulls the edge to it -- unless it is parked on this
+            # edge already (it is, after a trim), or the edge could never leave.
+            tl, du, _si = c.pieces[k]
+            edge = tl if kind == "in" else tl + du
+            near = abs(self.playhead - edge) * self.pps <= match_review.SNAP_PLAYHEAD_PX
             self._drag = {"mode": kind, "order": c.order, "k": k, "x0": e.x,
                           "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
-                          "moved": False}
+                          "moved": False,
+                          "ph": None if near else c.src_at(self.playhead)}
             self.select(c.order)
             return
         if kind == "select":
@@ -2801,10 +2850,12 @@ class AssemblyWindow(object):
                 o, ra, rb = self._range
                 anchor = ra if abs(a - rb) < abs(a - ra) else rb
                 self._range = (o, anchor, a)
+                placed = True
             else:
                 self._range = (c.order, a, a)
+                placed = False
             self.sel_region = None
-            self._drag = {"mode": "range", "x0": e.x, "t": a}
+            self._drag = {"mode": "range", "x0": e.x, "t": a, "placed": placed}
             if c.order != self.sel_order:
                 self.sel_order = c.order
                 self._mark_selected_in_script()
@@ -2842,10 +2893,16 @@ class AssemblyWindow(object):
             if self._range is None:
                 return
             o, a, _b = self._range
-            self._range = (o, a, min(max(self._t(e.x), 0.0), self.total_s))
+            free = bool(e.state & 0x0004)
+            b = min(max(self._t(e.x), 0.0), self.total_s)
+            if abs(self._x(b) - self._x(a)) >= DRAG_PX and not d["placed"]:
+                d["placed"] = True           # a drag, not a click: snap its start
+                a = self._snap_timeline(a, free)
+            self._range = (o, a, self._snap_timeline(b, free))
             self.redraw()
             self._status_range()
             return
+        d["free"] = bool(e.state & 0x0004)
         dx = e.x - d["x0"]
         if not d["moved"]:
             if abs(dx) < DRAG_PX:
@@ -2873,6 +2930,7 @@ class AssemblyWindow(object):
             d["value"] = self._trimmed(d, dt)
             self._layout({d["order"]: {"segments": d["value"]}})
         self.redraw()
+        self._show_snapped(d)
         self._status_drag(d)
 
     # A "space" is the silence in front of one region, which is what
@@ -2922,20 +2980,58 @@ class AssemblyWindow(object):
             sp["k"] + 1, c.label if c else "")
 
     def _trimmed(self, d, dt):
-        """The pull's segments with one edge moved by dt seconds, held
-        inside the neighbouring segments and the file."""
+        """The pull's segments with one edge moved by dt seconds and snapped,
+        held inside the neighbouring segments and the file."""
         segs = [list(s) for s in d["segs0"]]
         k = d["k"]
         a, b = segs[k]
         if d["mode"] == "in":
             lo = segs[k - 1][1] if k > 0 else 0.0
-            segs[k][0] = max(min(a + dt, b - MIN_SEG_S), lo)
+            segs[k][0] = max(min(self._snap_edge(d, a + dt), b - MIN_SEG_S), lo)
         else:
             c = self._clip(d["order"])
             hi = segs[k + 1][0] if k + 1 < len(segs) else \
                 self._file_end.get(c.play_path if c else None, float("inf"))
-            segs[k][1] = min(max(b + dt, a + MIN_SEG_S), hi)
+            segs[k][1] = min(max(self._snap_edge(d, b + dt), a + MIN_SEG_S), hi)
         return [tuple(s) for s in segs]
+
+    def _snap_edge(self, d, src):
+        """Where a dragged edge lands, at source time src: on a speech start
+        or stop, or the playhead, if it is near one -- the waveform editor's
+        snap, at the same distances on screen."""
+        if d.get("free"):
+            d["snapped"] = False
+            return src
+        best = match_review.snap_to_boundary(
+            src, self._sil.get(d["order"]) or (),
+            match_review.SNAP_PX / self.pps, d.get("ph"),
+            match_review.SNAP_PLAYHEAD_PX / self.pps)
+        d["snapped"] = best != src
+        return best
+
+    def _snap_timeline(self, t, free=False):
+        """A highlight's edge at timeline time t, snapped the same way."""
+        c = self._clip_at(t)
+        k = c.piece_at(t) if c is not None else None
+        if free or k is None:
+            return t
+        tl, du, si = c.pieces[k]
+        best = match_review.snap_to_boundary(
+            si + t - tl, self._sil.get(c.order) or (),
+            match_review.SNAP_PX / self.pps)
+        return min(max(tl + best - si, tl), tl + du)
+
+    def _show_snapped(self, d):
+        """The edge lights while it is held by a snap, as the editor's does."""
+        if not d.get("snapped"):
+            return
+        c = self._clip(d["order"])
+        if c is None or d["k"] >= len(c.pieces):
+            return
+        tl, du, _si = c.pieces[d["k"]]
+        x = self._x(tl if d["mode"] == "in" else tl + du)
+        y0, y1 = self._track_box()
+        self.cv.create_line(x, y0, x, y1, fill=_C_SNAPPED, width=2)
 
     def _on_track_release(self, e):
         d, self._drag = self._drag, None
@@ -2998,9 +3094,10 @@ class AssemblyWindow(object):
         seg0, seg = d["segs0"][d["k"]], d["value"][d["k"]]
         i = 0 if d["mode"] == "in" else 1
         c = self._clip(d["order"])
-        self.status.config(fg=TEXT, text="{}   {} {}   ({:+.3f}s)".format(
+        self.status.config(fg=TEXT, text="{}   {} {}   ({:+.3f}s){}".format(
             c.label if c else "", "in " if i == 0 else "out",
-            secs_tc(seg[i]), seg[i] - seg0[i]))
+            secs_tc(seg[i]), seg[i] - seg0[i],
+            "   ·   snapped  (Ctrl places it freely)" if d.get("snapped") else ""))
 
     def _status_range(self):
         o, a, b = self._range
@@ -3349,7 +3446,22 @@ class AssemblyWindow(object):
         self.view0 = anchor - frac * self._span()
         self.redraw()
 
+    def return_to_zero(self):
+        """Back to the top of the cut, as Pro Tools' Return to Zero: the
+        playhead, the insertion point, the track and the text.  Playing, it
+        carries on from there."""
+        self._range = self.sel_region = None
+        self._tx_clear()
+        self.seek(0.0)
+        self.view0 = 0.0
+        self._script_touched()               # stops a glide under way...
+        self._touched_at = 0.0               # ...and doesn't hold the follow off
+        self.text.yview_moveto(0.0)
+        self.redraw()
+        self._update_status()
+
     def fit(self):
+        """Zoom out full: the whole cut across the track."""
         self.pps = self._min_pps()
         self.view0 = 0.0
         self.redraw()
@@ -3536,9 +3648,7 @@ class AssemblyWindow(object):
         elif k in ("minus", "underscore", "KP_Subtract"):
             self.zoom(1 / 1.5)
         elif k == "Home":
-            self.seek(0.0)
-            self._range = self.sel_region = None
-            self._tx_clear()
+            self.return_to_zero()
         elif k == "End":
             self.seek(self.total_s)
         elif k == "Right":

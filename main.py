@@ -2598,6 +2598,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 inc(r.get("status", ""))
             elif not snap_accepted and was_accepted:
                 e["accepted_flag"][0] = False
+                r["_s4_accepted"] = False   # the card's own flag, as un-accepting does
                 e.get("set_normal_fn", lambda: None)()
                 dec(r.get("status", ""))
 
@@ -6236,6 +6237,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         vo_takes_by_part = {}
 
+        def _note_draft(who, path):
+            """A saved transcript that is only tiny's: the run is quick and its
+            matches rough until the second pass, and the log should say so."""
+            if _first and engines.transcript_model(path) == engines.DRAFT_MODEL:
+                self._log_line(
+                    "  {}: this transcript is a tiny draft; {} refines it and "
+                    "matches again after this run".format(
+                        who, engines.get_active_model_size()), WARN)
+
         _total_tx = sum(
             len(engines.pair_takes(vb.get_paths()))
             for vb in self.vo_bins.values()
@@ -6292,6 +6302,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             pi, take_i + 1, len(audio_words)), INFO)
                     self._set_tx_progress(
                         _d, _t, "VO transcription — {} / {}  [cached]".format(_d, _t))
+                    _note_draft("Part {} Take {}".format(pi, take_i + 1), ap)
                 elif (_pb_result := engines.pb_transcript_load(ap))[0] is not None:
                     audio_words, blobs = _pb_result
                     with _tx_lock:
@@ -6304,6 +6315,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     self._set_tx_progress(
                         _d, _t, "VO transcription — {} / {}  [pre-transcribed]".format(
                             _d, _t))
+                    _note_draft("Part {} Take {}".format(pi, take_i + 1), ap)
                 else:
                     # ── Log why both caches missed (helps diagnose stale/moved files) ──
                     _why = []
@@ -6557,6 +6569,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             "  [{}] using cached full-audio transcript "
                             "({} words)".format(token, len(_pb_words)),
                             SUCCESS)
+                        _note_draft("[{}]".format(token), tsrc)
                 elif (len(token_pulls) >= AUTO_FULL_TRANSCRIBE_THRESHOLD
                       and not self._cancel.is_set()):
                     self._log_line(
@@ -6824,6 +6837,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             _vo_sem.acquire()
             try:
                 part_takes = _transcribe_vo_part(pi, vb)
+            except engines.TranscriptionCancelled:
+                part_takes = []
             except Exception as e:
                 self._log_line(
                     "VO Part {}: transcription error — {}".format(pi, e), ERR)

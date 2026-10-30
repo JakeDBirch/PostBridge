@@ -284,6 +284,8 @@ The text beside the Assembly's controls is the transcript of the cut, and highli
 
 Tape out of the cut stays in the text, struck through: what went from inside a pull, and about 2 s either side. **H** (or Ctrl+H) puts highlighted words back. **W** swaps in the script, **Shift+W** hides the struck words. **Refine with `<model>`** in the TRANSCRIPT panel transcribes the cut's files again with the model now chosen.
 
+On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the whole cut. Dragged edges and track highlights snap to where speech starts and stops, as in the waveform editor, and the ticks on the track show where; hold Ctrl to place one freely. Return to start on stop and a 2 s pre-roll are on by default, and Follow playhead is off.
+
 ### Step 5 — Export
 
 Choose **AAF** or **XML**, set sequence name and inter-part gap, then export.

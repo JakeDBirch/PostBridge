@@ -517,3 +517,175 @@ def test_script_follows_the_lit_word_and_holds_off_after_a_scroll(view):
     win.set_insert(last.start + 2.05)
     _settle(app)
     assert t.yview()[0] == y0
+
+
+def test_undo_clears_the_pulls_accepted_flag(view):
+    app, win = view
+    e = app._rv[0]
+    snap = app._s4_snapshot()               # as it was: not accepted
+    e["accepted_flag"][0] = True
+    e["res"]["_s4_accepted"] = True
+    app._s4_apply_state(snap)
+    assert not e["accepted_flag"][0]
+    assert not e["res"]["_s4_accepted"]
+
+
+# ── Transport, zoom and snapping ─────────────────────────────────────────
+class _Ev(object):
+    def __init__(self, x, y, state=0):
+        self.x, self.y, self.state = x, y, state
+
+
+def test_monitoring_defaults():
+    import assembly_view
+    src = open(assembly_view.__file__, encoding="utf-8").read()
+    head = src[src.index("_MONITOR = {"):src.index("_PREROLLS")]
+    assert '"follow": False' in head
+    assert '"preroll_on": True' in head
+    assert '"return_on": True' in head
+
+
+def test_return_to_zero_goes_to_the_top_of_everything(view):
+    app, win = view
+    win.pps = 200.0                         # so the top can scroll out of view
+    win.view0 = 2.0
+    win.seek(3.0)
+    win._range = (1, 1.0, 2.0)
+    win.text.yview_moveto(1.0)
+    win.return_to_zero()
+    assert win.playhead == 0.0 and win.insert == 0.0
+    assert win._range is None
+    assert win.view0 == pytest.approx(0.0, abs=0.05)
+    assert win.text.yview()[0] == 0.0
+
+    win.seek(3.0)
+    _key(app, win.cv, "Home")
+    assert win.playhead == 0.0
+
+
+def test_zoom_out_full_shows_the_whole_cut(view):
+    app, win = view
+    win.zoom(4.0)
+    win.view0 = 1.0
+    win.win.focus_force()
+    win.cv.focus_force()
+    app.update()
+    win.cv.event_generate("<Alt-a>", when="now")
+    app.update()
+    assert win.pps == pytest.approx(win._min_pps())
+    assert win.view0 == 0.0
+    assert win.total_s * win.pps <= win.cv.winfo_width()
+
+
+def _edge_drag(win, order, mode, new_x, state=0):
+    """Press on a pull's edge and drag it to pixel new_x; the trim as it stands."""
+    c = win._clip(order)
+    tl, du, _si = c.pieces[-1 if mode == "out" else 0]
+    x = win._x(tl + du if mode == "out" else tl)
+    y0, y1 = win._track_box()
+    y = (y0 + y1) / 2.0
+    win._on_track_press(_Ev(x - 2 if mode == "out" else x + 2, y))
+    assert win._drag["mode"] == mode
+    win._drag["x0"] = x
+    win._on_track_drag(_Ev(new_x, y, state))
+    return win._drag
+
+
+def test_a_dragged_edge_snaps_as_in_the_waveform_editor(view):
+    app, win = view
+    win.pps = 100.0                         # 8 px = 0.08 s
+    win.redraw()
+    win._sil[1] = [12.0, 13.5]
+    win.set_insert(0.0)
+    d = _edge_drag(win, 1, "out", win._x(3.54))     # 13.54: 4 px from 13.5
+    assert d["value"][0] == (10.0, 13.5)
+    assert d["snapped"]
+    assert "snapped" in win.status.cget("text")
+    win._on_track_release(_Ev(0, 0))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 13.5)]
+    app._s4_undo()
+
+
+def test_an_edge_stays_free_past_the_snap_or_with_ctrl(view):
+    app, win = view
+    win.pps = 100.0
+    win.redraw()
+    win._sil[1] = [13.5]
+    win.set_insert(0.0)
+    d = _edge_drag(win, 1, "out", win._x(3.3))      # 20 px away
+    assert d["value"][0][1] == pytest.approx(13.3) and not d["snapped"]
+    win._on_track_release(_Ev(0, 0))
+    app._s4_undo()
+    win.refresh()
+    d = _edge_drag(win, 1, "out", win._x(3.54), state=0x0004)    # Ctrl
+    assert d["value"][0][1] == pytest.approx(13.54) and not d["snapped"]
+    win._on_track_release(_Ev(0, 0))
+
+
+def test_the_playhead_pulls_an_edge_unless_it_is_parked_on_it(view):
+    app, win = view
+    win.pps = 100.0
+    win.redraw()
+    win.set_insert(3.0)                     # 13.0 s
+    d = _edge_drag(win, 1, "out", win._x(3.1))      # 10 px off: within 12
+    assert d["value"][0][1] == pytest.approx(13.0) and d["snapped"]
+    win._on_track_release(_Ev(0, 0))
+    # A trim parks the insertion point on the new edge.  Trimming on from
+    # there must not be pulled straight back to where it started.
+    assert win.insert == pytest.approx(3.0)
+    d = _edge_drag(win, 1, "out", win._x(2.95))
+    assert d["value"][0][1] == pytest.approx(12.95) and not d["snapped"]
+    win._on_track_release(_Ev(0, 0))
+
+
+def test_a_highlight_snaps_at_both_ends(view):
+    app, win = view
+    win.pps = 100.0
+    win.redraw()
+    win._sil[1] = [11.0, 12.0]
+    y0, y1 = win._track_box()
+    y = y0 + 2
+    win._on_track_press(_Ev(win._x(1.04), y))
+    win._on_track_drag(_Ev(win._x(1.97), y))
+    win._on_track_release(_Ev(win._x(1.97), y))
+    assert win._range[1:] == (pytest.approx(1.0), pytest.approx(2.0))
+    # A plain click isn't moved: the insertion point goes where you put it.
+    win._on_track_press(_Ev(win._x(1.04), y))
+    win._on_track_release(_Ev(win._x(1.04), y))
+    assert win._range is None and win.insert == pytest.approx(1.04, abs=0.011)
+
+
+def test_snap_points_come_from_the_loaded_audio_and_are_ticked(view):
+    import numpy as np
+    from assembly_view import PLAY_SR, _silence_edges
+    app, win = view
+    t = np.arange(PLAY_SR * 3) / PLAY_SR
+    tone = (np.sin(2 * np.pi * 220 * t) * 12000).astype(np.int16)
+    tone[PLAY_SR:PLAY_SR * 2] = 0           # a second of silence in the middle
+    edges = _silence_edges(tone, 10.0)
+    assert len(edges) == 2
+    assert edges[0] == pytest.approx(11.0, abs=0.03)
+    assert edges[1] == pytest.approx(12.0, abs=0.03)
+    assert _silence_edges(np.zeros(0, np.int16), 0.0) == []
+
+    win.pps = 100.0
+    win._sil[1] = edges
+    win.redraw()
+    with_ticks = len(win.cv.find_all())
+    win._sil[1] = []
+    win.redraw()
+    assert with_ticks - len(win.cv.find_all()) == 4     # two ticks, top and bottom
+
+
+def test_the_shared_snap_keeps_the_editors_rules():
+    import match_review as mr
+    b = [1.0, 2.0, 3.0]
+    assert mr.nearest_boundary([], 1.0) is None
+    assert mr.nearest_boundary(b, 0.0) == 1.0
+    assert mr.nearest_boundary(b, 9.0) == 3.0
+    assert mr.nearest_boundary(b, 1.5) == 1.0            # a tie: the earlier
+    assert mr.snap_to_boundary(1.05, b, 0.1) == 1.0
+    assert mr.snap_to_boundary(1.5, b, 0.1) == 1.5
+    assert mr.snap_to_boundary(1.05, b, 0.1, 1.04, 0.2) == 1.04   # nearer wins
+    assert mr.snap_to_boundary(1.05, [], 0.1, 1.1, 0.2) == 1.1
+    assert mr.snap_to_boundary(1.05, b, 0.1, None, 0.2) == 1.0

@@ -114,6 +114,48 @@ _SLIP_DRAG_PX = 4       # pixels mouse must move before a body-press becomes a s
 _CHUNK_S          = 120.0   # seconds per lazy-load chunk (for scrolling beyond preview)
 _TRIGGER_S        = 15.0    # trigger next chunk when viewport is this close to a loaded edge
 _AUTO_SNAP_WINDOW = 0.35    # seconds: search radius for automatic boundary snap
+SNAP_PX           = 8       # a dragged edge snaps to a silence boundary this near
+SNAP_PLAYHEAD_PX  = 12      # ...and to the playhead this near, so it feels magnetic
+
+def nearest_boundary(boundaries, t):
+    """Nearest silence boundary to t, or None if there are none.
+
+    `boundaries` is sorted, so the nearest value is one of the two
+    neighbours of t's insertion point.  A full scan with a Python lambda
+    per element measured 2.6 ms across 25,500 boundaries (a 2.78-hour
+    source), on EVERY <B1-Motion> event of a drag.
+
+    Ties resolve to the earlier boundary, matching min()'s first-minimum
+    behaviour on a sorted list.
+    """
+    if not boundaries:
+        return None
+    i = bisect.bisect_left(boundaries, t)
+    if i == 0:
+        return boundaries[0]
+    if i >= len(boundaries):
+        return boundaries[-1]
+    before, after = boundaries[i - 1], boundaries[i]
+    return before if (t - before) <= (after - t) else after
+
+
+def snap_to_boundary(t, boundaries, radius, playhead=None, playhead_radius=0.0):
+    """t snapped to a silence boundary or the playhead, whichever is closer,
+    each within its own radius (seconds).  The boundary is tried first, so
+    the playhead wins nothing on a tie but wins anything closer.  Shared by
+    the waveform editor and the Assembly track."""
+    best_t, best_dist = t, float("inf")
+    sb = nearest_boundary(boundaries, t)
+    if sb is not None:
+        d = abs(sb - t)
+        if d <= radius and d < best_dist:
+            best_t, best_dist = sb, d
+    if playhead is not None:
+        d = abs(playhead - t)
+        if d <= playhead_radius and d < best_dist:
+            best_t, best_dist = playhead, d
+    return best_t
+
 
 # ── Region colours ────────────────────────────────────────────────────────────
 #   "kept"    — audio that will be included in the edit
@@ -1865,64 +1907,22 @@ class MatchReviewDialog:
         except Exception:
             pass
 
-    def _nearest_boundary(self, t):
-        """Nearest silence boundary to t, or None if there are none.
-
-        _silence_boundaries is sorted, so the nearest value is one of
-        the two neighbours of t's insertion point.  Both callers used
-        to run `min(self._silence_boundaries, key=lambda b: abs(b - t))`
-        — a full linear scan with a Python lambda per element, measured
-        at 2.6 ms across 25,500 boundaries (a 2.78-hour source), on
-        EVERY <B1-Motion> event of a drag.
-
-        Ties resolve to the earlier boundary, matching min()'s
-        first-minimum behaviour on a sorted list.
-        """
-        sb = self._silence_boundaries
-        if not sb:
-            return None
-        i = bisect.bisect_left(sb, t)
-        if i == 0:
-            return sb[0]
-        if i >= len(sb):
-            return sb[-1]
-        before, after = sb[i - 1], sb[i]
-        return before if (t - before) <= (after - t) else after
-
     def _snap_to_silence(self, t):
         """Return t snapped to nearest silence boundary if within ~8 pixels."""
-        best = self._nearest_boundary(t)
-        if best is None:
-            return t
-        radius = 8 * self._spp / self._sr   # 8 px at current zoom
-        return best if abs(best - t) <= radius else t
+        return snap_to_boundary(t, self._silence_boundaries,
+                                SNAP_PX * self._spp / self._sr)
 
     def _snap(self, t):
         """Snap t to silence boundaries or the playhead, whichever is closer.
 
         Playhead snap uses a slightly larger radius (12 px) so it feels
-        magnetic.  Silence snap runs second so the playhead wins ties.
+        magnetic.
         """
-        radius_sil = 8  * self._spp / self._sr   # pixels → seconds
-        radius_ph  = 12 * self._spp / self._sr
-
-        best_t    = t
-        best_dist = float("inf")
-
-        # Silence boundaries
-        sb = self._nearest_boundary(t)
-        if sb is not None:
-            d = abs(sb - t)
-            if d <= radius_sil and d < best_dist:
-                best_t, best_dist = sb, d
-
-        # Playhead cursor (skip if we're dragging the playhead itself)
-        if self._drag != "playhead":
-            d = abs(self._playhead_s - t)
-            if d <= radius_ph and d < best_dist:
-                best_t, best_dist = self._playhead_s, d
-
-        return best_t
+        return snap_to_boundary(
+            t, self._silence_boundaries, SNAP_PX * self._spp / self._sr,
+            # Skip the playhead if we're dragging the playhead itself.
+            None if self._drag == "playhead" else self._playhead_s,
+            SNAP_PLAYHEAD_PX * self._spp / self._sr)
 
     def _on_drag_motion(self, event):
         if not self._drag or self._samples is None:
