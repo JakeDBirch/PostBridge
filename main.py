@@ -5223,7 +5223,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         else:
             self.results = self._build_provisional_results(int_assets)
         self._bg_reconcile_active = True
-        self._bg_stats     = {"upgraded": 0, "reopened": 0, "kept": 0}
+        self._bg_stats      = {"upgraded": 0, "reopened": 0, "kept": 0}
         self._bg_deferred   = {}
         self._final_results = None
 
@@ -7058,9 +7058,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 fut  = ex.submit(dispatch_gated, item)
                 futures[fut] = item
 
-        # VO transcription: one thread per part with its own semaphore — completely
-        # independent from the reconcile gate so stalled reconcile futures cannot
-        # block VO transcription from starting.
+        # VO transcription: one thread per part, taking turns on the line —
+        # completely independent from the reconcile gate so stalled reconcile
+        # futures cannot block VO transcription from starting.  The semaphore
+        # bounds only the ffmpeg-heavy A/V offset detection.
         _n_fast_ref = getattr(self, "_reconcile_n_fast", MAX_WORKERS)
         _n_vo_concurrent = max(1, min(len(self.vo_bins), (_n_fast_ref + 1) // 2))
         _vo_sem = threading.Semaphore(_n_vo_concurrent)
