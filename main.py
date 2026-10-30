@@ -1832,10 +1832,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             del self._redo_setup
 
         # Apply pending setup from _open_session (home page "Open Session" card)
+        # The rest of this screen's setup waits for every row: it reads them
+        # all, and a jump to Step 4 takes the pool away.
         if getattr(self, "_pending_setup", None):
-            self._apply_setup_data(self._pending_setup)
+            _setup = self._pending_setup
             del self._pending_setup
+            self._apply_setup_data(_setup, then=self._step2_pool_ready)
+        else:
+            self._step2_pool_ready()
 
+    def _step2_pool_ready(self):
+        """Step 2's pool holds everything it is going to."""
         # Snapshot the freshly-applied assignments into _redo_setup so that a
         # future ← BACK from Step 4 can restore them — without this, opening
         # a session that has cached results would jump straight to Step 4,
@@ -4103,8 +4110,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 pass
         self.after(20, _do)
 
-    def _apply_setup_data(self, data):
-        """Apply a setup dict (from _save_setup) to the current pool.
+    def _apply_setup_data(self, data, then=None):
+        """Apply a setup dict (from _save_setup) to the current pool, then
+        call `then` once every row is in.
 
         Two-phase, screen-early construction:
 
@@ -4121,14 +4129,20 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
              clock, but the main thread is free between them).
 
         Trade-off: rows below the fold arrive a couple of frames after
-        the first paint, so any code that eagerly iterates self._pool
-        ._rows immediately after _apply_setup_data returns will see a
-        partial list.  All in-tree callers already use _bulk_loading /
-        the trace to react to individual row additions, so this is
-        safe today; a comment on the pool marks the invariant.
+        the first paint, so _rows is a partial list until `then` runs.
+        Anything that needs them all, or takes the screen away, goes there.
         """
         assignments = list(data.get("assignments", {}).items())
-        self._pool._bulk_loading = True
+        pool = self._pool
+        pool._bulk_loading = True
+
+        def _finish():
+            pool._bulk_loading = False
+            pool._refresh_count()
+            if missing:
+                self._report_missing_setup_files(missing)
+            if then is not None:
+                then()
 
         # Filter existence up front so the two-phase loop below doesn't
         # need to re-stat.  os.path.exists is a network hazard on Mac
@@ -4145,23 +4159,20 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # Phase 1: synchronous first batch — this is what paints.
         for fpath, _ in existing[:FIRST]:
-            self._pool._add(fpath)
+            pool._add(fpath)
 
         # Restore tokens for what we built in phase 1 so those rows
         # arrive already assigned.  The remaining rows get their token
         # applied as they're built in phase 2.
         assign_map = dict(assignments)
-        for r in self._pool._rows:
+        for r in pool._rows:
             saved_tok = assign_map.get(r["path"])
             if saved_tok:
                 r["var"].set(saved_tok)
 
         # If everything fit in the first batch, we're done synchronously.
         if len(existing) <= FIRST:
-            self._pool._bulk_loading = False
-            self._pool._refresh_count()
-            if missing:
-                self._report_missing_setup_files(missing)
+            _finish()
             return
 
         # Phase 2: stream the rest.  Closure over assign_map + missing so
@@ -4171,22 +4182,21 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         _idx = [0]
 
         def _build_batch():
+            if not pool.winfo_exists():    # the screen went away part way
+                return
             end = min(_idx[0] + BATCH, len(_remaining))
             for fpath, _ in _remaining[_idx[0]:end]:
-                self._pool._add(fpath)
+                pool._add(fpath)
                 tok = assign_map.get(fpath)
-                if tok and self._pool._rows:
+                if tok and pool._rows:
                     # The row we just added is the last one in _rows —
                     # assign directly rather than re-scanning.
-                    self._pool._rows[-1]["var"].set(tok)
+                    pool._rows[-1]["var"].set(tok)
             _idx[0] = end
             if _idx[0] < len(_remaining):
                 self.after(0, _build_batch)
             else:
-                self._pool._bulk_loading = False
-                self._pool._refresh_count()
-                if missing:
-                    self._report_missing_setup_files(missing)
+                _finish()
 
         self.after(0, _build_batch)
 

@@ -21,6 +21,10 @@
 - **Not yet covered:** a plain-script monolog still shows its cut once tiny has been through the whole read, because its pulls don't exist until then. Refine doesn't redo a Pull Quotes session made with another model; re-transcribe that in Pull Quotes.
 - **Whole-episode first pass may take longer.** `FULL_TRANSCRIBE_CONCURRENCY` in `config.py` is now 1, so the first file comes first. Raising it finishes the pass sooner but the first file later.
 
+### Opening a session with a big media pool, and `/` nudges by the default gap
+- **Opening a saved session no longer throws "bad window path name".** A session that goes straight to Step 4 left Step 2 while its media pool was still filling, and the rest of the pool failed to load. Step 4 now waits until the pool is full. That also fixes what the error was hiding: rows that hadn't loaded were missing from the pool, so going back to Step 2 or saving could drop those files' assignments.
+- **`/` in the Assembly view nudges later by the default gap,** in place of the big nudge. `,` and `.` still use the Nudge by value.
+
 ### Google Docs: plain scripts pass Script Check, and notes land by the pull they concern
 - **LINK GOOGLE DOC… now appears on the Stages card.** The Google Doc buttons on the Script → Session row were never drawn, so there was no way to link a Doc. The same mistake stopped the AAF → XML button from saying **OPENING AAF…** while a large AAF is read; it does now.
 - **A plain narration script no longer reports errors.** Script Check called a Gunfighters script broken ("No pulls and no VO blocks were parsed") even though it loads and cuts correctly, and **WRITE NOTES INTO DOC** would have written that into the Doc. It now reports nothing to fix.

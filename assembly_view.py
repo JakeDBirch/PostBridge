@@ -38,7 +38,7 @@ AAF:
     join;
   * , and . nudge the selected region (or pull) earlier or later the same
     way, by the nudge value chosen in the Edit panel; / nudges it later by
-    the next value up, for pacing;
+    the default gap, for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
   * double-click a pull with the grabber (or Enter) to open Step 4's
@@ -118,7 +118,7 @@ SEL_PAD     = 0.15    # a highlight's edge sits at most this far outside its wor
 TX_PARA_CHARS = 600   # a pull with no script starts a new paragraph after this much,
 TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without one
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
-NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds; / nudges by the next one up
+NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 
 _SMALL      = (FB[0], 9)
@@ -910,7 +910,7 @@ class AssemblyWindow(object):
         key(p, "Split", "B", self.split)
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
-        key(p, "Big nudge later", "/", lambda: self.nudge(1, big=True))
+        key(p, "Nudge later by default gap", "/", self.nudge_gap)
         amount = tk.Frame(p, bg=SURF)
         tk.Label(amount, text="Nudge by", font=(FB[0], 10), bg=SURF,
                  fg=TEXT).pack(side="left", padx=(0, 4))
@@ -3262,15 +3262,20 @@ class AssemblyWindow(object):
                 save()
         self._show_monitor()
 
-    def _nudge_step(self, big):
-        v = _MONITOR["nudge_s"]
-        return NUDGES[min(NUDGES.index(v) + 1, len(NUDGES) - 1)] if big else v
+    def nudge_gap(self):
+        """Nudge later by the default gap, for opening up a pause."""
+        step = float(self.app.gap_var.get())
+        if step <= 0:
+            self.status.config(fg=SUB, text="The default gap is 0: nothing to "
+                               "nudge by")
+            return
+        self.nudge(1, step)
 
-    def nudge(self, direction, big=False):
+    def nudge(self, direction, step=None):
         """Move the selected region -- or the selected pull -- and everything
-        after it earlier (-1) or later (1), by the nudge value or with `big`
-        the next one up: the silence in front of it shrinks or grows.  It
-        stops once it butts against what plays before it."""
+        after it earlier (-1) or later (1), by `step` or else the nudge value:
+        the silence in front of it shrinks or grows.  It stops once it butts
+        against what plays before it."""
         key = self.sel_region or (
             (self.sel_order, 0) if self.sel_order is not None else None)
         if key is None:
@@ -3284,7 +3289,7 @@ class AssemblyWindow(object):
                                "nothing in front of it to move".format(
                                    c.label if c else ""))
             return
-        step = self._nudge_step(big)
+        step = _MONITOR["nudge_s"] if step is None else step
         value = round(max(0.0, sp["value"] + direction * step), 4)   # as stored
         if abs(value - sp["value"]) < 1e-6:
             self.status.config(fg=SUB, text="{}   ·   already butted against "
@@ -3772,7 +3777,7 @@ class AssemblyWindow(object):
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
         elif k == "slash":
-            self.nudge(1, big=True)
+            self.nudge_gap()
         elif ctrl and k.lower() == "z":
             # Step 4's own history: edits here and on the cards share it.
             (self.app._s4_redo if e.state & 0x0001 else self.app._s4_undo)()

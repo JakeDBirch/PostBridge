@@ -221,7 +221,7 @@ def test_silence_inside_a_pull_drags_like_a_gap(view):
     app, win = view
     win.set_insert(1.5)
     win.split()
-    win.nudge(1, big=True)                  # half a second of silence
+    win.nudge_gap()                         # half a second of silence
     win.redraw()
     app.update()
     y0, y1 = win._track_box()
@@ -938,7 +938,7 @@ def test_the_shared_snap_keeps_the_editors_rules():
     assert mr.snap_to_boundary(1.05, b, 0.1, None, 0.2) == 1.0
 
 
-def test_nudge_values_and_the_big_nudge(view):
+def test_nudge_values(view):
     import assembly_view
     app, win = view
     win.select(2)
@@ -948,38 +948,36 @@ def test_nudge_values_and_the_big_nudge(view):
     win.nudge(-1)
     assert gap() == pytest.approx(0.5)
 
-    win.nudge(1, big=True)                    # the next value up: 500 ms
-    assert gap() == pytest.approx(1.0)
-    win.nudge(-1, big=True)
-    assert gap() == pytest.approx(0.5)
-
     win.set_nudge(0.01)
     assert app._prefs["assembly_nudge"] == 0.01
     assert win.nudge_keys[0.01].on and not win.nudge_keys[0.1].on
-    win.nudge(1, big=True)                    # at 10 ms, a big nudge is 100 ms
-    assert gap() == pytest.approx(0.6)
     win.nudge(1)
-    assert gap() == pytest.approx(0.61)
-
-    win.set_nudge(1.0)
-    win.nudge(1, big=True)                    # at the top it stays 1 s
-    assert gap() == pytest.approx(1.61)
+    assert gap() == pytest.approx(0.51)
     assert set(assembly_view.NUDGES) == {0.01, 0.1, 0.5, 1.0}
 
 
-def test_slash_is_the_big_nudge_and_angle_brackets_are_gone(view):
+def test_slash_nudges_by_the_default_gap_and_angle_brackets_are_gone(view):
     app, win = view
+    app.gap_var.v = 0.25                      # not any of the nudge values
+    win.refresh()
     win.select(2)
-    gap = lambda: _res(app, 1).get("gap_after_s", 0.5)
+    gap = lambda: _res(app, 1)["gap_after_s"]
     _key(app, win.cv, "slash")
-    assert gap() == pytest.approx(1.0)
+    assert gap() == pytest.approx(0.5)
+    _key(app, win.cv, "slash")
+    assert gap() == pytest.approx(0.75)
     _key(app, win.cv, "question", state=0x0001)   # Shift+/ does nothing
-    assert gap() == pytest.approx(1.0)
+    assert gap() == pytest.approx(0.75)
     _key(app, win.cv, "greater", state=0x0001)
-    assert gap() == pytest.approx(1.0)
+    assert gap() == pytest.approx(0.75)
+
+    app.gap_var.v = 0.0                       # says so, and leaves it alone
+    _key(app, win.cv, "slash")
+    assert gap() == pytest.approx(0.75)
+    assert "default gap is 0" in win.status.cget("text")
 
 
-def test_the_edit_panel_offers_one_big_nudge(view):
+def test_the_edit_panel_offers_the_gap_nudge(view):
     app, win = view
 
     def labels(w):
@@ -988,8 +986,8 @@ def test_the_edit_panel_offers_one_big_nudge(view):
             out += labels(c)
         return out
     shown = labels(win.edit_flow)
-    assert "Big nudge later" in shown and "Big nudge earlier" not in shown
-    assert "Shift+/" not in shown
+    assert "Nudge later by default gap" in shown
+    assert "Big nudge later" not in shown and "Shift+/" not in shown
 
 
 def test_the_spotting_keys(view):
