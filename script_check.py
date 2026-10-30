@@ -17,8 +17,8 @@ import os
 import re
 
 from episode import read_pq_session
-from parsers import (parse_script, discover_pq_sessions, _HEADER_RE, _normalize_tc,
-                     DEFAULT_DOC_TITLE)
+from parsers import (parse_script, parse_plain_script, is_plain_script,
+                     discover_pq_sessions, _HEADER_RE, _normalize_tc, DEFAULT_DOC_TITLE)
 import script_normalize
 
 # Severity ordering is also the display ordering.
@@ -714,6 +714,12 @@ def run_checks(text, script_path=None):
 
     _check_legacy_markers(lines, out)
     _legacy = any(f.category == "Format" and "obsolete" in f.title for f in out)
+    # No markers at all is a finished narration script (Gunfighters), not a
+    # broken one: there are no headers, tokens or timecodes to get wrong.
+    if (not _legacy and not pulls and not vo_blocks and is_plain_script(text)
+            and not script_normalize.has_loose_pulls(text)
+            and parse_plain_script(text)[3]):
+        return []
     _check_shape(parts, pulls, vo_blocks, out, legacy=_legacy)
     _check_indented_headers(lines, out)
     _check_unparsed_brackets(lines, out)

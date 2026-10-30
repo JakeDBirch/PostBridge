@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import gdocs  # noqa: E402
-from script_check import Finding, ERROR, WARN  # noqa: E402
+from script_check import Finding, ERROR, WARN, run_checks  # noqa: E402
 
 
 def _doc(lines, named=None):
@@ -94,6 +94,48 @@ def test_findings_become_anchored_notes():
     # A token-level finding with no line goes under that token's first pull.
     fs = [Finding(WARN, "Assets", "No session found for token BUTLER", "no BUTLER.pb_session.json")]
     assert gdocs.findings_to_notes(fs, text)[0][0] == "[BUTLER 00:00:05-00:00:20]"
+
+
+def test_findings_that_name_a_pull_land_under_it():
+    text = "\n".join(SCRIPT + ["[BUTLER 1:00:00-1:00:09]", "Much later."])
+    head = "[BUTLER 00:00:05-00:00:20]"
+    fs = [Finding(ERROR, "Transcript", "Timecodes point at the wrong audio", head + "\n“We went”"),
+          Finding(WARN, "Transcript", "Span is short", "[BUTLER 01:00:00-01:00:09] is 9s"),
+          Finding(WARN, "Transcript", "BUTLER was transcribed with the tiny model", "Most words."),
+          Finding(WARN, "Assets", "Token BUTLER is used oddly"),
+          Finding(WARN, "Assets", "Session discovery warning", "Duplicate session for token 'BUTLER': F:\\a"),
+          Finding(WARN, "Transcript", "Timecodes point at the wrong audio", "[JENA 00:00:01-00:00:02]"),
+          Finding(WARN, "Format", "No VO blocks were parsed")]
+    assert [a for a, _m in gdocs.findings_to_notes(fs, text)] == [
+        head, "[BUTLER 1:00:00-1:00:09]", head, head, head, None, None]
+
+
+def test_one_line_holds_several_notes_in_order():
+    doc = _doc(SCRIPT)
+    head = "[BUTLER 00:00:05-00:00:20]"
+    reqs, unplaced = gdocs.plan_notes(doc, [(head, "first"), (head, "second")])
+    assert unplaced == []
+    inserts = [r["insertText"] for r in reqs if "insertText" in r]
+    assert {i["location"]["index"] for i in inserts} == {gdocs.paragraphs(doc)[5][2]}
+    # Same index: the one inserted last ends up on top.
+    assert [i["text"] for i in inserts] == [gdocs.NOTE_PREFIX + "second\n", gdocs.NOTE_PREFIX + "first\n"]
+
+
+def test_repeated_lines_each_take_a_note():
+    doc = _doc(["Title", "Same line.", "Other.", "Same line."])
+    reqs, _unplaced = gdocs.plan_notes(doc, [("Same line.", "a"), ("Same line.", "b")])
+    paras = gdocs.paragraphs(doc)
+    assert [r["insertText"]["location"]["index"] for r in reqs if "insertText" in r] == [
+        paras[3][2], paras[1][2]]
+
+
+def test_plain_script_has_nothing_to_report():
+    plain = "Episode 9\nThe first paragraph, read aloud.\n\nThe second one.\n"
+    assert run_checks(plain) == []
+    # Not plain: a title alone, nothing at all, the obsolete syntax.
+    assert any(f.severity == ERROR for f in run_checks("Episode 9\n"))
+    assert any(f.severity == ERROR for f in run_checks(""))
+    assert any("obsolete" in f.title for f in run_checks("Episode 9\n@VO PART_1\nWords.\n"))
 
 
 def test_append_after_marker_or_at_end():

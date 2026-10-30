@@ -4,6 +4,11 @@
 
 ## October 30, 2026
 
+### Google Docs: plain scripts pass Script Check, and notes land by the pull they concern
+- **A plain narration script no longer reports errors.** Script Check called a Gunfighters script broken ("No pulls and no VO blocks were parsed") even though it loads and cuts correctly, and **WRITE NOTES INTO DOC** would have written that into the Doc. It now reports nothing to fix.
+- **Notes go under the pull they are about.** A finding that names a pull or a token now sits under that pull, where most used to pile up at the top of the Doc. On a long script with transcripts next to it, that took the notes at the top from 137 of 142 to 14. Only findings about the whole script stay at the top.
+- **One line can hold several notes,** in the order Script Check lists them.
+
 ### Long interviews transcribe without running the machine out of memory
 - **Whisper now gets a long file ten minutes at a time.** It builds its buffers for all the audio it is handed before it decodes a word, about 3.7 GB per hour of audio per pass. Pull Quotes runs two passes at once on a GPU, so an interview much over an hour could use all the memory on the machine and take everything down. Each window ends on the quietest moment near its end, so no word is cut in two. Files of ten minutes or less go through as before. There is no need to split a long interview by hand any more.
 - **Whole-file transcription no longer stops at 2:46:39.** Audio past that point was silently left out, and an audio extract that took over a minute failed.

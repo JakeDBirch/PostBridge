@@ -282,28 +282,44 @@ def existing_notes(doc):
 
 # ── Planning edits (pure) ─────────────────────────────────────────────────
 
+def _anchor_by_name(finding, lines):
+    """The script line a finding with no line number is about.  Most name a
+    pull as [TOKEN in-out]; token-level ones (no session, weak transcript)
+    name the token, and go under its first pull.  None for the rest."""
+    from parsers import _HEADER_RE, _normalize_tc, _strip_comment
+    by_pull, by_token = {}, {}
+    for ln in lines:
+        m = _HEADER_RE.match(_strip_comment(ln).strip())
+        if m and m.group("tok"):
+            key = (m.group("tok"), _normalize_tc(m.group("intc")), _normalize_tc(m.group("outtc")))
+            by_pull.setdefault(key, ln)
+            by_token.setdefault(m.group("tok"), ln)
+    for m in re.finditer(r"\[([A-Z][A-Z0-9_]*) (\d{1,2}:\d{2}:\d{2})-(\d{1,2}:\d{2}:\d{2})\]",
+                         finding.title + " " + str(finding.detail or "")):
+        key = (m.group(1), _normalize_tc(m.group(2)), _normalize_tc(m.group(3)))
+        if key in by_pull:
+            return by_pull[key]
+    for word in (re.findall(r"\b[A-Z][A-Z0-9_]*\b", finding.title)
+                 + re.findall(r"\btoken '([A-Z][A-Z0-9_]*)'", str(finding.detail or ""))):
+        if word in by_token:
+            return by_token[word]
+    return None
+
+
 def findings_to_notes(findings, script_text):
     """[(anchor_line_text or None, message)] from Script Check findings.
-    A finding with a line is anchored to that line's text; one without
-    goes to the top of the Doc."""
+    A finding is anchored to its line, else to the pull or token it names;
+    one about the whole script goes to the top of the Doc."""
     lines = normalize_text(script_text).split("\n")
     notes = []
     for f in findings:
         msg = "{} {}: {}".format(f.severity.upper(), f.category, f.title)
         if f.detail:
             msg += " — " + " ".join(str(f.detail).split())
-        anchor = None
         if f.line and 1 <= f.line <= len(lines) and lines[f.line - 1].strip():
             anchor = lines[f.line - 1]
         else:
-            # Token-level findings (no session, unknown token) name the
-            # token; put the note under that token's first pull so it
-            # lands where the writer looks, not at the top of the Doc.
-            m = re.search(r"\btoken\s+([A-Z][A-Z0-9_]*)",
-                          f.title + " " + str(f.detail or ""))
-            if m:
-                head = "[" + m.group(1) + " "
-                anchor = next((ln for ln in lines if ln.lstrip().startswith(head)), None)
+            anchor = _anchor_by_name(f, lines)
         notes.append((anchor, msg))
     return notes
 
@@ -334,19 +350,20 @@ def plan_notes(doc, notes):
         idx = None
         if anchor:
             want = " ".join(anchor.split())
-            for i, n in enumerate(norm):
-                if n == want and i not in used:
-                    used.add(i); idx = paras[i][2]
-                    break
-            if idx is None:
+            hits = [i for i, n in enumerate(norm) if n == want]
+            if hits:
+                # Repeated lines take a note each; one line can hold several.
+                i = next((h for h in hits if h not in used), hits[0])
+                used.add(i); idx = paras[i][2]
+            else:
                 unplaced.append(msg)
         if idx is None:
             idx = paras[0][2]
         inserts.append((idx, msg))
     reqs = []
     # Highest index first, so no insert shifts one still to come.  Notes at
-    # the same index keep their order because the sort is stable.
-    for n, (idx, msg) in enumerate(sorted(inserts, key=lambda t: -t[0])):
+    # the same index go in last-first, so they read in order in the Doc.
+    for n, (idx, msg) in enumerate(sorted(reversed(inserts), key=lambda t: -t[0])):
         text = NOTE_PREFIX + msg + "\n"
         name = "{}:{}".format(NOTE_RANGE, hashlib.sha1(
             (msg + str(idx) + str(n)).encode("utf-8")).hexdigest()[:12])
