@@ -48,6 +48,13 @@ def test_no_widget_gets_a_padding_pair():
                      "belong in pack()/grid():\n  " + "\n  ".join(bad))
 
 
+def test_output_capture_leaves_the_standard_handles_alone(request):
+    """Tcl keeps the standard handle numbers it first saw, for life.  With fd
+    capture moving those handles, Tk fails to start every so often, in any
+    test (see pytest.ini)."""
+    assert request.config.getoption("capture") != "fd"
+
+
 def _app_or_skip():
     tk = pytest.importorskip("tkinter")
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):

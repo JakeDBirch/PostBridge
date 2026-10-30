@@ -118,3 +118,16 @@ def pytest_configure(config):
 def _collect_on_the_main_thread():
     yield
     gc.collect()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    # A test skips when there is no display for Tk, as on a bare Linux box.
+    # Windows always has one, so Tk failing to start there is a fault, and a
+    # skip would only hide it.
+    outcome = yield
+    report = outcome.get_result()
+    if (sys.platform == "win32" and report.skipped and call.excinfo is not None
+            and "Tk unavailable" in str(call.excinfo.value)):
+        report.outcome = "failed"
+        report.longrepr = str(call.excinfo.value)

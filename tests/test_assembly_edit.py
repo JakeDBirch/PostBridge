@@ -683,7 +683,8 @@ def test_silence_between_regions_is_blank_at_every_zoom(view, pps):
     app.update()
     gap_a, gap_b = win._x(pieces[0][1]), win._x(pieces[1][0])
     shapes = _wave_items(win, c.colour(), "polygon")
-    assert len(shapes) == 2                # a region each
+    assert len(shapes) == 2, ("a region each", win.cv.winfo_width(), win.cv.winfo_height(),
+                              win.pps, win.view0, len(win.cv.find_all()), sorted(win._env))
     for s in shapes:
         xs = win.cv.coords(s)[0::2]
         assert max(xs) <= gap_a + 1 or min(xs) >= gap_b - 1, (min(xs), max(xs), gap_a, gap_b)
