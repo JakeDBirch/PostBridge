@@ -2872,15 +2872,16 @@ class AssemblyWindow(object):
             return
         if kind in ("in", "out"):
             self._range = None
-            # The playhead pulls the edge to it -- unless it is parked on this
-            # edge already (it is, after a trim), or the edge could never leave.
+            # The insertion point pulls the edge to it -- unless it is parked on
+            # this edge already (it is, after a trim), or the edge could never
+            # leave.  Not the playhead: that is a moving target during playback.
             tl, du, _si = c.pieces[k]
             edge = tl if kind == "in" else tl + du
-            near = abs(self.playhead - edge) * self.pps <= match_review.SNAP_PLAYHEAD_PX
+            near = abs(self.insert - edge) * self.pps <= match_review.SNAP_PLAYHEAD_PX
             self._drag = {"mode": kind, "order": c.order, "k": k, "x0": e.x,
                           "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
                           "moved": False,
-                          "ph": None if near else c.src_at(self.playhead)}
+                          "ph": None if near else c.src_at(self.insert)}
             self.select(c.order)
             return
         if kind == "select":
@@ -3185,17 +3186,18 @@ class AssemblyWindow(object):
         self.set_insert(a)
 
     def split(self):
-        """Split the region under the insertion point (the playhead, while
-        the cut plays) in two there -- or at both ends of a highlighted
-        span, which becomes a region of its own.  The same audio, butted:
-        two regions that trim and move on their own, two clips in the AAF.
-        The region after the split is selected, ready to nudge."""
+        """Split the region under the insertion point in two there -- or at
+        both ends of a highlighted span, which becomes a region of its own.
+        The same audio, butted: two regions that trim and move on their own,
+        two clips in the AAF.  The region after the split is selected, ready
+        to nudge.  Edits work from the insertion point, which stays where it
+        was put while the cut plays, never from the moving playhead."""
         r = self._range
         if r is not None and self.sel_region is None and \
                 abs(r[2] - r[1]) >= MIN_SEG_S:
             points = sorted(r[1:])
         else:
-            points = [self.playhead if self._playing else self.insert]
+            points = [self.insert]
         by_clip = {}
         for t in points:
             c = self._clip_at(t)
@@ -3295,7 +3297,7 @@ class AssemblyWindow(object):
     def cycle_reading(self, d):
         """Swap the selected pull to the next (or previous) reading of its
         lines: a monolog keeps every delivery it found as takes_data."""
-        o = self.sel_order if self.sel_order is not None             else self._order_at(self.playhead)
+        o = self.sel_order if self.sel_order is not None else self._order_at(self.insert)
         c = self._clip(o)
         if c is None:
             return
@@ -3313,7 +3315,7 @@ class AssemblyWindow(object):
 
     def open_selected(self):
         self.open_card(self.sel_order if self.sel_order is not None
-                       else self._order_at(self.playhead))
+                       else self._order_at(self.insert))
 
     # ── Spotting marks ───────────────────────────────────────────────────
     def _marker(self, key):
@@ -3508,7 +3510,9 @@ class AssemblyWindow(object):
         return max(1, self.cv.winfo_width()) / max(10.0, self.total_s * 1.02)
 
     def zoom(self, factor):
-        anchor = self.playhead if self.view0 <= self.playhead <= \
+        """Zoom on the insertion point, which holds still while the cut plays
+        (the middle of the view, when it is out of sight)."""
+        anchor = self.insert if self.view0 <= self.insert <= \
             self.view0 + self._span() else self.view0 + self._span() / 2.0
         frac = (anchor - self.view0) / self._span()
         self.pps = min(max(self.pps * factor, self._min_pps()), MAX_PPS)

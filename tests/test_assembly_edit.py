@@ -676,6 +676,88 @@ def test_up_close_falls_back_until_the_audio_is_there(view):
     assert len(_wave_items(win, c.colour(), "polygon")) == 1
 
 
+# ── Edits work from the ghost cursor while the cut plays ──────────────────────
+def _playing(win, insert, playhead):
+    """Mid-playback: the insertion point left where it was clicked, the
+    playhead somewhere else."""
+    win._playing = True
+    win.insert, win.playhead = insert, playhead
+
+
+def test_split_during_playback_is_at_the_ghost_cursor(view):
+    app, win = view
+    _playing(win, 1.0, 3.0)
+    try:
+        win.split()
+    finally:
+        win._playing = False
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.0), (11.0, 14.0)]
+    assert win.insert == 1.0               # and it stays put
+
+
+def test_zoom_during_playback_holds_the_ghost_cursor_still(view):
+    app, win = view
+    win.pps = max(1000.0, 8.0 * win.cv.winfo_width() / win.total_s)
+    win.view0 = 2.0 - 0.25 * win._span()
+    _playing(win, 2.0, 2.0 + 0.5 * win._span())
+    try:
+        x = win._x(2.0)
+        win.zoom(1.5)
+        win.zoom(1.5)
+        assert win._x(2.0) == pytest.approx(x)
+        # Not on screen: it zooms about the middle and doesn't jump there.
+        win.view0 = 4.0
+        mid = 4.0 + win._span() / 2.0
+        x = win._x(mid)
+        win.zoom(1.5)
+        assert win._x(mid) == pytest.approx(x)
+    finally:
+        win._playing = False
+
+
+def test_opening_and_swapping_during_playback_mean_the_ghost_cursors_pull(view):
+    app, win = view
+    win.sel_order = None
+    _playing(win, 1.0, 4.8)                # the playhead is past pull 1, in pull 2
+    try:
+        assert win._order_at(win.playhead) == 2
+        win.open_selected()
+    finally:
+        win._playing = False
+        win.stop = lambda key=False: None
+    assert app.opened == [1]
+    del win.stop
+
+
+def test_an_edge_snaps_to_the_ghost_cursor_not_the_moving_playhead(view):
+    app, win = view
+    win.pps = 100.0
+    win.view0 = 0.0
+    win.redraw()
+    app.update()
+    _playing(win, 3.5, 1.0)                # source 13.5 s; the playhead is elsewhere
+    try:
+        y0, y1 = win._track_box()
+        x_out = win._x(4.0) - 1
+        win._on_track_press(_Ev(x_out, (y0 + y1) / 2.0))
+        assert win._drag["mode"] == "out"
+        assert win._drag["ph"] == pytest.approx(13.5)
+    finally:
+        win._drag = None
+        win._playing = False
+
+
+def test_spotting_during_playback_stays_on_the_live_cursor(view):
+    """Marks are for what you hear as you hear it, as in Pro Tools."""
+    app, win = view
+    _playing(win, 1.0, 3.0)
+    try:
+        win.drop_marker("music_inflection")
+    finally:
+        win._playing = False
+    assert win.markers[0]["t"] == pytest.approx(3.0, abs=1e-3)
+
+
 def test_a_span_too_short_to_trim_can_still_be_deleted(view):
     """Zoomed in on a click: 10 ms is well under the shortest trim."""
     app, win = view

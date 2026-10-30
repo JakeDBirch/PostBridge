@@ -4,6 +4,10 @@
 
 ## October 30, 2026
 
+### Assembly view: edits work from where you clicked
+- **While the cut plays, edits use the insertion point, not the moving playhead.** Split (B), zoom (R and T), Open in editor (Enter), Other reading, and an edge snapping as you drag all go by the dashed cursor that stays where you last clicked. Before, a split landed wherever playback had got to. When playback is stopped the two cursors are in the same place, so nothing changes.
+- **Spotting and pull navigation stay on the live cursor.** Music inflection (M), SFX (X) and Note (N) still drop where you are listening, as markers do in Pro Tools, and ← / → still move from there.
+
 ### Assembly view: zoom in to the samples
 - **The zoom goes much further in.** It stopped at 800 px/s, about 2 s across a 1700 px window. It now goes to 128,000 px/s, about 13 ms across the same window, with 4 px to a sample of the 32 kHz audio the Assembly plays. Edits still land on the AAF's 48 kHz grid.
 - **Up close you see the audio itself.** The waveform was drawn from a 400-a-second summary, so zooming past that only made it blockier. From 400 px/s in, each pixel spans its real lowest and highest sample, in both directions, and past one sample a pixel it is a line through the samples. Each region is drawn on its own, so tape cut between two regions never shows at the join.
