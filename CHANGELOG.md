@@ -4,6 +4,10 @@
 
 ## October 30, 2026
 
+### Long interviews transcribe without running the machine out of memory
+- **Whisper now gets a long file ten minutes at a time.** It builds its buffers for all the audio it is handed before it decodes a word, about 3.7 GB per hour of audio per pass. Pull Quotes runs two passes at once on a GPU, so an interview much over an hour could use all the memory on the machine and take everything down. Each window ends on the quietest moment near its end, so no word is cut in two. Files of ten minutes or less go through as before. There is no need to split a long interview by hand any more.
+- **Whole-file transcription no longer stops at 2:46:39.** Audio past that point was silently left out, and an audio extract that took over a minute failed.
+
 ### Export: the sequence takes the save file's name
 Choosing where to save on Step 5 now fills in **Sequence name** with the file's name, without its extension, for AAF and XML alike. You can still retype it afterwards. A cancelled dialog leaves it alone.
 

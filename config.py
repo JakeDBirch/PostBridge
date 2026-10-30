@@ -64,6 +64,11 @@ SCRIPT_CONFORM_MERGE_GAP_S = 0.8   # merge segments whose inter-cut gap is
                                   # short pauses is "keep" not "remove";
                                   # 0.8 s catches breaths and natural beats
                                   # without merging real un-scripted asides.
+WHISPER_WINDOW_S = 600        # longest stretch of audio handed to Whisper at
+                              # once.  Its buffers cost 3.7 GB per hour of
+                              # audio, so 10 minutes holds ~0.6 GB per pass.
+WHISPER_WINDOW_SEEK_S = 30    # how far back from a window's end to look for
+                              # a pause to end it on
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # silence after each pull, unless it has its own

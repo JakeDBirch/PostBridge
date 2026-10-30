@@ -4729,7 +4729,7 @@ class PqWorkflowMixin:
                         tmp_paths.append(mix_path)
                         _set_phase("extracting audio")
                         ok, err = engines.extract_window(
-                            audios[0], 0, 9999, mix_path)
+                            audios[0], 0, None, mix_path)
                         if not ok:
                             raise RuntimeError(
                                 "audio extract failed: " + (err or ""))

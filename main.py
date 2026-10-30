@@ -6494,7 +6494,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                             tmp_a = tf.name
                         try:
-                            ok, err = engines.extract_window(ap, 0, 9999, tmp_a)
+                            ok, err = engines.extract_window(ap, 0, None, tmp_a)
                             if not ok:
                                 msg = "  Part {} Take {}: audio extract failed".format(
                                     pi, take_i + 1)

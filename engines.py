@@ -164,15 +164,17 @@ def check_ffmpeg():
 
 def extract_window(media_path, start_s, end_s, out_path):
     """
-    Extract a window of audio from media_path to out_path (WAV).
+    Extract a window of audio from media_path to out_path (WAV).  An end_s
+    of None runs to the end of the file, however long that takes.
     Returns (True, None) on success, (False, error_message) on failure.
     """
-    duration = max(1.0, end_s - start_s)
+    length = [] if end_s is None else ["-t", str(max(1.0, end_s - start_s))]
+    timeout = 3600 if end_s is None else 60
     ff = _ffmpeg_cmd()
     cmd = ff + [
         "-y",
         "-ss", str(max(0, start_s)),
-        "-t", str(duration),
+        *length,
         "-i", media_path,
         "-ar", "16000",
         "-ac", "1",
@@ -180,7 +182,7 @@ def extract_window(media_path, start_s, end_s, out_path):
         out_path
     ]
     try:
-        r = _run(cmd, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
+        r = _run(cmd, capture_output=True, timeout=timeout, text=True, encoding='utf-8', errors='replace')
         if r.returncode == 0:
             return True, None
         err = (r.stderr or r.stdout or "").strip()
@@ -191,7 +193,7 @@ def extract_window(media_path, start_s, end_s, out_path):
             cmd2 = ff + [
                 "-y",
                 "-ss", str(max(0, start_s)),
-                "-t", str(duration),
+                *length,
                 "-i", media_path,
                 "-map", "0:a:0",
                 "-ar", "16000",
@@ -199,7 +201,7 @@ def extract_window(media_path, start_s, end_s, out_path):
                 "-vn",
                 out_path
             ]
-            r2 = _run(cmd2, capture_output=True, timeout=60, text=True, encoding='utf-8', errors='replace')
+            r2 = _run(cmd2, capture_output=True, timeout=timeout, text=True, encoding='utf-8', errors='replace')
             if r2.returncode == 0:
                 return True, None
             err = (r2.stderr or r2.stdout or "").strip() or err
@@ -207,7 +209,7 @@ def extract_window(media_path, start_s, end_s, out_path):
     except FileNotFoundError:
         return False, "ffmpeg not found"
     except subprocess.TimeoutExpired:
-        return False, "ffmpeg timed out after 60s"
+        return False, "ffmpeg timed out after {}s".format(timeout)
     except Exception as e:
         return False, str(e)
 
@@ -1031,7 +1033,7 @@ def transcribe_file(media_path, progress_cb=None, model_size=None,
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tmp_a = tf.name
         try:
-            ok, _ = extract_window(media_path, 0, 9999, tmp_a)
+            ok, _ = extract_window(media_path, 0, None, tmp_a)
             if not ok:
                 _prog(1.0, "Audio extraction failed")
                 return None, None
@@ -1330,6 +1332,69 @@ def _transcribe_raw(wav_path, model_size=None):
     except Exception as e:
         return "error: {}".format(e)
 
+def _quietest_cut(pcm):
+    """Where to end a window: the middle of the quietest 300 ms in the last
+    WHISPER_WINDOW_SEEK_S of `pcm`, so no word is cut in two."""
+    import numpy as np
+    seek = pcm[-WHISPER_WINDOW_SEEK_S * _MIX_SR:]
+    rms  = _mix_frame_rms(seek)
+    span = 15   # 20 ms frames
+    if len(rms) <= span:
+        return len(pcm)
+    quiet = np.convolve(rms, np.ones(span), mode="valid")
+    frame = int(np.argmin(quiet)) + span // 2
+    return len(pcm) - len(seek) + frame * _MIX_FRAME_SAMP
+
+
+def _windowed_segments(model, wav_path, **options):
+    """Whisper a file one WHISPER_WINDOW_S at a time, yielding
+    (segment, offset_s).  Add offset_s to a segment's times for file time.
+
+    Whisper builds its VAD and mel buffers for all the audio it is handed
+    before decoding any of it: measured at 3.7 GB per hour per pass, and
+    Pull Quotes runs two passes at once on GPU, so a long interview could
+    take the machine down.  A window at a time holds that to about 0.6 GB
+    per pass at any length.  A file that fits in one window, or isn't a
+    16 kHz mono WAV, goes to Whisper whole."""
+    import numpy as np
+    try:
+        wf = wave.open(wav_path, "rb")
+    except (OSError, EOFError, wave.Error):
+        wf = None
+    window = WHISPER_WINDOW_S * _MIX_SR
+    if (wf is None or wf.getnframes() <= window or wf.getnchannels() != 1
+            or wf.getsampwidth() != 2 or wf.getframerate() != _MIX_SR):
+        if wf is not None:
+            wf.close()
+        for seg in model.transcribe(wav_path, **options)[0]:
+            yield seg, 0.0
+        return
+    with wf:
+        carry  = np.zeros(0, dtype=np.float32)
+        done   = 0
+        prompt = None
+        while True:
+            raw = wf.readframes(window - len(carry))
+            pcm = np.concatenate([
+                carry,
+                np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0])
+            if not len(pcm):
+                return
+            last = wf.tell() >= wf.getnframes()
+            cut  = len(pcm) if last else _quietest_cut(pcm)
+            carry = pcm[cut:]
+            if options.get("condition_on_previous_text") and prompt:
+                # Carry the sentence across the join, as Whisper does
+                # between segments within a window.
+                options["initial_prompt"] = prompt
+            for seg in model.transcribe(pcm[:cut], **options)[0]:
+                prompt = seg.text
+                yield seg, done / _MIX_SR
+            done += cut
+            if last:
+                return
+
+
 def transcribe_clip(wav_path, progress_cb=None, model_size=None,
                     segment_cb=None, cancel_event=None):
     """Transcribe a WAV file into a flat list of word dicts.  Used by the
@@ -1353,7 +1418,8 @@ def transcribe_clip(wav_path, progress_cb=None, model_size=None,
     #   decoding so the model never tries to transcribe an empty or noisy clip.
     # no_speech_threshold=0.6           — treat segments with high no-speech
     #   probability as silence and discard them without running beam search.
-    segments, _ = model.transcribe(
+    segments = _windowed_segments(
+        model,
         wav_path,
         word_timestamps=True,
         language="en",
@@ -1363,7 +1429,7 @@ def transcribe_clip(wav_path, progress_cb=None, model_size=None,
         no_speech_threshold=0.6,
     )
     words = []
-    for seg in segments:
+    for seg, off in segments:
         if cancel_event is not None and cancel_event.is_set():
             raise TranscriptionCancelled(partial_words=words)
         new = []
@@ -1372,14 +1438,16 @@ def transcribe_clip(wav_path, progress_cb=None, model_size=None,
                 clean = re.sub(r"[^a-z']", "", w.word.lower())
                 if clean:
                     new.append({"word": clean, "text": w.word,
-                                "start": w.start, "end": w.end, "_src": size})
+                                "start": w.start + off, "end": w.end + off,
+                                "_src": size})
                 elif w.word.strip() and (new or words):
                     (new or words)[-1].setdefault("extras", []).append(
-                        {"text": w.word, "start": w.start, "end": w.end})
+                        {"text": w.word, "start": w.start + off,
+                         "end": w.end + off})
         else:
             for w in re.findall(r"[a-z']+", seg.text.lower()):
-                new.append({"word": w, "start": seg.start, "end": seg.end,
-                            "_src": size})
+                new.append({"word": w, "start": seg.start + off,
+                            "end": seg.end + off, "_src": size})
         words.extend(new)
         if new and callable(segment_cb):
             try:
@@ -1388,7 +1456,7 @@ def transcribe_clip(wav_path, progress_cb=None, model_size=None,
                 pass
         if progress_cb is not None:
             try:
-                progress_cb(float(seg.end))
+                progress_cb(float(seg.end) + off)
             except Exception:
                 pass
     return words
@@ -1448,7 +1516,8 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
     """
     effective_size = model_size or get_active_model_size()
     model = get_model(size=effective_size)
-    segments, info = model.transcribe(
+    segments = _windowed_segments(
+        model,
         wav_path,
         word_timestamps=True,
         language="en",
@@ -1464,7 +1533,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
     out = []
     first_segment = True
     prev_end = 0.0
-    for seg in segments:
+    for seg, off in segments:
         # Cancel check at the segment boundary.  CTranslate2 has just
         # finished decoding one segment and is about to start the next;
         # this is the natural point to bail out.
@@ -1474,11 +1543,11 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
             # Record the silence gap so the renderer can choose between a
             # within-paragraph line break (short gap) and a paragraph break
             # (long gap).
-            gap = max(0.0, float(seg.start) - prev_end)
+            gap = max(0.0, float(seg.start) + off - prev_end)
             out.append({
                 "word":  "\n",   # placeholder; renderer decides single vs double
-                "start": float(seg.start),
-                "end":   float(seg.start),
+                "start": float(seg.start) + off,
+                "end":   float(seg.start) + off,
                 "break": True,
                 "gap":   gap,
                 "_src":  effective_size,
@@ -1500,8 +1569,8 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
                     continue
                 entry = {
                     "word":  wt,
-                    "start": float(w.start),
-                    "end":   float(w.end),
+                    "start": float(w.start) + off,
+                    "end":   float(w.end) + off,
                     "_src":  effective_size,
                 }
                 out.append(entry)
@@ -1512,8 +1581,8 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
             if text:
                 entry = {
                     "word":  (" " if out and not out[-1].get("break") else "") + text,
-                    "start": float(seg.start),
-                    "end":   float(seg.end),
+                    "start": float(seg.start) + off,
+                    "end":   float(seg.end) + off,
                     "_src":  effective_size,
                 }
                 out.append(entry)
@@ -1526,7 +1595,7 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
                 # Streaming UI hook should never break decoding.
                 pass
 
-        prev_end = float(seg.end)
+        prev_end = float(seg.end) + off
         if callable(progress_cb):
             try:
                 progress_cb(prev_end)
@@ -1578,7 +1647,7 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tmp = tf.name
         try:
-            ok, err = extract_window(src, 0, 9999, tmp)
+            ok, err = extract_window(src, 0, None, tmp)
             if not ok:
                 raise RuntimeError(
                     "audio extract failed for {}: {}".format(
