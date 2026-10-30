@@ -28,6 +28,8 @@
 - **New defaults:** Return to start on stop on, Pre-roll on (2 s), Follow playhead off.
 - **A cut that stands on a draft says so.** A re-run can be instant when a tiny transcript is already saved, with matches that are rough until the second pass lands, and nothing used to say that. Step 3's log now names each draft it picks up, and a line at the top of Step 4 reads "Working from a tiny draft" with the second pass's progress until it finishes.
 - **Undo really un-accepts a pull.** Undoing an edit cleared the card's accepted look but left the pull's saved flag set. It came back accepted the next time Step 4 was built, and the second pass treated it as hand-edited.
+- **Other reading shows only when a pull has one.** It used to show for any plain script, where it could only report that none was found. It comes and goes as a re-cut changes the answer.
+- **Long pulls read in paragraphs.** Now that a continuous read can be one pull of several minutes, its transcript starts a new paragraph every 600 characters or so, at a sentence end or a pause of a second. The script view keeps the script's own paragraphs, and only times a pull's script when it is needed, so a redraw stays quick on an episode of long pulls.
 
 ### Assembly view: edit by highlighting the transcript; tiny first, your model behind it
 - **The text beside the controls is now the transcript of the cut.** It reads as Whisper wrote it, with casing, punctuation and figures. **W** swaps the script back in; a pull with no transcript shows its script line either way.

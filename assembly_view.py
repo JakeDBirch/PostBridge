@@ -111,6 +111,8 @@ SEL_PAD     = 0.15    # a highlight's edge sits at most this far outside its wor
 TX_HANDLE_S = 2.0     # tape shown struck through either side of a pull
 TX_CUT_MAX  = 30      # a longer run of cut words shows only its ends...
 TX_CUT_ENDS = 6       # ...this many at each, and a count for the rest
+TX_PARA_CHARS = 600   # a pull's transcript starts a new paragraph after this much,
+TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without one
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 
 _SMALL      = (FB[0], 9)
@@ -360,6 +362,7 @@ def _segments_with(segments, spans):
     return out
 
 
+_SENT_END_RE = re.compile(r"[.!?][\"'”’)\]]*$")
 _WORD_INDEX = {}
 
 
@@ -484,7 +487,8 @@ def _transcript_line(c, words, neighbours=(), show_cut=True, fade=False):
             shown.extend(run)
         j = e
 
-    tokens, chunks, pos, prev_style = [], [], 0, None
+    tokens, chunks, pos, prev_style, prev_text = [], [], 0, None, ""
+    para = 0                             # characters in the paragraph so far
 
     def emit(text, style):
         if chunks and chunks[-1][1] == style:
@@ -496,9 +500,16 @@ def _transcript_line(c, words, neighbours=(), show_cut=True, fade=False):
         style = "txcut" if k is None else (
             "txdraft" if fade and src == engines.DRAFT_MODEL else None)
         if tokens and not glued:
-            emit(" ", style if style == prev_style else None)
+            if para >= TX_PARA_CHARS and (
+                    s0 - tokens[-1].s1 >= TX_PARA_PAUSE_S
+                    or _SENT_END_RE.search(prev_text)):
+                emit("\n", None)
+                para = 0
+            else:
+                emit(" ", style if style == prev_style else None)
             pos += 1
         emit(text, style)
+        para += len(text) + 1
         if k is None:
             t0 = t1 = None
         else:
@@ -507,7 +518,7 @@ def _transcript_line(c, words, neighbours=(), show_cut=True, fade=False):
             t1 = max(t0, min(tl + du, tl + s1 - si))
         tokens.append(_Tok(pos, pos + len(text), t0, t1, s0, s1, k is not None, k))
         pos += len(text)
-        prev_style = style
+        prev_style, prev_text = style, text
     return _Line("".join(x[0] for x in chunks), tokens,
                  [tuple(x) for x in chunks])
 
@@ -681,6 +692,7 @@ class AssemblyWindow(object):
         self._words_lock = threading.Lock()
         self._words_queued = set()
         self._tx_lines  = {}             # order -> its _Line in the text
+        self._script_memo = {}           # order -> its script line, once timed
         self._tx_order  = []             # the orders down the text
         self._tx_seq    = {}             # order -> its place in that
         self._tx_anchor = None           # highlighted words: (order, word) where
@@ -871,6 +883,8 @@ class AssemblyWindow(object):
                               self.toggle_script_follow, toggle=True)
 
         p = self._panel("EDIT")
+        self.edit_flow = p
+        self.reading_key = None
         key(p, "Delete selection", "Del", self._delete_key)
         key(p, "Split", "B", self.split)
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
@@ -893,8 +907,7 @@ class AssemblyWindow(object):
         self._gap_box.bind("<FocusOut>", self._gap_from_box)
         p.add(gap)
         self._show_default_gap()
-        if any(res.get("monolog") for res in (self.app.results or ())):
-            key(p, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
+        self._show_other_reading()
 
         p = self._panel("TRANSCRIPT")
         self.tx_flow = p
@@ -1065,6 +1078,7 @@ class AssemblyWindow(object):
             self._range = None
         self._sync_region_range()
         self._show_default_gap()
+        self._show_other_reading()
         self._render_script()
         self._queue_loads()
         self.redraw()
@@ -1516,15 +1530,21 @@ class AssemblyWindow(object):
                                         _MONITOR["cut_words"], fade)
                 if line is not None:
                     return line
-        return _script_line(body, c)
+        return _Line(body, [], script=True, words=False)     # timed by _line
 
     def _line(self, order):
-        """A pull's line; a script line follows its clip's words as they load."""
+        """A pull's line.  A script line is timed when first asked for, and
+        again when its clip's words change: on a long pull that takes tens of
+        milliseconds, too many for every pull on every redraw."""
         line = self._tx_lines.get(order)
         if line is not None and line.script:
             c = self._clip(order)
             if c is not None and line.words is not c.words:
-                line = self._tx_lines[order] = _script_line(line.body, c)
+                memo = self._script_memo.get(order)
+                if memo is None or memo.words is not c.words \
+                        or memo.body != line.body:
+                    memo = self._script_memo[order] = _script_line(line.body, c)
+                line = self._tx_lines[order] = memo
         return line
 
     def _text_top(self):
@@ -2190,6 +2210,21 @@ class AssemblyWindow(object):
                 self._scroll_after = self.win.after(
                     25, lambda: _step(n - 1, left - d))
         _step()
+
+    def _show_other_reading(self):
+        """The button is there only while some pull has another reading to
+        swap to: a monolog usually has a few, and a re-cut can change that."""
+        has = any(len(r.get("takes_data") or []) > 1
+                  for r in self.app.results or ())
+        if has and self.reading_key is None:
+            self.reading_key = _KeyButton(self.edit_flow, "Other reading", "↑ ↓",
+                                          lambda: self.cycle_reading(1))
+            self.edit_flow.add(self.reading_key.frame)
+        elif not has and self.reading_key is not None:
+            self.edit_flow.remove(self.reading_key.frame)
+            self.reading_key.frame.destroy()
+            self.reading_key = None
+            self.edit_flow._reflow()
 
     def _gap_from_box(self, _e=None):
         try:

@@ -604,3 +604,101 @@ def test_busy_while_listening_or_mid_gesture(view):
     assert win.busy()
     win._on_text_release(_E(x, y))
     assert not win.busy()
+
+
+# ── Long pulls ───────────────────────────────────────────────────────────
+def _long_clip(n_words):
+    from assembly_view import _Clip
+    sr = 48000
+    dur = n_words * 0.4 + 1.0
+    return _Clip({"start": 0, "end": int(dur * sr), "gap": 0, "segments": [(0.0, dur)],
+                  "pieces": [(0, int(dur * sr), 0)]},
+                 {"order": 1}, sr, "vo", False, None)
+
+
+def test_a_long_pull_reads_in_paragraphs_at_sentence_ends():
+    from assembly_view import TX_PARA_CHARS, _transcript_line
+    words = []
+    for i in range(400):
+        text = "sentence{}.".format(i) if i % 10 == 9 else "word{}".format(i)
+        words.append(_w(text, i * 0.4, i * 0.4 + 0.3))
+    line = _transcript_line(_long_clip(400), words)
+    paras = line.body.split("\n")
+    assert len(paras) > 2
+    for p in paras[:-1]:
+        assert len(p) >= TX_PARA_CHARS and p.endswith(".")
+    # The words still sit where their tokens say.
+    for tok in line.tokens[::37]:
+        assert " " not in line.body[tok.cs:tok.ce]
+        assert "\n" not in line.body[tok.cs:tok.ce]
+    assert line.body[line.tokens[-1].cs:line.tokens[-1].ce] == "sentence399."
+
+
+def test_a_transcript_with_no_punctuation_breaks_at_a_pause():
+    from assembly_view import _transcript_line
+    words = [{"word": "word{}".format(i), "start": i * 0.4, "end": i * 0.4 + 0.3}
+             for i in range(200)]
+    for w in words[150:]:
+        w["start"] += 2.0
+        w["end"] += 2.0
+    line = _transcript_line(_long_clip(205), words)
+    assert line.body.count("\n") == 1
+    assert line.body.split("\n")[1].startswith("word150")
+
+
+def test_a_short_pull_stays_one_paragraph(view):
+    _app, win = view
+    assert "\n" not in _body(win, 1)
+
+
+def test_a_script_of_several_paragraphs_highlights_across_them(view):
+    app, win = view
+    _res(app, 1)["quote_text"] = "We walked the ridge.\nBefore dawn."
+    win.toggle_transcript()
+    c = win._clip(1)
+    c.words = win._map_words(c)
+    win.refresh()
+    assert _body(win, 1) == "We walked the ridge.\nBefore dawn."
+    _drag(app, win, 1, "ridge.", 1, "Before")
+    assert _highlighted(win) == "ridge.\nBefore"
+    assert win._range[1] == pytest.approx(1.15)
+    assert win._range[2] == pytest.approx(2.5)
+    win.delete_range()
+    assert len(_segs(app, 1)) == 2
+
+
+def test_a_redraw_does_not_time_every_script_line(view, monkeypatch):
+    import assembly_view
+    app, win = view
+    win.toggle_transcript()
+    for c in win.clips:
+        c.words = win._map_words(c)
+    calls = []
+    real = assembly_view._script_timing
+    monkeypatch.setattr(assembly_view, "_script_timing",
+                        lambda body, words: (calls.append(body), real(body, words))[1])
+    win._render_script()
+    win.redraw()
+    win.set_insert(1.4)                        # only the pull under the playhead
+    assert len(set(calls)) == 1
+    first = len(calls)
+    win._render_script()
+    win.redraw()
+    assert len(calls) == first                 # its timing is kept
+    assert win._line(1).kept
+
+
+def test_other_reading_shows_only_when_a_pull_has_one(view):
+    app, win = view
+    assert win.reading_key is None
+    _res(app, 1)["monolog"] = True
+    _res(app, 1)["takes_data"] = [{"segments": [(10.0, 14.0)], "apath": WAV}]
+    win.refresh()
+    assert win.reading_key is None             # a monolog with only the one
+    _res(app, 1)["takes_data"].append({"segments": [(40.0, 44.0)], "apath": WAV})
+    win.refresh()
+    assert win.reading_key is not None
+    assert win.reading_key.frame.winfo_exists()
+    _res(app, 1)["takes_data"].pop()           # a re-cut changes the answer
+    win.refresh()
+    assert win.reading_key is None
