@@ -279,3 +279,84 @@ def test_later_recording_wins_and_earlier_reading_is_an_alternative():
     # Every pull is numbered in cut order and is a VO row build_aaf can place.
     assert [r["order"] for r in res] == [1, 2]
     assert all(r["is_vo"] and r["monolog"] for r in res)
+
+
+# ── While the first pass is hearing the read ─────────────────────────────
+_P1 = "In the spring of that year the riders came down from the northern hills into town."
+_P2 = "Nobody in the valley had seen so many horses since before the long and bitter war."
+_P3 = "By the end of summer every one of those men was dead or gone for good and all."
+
+
+def _past(blocks, read, frontier, landed=(), **kw):
+    return monolog.paragraphs_past(blocks, [(read.words, 0.0, None, "take1.wav", None)],
+                                   "take1.wav", frontier, set(landed), **kw)
+
+
+def test_the_script_stands_in_for_the_cut_a_paragraph_a_row():
+    rows = monolog.pending_rows(_blocks(_P1, "", _P2, "", _P3))
+    assert [r["order"] for r in rows] == [1, 2, 3]
+    assert [r["status"] for r in rows] == ["not_run"] * 3
+    assert all(r["is_vo"] and r["monolog"] and r["segments"] == [] for r in rows)
+    assert rows[0]["quote_text"] == _P1
+    # Spans run on along the script, as a cut's do.
+    assert rows[1]["script_span"][0] == rows[0]["script_span"][1] + 1
+
+
+def test_a_paragraph_goes_in_once_the_read_is_past_it():
+    blocks = _blocks(_P1, "", _P2, "", _P3)
+    rd = Read().say(_P1)
+    heard_to = rd.t
+    assert _past(blocks, rd, heard_to) == []          # might not be finished
+    rd.pause(1.0).say(_P2)
+    got = _past(blocks, rd, rd.t)
+    assert [r["order"] for r in got] == [1]
+    assert got[0]["status"] == "ok" and got[0]["segments"]
+    assert got[0]["segments"][-1][1] <= heard_to + monolog.TAIL_S + 0.01
+    assert got[0]["quote_text"] == _P1
+    assert got[0]["script_span"] == monolog.pending_rows(blocks)[0]["script_span"]
+    assert got[0]["best_take_index"] == 0 and len(got[0]["takes_data"]) == 1
+    # Nothing goes in twice; the next one comes in its turn.
+    rd.pause(1.0).say(_P3)
+    assert [r["order"] for r in _past(blocks, rd, rd.t, {1})] == [2]
+
+
+def test_half_a_paragraph_stays_out_even_with_the_read_gone_on_elsewhere():
+    blocks = _blocks(_P1, "", _P2)
+    rd = Read().say("in the spring of that year")
+    rd.pause(3.0).say("sorry can we stop there a moment and get some water please")
+    assert _past(blocks, rd, rd.t + 10.0) == []
+
+
+def test_a_false_start_inside_a_paragraph_stays_cut():
+    blocks = _blocks(_P1, "", _P2)
+    rd = Read().say("in the spring of that").pause(1.0).say(_P1).pause(1.0).say(_P2)
+    got = _past(blocks, rd, rd.t)
+    assert got[0]["order"] == 1
+    assert _kept(got, rd).split()[:6] == "in the spring of that year".split()
+    assert len(_kept(got, rd).split()) == len(_P1.split())
+
+
+def test_only_the_next_few_paragraphs_are_looked_for():
+    paras = []
+    for n in "alpha bravo charlie delta echo foxtrot".split():
+        paras += ["The {} patrol rode out at dawn and came back long after dark that day.".format(n), ""]
+    blocks = _blocks(*paras)
+    rd = Read()
+    for p in paras:
+        if p:
+            rd.say(p).pause(1.0)
+    assert [r["order"] for r in _past(blocks, rd, rd.t + 10.0, ahead=2)] == [1, 2]
+    assert [r["order"] for r in _past(blocks, rd, rd.t + 10.0, {1, 2}, ahead=2)] == [3, 4]
+
+
+def test_the_real_cut_keeps_a_paragraph_you_worked_on_and_cuts_round_it():
+    blocks = _blocks(_P1, "", _P2)
+    rd = Read().say(_P1).pause(1.0).say(_P2).pause(10.0)
+    takes = [(rd.words, 0.0, None, "take1.wav", None)]
+    first = _past(blocks, rd, rd.t)
+    assert first
+    worked = dict(first[0], _s4_accepted=True, segments=[(0.5, first[0]["segments"][-1][1])])
+    rows = monolog.recut_around(blocks, takes, [worked], lambda r: r.get("_s4_accepted"))
+    assert rows[0]["_s4_accepted"] and rows[0]["segments"] == worked["segments"]
+    assert rows[0]["order"] == 1
+    assert _kept(rows[1:], rd).startswith("nobody in the valley")

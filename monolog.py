@@ -834,6 +834,79 @@ def reconcile(vo_blocks, takes, keep=()):
     return results
 
 
+def pending_rows(vo_blocks):
+    """The read's stand-in cut while the first pass is hearing it: one row per
+    paragraph of the script.  The real pulls are numbered by the real cut, which
+    only exists once the whole read is heard, and can be retaken up to the last
+    minute; these are there to work in until then, and paragraphs_past fills
+    them."""
+    S = _Script(vo_blocks)
+    rows = []
+    for bi, block in enumerate(S.blocks):
+        r = engines._vo_base_result(dict(block, order=bi + 1))
+        r["vo_id"] = block["id"]
+        r["monolog"] = True
+        r["gap_after"] = True
+        r["gap_after_s"] = 0.0
+        r["script_span"] = (S.block_start[bi], S.block_start[bi + 1] - 1)
+        rows.append(r)
+    return rows
+
+
+def paragraphs_past(vo_blocks, takes, path, frontier, landed, ahead=3, margin=5.0):
+    """pending_rows' rows the first pass has got far enough past to trust:
+    each paragraph cut against the read so far, where `path` is the recording
+    still coming in (None once all are heard), heard as far as `frontier`.
+    `landed` holds the orders already filled; only the next `ahead` paragraphs
+    are looked for (None: every one left).  A paragraph goes in once `margin`
+    seconds are past it and most of it has been read."""
+    rows = pending_rows(vo_blocks)
+    done = [i for i, r in enumerate(rows) if r["order"] in landed]
+    todo = rows if ahead is None else rows[(done[-1] + 1 if done else 0):][:ahead]
+    out = []
+    for row in todo:
+        if row["order"] in landed:
+            continue
+        first, last = row["script_span"]
+        block = dict(next(b for b in sorted(vo_blocks, key=lambda b: b["order"])
+                          if b["id"] == row["vo_id"]))
+        pulls = [r for r in reconcile([block], takes) if r.get("segments")]
+        if not pulls:
+            continue
+        src = pulls[-1]["source_audio"]      # where it was read last
+        pulls = [r for r in pulls if r["source_audio"] == src]
+        n_tok = last - first + 1
+        said = sum((r["script_span"][1] - r["script_span"][0] + 1) * r["confidence"]
+                   for r in pulls)
+        segs = _join([list(s) for r in pulls for s in r["segments"]])
+        # Part of a paragraph may yet be read while any of the read is to come.
+        if path is not None and said < MIN_SHOW * n_tok:
+            continue
+        if src == path and segs[-1][1] + margin > frontier:
+            continue
+        chosen = dict(pulls[-1]["takes_data"][pulls[-1]["best_take_index"]],
+                      segments=[tuple(s) for s in segs])
+        filled = dict(row)
+        filled.update({
+            "segments":        [tuple(s) for s in segs],
+            "rec_in_s":        segs[0][0],
+            "rec_out_s":       segs[-1][1],
+            "rec_in_tc":       secs_tc(segs[0][0]),
+            "rec_out_tc":      secs_tc(segs[-1][1]),
+            "in_tc":           secs_tc(segs[0][0]),
+            "out_tc":          secs_tc(segs[-1][1]),
+            "confidence":      round(said / float(n_tok), 3),
+            "matched_text":    " ".join(r["matched_text"] for r in pulls),
+            "n_internal_cuts": len(segs) - 1,
+            "takes_data":      [chosen],
+            "best_take_index": 0,
+            "source_audio":    src,
+            "status":          "ok" if said >= MIN_SHOW * n_tok else "low_confidence",
+        })
+        out.append(filled)
+    return out
+
+
 def locate_spans(vo_blocks, rows):
     """Give script_span to pulls cut before spans were recorded: a pull's
     quote_text is a slice of the script, found in order along it.  One that

@@ -1231,3 +1231,76 @@ def test_refine_again_does_not_call_a_finished_transcript_a_draft(media, monkeyp
         assert "refined with medium" in app._rf().strip[1].cget("text")
     finally:
         root.destroy()
+
+
+# ── A monolog's first pass ───────────────────────────────────────────────
+def _finish_monolog(media, monkeypatch, touched=False):
+    """_finish_reconcile with the paragraphs on screen and the real cut in."""
+    import main
+    app = _monolog_app(media, monkeypatch)
+    for n in ("_finish_reconcile", "_stop_reconcile_runners"):
+        setattr(type(app), n, getattr(main.App, n))
+    app._s4_is_live = lambda: True
+    app._write_conform_baseline = lambda: None
+    app._ep_amend_stage = lambda: None
+    app._log_line = lambda *a: None
+    app._bg_reconcile_active = True
+    taken = []
+    app._refine_take_cut = taken.append
+    app._refine_resume = lambda: None
+    app._bg_finish_live = lambda: None
+    row = dict(_row(1, 1.0, 2.0, media), is_vo=True, monolog=True,
+               _s4_accepted=touched)
+    app.results = [row]
+    takes = {0: [(_draft_words(), 0.0, None, media, None)]}
+    app._vo_takes_by_part = takes
+    cut = [dict(_row(1, 1.0, 2.5, media), is_vo=True), dict(_row(2, 3.0, 4.0, media), is_vo=True)]
+    app._final_results = cut
+    app._finish_reconcile()
+    return app, row, cut, taken, takes
+
+
+def test_an_untouched_monolog_takes_the_real_cut_when_the_read_is_heard(media, monkeypatch):
+    app, row, cut, taken, _t = _finish_monolog(media, monkeypatch)
+    assert taken == [cut]
+    assert not app._refine_held()
+    assert not app._bg_reconcile_active
+
+
+def test_a_monolog_you_worked_on_while_it_was_heard_waits_for_the_update(media, monkeypatch):
+    app, row, cut, taken, takes = _finish_monolog(media, monkeypatch, touched=True)
+    assert not taken                     # the cut isn't touched under you
+    assert app.results == [row] and row["segments"] == [(1.0, 2.0)]
+    assert app._refine_held()
+    assert "whole read is heard" in app._refine_status()
+    assert app._rf().held == takes[0]
+
+
+def test_a_monolog_is_never_merged_by_number(media, monkeypatch):
+    """The cut's #1 isn't the paragraphs' #1."""
+    app = _monolog_app(media, monkeypatch)
+    row = dict(_row(1, 1.0, 2.0, media), is_vo=True, monolog=True)
+    app.results = [row]
+    app._bg_reconcile_active = True
+    app._draft_to_review = lambda: None
+    filled = dict(row, segments=[(5.0, 6.0)])
+    app._draft_land([filled], media)     # a paragraph that has landed: yes, by order
+    _pump(app, lambda: not app.q.qsize())
+    assert app.results[0] is row
+
+
+def test_paragraphs_left_over_fill_in_when_the_cut_stays_as_it_is(media, monkeypatch):
+    app = _monolog_app(media, monkeypatch)
+    app._bg_reconcile_active = True
+    text = "in the spring of that year the riders came down from the northern hills"
+    app.vo_blocks = [{"order": 1, "id": "P1", "part_index": 0, "text": "worked on already here"},
+                     {"order": 2, "id": "P2", "part_index": 0, "text": text}]
+    rows = monolog.pending_rows(app.vo_blocks)
+    rows[0].update(status="ok", segments=[(0.0, 1.0)], _s4_accepted=True)
+    app.results = rows
+    words = [_word(w, 10.0 + i * 0.4, 10.3 + i * 0.4, "tiny") for i, w in enumerate(text.split())]
+    app._refine_monolog_ready([], {0: [(words, 0.0, None, media, None)]})
+    assert app._refine_held()
+    assert rows[1]["status"] == "ok" and rows[1]["segments"]
+    assert rows[1]["segments"][0][0] == pytest.approx(10.0, abs=0.2)
+    assert rows[0]["segments"] == [(0.0, 1.0)] and rows[0]["_s4_accepted"]

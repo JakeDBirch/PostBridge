@@ -3568,6 +3568,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             msg = ("Transcribing in background from the top of the script — "
                    "nothing matched yet.  Clips show script timecodes until "
                    "the first pass reaches them.")
+        elif self._monolog:
+            msg = ("Hearing the read — {} of {} paragraphs in.  The read is cut "
+                   "properly once it has all been heard.".format(matched, total))
         else:
             msg = ("Matching in background — {} of {} clips have real matches; "
                    "the rest still show script timecodes.".format(matched, total))
@@ -5214,14 +5217,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # row the user confirmed/ignored while transcription was
         # still running in the background.
         if self._monolog:
-            # A monolog's pulls only exist once the whole read is matched,
-            # so there are no per-pull rows to show early.
-            self.results = []
-            self._bg_reconcile_active = False
+            # A monolog's pulls only exist once the whole read is matched, so
+            # until then its paragraphs stand in for them.
+            self.results = monolog.pending_rows(self.vo_blocks)
         else:
             self.results = self._build_provisional_results(int_assets)
-            self._bg_reconcile_active = True
-        self._bg_stats      = {"upgraded": 0, "reopened": 0, "kept": 0}
+        self._bg_reconcile_active = True
+        self._bg_stats     = {"upgraded": 0, "reopened": 0, "kept": 0}
         self._bg_deferred   = {}
         self._final_results = None
 
@@ -5233,8 +5235,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                "as it goes. Step 4 opens as soon as the first lines "
                                "are in; the rest arrive while you work."
                                if not self._monolog else
-                               "Transcribing the read, then cutting it to your script. "
-                               "Step 4 opens when the cut is made."),
+                               "Transcribing the read from the top. Step 4 opens as "
+                               "soon as the first paragraph is in; the rest arrive while "
+                               "you work, and the read is cut properly once it's all heard."),
                          font=FB, bg=BG, fg=SUB, justify="left", anchor="w")
         _desc.pack(fill="x", pady=(0, 10))
         _desc.bind("<Configure>", lambda e: _desc.config(wraplength=e.width))
@@ -6522,12 +6525,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     _landed = _vo_landed.setdefault(pi, set())
 
                     def _land_vo(words, frontier, _vp=vp, _ap=ap, _sofar=part_takes):
-                        if self._monolog:
-                            return
+                        _takes = list(_sofar) + [(words, 0.0, _vp, _ap, None)]
                         try:
-                            fresh = lines_past(
-                                _blocks, list(_sofar) + [(words, 0.0, _vp, _ap, None)],
-                                _ap, frontier, _landed | set(_carried))
+                            if self._monolog:
+                                fresh = monolog.paragraphs_past(
+                                    _blocks, _takes, _ap, frontier, _landed)
+                            else:
+                                fresh = lines_past(_blocks, _takes, _ap, frontier,
+                                                   _landed | set(_carried))
                         except Exception as exc:
                             print("Landing VO lines failed: {}".format(exc),
                                   file=sys.stderr)
@@ -7246,7 +7251,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                             status="error", matched_text=str(e))
                                         for b in blocks]
 
-                    if not self._cancel.is_set():
+                    # (A monolog's cut is numbered its own way: _finish_reconcile.)
+                    if not self._cancel.is_set() and not self._monolog:
                         self._draft_land(
                             res_list, more_to_come=bool(pending)
                             or not _vo_done_event.is_set())
@@ -7549,7 +7555,16 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         _final = getattr(self, "_final_results", None) or []
         self._final_results = None
         _live = _was_bg and self._s4_is_live()
-        if _live:
+        if self._monolog:
+            # The real cut for the paragraphs that stood in for it, by the
+            # second pass's rule: at once if nothing has been touched, otherwise
+            # when asked.
+            if _live:
+                self._refine_monolog_ready(_final, getattr(self, "_vo_takes_by_part", {}))
+                self._bg_finish_live()
+            else:
+                self.results = _final
+        elif _live:
             # Same in-place merge the per-token batches used; rows already
             # merged are skipped, so this only catches stragglers.
             self._bg_apply_batch(_final, final=True)

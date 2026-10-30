@@ -249,7 +249,7 @@ class RefineMixin(object):
                     secs_tc(draft.frontier).split(".")[0],
                     secs_tc(draft.total).split(".")[0], os.path.basename(st.draft))
             if st.held is not None:
-                return ("Refined.  You have worked on this cut, so it stays "
+                return ("The whole read is heard.  You have worked on this cut, so it stays "
                         "as it is until you update it.")
             return st.note
         name = os.path.basename(job["path"])
@@ -839,9 +839,22 @@ class RefineMixin(object):
             # Only the words are held.  The new cut is made when it is asked
             # for, around whatever has been worked on by then.
             self._rf().held = next(iter(takes_by_part.values()))
+            self._refine_fill_paragraphs(self._rf().held)
             self._refine_show()
             return
         self._refine_take_cut(fresh)
+
+    def _refine_fill_paragraphs(self, takes):
+        """The whole read is heard but the cut is staying as it is: paragraphs
+        still standing in for one take their tape, so there's the rest of the
+        read to work in without pressing Update the cut."""
+        rows = getattr(self, "results", None) or []
+        if not any(r.get("status") == "not_run" for r in rows):
+            return
+        landed = {r.get("order") for r in rows if r.get("status") != "not_run"}
+        self._refine_apply(monolog.paragraphs_past(
+            list(self.vo_blocks), takes, None, float("inf"), landed, ahead=None),
+            refined=False)
 
     def _refine_stamp_ignored(self):
         for e in getattr(self, "_rv", None) or []:

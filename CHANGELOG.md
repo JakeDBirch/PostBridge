@@ -18,7 +18,8 @@
 - **A VO line moved to a new file by hand** gets tiny, then the chosen model, rather than a long wait with the chosen model alone.
 - **Session files say which model made them.** `.pb_session.json` files and the sessions inside episode files now carry `"model"`, shown on the session's row and status line, and in CHECK TRANSCRIPTS. Older sessions go by the model recorded on each word.
 - **A transcript's label stays true across machines.** Re-saving Jordan's transcript here used to relabel it with whatever model you had chosen. It now keeps the model that actually made it. A session that's only a tiny draft gets a second pass here like any other draft; any other model is left as it is.
-- **Not yet covered:** a plain-script monolog still shows its cut once tiny has been through the whole read, because its pulls don't exist until then. Refine doesn't redo a Pull Quotes session made with another model; re-transcribe that in Pull Quotes.
+- **A plain-script monolog works the same way.** Step 4 and the Assembly open once tiny is past the first paragraph, with one row per paragraph of the script, and each fills in as tiny passes it. When the whole read is heard, the real cut takes over: straight away if you haven't touched anything, otherwise when you press **Update the cut**, keeping what you worked on. The paragraphs left over fill in meanwhile, so the whole read is there to work in. A line retaken later in the read keeps its first reading until the real cut arrives.
+- **Not covered:** Refine doesn't redo a Pull Quotes session made with another model; re-transcribe that in Pull Quotes.
 - **Whole-episode first pass may take longer.** `FULL_TRANSCRIBE_CONCURRENCY` in `config.py` is now 1, so the first file comes first. Raising it finishes the pass sooner but the first file later.
 
 ### Opening a session with a big media pool, and `/` nudges by the default gap
