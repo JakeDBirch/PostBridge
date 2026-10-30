@@ -100,6 +100,10 @@ LAYOUT_SR   = 48000   # sample grid layout_timeline places on, as the AAF
 HANDLE_S    = 3.0     # extra source audio loaded either side of each pull,
                       # so a trim can open a pull up without a reload
 ENV_HZ      = 400     # waveform envelope resolution (bins per second)
+MAX_PPS     = PLAY_SR * 4.0   # closest zoom: 4 px to a sample of that audio
+RULER_STEPS = (0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
+               2, 5, 10, 15, 30, 60, 120, 300, 600)   # seconds between ticks
+MIN_CUT_S   = 0.001   # shortest span Delete will take out
 LEAD_S      = 0.5     # silence ahead of 0:00 so playback can start at the top
 LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
@@ -230,14 +234,16 @@ class _KeyButton(object):
         return self
 
 
-def _fmt_tc(t):
-    """Timeline position as M:SS.s (H:MM:SS.s past the hour)."""
+def _fmt_tc(t, places=1):
+    """Timeline position as M:SS.s (H:MM:SS.s past the hour), to `places`
+    decimals of a second."""
     t = max(0.0, t)
     h, r = divmod(t, 3600)
     m, s = divmod(r, 60)
+    sec = "{:0{w}.{p}f}".format(s, w=places + 3 if places else 2, p=places)
     if h:
-        return "{:d}:{:02d}:{:04.1f}".format(int(h), int(m), s)
-    return "{:d}:{:04.1f}".format(int(m), s)
+        return "{:d}:{:02d}:{}".format(int(h), int(m), sec)
+    return "{:d}:{}".format(int(m), sec)
 
 
 class _Clip(object):
@@ -2302,17 +2308,21 @@ class AssemblyWindow(object):
         ls, rh = self._ls, self._ruler_h
         cv.create_rectangle(0, 0, w, rh, fill=SURF, outline="")
         cv.create_line(0, rh, w, rh, fill=BORDER)
-        step = next((s for s in (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600)
-                     if self._font.measure("00:00.0") + 24 <= s * self.pps), 1200)
-        k = math.floor(t0 / step) * step
-        while k <= t1:
+        # As many decimals as the ticks are apart: 0:01.25 at 10 ms.
+        def _places(s):
+            return next((n for n, u in enumerate((1, 0.1, 0.01, 0.001)) if s >= u), 4)
+        step = next((s for s in RULER_STEPS
+                     if self._font.measure(_fmt_tc(t1, _places(s))) + 24 <= s * self.pps),
+                    1200)
+        n = math.floor(t0 / step)
+        while n * step <= t1:
+            k = n * step                 # not a running sum: it drifts at small steps
             x = self._x(k)
             cv.create_line(x, 2, x, ls + 2, fill=BORDER)
             if k >= 0:
-                cv.create_text(x + 4, 2, text=_fmt_tc(k) if step < 1
-                               else _fmt_tc(k).split(".")[0],
+                cv.create_text(x + 4, 2, text=_fmt_tc(k, _places(step)),
                                anchor="nw", font=self._font, fill=SUB)
-            k += step
+            n += 1
         marks = self.part_marks
         for n, (pt, name) in enumerate(marks):
             x = self._x(pt)
@@ -2408,7 +2418,7 @@ class AssemblyWindow(object):
             cv.create_line(xi, 0, xi, y1, fill=TEXT, dash=(3, 3), tags=("ins",))
         x = self._x(self.playhead)
         cv.create_line(x, 0, x, y1, fill=_C_PLAYHEAD, width=2, tags=("ph",))
-        self.tc_lbl.config(text=_fmt_tc(self.playhead))
+        self.tc_lbl.config(text=self._tc_text())
         self._light_word()
         self._light_script_word()
         self._draw_overview()
@@ -2495,6 +2505,8 @@ class AssemblyWindow(object):
         e_t0, e = env
         if not len(e):
             return
+        if self.pps >= ENV_HZ and self._draw_samples(c, a, b, mid, half, col):
+            return
         px  = np.arange(a, b, dtype=np.float64)
         tt  = self.view0 + px / self.pps
         src = np.full(len(px), np.nan)
@@ -2521,6 +2533,51 @@ class AssemblyWindow(object):
         pts = np.concatenate((top, bot)).tolist()
         if len(pts) >= 6:
             cv.create_polygon(pts, fill=col, outline="")
+
+    def _draw_samples(self, c, a, b, mid, half, col):
+        """Up close the envelope has no more detail to give: draw the audio
+        itself, a region at a time so nothing cut shows through.  Each pixel
+        spans its lowest and highest sample; with less than a sample to a
+        pixel, a line runs through the samples.  False when the pull's audio
+        isn't loaded yet."""
+        buf = self.audio.buffer(c.order)
+        if buf is None or buf[0] != c.play_path or not len(buf[2]):
+            return False
+        _path, t0, pcm = buf
+        cv = self.cv
+        per_px = PLAY_SR / self.pps
+        k = half * 0.95 / (max(self._env_scale, 1e-4) * 32768.0)
+        last = len(pcm) - 1
+        for tl, du, si in c.pieces:
+            pa = max(a, int(math.ceil(self._x(tl))))
+            pb = min(b, int(math.ceil(self._x(tl + du))))
+            if pb - pa < 2:
+                continue
+            # The sample under this region's first pixel.
+            first = (si + self.view0 + pa / self.pps - tl - t0) * PLAY_SR
+            if per_px >= 1.0:
+                edges = (first + np.arange(pb - pa + 1) * per_px).astype(np.int64)
+                edges = np.clip(edges, 0, last)
+                run = pcm[edges[0]:edges[-1] + 1]
+                off = edges[:-1] - edges[0]
+                hi = np.maximum.reduceat(run, off) * k
+                lo = np.minimum.reduceat(run, off) * k
+                xs = np.arange(pa, pb, dtype=np.float64)
+                top = np.column_stack((xs, np.maximum(mid - hi - 0.5, mid - half))).ravel()
+                bot = np.column_stack((xs[::-1], np.minimum(mid - lo + 0.5,
+                                                            mid + half)[::-1])).ravel()
+                cv.create_polygon(np.concatenate((top, bot)).tolist(),
+                                  fill=col, outline="")
+                continue
+            i0 = max(0, int(math.ceil(first)))
+            i1 = min(last, int(first + (pb - pa) * per_px))
+            if i1 - i0 < 1:
+                continue
+            idx = np.arange(i0, i1 + 1)
+            xs = pa + (idx - first) / per_px
+            ys = np.clip(mid - pcm[idx] * k, mid - half, mid + half)
+            cv.create_line(np.column_stack((xs, ys)).ravel().tolist(), fill=col)
+        return True
 
     def _draw_snap_ticks(self, c, top, bot, w):
         """Where an edge will snap: short ticks top and bottom of the lane, as
@@ -2592,6 +2649,10 @@ class AssemblyWindow(object):
         ov.create_line(self.playhead * k, 0, self.playhead * k, h,
                        fill=_C_PLAYHEAD, width=2, tags=("ph",))
 
+    def _tc_text(self):
+        """The playhead's time, to the millisecond once zoomed in that far."""
+        return _fmt_tc(self.playhead, 3 if self.pps >= ENV_HZ else 1)
+
     def _move_playhead(self):
         x = self._x(self.playhead)
         y1 = self._track_box()[1]
@@ -2600,7 +2661,7 @@ class AssemblyWindow(object):
             k = max(1, self.ov.winfo_width()) / self.total_s
             self.ov.coords("ph", self.playhead * k, 0, self.playhead * k,
                            self.ov.winfo_height())
-        self.tc_lbl.config(text=_fmt_tc(self.playhead))
+        self.tc_lbl.config(text=self._tc_text())
         self._light_word()
         self._light_script_word()
 
@@ -3108,7 +3169,7 @@ class AssemblyWindow(object):
         a, b = min(a, b), max(a, b)
         self._range = self.sel_region = None
         self._tx_clear()
-        if b - a < MIN_SEG_S:
+        if b - a < MIN_CUT_S:
             self.redraw()
             return
         edits, gone = {}, []
@@ -3430,7 +3491,7 @@ class AssemblyWindow(object):
         notches = e.delta / 120.0
         if e.state & 0x0004:                       # Ctrl: zoom at the mouse
             t = self._t(e.x)
-            self.pps = min(max(self.pps * (1.25 ** notches), self._min_pps()), 800.0)
+            self.pps = min(max(self.pps * (1.25 ** notches), self._min_pps()), MAX_PPS)
             self.view0 = t - e.x / self.pps
         else:
             self.view0 -= notches * self._span() * 0.15
@@ -3450,7 +3511,7 @@ class AssemblyWindow(object):
         anchor = self.playhead if self.view0 <= self.playhead <= \
             self.view0 + self._span() else self.view0 + self._span() / 2.0
         frac = (anchor - self.view0) / self._span()
-        self.pps = min(max(self.pps * factor, self._min_pps()), 800.0)
+        self.pps = min(max(self.pps * factor, self._min_pps()), MAX_PPS)
         self.view0 = anchor - frac * self._span()
         self.redraw()
 

@@ -4,6 +4,13 @@
 
 ## October 30, 2026
 
+### Assembly view: zoom in to the samples
+- **The zoom goes much further in.** It stopped at 800 px/s, about 2 s across a 1700 px window. It now goes to 128,000 px/s, about 13 ms across the same window, with 4 px to a sample of the 32 kHz audio the Assembly plays. Edits still land on the AAF's 48 kHz grid.
+- **Up close you see the audio itself.** The waveform was drawn from a 400-a-second summary, so zooming past that only made it blockier. From 400 px/s in, each pixel spans its real lowest and highest sample, in both directions, and past one sample a pixel it is a line through the samples. Each region is drawn on its own, so tape cut between two regions never shows at the join.
+- **The ruler and clock keep up.** Ticks go down to a millisecond, and the playhead readout shows milliseconds once you're zoomed in that far.
+- **Delete works on a span down to 1 ms.** Anything under 40 ms used to be ignored without a word, so a click you'd zoomed in to find couldn't be taken out.
+- On Episode 10's real audio, a redraw took 7–22 ms at every zoom level tried.
+
 ### Assembly view: the text is just the text; spotting, nudge and marker changes
 - **The text shows the words of the cut and nothing else.** Excised words, handles, marker labels and the `#003 TOKEN` headers are gone. A plain narration script reads as paragraphs. On an interview, the speaker's name appears only where the speaker changes, and part headings stay.
 - **It reads as the script, and only differences are marked.** Where a word was said as written, you see the script's wording, with its punctuation and spelling. Script wording that wasn't said is struck through. Words said that aren't in the script are tinted, because there is nothing to strike for them. A word you delete from the script therefore shows struck, and a false start the cut removed doesn't show at all. Casing, punctuation and hyphenation don't count as differences, and neither does Whisper's spelling of a capitalised name ("Hardin" / "Harden"). A different word form does ("killings" / "killing").

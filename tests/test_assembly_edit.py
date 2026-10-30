@@ -566,6 +566,125 @@ def test_zoom_out_full_shows_the_whole_cut(view):
     assert win.total_s * win.pps <= win.cv.winfo_width()
 
 
+# ── Zoomed all the way in ─────────────────────────────────────────────────────
+def _load(win, order, pcm, t0=9.0):
+    """Give a pull its audio, as _on_loaded does (the test file doesn't exist)."""
+    import numpy as np
+    c = win._clip(order)
+    win.audio.put(order, c.play_path, t0, np.asarray(pcm, dtype=np.int16))
+    win._env[order] = (t0, np.full(4000, 0.5, np.float32))
+    win._env_scale = 1.0
+    return c
+
+
+def _wave_items(win, col, kind):
+    return [i for i in win.cv.find_all()
+            if win.cv.type(i) == kind and win.cv.itemcget(i, "fill") == col]
+
+
+def test_zoom_reaches_the_samples_and_the_ruler_and_clock_keep_up(view):
+    import assembly_view
+    app, win = view
+    for _ in range(40):
+        win.zoom(1.5)
+    assert win.pps == assembly_view.MAX_PPS == 128000.0
+    win.set_insert(1.5)
+    win.view0 = 1.5
+    win.redraw()
+    app.update()
+    # 1 ms between ticks, so there are ticks to read, to the millisecond.
+    texts = [win.cv.itemcget(i, "text") for i in win.cv.find_all()
+             if win.cv.type(i) == "text"]
+    assert any(t.startswith("0:01.50") and len(t) == 8 for t in texts), texts
+    assert sum(1 for t in texts if t.startswith("0:01.5")) >= 5
+    assert win.tc_lbl.cget("text") == "0:01.500"
+    win.fit()
+    assert win.tc_lbl.cget("text") == "0:01.5"
+
+
+def test_wheel_zoom_stops_at_the_samples(view):
+    import assembly_view
+    app, win = view
+    win.pps = 100000.0
+    ev = _Ev(10, 10, state=0x0004)
+    ev.delta = 120 * 5
+    win._on_wheel(ev)
+    assert win.pps == assembly_view.MAX_PPS
+
+
+def test_up_close_the_wave_is_the_audio_not_the_envelope(view):
+    """Positive-only audio: the envelope would draw it either side of centre."""
+    import numpy as np
+    import assembly_view
+    app, win = view
+    c = _load(win, 1, np.full(32000 * 6, 16000))
+    win.pps = 2000.0                       # 16 samples to a pixel
+    win.view0 = 0.5
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    mid = (y0 + win._ls + 8 + y1 - win._ls - 8) / 2.0
+    polys = _wave_items(win, c.colour(), "polygon")
+    assert len(polys) == 1
+    ys = win.cv.coords(polys[0])[1::2]
+    assert min(ys) < mid - 20              # up to the sample's level
+    assert max(ys) <= mid + 1              # and nothing below centre
+
+    # Further in than a sample to a pixel: a line through the samples.
+    win.pps = assembly_view.MAX_PPS
+    win.redraw()
+    app.update()
+    lines = [i for i in _wave_items(win, c.colour(), "line")
+             if len(win.cv.coords(i)) > 40]
+    assert len(lines) == 1
+    xs = win.cv.coords(lines[0])[0::2]
+    assert np.diff(xs) == pytest.approx(4.0)   # 4 px to a sample
+    assert not _wave_items(win, c.colour(), "polygon")
+
+
+def test_up_close_a_cut_stays_out_of_the_drawing(view):
+    """Loud tape between two regions: the pixel at the join must not span it."""
+    import numpy as np
+    app, win = view
+    pcm = np.full(32000 * 6, 1000)
+    pcm[int(2.0 * 32000):int(3.0 * 32000)] = 30000      # source 11-12 s
+    app._assembly_set_segments(1, [(10.0, 11.0), (12.0, 14.0)])
+    win.refresh()
+    c = _load(win, 1, pcm)
+    win.pps = 1000.0
+    win.view0 = 0.2
+    win.redraw()
+    app.update()
+    polys = _wave_items(win, c.colour(), "polygon")
+    assert len(polys) == 2                 # a region each
+    y0, y1 = win._track_box()
+    mid = (y0 + y1) / 2.0
+    for p in polys:
+        ys = win.cv.coords(p)[1::2]
+        assert max(ys) - min(ys) < 12      # only the quiet audio, in both
+
+
+def test_up_close_falls_back_until_the_audio_is_there(view):
+    import numpy as np
+    app, win = view
+    c = win._clip(1)
+    win._env[1] = (9.0, np.full(4000, 0.5, np.float32))
+    win.pps = 2000.0
+    win.view0 = 0.5
+    win.redraw()                           # no buffer yet: no crash, the envelope
+    app.update()
+    assert len(_wave_items(win, c.colour(), "polygon")) == 1
+
+
+def test_a_span_too_short_to_trim_can_still_be_deleted(view):
+    """Zoomed in on a click: 10 ms is well under the shortest trim."""
+    app, win = view
+    win._range = (1, 1.0, 1.01)
+    win.delete_range()
+    r = _res(app, 1)
+    assert [tuple(s) for s in r["segments"]] == [(10.0, 11.0), (11.01, 14.0)]
+
+
 def _edge_drag(win, order, mode, new_x, state=0):
     """Press on a pull's edge and drag it to pixel new_x; the trim as it stands."""
     c = win._clip(order)
