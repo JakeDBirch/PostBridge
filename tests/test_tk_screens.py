@@ -60,8 +60,15 @@ def _app_or_skip():
     return app
 
 
+def _all_widgets(w):
+    yield w
+    for c in w.winfo_children():
+        yield from _all_widgets(c)
+
+
 def test_the_sequence_takes_the_save_files_name(monkeypatch):
     import main
+    tk = pytest.importorskip("tkinter")
     app = _app_or_skip()
     app.withdraw()
     try:
@@ -80,9 +87,15 @@ def test_the_sequence_takes_the_save_files_name(monkeypatch):
         app._pick_out(".aaf")
         assert app.seq_name.get() == "my own name"
         # A path typed into the field counts too; clearing it changes nothing.
+        field = next(w for w in _all_widgets(app) if isinstance(w, tk.Entry)
+                     and str(w.cget("textvariable")) == str(app.out_path))
+        # (Called directly: a withdrawn window gets no key events.)
+        assert field.bind("<KeyRelease>")
         app.out_path.set("F:\\Show\\typed.aaf")
+        app._seq_from_out_path()
         assert app.seq_name.get() == "typed"
         app.out_path.set("")
+        app._seq_from_out_path()
         assert app.seq_name.get() == "typed"
     finally:
         app.destroy()

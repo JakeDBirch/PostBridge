@@ -11,8 +11,11 @@ before it builds a window.  It does not stop a test taking keyboard focus: the
 few that call focus_force need it to deliver key events.
 """
 import ctypes
+import gc
 import re
 import sys
+
+import pytest
 
 # PnP IDs: ASUS sells under both.
 _ASUS_IDS = ("MONITOR\\ACI", "MONITOR\\AUS")
@@ -99,7 +102,19 @@ def send_windows_to_asus():
 
 
 def pytest_configure(config):
+    # A test's dead Tk interpreter must be freed on the thread that made it, or
+    # Tcl aborts the whole run.  Python's automatic collection runs on whichever
+    # thread happens to allocate, often a worker the app started, so which test
+    # dies shifts with any change to the suite.  Collect between tests instead
+    # (below).  The app has one interpreter, alive until exit, so it can't hit this.
+    gc.disable()
     try:
         send_windows_to_asus()
     except Exception:
         pass                  # no tkinter: nothing to place
+
+
+@pytest.fixture(autouse=True)
+def _collect_on_the_main_thread():
+    yield
+    gc.collect()

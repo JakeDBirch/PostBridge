@@ -215,8 +215,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         self.seq_name   = tk.StringVar()
         self.out_path   = tk.StringVar()
-        # The sequence takes the save file's name; it can still be retyped.
-        self.out_path.trace_add("write", self._seq_from_out_path)
         self.gap_var    = tk.DoubleVar(value=DEFAULT_GAP)
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
@@ -9459,9 +9457,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                  width=26, anchor="w").pack(side="left")
         self._btn(row3, "BROWSE",
                   lambda: self._pick_out(ext), small=True).pack(side="right")
-        tk.Entry(row3, textvariable=self.out_path, font=FB,
-                 bg=SURF2, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", bd=6).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        path_ent = tk.Entry(row3, textvariable=self.out_path, font=FB,
+                            bg=SURF2, fg=TEXT, insertbackground=TEXT,
+                            relief="flat", bd=6)
+        path_ent.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        path_ent.bind("<KeyRelease>", self._seq_from_out_path)
 
         # ── Clip-review panel: shows what will actually be exported ──────────
         # Segments are read live from self.results so any Step 4 edits
@@ -9549,9 +9549,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             defaultextension=ext,
             filetypes=ftypes,
             initialfile="roughcut{}".format(ext))
-        if p: self.out_path.set(p)
+        if p:
+            self.out_path.set(p)
+            self._seq_from_out_path()
 
-    def _seq_from_out_path(self, *_):
+    def _seq_from_out_path(self, _e=None):
+        """The sequence takes the save file's name; it can still be retyped."""
         name = os.path.splitext(os.path.basename(self.out_path.get()))[0]
         if name:
             self.seq_name.set(name)
