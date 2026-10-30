@@ -591,6 +591,8 @@ class MediaPool(tk.Frame):
         self._sort_scheduled    = False   # deferred _sort_rows flag
         self._bulk_loading      = False   # suppresses trace-driven rebuild during restore
         self._user_unassigned   = set()   # paths the user explicitly cleared
+        self._sort_col          = "file"  # column the rows are shown by
+        self._sort_dir          = "asc"
 
         self._hdr = hdr = tk.Frame(self, bg=SURF)
         hdr.pack(fill="x", padx=12, pady=(10,4))
@@ -763,8 +765,9 @@ class MediaPool(tk.Frame):
 
         kind = "VIDEO" if is_video(path) else "AUDIO"
         kc   = ("#1e3a1e","#5aab61") if kind=="VIDEO" else ("#1e2a3a","#5588cc")
-        tk.Label(row, text=kind, font=("Courier New",9,"bold"),
-                 bg=kc[0], fg=kc[1], padx=5, pady=3).pack(side="left")
+        kind_lbl = tk.Label(row, text=kind, font=("Courier New",9,"bold"),
+                            bg=kc[0], fg=kc[1], padx=5, pady=3)
+        kind_lbl.pack(side="left")
 
         # ── Filename column (fixed pixel width, auto-sized to content) ──────────
         fn_w = self._pool_name_col_w if self._pool_name_col_w else 240
@@ -856,7 +859,8 @@ class MediaPool(tk.Frame):
         rm.pack(side="left")
         tint_refs.append(rm)
 
-        rec = {"path": path, "var": var, "row": row, "fn_frame": fn_frame,
+        rec = {"path": path, "var": var, "row": row, "kind_lbl": kind_lbl,
+               "fn_frame": fn_frame,
                "fn_lbl": fn_lbl, "dd_frame": dd_frame, "sash": sash,
                "link_id": None, "link_mirrored": False,
                "link_lbl": link_lbl, "rm_lbl": rm}
@@ -887,8 +891,12 @@ class MediaPool(tk.Frame):
         threading.Thread(target=_fetch_dur, daemon=True).start()
 
     def _sort_rows(self):
-        """Re-pack pool rows alphabetically; auto-size columns unless user has
-        manually resized via the sash."""
+        """Re-pack pool rows in the chosen display order; auto-size columns
+        unless user has manually resized via the sash.
+
+        _rows itself always stays alphabetical: assignments, saves and a
+        monolog's recording order all read it, and clicking a column header
+        must not change what any of them see."""
         self._rows.sort(key=lambda r: os.path.basename(r["path"]).lower())
 
         if self._rows:
@@ -932,7 +940,27 @@ class MediaPool(tk.Frame):
 
         for r in self._rows:
             r["row"].pack_forget()
+        for r in self._display_rows():
             r["row"].pack(fill="x", pady=1)
+
+    def _display_rows(self):
+        """The rows in on-screen order.  Sorting by TYPE keeps each type's
+        files alphabetical in either direction (sorted() is stable)."""
+        if self._sort_col == "type":
+            key = lambda r: is_video(r["path"])    # AUDIO, then VIDEO
+        else:
+            key = lambda r: os.path.basename(r["path"]).lower()
+        return sorted(self._rows, key=key, reverse=self._sort_dir == "desc")
+
+    def _sort_by(self, col):
+        """Sort the shown rows by col; second click on same col reverses."""
+        if self._sort_col == col:
+            self._sort_dir = "desc" if self._sort_dir == "asc" else "asc"
+        else:
+            self._sort_col = col
+            self._sort_dir = "asc"
+        self._rebuild_col_hdr()
+        self._sort_rows()
 
     def _rebuild_col_hdr(self):
         """Rebuild the column header labels to match current column widths."""
@@ -955,20 +983,28 @@ class MediaPool(tk.Frame):
 
         _HDR_H = 20   # explicit header row height in pixels
 
-        # Fixed prefix: strip (6px) + KIND badge.  Measure by asking tk for the
-        # badge width after rendering; fall back to a safe constant.
-        _PREFIX_W = 62   # 6px strip + ~56px "AUDIO"/"VIDEO" badge with padx=5
+        # Fixed prefix: row border (1px) + strip (6px) + KIND badge.  The badge's
+        # width depends on display scaling, so ask tk for it.
+        _PREFIX_W = 7 + self._rows[0]["kind_lbl"].winfo_reqwidth()
 
-        tk.Frame(self._col_hdr, bg=SURF,
-                 width=_PREFIX_W, height=_HDR_H).pack(side="left")
+        def _sort_hdr(text, col, width):
+            """A click-to-sort header cell; the active column shows its arrow."""
+            if self._sort_col == col:
+                text += " ▲" if self._sort_dir == "asc" else " ▼"
+            f = tk.Frame(self._col_hdr, bg=SURF, width=width, height=_HDR_H,
+                         cursor="hand2")
+            f.pack_propagate(False)
+            f.pack(side="left")
+            lbl = tk.Label(f, text=text, font=("Courier New", 8, "bold"),
+                           bg=SURF, fg=SUB, anchor="w", padx=0, cursor="hand2")
+            lbl.pack(fill="both", expand=True, padx=(6, 0))
+            for w in (f, lbl):
+                w.bind("<ButtonRelease-1>", lambda e: self._sort_by(col))
+
+        _sort_hdr("TYPE", "type", _PREFIX_W)
 
         # FILE header — fixed pixel width + explicit height avoids collapse
-        name_w = self._pool_name_col_w or 240
-        nf = tk.Frame(self._col_hdr, bg=SURF, width=name_w, height=_HDR_H)
-        nf.pack_propagate(False)
-        nf.pack(side="left")
-        tk.Label(nf, text="FILE", font=("Courier New", 8, "bold"),
-                 bg=SURF, fg=SUB, anchor="w", padx=6).pack(fill="both", expand=True)
+        _sort_hdr("FILE", "file", self._pool_name_col_w or 240)
 
         # Sash spacer (matches the 5px sash in every row)
         tk.Frame(self._col_hdr, bg=SURF3,

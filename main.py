@@ -1794,6 +1794,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # ── Scrollable content area fills remaining space ─────────────────────
         sf = self._scroll_frame(self.body)
+        _prev_pool = getattr(self, "_pool", None)
 
         if self._monolog:
             # One narration target for the whole script: every recording is
@@ -1805,6 +1806,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._pool = MediaPool(sf, self.tokens, self.parts,
                                   aaf_mode=(self.workflow in ("script_aaf", "script_session")))
         self._pool.pack(fill="x", pady=(0,10), padx=2)
+        # Coming back to this screen keeps the order the rows were sorted in.
+        if _prev_pool is not None:
+            self._pool._sort_col = _prev_pool._sort_col
+            self._pool._sort_dir = _prev_pool._sort_dir
         self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
                   small=True).pack(side="left", padx=(10, 0))
 
