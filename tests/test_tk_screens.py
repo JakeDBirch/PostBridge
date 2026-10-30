@@ -73,6 +73,32 @@ def _all_widgets(w):
         yield from _all_widgets(c)
 
 
+def test_a_crash_on_the_ui_queue_is_reported_and_the_queue_carries_on():
+    """A Step 2 that crashed on this queue left a blank screen and not a word
+    why: the error was thrown away.  A widget gone with its screen is no fault."""
+    tk = pytest.importorskip("tkinter")
+    app = _app_or_skip()
+    app.withdraw()
+    reported, ran = [], []
+    app.report_callback_exception = lambda exc, val, tb: reported.append(val)
+    gone = tk.Label(app)
+    gone.destroy()
+
+    def _crash():
+        raise AttributeError("a fault")
+    try:
+        app._ui(_crash)
+        app._ui(lambda: gone.config(text="too late"))
+        app._ui(lambda: tk.Label(app, no_such_option=1))
+        app._ui(lambda: ran.append(True))
+        app._pump_ui()
+        assert ran
+        assert [type(e) for e in reported] == [AttributeError, tk.TclError], reported
+        assert "no_such_option" in str(reported[1])
+    finally:
+        app.destroy()
+
+
 def test_the_sequence_takes_the_save_files_name(monkeypatch):
     import main
     tk = pytest.importorskip("tkinter")

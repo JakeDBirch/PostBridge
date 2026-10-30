@@ -14,6 +14,7 @@ import ctypes
 import gc
 import re
 import sys
+import time
 
 import pytest
 
@@ -99,6 +100,29 @@ def send_windows_to_asus():
 
     _opens_there(tk.Tk)
     _opens_there(tk.Toplevel)
+
+
+def open_assembly(app):
+    """The Assembly window over `app`, ready for a test.
+
+    It places its dividers and sets its first zoom on timers.  They fire here, or
+    they can land inside a test and change the zoom it just set.
+
+    On a busy machine Tk now and then never maps the window, however long it is
+    given: the canvas stays 1x1, so nothing draws and a click lands nowhere, and
+    deiconify doesn't bring it.  Why isn't known.  Another window maps, so open one."""
+    import assembly_view
+    for _ in range(5):
+        win = assembly_view.AssemblyWindow(app)
+        app._assembly = win
+        settle = time.monotonic() + 0.2
+        while time.monotonic() < settle:
+            app.update()
+        if win.win.winfo_ismapped():
+            return win
+        win.close()
+        getattr(app, "_prefs", {}).pop("assembly_layout", None)   # measured at 1x1
+    pytest.fail("the Assembly window never mapped, five times running")
 
 
 def pytest_configure(config):

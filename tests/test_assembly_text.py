@@ -14,6 +14,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from conftest import open_assembly  # noqa: E402
 import engines  # noqa: E402
 
 tk = pytest.importorskip("tkinter")
@@ -138,10 +139,7 @@ def view(monkeypatch):
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
     monkeypatch.setattr(os.path, "isfile",
                         lambda p, _f=os.path.isfile: p == WAV or _f(p))
-    win = assembly_view.AssemblyWindow(app)
-    app._assembly = win
-    for _ in range(5):
-        app.update()
+    win = open_assembly(app)
     win.refresh()
     app.update()
     yield app, win

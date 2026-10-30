@@ -22,6 +22,10 @@
 - **Not covered:** Refine doesn't redo a Pull Quotes session made with another model; re-transcribe that in Pull Quotes.
 - **Whole-episode first pass may take longer.** `FULL_TRANSCRIBE_CONCURRENCY` in `config.py` is now 1, so the first file comes first. Raising it finishes the pass sooner but the first file later.
 
+### Leaving a folder scan stays left, and background crashes get reported
+- **A folder scan no longer pulls you back when it finishes.** If you left the episode screen while its folder was still being scanned, the end of the scan sent you back to that screen and wiped the one you had moved to. With the episode closed, it crashed instead. The scan's results still reach the episode.
+- **Crashes in work handed back to the screen now reach the console.** They were thrown away, so a screen that crashed while building stayed blank with no explanation. They now print like every other error. A background job updating a screen you have already left stays quiet, since that is no fault.
+
 ### Opening a session with a big media pool, and `/` nudges by the default gap
 - **Opening a saved session no longer throws "bad window path name".** A session that goes straight to Step 4 left Step 2 while its media pool was still filling, and the rest of the pool failed to load. Step 4 now waits until the pool is full. That also fixes what the error was hiding: rows that hadn't loaded were missing from the pool, so going back to Step 2 or saving could drop those files' assignments.
 - **`/` in the Assembly view nudges later by the default gap,** in place of the big nudge. `,` and `.` still use the Nudge by value.

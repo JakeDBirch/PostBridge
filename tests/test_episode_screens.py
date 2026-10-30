@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
 
@@ -135,6 +136,34 @@ def test_choose_folder_scan_save_reopen(app, monkeypatch, project):
     app._ep = None
     _open_fresh(app, monkeypatch, project, reset=False)
     assert app._ep["sources"]["Ep 7 pt 1"]["token"] == "NARR1"
+    assert not app._errors, "\n".join(app._errors)
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_a_scan_that_ends_after_you_left_leaves_you_where_you_are(
+        app, monkeypatch, project, closed):
+    """It went back to the episode screen from anywhere, wiping that screen;
+    with the episode closed, it crashed."""
+    _open_fresh(app, monkeypatch, project)
+    scan, finish, done = EP.scan, threading.Event(), threading.Event()
+
+    def _slow_scan(*a, **k):
+        finish.wait(30)
+        try:
+            return scan(*a, **k)
+        finally:
+            done.set()
+    monkeypatch.setattr(EP, "scan", _slow_scan)
+    app._ep_scan()
+    _pump(app, 3)
+    app._home()
+    if closed:
+        app._ep = None
+    _pump(app, 3)
+    finish.set()
+    assert _wait(app, done.is_set)
+    _pump(app, 10)
+    assert app.workflow is None
     assert not app._errors, "\n".join(app._errors)
 
 

@@ -273,8 +273,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 cb = self._ui_q.get_nowait()
                 try:
                     cb()
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Background work can outlast its screen, and a widget that
+                    # went with it is no fault.  Anything else is reported as Tk
+                    # reports its own callbacks' errors: dropped here, a crash
+                    # building a screen left it blank, with no word why.
+                    if not (isinstance(e, tk.TclError) and (
+                            "invalid command name" in str(e)
+                            or "bad window path name" in str(e))):
+                        self.report_callback_exception(*sys.exc_info())
         except queue.Empty:
             pass
         self.after(20, self._pump_ui)

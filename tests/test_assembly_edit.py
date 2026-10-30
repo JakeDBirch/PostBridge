@@ -18,6 +18,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from conftest import open_assembly  # noqa: E402
 import engines  # noqa: E402
 
 tk = pytest.importorskip("tkinter")
@@ -124,10 +125,7 @@ def view(monkeypatch):
 
     monkeypatch.setitem(assembly_view._MONITOR, "nudge_s", 0.1)
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
-    win = assembly_view.AssemblyWindow(app)
-    app._assembly = win
-    for _ in range(5):
-        app.update()
+    win = open_assembly(app)
     yield app, win
     win.close()
     app.destroy()
@@ -681,6 +679,7 @@ def test_silence_between_regions_is_blank_at_every_zoom(view, pps):
     win.view0 = 0.0
     win.redraw()
     app.update()
+    assert win.pps == pps
     gap_a, gap_b = win._x(pieces[0][1]), win._x(pieces[1][0])
     shapes = _wave_items(win, c.colour(), "polygon")
     assert len(shapes) == 2, ("a region each", win.cv.winfo_width(), win.cv.winfo_height(),

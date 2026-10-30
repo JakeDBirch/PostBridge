@@ -276,6 +276,12 @@ class EpisodeWorkflowMixin:
             self._ui(lambda: detail.config(
                 text="Measuring {} of {}: {}".format(done, total, name)))
 
+        def _back():
+            # Only if this screen is still up: the user may have moved on while
+            # it looked, and this would wipe wherever they are now.
+            if self._ep is ep and status.winfo_exists():
+                self._ep_view()
+
         def _run():
             try:
                 res = EP.scan(ep["root"], progress=_progress,
@@ -283,11 +289,11 @@ class EpisodeWorkflowMixin:
             except Exception as e:
                 msg = str(e)    # `e` is unbound by the time the lambda runs
                 self._ui(lambda: messagebox.showerror("Scan failed", msg))
-                self._ui(self._ep_view)
+                self._ui(_back)
                 return
             def _done():
                 EP.apply_scan(ep, res)
-                self._ep_view()
+                _back()
             self._ui(_done)
 
         threading.Thread(target=_run, daemon=True).start()
