@@ -290,7 +290,7 @@ On the track, **Home** returns to zero and **Alt+A** (or F) zooms out to the who
 
 ### Step 5 — Export
 
-Choose **AAF** or **XML**, set sequence name and inter-part gap, then export.
+Choose **AAF** or **XML** and where to save it, then export. The sequence takes the save file's name unless you retype it.
 
 ---
 

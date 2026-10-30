@@ -4,6 +4,9 @@
 
 ## October 30, 2026
 
+### Export: the sequence takes the save file's name
+Choosing where to save on Step 5 now fills in **Sequence name** with the file's name, without its extension, for AAF and XML alike. You can still retype it afterwards. A cancelled dialog leaves it alone.
+
 ### Update the cut keeps your work, and silence looks like silence
 - **Update the cut keeps every pull you've worked on.** Its dialog promised that, but a pull cut before the app recorded its place in the script was thrown away, worked on or not. On Episode 10 that was all 67 pulls and their markers, and the result would then have gone into the episode file. A pull now finds its place from its own text. If one can't be placed, because the script has changed, the update is refused and the cut stays exactly as it was.
 - **New pulls cover only the lines you haven't worked on, so nothing plays twice.** One long new pull used to be added whole around any edited pull inside it. New pulls also give way to tape a kept pull already plays. The dialog now says how many pulls stay and how many change.

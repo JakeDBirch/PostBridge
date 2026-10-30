@@ -60,6 +60,34 @@ def _app_or_skip():
     return app
 
 
+def test_the_sequence_takes_the_save_files_name(monkeypatch):
+    import main
+    app = _app_or_skip()
+    app.withdraw()
+    try:
+        # The name a script loads with, on Step 5 as the user sees it.
+        app.workflow, app.results = "script_session", []
+        app.seq_name.set("High Noon in Dodge City (AUTO)")
+        app._step5()
+        app.update()
+        monkeypatch.setattr(main.filedialog, "asksaveasfilename",
+                            lambda **k: "F:/Show/01_PROJECT FILES/GF_10 v2.1 for mix.aaf")
+        app._pick_out(".aaf")
+        assert app.seq_name.get() == "GF_10 v2.1 for mix"
+        # It can still be retyped, and a cancelled dialog leaves it be.
+        app.seq_name.set("my own name")
+        monkeypatch.setattr(main.filedialog, "asksaveasfilename", lambda **k: "")
+        app._pick_out(".aaf")
+        assert app.seq_name.get() == "my own name"
+        # A path typed into the field counts too; clearing it changes nothing.
+        app.out_path.set("F:\\Show\\typed.aaf")
+        assert app.seq_name.get() == "typed"
+        app.out_path.set("")
+        assert app.seq_name.get() == "typed"
+    finally:
+        app.destroy()
+
+
 def test_pull_quotes_session_view_shows_transcript(tmp_path):
     media = tmp_path / "Butler.mp3"
     media.write_bytes(b"")

@@ -215,6 +215,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         self.seq_name   = tk.StringVar()
         self.out_path   = tk.StringVar()
+        # The sequence takes the save file's name; it can still be retyped.
+        self.out_path.trace_add("write", self._seq_from_out_path)
         self.gap_var    = tk.DoubleVar(value=DEFAULT_GAP)
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
@@ -9548,6 +9550,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             filetypes=ftypes,
             initialfile="roughcut{}".format(ext))
         if p: self.out_path.set(p)
+
+    def _seq_from_out_path(self, *_):
+        name = os.path.splitext(os.path.basename(self.out_path.get()))[0]
+        if name:
+            self.seq_name.set(name)
 
     def _collect_export_inputs(self):
         """Snapshot the export inputs on the main thread: the edited result
