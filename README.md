@@ -214,6 +214,8 @@ PostBridge picks the fastest path per token:
 - **5+ pulls and no cache** → transcribes the full audio once and caches it, then looks up each pull
 - **Under 5 pulls** → traditional per-pull Whisper on padded windows
 
+**Two passes.** Anything that has to be transcribed gets the tiny model here, so Step 4 and the Assembly open straight away. The model chosen in the picker then runs in the background, one file at a time, and its words replace tiny's as they are decoded. When a file finishes, its transcript is saved labelled with that model and its pulls are matched again: a pull you accepted or reassigned keeps your cut, and your marks and gaps stay on every pull. A monolog is cut again once all its recordings are done, straight away if nothing has been touched, otherwise when you press **Update the cut**, which keeps the pulls you worked on. A session closed part way picks up the next time Step 4 opens. With tiny chosen in the picker, the one pass is all there is.
+
 When a token has **two or more audio files**, reconcile mixes them and transcribes the mix — so a sidecar on one individual track doesn't help, and the Pull Quotes session is dropped as possibly stale. What does help is every track carrying the *same* transcript, which is exactly how Pull Quotes mirrors one when you save a session: reconcile reuses it for the mix and stamps it onto the mix for next time. A partial set (only some tracks have a sidecar) or a disagreeing set is rejected, and the mix is transcribed.
 
 A sidecar is accepted when the media's mtime still matches it (±2 s). If the mtime drifted — copying media off a shared drive, restoring from backup, and re-saving all rewrite it — PostBridge falls back to the sidecar's baked `audio_signature` (size → duration → SHA-256) and reuses the transcript when the audio is provably identical. Sidecars written before signatures existed remain mtime-gated.
@@ -275,6 +277,12 @@ The − / × / + stepper covers 0.75× to 3× (or `[` and `]`; the end stops dim
 This needs `sounddevice` (PortAudio). Without it PostBridge falls back to the old render-a-WAV-and-play-it path, which works on Windows only and has no live response.
 
 Other editor shortcuts: `space` play/stop, `←`/`→` nudge IN, `shift+←`/`→` nudge OUT, `shift+S` toggle SKIP CUTS, `+`/`-` zoom.
+
+### The Assembly's text
+
+The text beside the Assembly's controls is the transcript of the cut, and highlighting it selects the audio. Drag across words, double-click a word, triple-click a pull, Shift-click to extend; a selection can run across pulls. Space plays it, Delete takes it out, B splits at both ends, I / O / U / M / K spot on it, Ctrl+C copies the words, and right-click offers all of these. Deleting or splitting across pulls is one undo step. It edits the audio, not the words: there is no typing corrections into the transcript.
+
+Tape out of the cut stays in the text, struck through: what went from inside a pull, and about 2 s either side. **H** (or Ctrl+H) puts highlighted words back. **W** swaps in the script, **Shift+W** hides the struck words. **Refine with `<model>`** in the TRANSCRIPT panel transcribes the cut's files again with the model now chosen.
 
 ### Step 5 — Export
 

@@ -66,6 +66,7 @@ from aaf_workflow import AafWorkflowMixin
 from pq_workflow import PqWorkflowMixin
 from episode import read_pq_session
 from episode_workflow import EpisodeWorkflowMixin
+from refine import RefineMixin
 
 
 def _tx_count_chars(tx, a, b):
@@ -103,7 +104,7 @@ def _tx_count_displaylines(tx, a, b):
     return int(r)
 
 
-class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
+class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
           TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     # ── Status display maps (single source of truth) ────────────────
@@ -584,6 +585,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             self._prefs["whisper_model"] = new_choice
             self._save_prefs()
             self._refresh_model_indicators()
+            self._refine_model_changed()
 
         var.trace_add("write", _on_change)
 
@@ -669,11 +671,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # of wrapping every line.  Caller can drag tighter if they want.
         self._center_dialog(win, 1080, 420)
 
-    def _is_transcription_running(self):
+    def _is_transcription_running(self, refine=True):
         """Return True if any transcription is currently in flight.
         Used to gate the Settings dialog model swap — applying a new
         model mid-transcription can segfault the CTranslate2 backend
-        (confirmed crash with small -> tiny swap on GPU)."""
+        (confirmed crash with small -> tiny swap on GPU).  `refine=False`
+        leaves out the second pass, whose draft stands if it is stopped."""
         # Pull Quotes: every session carries a _progress.active flag
         # while its Whisper worker is running.
         proj = getattr(self, "_pq_project", None)
@@ -684,6 +687,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # Script -> Session: tracked by the global busy flag the
         # reconcile launcher sets (see _start_reconcile / _finish_reconcile).
         if getattr(self, "_reconcile_busy", False):
+            return True
+        if refine and self._refine_running():
             return True
         return False
 
@@ -782,6 +787,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 self._cancel.set()
             except Exception:
                 pass
+        self._refine_stop()
 
     def _refresh_model_indicators(self):
         """Push the active model name into every visible picker dropdown.
@@ -1813,25 +1819,45 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
             order = r.get("order")
             if order is None:
                 continue
-            entry = {
-                "segments":   r.get("segments", []),
-                "rec_in_tc":  r.get("rec_in_tc",  ""),
-                "rec_out_tc": r.get("rec_out_tc", ""),
-                "rec_in_s":   r.get("rec_in_s",   0.0),
-                "rec_out_s":  r.get("rec_out_s",  0.0),
-                "status":     r.get("status",     ""),
-                "token":      r.get("token",      ""),
-                "source_audio": r.get("source_audio", ""),
-                "is_vo":      bool(r.get("is_vo", False)),
-                "confidence": r.get("confidence", None),
-                # Fresh reconcile output starts unflagged on both axes.
-                "ignored":    False,
-                "accepted":   False,
-            }
-            if "gap_after_s" in r:
-                entry["gap_after_s"] = r["gap_after_s"]
-            snap[str(order)] = entry
+            snap[str(order)] = self._conform_baseline_entry(r)
         try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _conform_baseline_entry(r):
+        entry = {
+            "segments":   r.get("segments", []),
+            "rec_in_tc":  r.get("rec_in_tc",  ""),
+            "rec_out_tc": r.get("rec_out_tc", ""),
+            "rec_in_s":   r.get("rec_in_s",   0.0),
+            "rec_out_s":  r.get("rec_out_s",  0.0),
+            "status":     r.get("status",     ""),
+            "token":      r.get("token",      ""),
+            "source_audio": r.get("source_audio", ""),
+            "is_vo":      bool(r.get("is_vo", False)),
+            "confidence": r.get("confidence", None),
+            # Fresh reconcile output starts unflagged on both axes.
+            "ignored":    False,
+            "accepted":   False,
+        }
+        if "gap_after_s" in r:
+            entry["gap_after_s"] = r["gap_after_s"]
+        return entry
+
+    def _conform_baseline_patch(self, rows):
+        """The second pass's new matches ({order: row}) are the algorithm's
+        output now, so a change they made is not an edit of the user's."""
+        path = self._conform_baseline_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            for order, r in rows.items():
+                snap[str(order)] = self._conform_baseline_entry(r)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(snap, f, indent=2)
         except Exception:
@@ -2586,6 +2612,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
     def _s4_push_undo(self):
         """Save current state onto the undo stack before a mutation."""
+        if getattr(self, "_s4_undo_hold", False):
+            return                       # inside one step (_assembly_edit_many)
         stack = getattr(self, "_s4_undo_stack", None)
         if stack is None:
             self._s4_undo_stack = []
@@ -3256,6 +3284,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         real match and goes back to unconfirmed), "kept" (hand-edited or
         reassigned — the user's version stays), or None (nothing to do).
         """
+        if fresh.get("_refined"):
+            return self._refine_merge_row(cur, fresh)
         if cur.get("_bg_matched"):
             return None
         cur["_bg_matched"] = True
@@ -3735,7 +3765,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # asked two questions when both apply — abandoning the run is
         # the bigger decision.)
         try:
-            running = self._is_transcription_running()
+            running = self._is_transcription_running(refine=False)
         except Exception:
             running = False
         if running:
@@ -4905,6 +4935,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
     def _start_reconcile(self):
         # A fresh reconcile always produces new results — discard any loaded results.
         self._pending_results = None
+        # ...and picks up any draft still waiting for its second pass.
+        self._refine_stop()
 
         if not HAS_WHISPER:
             messagebox.showerror("Not Installed",
@@ -5027,11 +5059,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 _names += "\n  …and {} more".format(len(_vo_uncached) - 6)
             _msg = (
                 "{} VO audio file{} have no usable transcription cache:\n\n{}\n\n"
-                "PostBridge will transcribe them now, which may take several "
-                "minutes.".format(
+                "{}".format(
                     len(_vo_uncached),
                     "s" if len(_vo_uncached) != 1 else "",
-                    _names)
+                    _names,
+                    ("PostBridge will transcribe them now, which may take "
+                     "several minutes." if engines.draft_model() is None else
+                     "PostBridge will make a quick draft with the tiny model "
+                     "now, then refine it with {} in the background while you "
+                     "work.".format(engines.get_active_model_size())))
             )
             if not messagebox.askyesno("VO Transcription Cache Missing", _msg,
                                        icon="warning"):
@@ -6164,19 +6200,27 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # Pre-load Whisper model before any gated work starts.
         # Without this, the first thread to need it loads the model while holding
         # a gate slot — freezing progress for 60+ seconds with nothing visible.
+        #
+        # Anything not yet transcribed gets the tiny model here, so Step 4 and
+        # the Assembly are there to work in at once; the chosen model follows
+        # in the background (refine.py).  None: tiny is the one chosen.
+        _first = engines.draft_model()
         if HAS_WHISPER:
             try:
-                # Read the ACTIVE model size (picker override or config
-                # default) rather than the raw WHISPER_MODEL config
-                # constant.  engines.get_model() below picks the same
-                # value; without this the log printed "small" even when
-                # the user had set the picker to medium (reported), even
-                # though the actually-loaded model was medium.
+                # The model this pass needs: the draft's, or the ACTIVE size
+                # (picker override or config default) when there is no draft.
+                # Only this one is loaded now -- the chosen model's load (or
+                # first-use download) is the second pass's to wait for.
                 self._log_line(
                     "Loading model ({})…".format(
-                        engines.get_active_model_size()), INFO)
-                engines.get_model()
+                        _first or engines.get_active_model_size()), INFO)
+                engines.get_model(size=_first)
                 self._log_line("Model ready.", SUCCESS)
+                if _first:
+                    self._log_line(
+                        "Anything new gets a quick {} draft now; {} refines it "
+                        "in the background after this.".format(
+                            _first, engines.get_active_model_size()), SUB)
             except Exception as e:
                 self._log_line("Model load failed: {}".format(e), ERR)
                 self._elapsed_running = False
@@ -6314,7 +6358,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                                 "  Part {} Take {}: {} chunk{} — transcribing…".format(
                                     pi, take_i + 1, len(chunks),
                                     "s" if len(chunks) != 1 else ""), INFO)
-                            audio_words = engines.transcribe_in_chunks(ap, chunks)
+                            audio_words = engines.transcribe_in_chunks(
+                                ap, chunks, model_size=_first)
                             self._log_line(
                                 "  Part {} Take {}: chunked done in {:.1f}s "
                                 "({} words)".format(
@@ -6339,7 +6384,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                                         err[:200] if len(err) > 200 else err)
                                 self._log_line(msg, ERR)
                                 continue
-                            audio_words = engines.transcribe_clip(tmp_a)
+                            audio_words = engines.transcribe_clip(
+                                tmp_a, model_size=_first)
                             self._log_line(
                                 "  Part {} Take {}: full-file done in {:.1f}s "
                                 "({} words)".format(
@@ -6371,7 +6417,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                             "  Part {} Take {}: no words transcribed".format(
                                 pi, take_i + 1), ERR)
                         continue
-                    engines.cache_save(ap, audio_words, blobs=blobs)
+                    engines.cache_save(ap, audio_words, blobs=blobs, model=_first)
                     # ALSO write the .pb_transcript.json sidecar next to
                     # the source audio.  The internal cache above is keyed
                     # by md5 in .pb_cache/ so only reconcile can see it;
@@ -6381,7 +6427,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                     # interview-source path already writes both; this
                     # brings VO takes into parity.
                     try:
-                        engines.pb_transcript_save(ap, audio_words, blobs=blobs)
+                        engines.pb_transcript_save(ap, audio_words, blobs=blobs,
+                                                   model=_first)
                     except Exception:
                         pass
                     self._log_line(
@@ -6550,10 +6597,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                                 self._log_line(
                                     "  [{}] {}".format(_tok, msg), SUB)
                             _full_words, _full_blobs = engines.transcribe_file(
-                                tsrc, progress_cb=_prog_cb)
+                                tsrc, progress_cb=_prog_cb, model_size=_first)
                             if _full_words:
                                 engines.pb_transcript_save(
-                                    tsrc, _full_words, blobs=_full_blobs)
+                                    tsrc, _full_words, blobs=_full_blobs,
+                                    model=_first)
                                 _pq_data = {
                                     "transcript":  _full_words,
                                     "audio_cache": tsrc,
@@ -6617,7 +6665,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                 else:
                     r = engines.reconcile_interview_pull(
                         pull, tsrc, pad=pad,
-                        min_start_s=_effective_cursor)
+                        min_start_s=_effective_cursor,
+                        model_size=_first)
                 # source_audio is set to tsrc (the mix WAV) inside
                 # reconcile_interview_pull.  We keep it pointing there — the mix
                 # file stays alive through Step 4 so the waveform editor shows the
@@ -7236,6 +7285,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
         # position, an open editor and undo history all survive.
         if not _live:
             self.after(800, self._step4)
+        self._refine_resume()
 
     def _cancel_reconcile(self):
         if not messagebox.askyesno(
@@ -7299,6 +7349,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
 
         self._clear()
         self._section("STEP 4 — REVIEW")
+        # A session closed part way through its second pass picks it up here.
+        self.after(1000, self._refine_resume)
 
         # ── Background-reconcile progress strip ─────────────────────────
         # When the user jumped into Step 4 via → REVIEW NOW while
@@ -8757,6 +8809,29 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin,
                   if e["res"].get("order") == order), None)
         if e is not None and not e["skip_var"].get():
             e["toggle_ignore_fn"]()
+
+    def _assembly_unignore(self, order):
+        """A pull brought back from the Assembly's text pane."""
+        e = next((e for e in getattr(self, "_rv", [])
+                  if e["res"].get("order") == order), None)
+        if e is not None and e["skip_var"].get():
+            e["toggle_ignore_fn"]()
+
+    def _assembly_edit_many(self, edits, ignores=(), unignores=()):
+        """One edit across pulls, as one undo step: {order: (segments, gaps)}
+        (gaps None: the card's accept carries the join silences over), plus
+        pulls to IGNORE and to bring back."""
+        self._s4_push_undo()
+        self._s4_undo_hold = True
+        try:
+            for order, (segments, gaps) in edits.items():
+                self._assembly_set_segments(order, segments, gaps)
+            for order in ignores:
+                self._assembly_ignore(order)
+            for order in unignores:
+                self._assembly_unignore(order)
+        finally:
+            self._s4_undo_hold = False
 
     def _assembly_set_markers(self, changes):
         """Spotting markers edited on the Assembly track: {order: [marker]}

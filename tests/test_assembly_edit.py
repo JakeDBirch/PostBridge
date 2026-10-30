@@ -30,7 +30,7 @@ _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_assembly_set_default_gap",
                 "_assembly_set_segments", "_assembly_set_gap",
                 "_assembly_set_markers", "_assembly_set_reading",
-                "_collect_export_inputs")
+                "_assembly_edit_many", "_collect_export_inputs")
 
 
 class _Var(object):

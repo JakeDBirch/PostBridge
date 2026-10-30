@@ -104,6 +104,17 @@ def get_active_model_size():
     return _active_model_override or WHISPER_MODEL
 
 
+# Script -> Session transcribes twice, as Pull Quotes does: this model first,
+# so work can start at once, then the chosen one in the background (refine.py).
+DRAFT_MODEL = "tiny"
+
+
+def draft_model():
+    """The model a first pass runs: DRAFT_MODEL -- or None when that is the
+    model chosen, so the one pass is all there is."""
+    return None if get_active_model_size() == DRAFT_MODEL else DRAFT_MODEL
+
+
 def is_cuda_available():
     """Return True if a CUDA-enabled PyTorch build is installed and the
     current machine actually has a usable GPU.  Used by the Pull Quotes
@@ -799,13 +810,14 @@ def cache_load(media_path):
     except Exception:
         return None
 
-def cache_save(media_path, words, blobs=None):
+def cache_save(media_path, words, blobs=None, model=None):
     cp = _cache_path(media_path)
     if not cp:
         return
     try:
         os.makedirs(os.path.dirname(cp), exist_ok=True)
         meta = _cache_key_meta(media_path)
+        meta["model"] = model or get_active_model_size()
         meta["words"] = words
         if blobs is not None:
             meta["blobs"] = blobs
@@ -877,11 +889,13 @@ def pb_transcript_load(media_path):
     except Exception:
         return None, None
 
-def pb_transcript_save(media_path, words, blobs=None):
-    """Write a .pb_transcript.json alongside media_path."""
+def pb_transcript_save(media_path, words, blobs=None, model=None):
+    """Write a .pb_transcript.json alongside media_path.  `model` is the
+    Whisper size that made these words (the active one when not given)."""
     p = pb_transcript_path(media_path)
     mtime = _safe_getmtime(media_path)
-    data = {"version": 1, "model": WHISPER_MODEL, "mtime": mtime, "words": words}
+    data = {"version": 1, "model": model or get_active_model_size(),
+            "mtime": mtime, "words": words}
     if blobs is not None:
         data["blobs"] = blobs
     # Bake audio_signature so cross-machine reconcile can verify the
@@ -899,6 +913,26 @@ def pb_transcript_save(media_path, words, blobs=None):
             json.dump(data, f, indent=2)
     except Exception:
         pass
+
+_MODEL_LABEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
+
+
+def transcript_model(media_path):
+    """The Whisper size that made media_path's saved transcript, or None
+    when there is none (or it predates the label).  Reads only the head of
+    the file, ahead of the words, so asking is cheap on any transcript."""
+    for p in (pb_transcript_path(media_path), _cache_path(media_path)):
+        if not p or not _safe_isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                m = _MODEL_LABEL_RE.search(f.read(8192))
+        except Exception:
+            continue
+        if m:
+            return m.group(1)
+    return None
+
 
 def pooled_transcript_load(paths):
     """Return (words, blobs) when every audio file in `paths` carries the
@@ -940,17 +974,23 @@ def pooled_transcript_load(paths):
     return first_words, first_blobs
 
 
-def transcribe_file(media_path, progress_cb=None):
+def transcribe_file(media_path, progress_cb=None, model_size=None,
+                    segment_cb=None, cancel_event=None, blobs=None):
     """Transcribe an entire media file using the same chunked pipeline as VO
     reconcile.  Returns (words, blobs).  progress_cb(fraction, status_str) is
-    called periodically if provided."""
+    called periodically if provided.
+
+    `model_size` forces a Whisper size (the active one otherwise);
+    `segment_cb` gets each decoded segment's words, in file time, as they
+    come; `cancel_event` raises TranscriptionCancelled between segments;
+    `blobs`, already detected on this file, are reused rather than found
+    again."""
     def _prog(frac, msg):
         if progress_cb:
             try: progress_cb(frac, msg)
             except Exception: pass
 
     words = None
-    blobs = None
 
     # Probe total duration so the segment-level progress callback can
     # report "X% (HH:MM:SS of HH:MM:SS)" to the caller's UI.
@@ -980,7 +1020,10 @@ def transcribe_file(media_path, progress_cb=None):
         if chunks:
             _prog(0.10, "Transcribing ({} chunks)…".format(len(chunks)))
             words = transcribe_in_chunks(media_path, chunks,
-                                          progress_cb=_seg_cb)
+                                          progress_cb=_seg_cb,
+                                          model_size=model_size,
+                                          segment_cb=segment_cb,
+                                          cancel_event=cancel_event)
 
     if words is None:
         # Either WAVEFORM_CONFORM is off or silence split failed — full-file path
@@ -993,7 +1036,10 @@ def transcribe_file(media_path, progress_cb=None):
                 _prog(1.0, "Audio extraction failed")
                 return None, None
             _prog(0.30, "Transcribing…")
-            words = transcribe_clip(tmp_a, progress_cb=_seg_cb)
+            words = transcribe_clip(tmp_a, progress_cb=_seg_cb,
+                                    model_size=model_size,
+                                    segment_cb=segment_cb,
+                                    cancel_event=cancel_event)
         finally:
             try: os.unlink(tmp_a)
             except Exception: pass
@@ -1002,7 +1048,7 @@ def transcribe_file(media_path, progress_cb=None):
         _prog(1.0, "No words detected")
         return None, None
 
-    if WAVEFORM_CONFORM:
+    if WAVEFORM_CONFORM and blobs is None:
         _prog(0.85, "Detecting speech boundaries…")
         blobs = detect_speech_blobs(media_path)
 
@@ -1263,14 +1309,14 @@ def _clip_rms_db(wav_path):
         pass
     return -99.0
 
-def _transcribe_raw(wav_path):
+def _transcribe_raw(wav_path, model_size=None):
     """
     Transcribe wav_path with no VAD filter and a permissive no-speech threshold.
     Used only for diagnostics when the normal transcription returns nothing.
     Returns the raw text string (may be empty or hallucinated).
     """
     try:
-        model = get_model()
+        model = get_model(size=model_size)
         segments, _ = model.transcribe(
             wav_path,
             word_timestamps=False,
@@ -1284,14 +1330,23 @@ def _transcribe_raw(wav_path):
     except Exception as e:
         return "error: {}".format(e)
 
-def transcribe_clip(wav_path, progress_cb=None):
-    """Transcribe a WAV file into a flat list of word dicts (lowercase,
-    alphanumeric-stripped).  Used by the reconcile / matching path.
+def transcribe_clip(wav_path, progress_cb=None, model_size=None,
+                    segment_cb=None, cancel_event=None):
+    """Transcribe a WAV file into a flat list of word dicts.  Used by the
+    reconcile / matching path.
+
+    "word" is what the matchers read: lowercase, letters and apostrophes
+    only.  "text" is what Whisper wrote (casing, punctuation, its leading
+    space), for reading.  A word with no letters ("1876,") is nothing to a
+    matcher, so it rides on the word before it, in that word's "extras".
+    "_src" is the Whisper size that heard it.
 
     ``progress_cb``, if provided, is called once per Whisper segment with
     the audio offset (seconds) of that segment's end — same shape as
-    ``transcribe_clip_verbatim`` so the same UI hook works for both."""
-    model = get_model()
+    ``transcribe_clip_verbatim`` so the same UI hook works for both.
+    ``model_size``, ``segment_cb`` and ``cancel_event`` as there too."""
+    size  = model_size or get_active_model_size()
+    model = get_model(size=size)
     # condition_on_previous_text=False  — each segment decoded independently;
     #   prevents cascading hallucination loops (the #1 cause of infinite hangs).
     # vad_filter=True                   — skip silence/noise regions before
@@ -1309,22 +1364,34 @@ def transcribe_clip(wav_path, progress_cb=None):
     )
     words = []
     for seg in segments:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled(partial_words=words)
+        new = []
         if seg.words:
             for w in seg.words:
-                words.append({
-                    "word":  re.sub(r"[^a-z']", "", w.word.lower()),
-                    "start": w.start,
-                    "end":   w.end,
-                })
+                clean = re.sub(r"[^a-z']", "", w.word.lower())
+                if clean:
+                    new.append({"word": clean, "text": w.word,
+                                "start": w.start, "end": w.end, "_src": size})
+                elif w.word.strip() and (new or words):
+                    (new or words)[-1].setdefault("extras", []).append(
+                        {"text": w.word, "start": w.start, "end": w.end})
         else:
             for w in re.findall(r"[a-z']+", seg.text.lower()):
-                words.append({"word": w, "start": seg.start, "end": seg.end})
+                new.append({"word": w, "start": seg.start, "end": seg.end,
+                            "_src": size})
+        words.extend(new)
+        if new and callable(segment_cb):
+            try:
+                segment_cb(new)
+            except Exception:
+                pass
         if progress_cb is not None:
             try:
                 progress_cb(float(seg.end))
             except Exception:
                 pass
-    return [w for w in words if w["word"]]
+    return words
 
 
 class TranscriptionCancelled(Exception):
@@ -2799,7 +2866,8 @@ def reconcile_pull_from_session(pull, session_data):
     return result
 
 
-def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.0):
+def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.0,
+                             model_size=None):
     """
     Reconcile a single pull against its source transcript.
 
@@ -2814,6 +2882,10 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
     In both cases, when WAVEFORM_CONFORM is enabled a waveform blob pass runs
     on the same extracted clip to push edges to ms / sample precision — the
     same refinement applied to VO blocks.
+
+    `model_size` forces a Whisper size for a first pass.  Its result carries
+    that size as "_tx_model", for the second pass to find, and is not kept
+    in the pull-result cache: a re-run has to do better than a draft.
     """
     orig_in  = pull["in_seconds"]
     orig_out = pull["out_seconds"]
@@ -2849,11 +2921,12 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             result["_diag"] = "extract_failed: {}".format(extract_err or "unknown")
             return result
 
-        words = transcribe_clip(tmp_wav)
+        result["_tx_model"] = model_size or get_active_model_size()
+        words = transcribe_clip(tmp_wav, model_size=model_size)
         if not words:
             # ── Diagnostic: re-run without VAD/no-speech filtering to see if
             # Whisper would find ANYTHING in this clip when restrictions are off
-            raw_text = _transcribe_raw(tmp_wav)
+            raw_text = _transcribe_raw(tmp_wav, model_size=model_size)
             rms_db   = _clip_rms_db(tmp_wav)
             diag_str = "PULL_DIAG  order={}  token={}  tc={}-{}  rms={:.1f}dB  raw={}".format(
                 result.get("order", "?"),
@@ -2886,11 +2959,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
 
         # Offset word timestamps from clip-relative → absolute file time
         # and store on the result so the waveform editor can display them.
-        abs_words = [
-            {**w, "start": round(w["start"] + clip_start, 4),
-                  "end":   round(w["end"]   + clip_start, 4)}
-            for w in words
-        ]
+        abs_words = [_shift_word(w, clip_start) for w in words]
         result["words"] = abs_words
 
         # ── Waveform blob detection for ms-level edge snapping ──────────────
@@ -2973,7 +3042,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             })
 
         # ── Cache ok results so re-runs skip transcription for matched pulls ────
-        if result["status"] == "ok":
+        if result["status"] == "ok" and not model_size:
             pull_result_cache_save(pull, transcript_file, pad, result)
     finally:
         try: os.unlink(tmp_wav)
@@ -3256,7 +3325,19 @@ def detect_silence_splits(audio_path, silence_db=None,
     return final if final else None
 
 
-def transcribe_in_chunks(audio_path, chunks, progress_cb=None):
+def _shift_word(w, offset):
+    """A transcribe_clip word, moved `offset` seconds along the file."""
+    out = dict(w, start=round(w["start"] + offset, 4),
+               end=round(w["end"] + offset, 4))
+    if w.get("extras"):
+        out["extras"] = [dict(x, start=round(x["start"] + offset, 4),
+                              end=round(x["end"] + offset, 4))
+                         for x in w["extras"]]
+    return out
+
+
+def transcribe_in_chunks(audio_path, chunks, progress_cb=None, model_size=None,
+                         segment_cb=None, cancel_event=None):
     """
     Transcribe audio_path in independent segments defined by `chunks`
     (list of (start_s, end_s) pairs from detect_silence_splits).
@@ -3268,9 +3349,13 @@ def transcribe_in_chunks(audio_path, chunks, progress_cb=None):
     ``progress_cb``, if provided, is called as ``progress_cb(audio_s)``
     where ``audio_s`` is the absolute audio offset of the last completed
     segment.  Used by the Script→Session UI to show "of HH:MM:SS (NN%)".
+    ``model_size``, ``segment_cb`` (words in file time) and ``cancel_event``
+    as for transcribe_clip.
     """
     all_words = []
     for chunk_start, chunk_end in chunks:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled(partial_words=all_words)
         tmp = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
@@ -3287,13 +3372,15 @@ def transcribe_in_chunks(audio_path, chunks, progress_cb=None):
                         progress_cb(seg_end_local + _co)
                     except Exception:
                         pass
-            words = transcribe_clip(tmp, progress_cb=inner_cb)
-            for w in words:
-                all_words.append({
-                    "word":  w["word"],
-                    "start": round(w["start"] + chunk_start, 4),
-                    "end":   round(w["end"]   + chunk_start, 4),
-                })
+            inner_seg = None
+            if callable(segment_cb):
+                def inner_seg(seg_words, _co=chunk_start):
+                    segment_cb([_shift_word(w, _co) for w in seg_words])
+            words = transcribe_clip(tmp, progress_cb=inner_cb,
+                                    model_size=model_size,
+                                    segment_cb=inner_seg,
+                                    cancel_event=cancel_event)
+            all_words.extend(_shift_word(w, chunk_start) for w in words)
         finally:
             if tmp:
                 try: os.unlink(tmp)

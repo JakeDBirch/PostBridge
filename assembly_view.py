@@ -3,8 +3,8 @@
 Step 4 reviews one pull at a time.  This is the other way of looking at the
 same data: every placed pull laid end to end, exactly where build_aaf will
 put it (engines.layout_timeline is the one source of placement for both),
-played back as a single reference track, the script beside the controls
-above it.  Every divider drags (narrow the script, size each control
+played back as a single reference track, its text beside the controls
+above it.  Every divider drags (narrow the text, size each control
 panel), and the layout is kept in the app's prefs.  Ctrl+= goes back to
 Step 4 and comes here again, like Pro Tools' Edit / Mix toggle; Ctrl+S
 saves the session.
@@ -52,7 +52,17 @@ MUSIC, SFX and NOTES marker tracks beside PARTS.  Drag a flag to move it,
 double-click to name it, Delete to remove it; an SFX spot or a note opens
 for naming as it lands.
 
-While the cut plays, the script lights each word as it is said.
+The text beside the controls is the transcript of the cut, and it edits like
+the track.  Highlight words and they are the selection, on the track too, for
+Space, Delete, B, the spotting keys or the right-click menu, across as many
+pulls as you like (one undo step).  Tape that is out of the cut stays in the
+text, struck through -- what went from inside a pull, and a little either side
+of it -- and H puts highlighted words back, as Pro Tools' heal does.  W swaps
+the transcript for the script, which highlights the same way wherever its
+words are matched to the audio.  Words from the tiny first pass read faded
+while the chosen model works through them (refine.py), and firm up in place.
+
+While the cut plays, the text lights each word as it is said.
 
 Audio is pulled per pull, with a few seconds of handle either side, from a
 small thread pool, nearest-the-view first, and composed on demand by
@@ -68,6 +78,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import messagebox
 
 import numpy as np
 
@@ -93,6 +104,12 @@ WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
 SCRIPT_HOLD_S = 4.0   # the script stops following this long after you scroll it
 SCRIPT_BAND = (0.12, 0.7)   # the lit word may sit anywhere in this band of
 SCRIPT_AT   = 0.3           # the pane; outside it, it is scrolled back to here
+SEL_PAD     = 0.15    # a highlight's edge sits at most this far outside its word
+                      # (halfway to the next word, if that is nearer)
+TX_HANDLE_S = 2.0     # tape shown struck through either side of a pull
+TX_CUT_MAX  = 30      # a longer run of cut words shows only its ends...
+TX_CUT_ENDS = 6       # ...this many at each, and a count for the rest
+MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -111,12 +128,15 @@ _C_CLIP_BG  = SURF
 _C_MUSIC    = "#4f9be0"   # music cue in / out
 _C_SFX      = "#e0609a"   # SFX spot
 _C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
+_C_CUT      = "#6a6a6a"   # words out of the cut, in the text
+_C_TXSEL    = "#35597a"   # highlighted words
 
 
 
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": True, "preroll_on": False, "preroll_s": 2.0,
-            "return_on": False, "script": True}
+            "return_on": False, "script": True,
+            "transcript": True, "cut_words": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -259,6 +279,10 @@ class _Clip(object):
         k = self.piece_at(t)
         return None if k is None else self.pieces[k][2] + (t - self.pieces[k][0])
 
+    def keeps(self, src):
+        """Is source time `src` in the cut, in this pull?"""
+        return any(si <= src < si + du for _tl, du, si in self.pieces)
+
     def piece_at(self, t):
         """Index of the region (segment) under timeline time t, or None."""
         for k, (tl, du, _si) in enumerate(self.pieces):
@@ -301,6 +325,173 @@ def _segments_without(clip, a, b):
             before.append(pend)
             pend = 0.0
     return _tidy(segs, before[1:])
+
+
+def _segments_with(segments, spans):
+    """A pull's segments with source spans put back.  A span that meets a
+    segment heals into it; the others stay as they were, butted or not."""
+    out = [(float(a), float(b)) for a, b in segments]
+    for a, b in spans:
+        rest = []
+        for s, e in out:
+            if s <= b + 1e-3 and a <= e + 1e-3:
+                a, b = min(a, s), max(b, e)
+            else:
+                rest.append((s, e))
+        out = sorted(rest + [(a, b)])
+    return out
+
+
+_WORD_INDEX = {}
+
+
+def _indexed(words):
+    """(words in time order, their start times), worked out once per list --
+    a pull looks its words up by time, many times a second while they stream."""
+    memo = _WORD_INDEX.get(id(words))
+    if memo is not None and memo[0] is words:
+        return memo[1], memo[2]
+    if len(_WORD_INDEX) > 64:
+        _WORD_INDEX.clear()
+    ordered = sorted((w for w in words or ()
+                      if isinstance(w, dict) and "start" in w
+                      and not w.get("break") and not w.get("_deleted")),
+                     key=lambda w: float(w["start"]))
+    starts = [float(w["start"]) for w in ordered]
+    _WORD_INDEX[id(words)] = (words, ordered, starts)
+    return ordered, starts
+
+
+def _word_point(s0, s1):
+    """Where a word counts as being, for in or out of the cut: two thirds of
+    the way through.  Whisper's starts run early, so the first word of a pull
+    often "starts" ahead of the edit that has all of it."""
+    return s0 + (s1 - s0) * 2.0 / 3.0
+
+
+def _word_units(w):
+    """A transcript word as it reads: [(start, end, text, glued, model)], the
+    word and any figures riding on it (engines.transcribe_clip).  Glued: no
+    space in front of it, where Whisper wrote it so."""
+    s0 = float(w["start"])
+    has_text = "text" in w
+    raw = str(w.get("text", w.get("word", "")))
+    src = w.get("_src")
+    out = []
+    if raw.strip():
+        out.append((s0, float(w.get("end", s0)), raw.strip(),
+                    has_text and not raw[:1].isspace(), src))
+    for x in w.get("extras") or ():
+        t = str(x.get("text", ""))
+        if t.strip():
+            xs = float(x.get("start", s0))
+            out.append((xs, float(x.get("end", xs)), t.strip(),
+                        not t[:1].isspace(), src))
+    return out
+
+
+class _Tok(object):
+    """One word of a pull's line in the text.  cs..ce: where it sits in the
+    line.  t0..t1: when it plays, if it is in the cut (kept); s0..s1: where it
+    is in the source, for the transcript's words.  k: its region."""
+    __slots__ = ("cs", "ce", "t0", "t1", "s0", "s1", "kept", "k")
+
+    def __init__(self, cs, ce, t0, t1, s0, s1, kept, k):
+        self.cs, self.ce, self.t0, self.t1 = cs, ce, t0, t1
+        self.s0, self.s1, self.kept, self.k = s0, s1, kept, k
+
+
+class _Line(object):
+    """One pull's words in the text: the line, its words, and the runs of it
+    that take a style (the whole pane is one insert per pull, no tag a word)."""
+
+    def __init__(self, body, tokens, chunks=None, script=False, words=None):
+        self.body = body
+        self.tokens = tokens
+        self.chunks = chunks if chunks is not None else [(body, None)]
+        self.script = script             # the script's words, not the transcript's
+        self.words = words               # the clip's words it was timed against
+        self.starts = [t.cs for t in tokens]
+        self.kept = [t for t in tokens if t.kept]
+        self.kept_t0 = [t.t0 for t in self.kept]
+
+
+def _transcript_line(c, words, neighbours=(), show_cut=True, fade=False):
+    """The pull as its transcript reads, or None when it holds no word of
+    what is in the cut.  With show_cut, the tape it leaves out -- inside it,
+    and TX_HANDLE_S either side unless a neighbouring pull plays that -- is
+    there too, as words that aren't kept.  fade: the draft's words read dim."""
+    ordered, starts = _indexed(words)
+    if not ordered or not c.pieces:
+        return None
+    reach = TX_HANDLE_S if show_cut else 0.0
+    i = bisect.bisect_left(starts, c.src_lo - reach - MAX_WORD_S)
+    units, any_kept = [], False
+    while i < len(ordered) and starts[i] < c.src_hi + reach:
+        for s0, s1, text, glued, src in _word_units(ordered[i]):
+            at = _word_point(s0, s1)
+            k = next((n for n, (_tl, du, si) in enumerate(c.pieces)
+                      if si <= at < si + du), None)
+            if k is None:
+                if not show_cut or not c.src_lo - reach <= at < c.src_hi + reach:
+                    continue
+                if (at < c.src_lo or at >= c.src_hi) and \
+                        any(n.keeps(at) for n in neighbours):
+                    continue
+            else:
+                any_kept = True
+            units.append((s0, s1, text, glued, src, k))
+        i += 1
+    if not any_kept:
+        return None
+
+    # A long run of cut tape reads as its two ends and a count.
+    shown, j = [], 0
+    while j < len(units):
+        if units[j][5] is not None:
+            shown.append(units[j])
+            j += 1
+            continue
+        e = j
+        while e < len(units) and units[e][5] is None:
+            e += 1
+        run = units[j:e]
+        if len(run) > TX_CUT_MAX:
+            mid = run[TX_CUT_ENDS:-TX_CUT_ENDS]
+            shown.extend(run[:TX_CUT_ENDS])
+            shown.append((mid[0][0], mid[-1][1], "[{} words]".format(len(mid)),
+                          False, None, None))
+            shown.extend(run[-TX_CUT_ENDS:])
+        else:
+            shown.extend(run)
+        j = e
+
+    tokens, chunks, pos, prev_style = [], [], 0, None
+
+    def emit(text, style):
+        if chunks and chunks[-1][1] == style:
+            chunks[-1][0] += text
+        else:
+            chunks.append([text, style])
+
+    for s0, s1, text, glued, src, k in shown:
+        style = "txcut" if k is None else (
+            "txdraft" if fade and src == engines.DRAFT_MODEL else None)
+        if tokens and not glued:
+            emit(" ", style if style == prev_style else None)
+            pos += 1
+        emit(text, style)
+        if k is None:
+            t0 = t1 = None
+        else:
+            tl, du, si = c.pieces[k]
+            t0 = max(tl, tl + s0 - si)
+            t1 = max(t0, min(tl + du, tl + s1 - si))
+        tokens.append(_Tok(pos, pos + len(text), t0, t1, s0, s1, k is not None, k))
+        pos += len(text)
+        prev_style = style
+    return _Line("".join(x[0] for x in chunks), tokens,
+                 [tuple(x) for x in chunks])
 
 
 _WORD_RE = re.compile(r"\S+")
@@ -351,6 +542,13 @@ def _script_timing(body, words):
         i = j
     return [(tm[0], tm[1], cs, ce)
             for (cs, ce, _k), tm in zip(toks, times) if tm is not None]
+
+
+def _script_line(body, c):
+    """The pull's script line, with its words timed from the transcript."""
+    tokens = [_Tok(cs, ce, t0, t1, None, None, True, c.piece_at(t0))
+              for t0, t1, cs, ce in _script_timing(body, c.words or [])]
+    return _Line(body, tokens, script=True, words=c.words)
 
 
 class _AssemblyAudio(object):
@@ -448,7 +646,6 @@ class AssemblyWindow(object):
         self._cur_order = None           # pull the playhead is in
         self._word_items = []            # [(tl_start, tl_end, item)] on screen
         self._lit_word  = None
-        self._karaoke   = {}             # order -> (words, (starts, spans))
         self._lit_script = None          # (order, char_start, char_end) lit
         self._lit_range = None           # its Text indices
         self._touched_at = 0.0           # when the script was last scrolled
@@ -460,8 +657,22 @@ class AssemblyWindow(object):
         self._refresh_after = None
         self._tick_after = None
         self._closed    = False
-        self._words_memo = {}
+        self._by_order  = {}
+        self._words_memo = {}            # path -> the file's saved transcript
         self._words_lock = threading.Lock()
+        self._words_queued = set()
+        self._tx_lines  = {}             # order -> its _Line in the text
+        self._tx_order  = []             # the orders down the text
+        self._tx_seq    = {}             # order -> its place in that
+        self._tx_anchor = None           # highlighted words: (order, word) where
+        self._tx_head   = None           # it started, and where it reaches
+        self._tx_range  = None           # the _range they made
+        self._tx_click  = None           # where the last click landed (Shift extends)
+        self._tx_painted = None
+        self._tx_fading = False          # draft words shown faded
+        self._tdrag     = None           # a highlight being dragged
+        self._tx_render_after = None
+        self._tx_scroll_after = None
         self._file_end  = {}             # path -> length, once a read ran short
         self._inputs    = None           # export inputs, held while dragging
         self._drag      = None           # the gesture in progress
@@ -509,7 +720,7 @@ class AssemblyWindow(object):
         sb.pack(side="right", fill="y")
         self.text = tk.Text(script, bg=BG, fg=TEXT, font=(FB[0], 12),
                             wrap="word", bd=0, highlightthickness=0, padx=24,
-                            pady=14, spacing1=2, spacing3=8, cursor="arrow",
+                            pady=14, spacing1=2, spacing3=8, cursor="xterm",
                             insertwidth=0, yscrollcommand=sb.set, width=40)
         self.text.pack(side="left", fill="both", expand=True)
         sb.config(command=self.text.yview)
@@ -527,10 +738,22 @@ class AssemblyWindow(object):
         self.text.tag_config("mk_sfx", foreground=_C_SFX, font=_SMALL)
         self.text.tag_config("mk_note", foreground=_C_NOTE, font=_SMALL)
         self.text.tag_config("sel_pull", background=SURF2)
+        self.text.tag_config("txdraft", foreground=SUB)
+        self.text.tag_config("txcut", foreground=_C_CUT, overstrike=True)
+        self.text.tag_config("txsel", background=_C_TXSEL)
         self.text.tag_config("word", background=ACCENT, foreground=TEXT)
         self.text.tag_raise("cur")
+        self.text.tag_raise("txsel")
         self.text.tag_raise("word")
-        self.text.bind("<Button-1>", self._on_text_click)
+        self.text.bind("<Button-1>", self._on_text_press)
+        self.text.bind("<B1-Motion>", self._on_text_drag)
+        self.text.bind("<ButtonRelease-1>", self._on_text_release)
+        self.text.bind("<Double-Button-1>", self._on_text_double)
+        self.text.bind("<Triple-Button-1>", self._on_text_triple)
+        self.text.bind("<Button-3>", self._on_text_menu)
+        # Tk's own auto-scan would run the native selection over ours.
+        for seq in ("<B1-Leave>", "<B1-Enter>", "<Control-Button-1>"):
+            self.text.bind(seq, lambda e: "break")
         self._top.add(script, minsize=200, stretch="always")
 
         # Control panels, one above the other
@@ -650,6 +873,18 @@ class AssemblyWindow(object):
         if any(res.get("monolog") for res in (self.app.results or ())):
             key(p, "Other reading", "↑ ↓", lambda: self.cycle_reading(1))
 
+        p = self._panel("TRANSCRIPT")
+        self.tx_flow = p
+        self.tx_key = key(p, "Transcript", "W", self.toggle_transcript, toggle=True)
+        self.cut_key = key(p, "Show cut words", "Shift+W", self.toggle_cut_words,
+                           toggle=True)
+        key(p, "Restore", "H", self.restore)
+        self.refine_key = key(p, "", "", self._refine_again)
+        self.recut_key = None
+        self.tx_status = tk.Label(p, font=(FB[0], 10), bg=SURF, fg=SUB,
+                                  justify="left", anchor="w")
+        p.add(self.tx_status, fill=True)
+
         p = self._panel("SPOT")
         key(p, "Music in", "I", lambda: self.drop_marker("music_in"))
         key(p, "Inflection", "U", lambda: self.drop_marker("music_inflection"))
@@ -671,11 +906,14 @@ class AssemblyWindow(object):
             "highlight).  Bottom half: grab (click = region, drag = move, "
             "double-click = waveform editor).  Edge: trim.  Gap: drag to "
             "retime.  Flag: drag, or double-click to name.  "
-            "Ctrl+wheel: zoom.")), fill=True)
+            "Ctrl+wheel: zoom.  In the text: drag to highlight, double-click "
+            "a word, triple-click its pull, right-click for everything.")),
+            fill=True)
         self.legend = p
         self._legend_items = []
         self._show_rate()
         self._show_monitor()
+        self.show_refine_status()
 
     def _show_legend(self):
         """Swatches for the speakers on the track, refreshed as they change."""
@@ -867,6 +1105,7 @@ class AssemblyWindow(object):
                 self._show_legend()
 
         self.clips   = clips
+        self._by_order = {c.order: c for c in clips}
         self._starts = [c.start for c in clips]
         self.joints  = self._find_joints(clips)
         self.total_s = clips[-1].end if clips else 0.0
@@ -932,7 +1171,8 @@ class AssemblyWindow(object):
             return
         a, b = sorted((j["a"], j["b"]))
         words = self._raw_words(c) if c is not None else []
-        said = " ".join(str(w.get("word", "")).strip() for w in words or ()
+        said = " ".join(str(w.get("text", w.get("word", ""))).strip()
+                        for w in words or ()
                         if isinstance(w, dict) and a <= float(w.get("start", -1)) < b)
         head = ("Pickup from later in the read ({} → {})".format(
                     secs_tc(b), secs_tc(a)) if j["b"] < j["a"] else
@@ -947,6 +1187,7 @@ class AssemblyWindow(object):
     def _queue_loads(self):
         """Fetch every pull whose loaded audio no longer covers it,
         nearest the middle of the view first."""
+        self._queue_words()
         mid = self.view0 + self._span() / 2.0
         todo = []
         for c in self.clips:
@@ -997,41 +1238,201 @@ class AssemblyWindow(object):
             return
         self.app._ui(lambda: self._on_loaded(c, path, t0, pcm, env, words))
 
-    def _raw_words(self, c, load=True):
-        """The transcript behind a pull: its own windowed words, else the
-        source file's cached transcript.  None when that is not loaded yet
-        and `load` is False (the UI thread never waits on a parse)."""
-        words = c.res.get("words")
-        if words or not c.play_path:
-            return words or []
-        with self._words_lock:
-            words = self._words_memo.get(c.play_path)
-            if words is None and load:
-                try:
-                    words = engines.cache_load(c.play_path) or []
-                except Exception:
-                    words = []
-                self._words_memo[c.play_path] = words
+    def _file_words(self, path, load=True):
+        """A whole file's transcript: the second pass's as it comes in, else
+        what is saved.  None when that is not parsed yet and `load` is False
+        (the UI thread never waits on a parse)."""
+        live = getattr(self.app, "_refine_words", None)
+        words = live(path) if live is not None else None
+        if words:
+            return words
+        words = self._words_memo.get(path)
+        if words is None and load:
+            with self._words_lock:
+                words = self._words_memo.get(path)
+                if words is None:
+                    try:
+                        words = (engines.cache_load(path)
+                                 or engines.pb_transcript_load(path)[0] or [])
+                    except Exception:
+                        words = []
+                    self._words_memo[path] = words
         return words
 
+    def _raw_words(self, c, load=True):
+        """The transcript behind a pull: its file's whole transcript when
+        there is one (the text shows the tape around the pull as well), else
+        the pull's own windowed words, else a Pull Quotes session's.  None
+        when none of that is to hand yet and `load` is False."""
+        words = self._file_words(c.play_path, load) if c.play_path else []
+        if words:
+            return words
+        own = c.res.get("words")
+        if own:
+            return own
+        if words is None:
+            return None
+        pq = (getattr(self.app, "_pq_session_data", None) or {}).get(
+            c.res.get("token"))
+        return (pq or {}).get("transcript") or []
+
     def _map_words(self, c, load=True):
-        """Transcript words that fall inside the pull's segments, moved
-        onto the timeline."""
+        """Transcript words the pull's segments keep (_word_point), moved onto
+        the timeline.  Looked up by time: a whole file's words, many pulls."""
         words = self._raw_words(c, load)
         if words is None:
             return None
+        ordered, starts = _indexed(words)
         out = []
-        for w in words or []:
-            if not isinstance(w, dict) or "start" not in w:
-                continue
-            ws = float(w["start"]); we = float(w.get("end", ws))
-            for tl, du, si in c.pieces:
-                if si <= ws < si + du:
-                    out.append((tl + ws - si, tl + min(we, si + du) - si,
-                                str(w.get("word", "")).strip()))
-                    break
+        for tl, du, si in c.pieces:
+            i = bisect.bisect_left(starts, si - MAX_WORD_S)
+            while i < len(ordered) and starts[i] < si + du:
+                for ws, we, text, _glued, _src in _word_units(ordered[i]):
+                    if si <= _word_point(ws, we) < si + du:
+                        t0 = max(tl, tl + ws - si)
+                        out.append((t0, max(t0, min(tl + du, tl + we - si)), text))
+                i += 1
         out.sort()
         return out
+
+    def _queue_words(self):
+        """Parse each file's transcript ahead of the audio, so the text is
+        there at once; the audio takes a while longer."""
+        for path in {c.play_path for c in self.clips if c.play_path}:
+            if path not in self._words_memo and path not in self._words_queued:
+                self._words_queued.add(path)
+                self._pool.submit(self._load_words, path)
+
+    def _load_words(self, path):
+        """Worker thread."""
+        if self._closed:
+            return
+        self._file_words(path)
+        self.app._ui(lambda: self._on_words_parsed(path))
+
+    def _on_words_parsed(self, path):
+        if self._closed:
+            return
+        self._words_queued.discard(path)
+        self._remap_words(path)
+
+    def _remap_words(self, path):
+        for c in self.clips:
+            if c.play_path == path:
+                words = self._map_words(c, load=False)
+                if words is not None:
+                    c.words = words
+        self._schedule_tx_render()
+
+    def transcript_changed(self, path):
+        """The second pass brought more words for this file (refine.py)."""
+        if self._closed:
+            return
+        self._words_memo.pop(path, None)     # what is saved has changed too
+        self._words_queued.discard(path)
+        self._remap_words(path)
+        self._queue_words()
+
+    def show_refine_status(self):
+        """The TRANSCRIPT panel, as the second pass stands."""
+        if self._closed:
+            return
+        app = self.app
+        fn = getattr(app, "_refine_status", None)
+        text = fn() if fn is not None else ""
+        held = getattr(app, "_refine_held", None)
+        held = held() if held is not None else False
+        running = getattr(app, "_refine_running", None)
+        running = running() if running is not None else False
+        changed = False
+        try:
+            self.refine_key.set_text(
+                "Refine with {}".format(engines.get_active_model_size()))
+            if text != self.tx_status.cget("text"):
+                self.tx_status.config(text=text)
+                changed = True
+            if held and self.recut_key is None:
+                self.recut_key = _KeyButton(self.tx_flow, "Update the cut", "",
+                                            self.update_the_cut)
+                self.tx_flow.add(self.recut_key.frame)
+                changed = True
+            elif not held and self.recut_key is not None:
+                self.tx_flow.remove(self.recut_key.frame)
+                self.recut_key.frame.destroy()
+                self.recut_key = None
+                changed = True
+            if changed:
+                self.tx_flow._reflow()
+        except tk.TclError:
+            return
+        if running != self._tx_fading:
+            self._schedule_tx_render()
+
+    def _refine_again(self):
+        fn = getattr(self.app, "_refine_again", None)
+        if fn is not None:
+            fn()
+
+    def update_the_cut(self):
+        """Take the monolog's new cut, from the refined transcript."""
+        if not messagebox.askyesno(
+                "Update the cut",
+                "Cut the read again from the refined transcript?\n\n"
+                "Pulls you have edited, marked or ignored stay as they are.  "
+                "The rest take the new cut, and the undo history starts over.",
+                parent=self.win):
+            return
+        self.app._refine_update_the_cut()
+
+    def busy(self):
+        """Mid-gesture or listening: not the moment for the cut to shift."""
+        return bool(self._playing or self._drag is not None
+                    or self._tdrag is not None or self._rename is not None)
+
+    def capture_place(self):
+        """Where the insertion point, the playhead and the highlight are in
+        the audio, for a background change to the cut to keep them on it."""
+        def at(t):
+            c = self._clip_at(t)
+            src = c.src_at(t) if c is not None else None
+            return (c.order, src) if src is not None else None
+        r = self._range
+        return {"insert": (at(self.insert), self.insert),
+                "playhead": (at(self.playhead), self.playhead),
+                "range": None if r is None else (r[0], (at(r[1]), r[1]), (at(r[2]), r[2])),
+                "text": r is not None and r == self._tx_range,
+                "view": self.view0 - self.playhead}
+
+    def restore_place(self, place):
+        if place is None or self._closed:
+            return
+
+        def back(entry):
+            anchor, fallback = entry
+            if anchor is not None:
+                c = self._clip(anchor[0])
+                for tl, du, si in (c.pieces if c is not None else ()):
+                    if si <= anchor[1] < si + du:
+                        return tl + anchor[1] - si
+            return max(0.0, min(fallback, self.total_s))
+        self.insert = back(place["insert"])
+        self.playhead = back(place["playhead"])
+        r = place["range"]
+        if r is not None and self._clip(r[0]) is not None:
+            self._range = (r[0], back(r[1]), back(r[2]))
+            if place["text"]:
+                self._tx_range = self._range
+            self._sync_region_range()
+        self.view0 = self.playhead + place["view"]
+        self.redraw()
+
+    def restore_view(self, pps, view0, playhead):
+        """After the window is opened afresh over a new cut."""
+        if self._closed:
+            return
+        self.pps, self.view0 = pps, view0
+        self.playhead = self.insert = max(0.0, min(playhead, self.total_s))
+        self.redraw()
 
     def _on_loaded(self, c, path, t0, pcm, env, words):
         self._loading.discard(c.order)
@@ -1076,16 +1477,66 @@ class AssemblyWindow(object):
             text="Loading audio … {} pulls to go".format(n) if n else "")
 
     # ── Script pane ──────────────────────────────────────────────────────
+    def _build_line(self, r, c, neighbours, fade):
+        body = (r.get("quote_text") or "").strip()
+        if c is None:
+            body += "   (not in the cut)"
+            return _Line(body, [_Tok(0, len(body), None, None, None, None, False, None)])
+        if _MONITOR["transcript"]:
+            words = self._raw_words(c, load=False)
+            if words:
+                line = _transcript_line(c, words, neighbours,
+                                        _MONITOR["cut_words"], fade)
+                if line is not None:
+                    return line
+        return _script_line(body, c)
+
+    def _line(self, order):
+        """A pull's line; a script line follows its clip's words as they load."""
+        line = self._tx_lines.get(order)
+        if line is not None and line.script:
+            c = self._clip(order)
+            if c is not None and line.words is not c.words:
+                line = self._tx_lines[order] = _script_line(line.body, c)
+        return line
+
+    def _text_top(self):
+        """(pull, characters into it) at the top of the pane."""
+        t = self.text
+        try:
+            idx = t.index("@0,0")
+            o = next((g for g in t.tag_names(idx)
+                      if g[0] == "o" and g[1:].isdigit()), None)
+            if o is None:
+                return None
+            return o, self._chars(t.tag_ranges(o)[0], idx)
+        except (tk.TclError, IndexError):
+            return None
+
+    def _chars(self, a, b):
+        n = self.text.count(a, b, "chars")
+        return (n[0] if isinstance(n, tuple) else n) or 0
+
     def _render_script(self):
         t = self.text
         y0 = t.yview()[0]
+        top = self._text_top()
+        keep = self._tx_capture()
         t.config(state="normal")
         t.delete("1.0", "end")
-        placed = {c.order for c in self.clips}
+        placed = {c.order: c for c in self.clips}
         names  = {p.get("index"): p.get("name", "") for p in (self.app.parts or [])}
         marks = {}
         for m in self.markers:
             marks.setdefault(m["order"], []).append(m)
+        near = {}
+        for a, b in zip(self.clips, self.clips[1:]):
+            if a.play_path == b.play_path:
+                near.setdefault(a.order, []).append(b)
+                near.setdefault(b.order, []).append(a)
+        running = getattr(self.app, "_refine_running", None)
+        self._tx_fading = fade = bool(running()) if running is not None else False
+        self._tx_lines, self._tx_order, self._tx_seq = {}, [], {}
         cur_part = object()
         for r in sorted(self.app.results, key=lambda r: r.get("order", 0)):
             pi = r.get("part_index")
@@ -1098,11 +1549,18 @@ class AssemblyWindow(object):
             out = () if o in placed else ("out",)
             tok = r.get("token", "")
             t.insert("end", "#{:03d} {}   ".format(o, tok), ("tok", tag) + out)
-            body = (r.get("quote_text") or "").strip()
-            if o not in placed:
-                body += "   (not in the cut)"
-            # b<order>: where the line starts, for lighting its words.
-            t.insert("end", body, (tag, "b{}".format(o)) + out)
+            line = self._build_line(r, placed.get(o), near.get(o, ()), fade)
+            self._tx_seq[o] = len(self._tx_order)
+            self._tx_order.append(o)
+            self._tx_lines[o] = line
+            # b<order>: where the line starts, for finding its words.
+            args = []
+            for text, style in line.chunks:
+                if text:
+                    args += [text, (tag, "b{}".format(o)) + out
+                             + ((style,) if style else ())]
+            if args:
+                t.insert("end", *args)
             for m in marks.get(o, ()):
                 t.insert("end", "   [{}]".format(m["label"]),
                          (tag, {"sfx": "mk_sfx", "note": "mk_note"}.get(
@@ -1111,35 +1569,535 @@ class AssemblyWindow(object):
             t.insert("end", "\n", (tag,) + out)
         t.config(state="disabled")
         t.yview_moveto(y0)
+        if top is not None:
+            try:
+                t.yview("{}.first + {} chars".format(*top))
+            except tk.TclError:
+                pass
         self._cur_order = None
-        self._karaoke = {}
         self._lit_script = self._lit_range = None
+        self._tx_restore(keep)
+        self._tx_painted = None
         self._highlight_script(self._order_at(self.playhead), see=False)
         self._mark_selected_in_script()
 
-    def _order_from_text_event(self, e):
-        idx = self.text.index("@{},{}".format(e.x, e.y))
-        for tag in self.text.tag_names(idx):
-            if tag.startswith("o") and tag[1:].isdigit():
-                return int(tag[1:])
-        return None
+    def _schedule_tx_render(self):
+        """More words: draw them once this burst settles, and not under a
+        highlight being dragged."""
+        if self._closed or self._tx_render_after is not None:
+            return
+        self._tx_render_after = self.win.after(100, self._tx_render_now)
 
-    def _on_text_click(self, e):
-        idx = self.text.index("@{},{}".format(e.x, e.y))
-        for tag in self.text.tag_names(idx):
+    def _tx_render_now(self):
+        self._tx_render_after = None
+        if self._closed:
+            return
+        if self._tdrag is not None:
+            self._tx_render_after = self.win.after(300, self._tx_render_now)
+            return
+        if _MONITOR["transcript"]:
+            self._render_script()
+        self.redraw()
+
+    # ── Highlighting the text ────────────────────────────────────────────
+    def _tx_capture(self):
+        """The highlight's two ends by the audio under them, to survive a
+        new drawing of the text (the words may have changed)."""
+        if self._tx_anchor is None:
+            return None
+        out = []
+        for o, i in (self._tx_anchor, self._tx_head):
+            line = self._tx_lines.get(o)
+            if line is None or not line.tokens:
+                return None
+            tok = line.tokens[min(i, len(line.tokens) - 1)]
+            out.append((o, tok.s0 if tok.s0 is not None else tok.t0))
+        return out
+
+    def _tx_restore(self, kept):
+        if kept is None:
+            self._tx_anchor = self._tx_head = None
+            return
+        ends = []
+        for o, at in kept:
+            line = self._line(o)
+            if line is None or not line.tokens:
+                self._tx_anchor = self._tx_head = None
+                return
+            if at is None:
+                ends.append((o, 0))
+                continue
+            ends.append((o, min(
+                range(len(line.tokens)),
+                key=lambda n: abs((line.tokens[n].s0 if line.tokens[n].s0 is not None
+                                   else (line.tokens[n].t0 or 0.0)) - at))))
+        self._tx_anchor, self._tx_head = ends
+
+    def _tx_clear(self):
+        self._tx_anchor = self._tx_head = self._tx_range = None
+
+    def _tx_selected(self):
+        """[(order, clip or None, line, first word, last word)] for the
+        highlighted words, down the text."""
+        if self._tx_anchor is None:
+            return []
+        a, b = self._tx_anchor, self._tx_head
+        seq = self._tx_seq
+        if a[0] not in seq or b[0] not in seq:
+            return []
+        if (seq[a[0]], a[1]) > (seq[b[0]], b[1]):
+            a, b = b, a
+        out = []
+        for o in self._tx_order[seq[a[0]]:seq[b[0]] + 1]:
+            line = self._line(o)
+            if line is None or not line.tokens:
+                continue
+            last = len(line.tokens) - 1
+            out.append((o, self._clip(o), line,
+                        min(a[1], last) if o == a[0] else 0,
+                        min(b[1], last) if o == b[0] else last))
+        return out
+
+    def _word_in(self, c, line, i):
+        """Where a highlight starting on this word starts on the timeline:
+        halfway back to the word before (SEL_PAD at most), or the region's
+        own edge when nothing is said between."""
+        tok = line.tokens[i]
+        k = tok.k if tok.k is not None else c.piece_at(tok.t0)
+        if k is None:
+            return tok.t0
+        for j in range(i - 1, -1, -1):
+            p = line.tokens[j]
+            if p.kept:
+                if p.k == k:
+                    return max((p.t1 + tok.t0) / 2.0, tok.t0 - SEL_PAD)
+                break
+        return c.pieces[k][0]
+
+    def _word_out(self, c, line, i):
+        tok = line.tokens[i]
+        k = tok.k if tok.k is not None else c.piece_at(tok.t0)
+        if k is None:
+            return tok.t1
+        for j in range(i + 1, len(line.tokens)):
+            n = line.tokens[j]
+            if n.kept:
+                if n.k == k:
+                    return min((tok.t1 + n.t0) / 2.0, tok.t1 + SEL_PAD)
+                break
+        return c.pieces[k][0] + c.pieces[k][1]
+
+    def _tx_apply(self):
+        """The highlighted words become the track's selection."""
+        first = last = None
+        for _o, c, line, i0, i1 in self._tx_selected():
+            if c is None:
+                continue
+            for i in range(i0, i1 + 1):
+                if line.tokens[i].kept:
+                    if first is None:
+                        first = (c, line, i)
+                    last = (c, line, i)
+        self.sel_region = self.sel_marker = None
+        if first is None:
+            self._range = None
+        else:
+            self._range = (first[0].order, self._word_in(*first), self._word_out(*last))
+            if first[0].order != self.sel_order:
+                self.sel_order = first[0].order
+                self._mark_selected_in_script()
+        self._tx_range = self._range
+        self.redraw()
+        self._status_text_sel()
+
+    def _status_text_sel(self):
+        if self._range is not None:
+            self._status_range()
+            return
+        n = sum(1 for _o, c, line, i0, i1 in self._tx_selected()
+                for tok in line.tokens[i0:i1 + 1] if not tok.kept)
+        if n:
+            self.status.config(fg=TEXT, text="{} word{} out of the cut highlighted"
+                               "   ·   H puts them back".format(n, "" if n == 1 else "s"))
+
+    def _tx_sel_ends(self):
+        """The highlight as ((order, first char), (order, end char)) -- the
+        words picked in the text, or those under the track's selection."""
+        if self._tx_anchor is not None:
+            sel = self._tx_selected()
+            if not sel:
+                return None
+            f, l = sel[0], sel[-1]
+            return (f[0], f[2].tokens[f[3]].cs), (l[0], l[2].tokens[l[4]].ce)
+        if self._range is None:
+            return None
+        a, b = sorted(self._range[1:])
+        first = last = None
+        for c in self._clips_in(a, b):
+            line = self._line(c.order)
+            for tok in (line.kept if line is not None else ()):
+                if a <= (tok.t0 + tok.t1) / 2.0 <= b:
+                    if first is None:
+                        first = (c.order, tok.cs)
+                    last = (c.order, tok.ce)
+        return None if first is None else (first, last)
+
+    def _paint_tx_sel(self):
+        if self._tx_anchor is not None and self._range != self._tx_range:
+            self._tx_anchor = self._tx_head = None   # the track has moved on
+        key = (self._tx_anchor, self._tx_head, self._range)
+        if key == self._tx_painted:
+            return
+        self._tx_painted = key
+        t = self.text
+        t.tag_remove("txsel", "1.0", "end")
+        ends = self._tx_sel_ends()
+        if ends is not None:
+            try:
+                t.tag_add("txsel", "b{}.first + {} chars".format(*ends[0]),
+                          "b{}.first + {} chars".format(*ends[1]))
+            except tk.TclError:
+                pass
+
+    def _tx_hit(self, x, y):
+        """(order, word, on its #number) under the mouse, or None off any pull."""
+        t = self.text
+        idx = t.index("@{},{}".format(x, y))
+        tags = t.tag_names(idx)
+        o = next((int(g[1:]) for g in tags if g[0] == "o" and g[1:].isdigit()), None)
+        if o is None:
+            return None
+        line = self._line(o)
+        if line is None or not line.tokens:
+            return o, None, "tok" in tags
+        if "b{}".format(o) in tags:
+            off = self._chars("b{}.first".format(o), idx)
+        else:
+            off = 0 if "tok" in tags else len(line.body)
+        return o, max(0, bisect.bisect_right(line.starts, off) - 1), "tok" in tags
+
+    def _on_text_press(self, e):
+        t = self.text
+        t.focus_set()
+        self._end_rename(commit=True)
+        self._script_touched()
+        self._tdrag = None
+        idx = t.index("@{},{}".format(e.x, e.y))
+        for tag in t.tag_names(idx):
             if tag.startswith("mk") and "_" in tag:
                 o, i = (int(v) for v in tag[2:].split("_"))
                 m = self._marker((o, i))
                 if m is not None:
+                    self._range = None
+                    self._tx_clear()
                     self.select_marker((o, i))
                     self.seek(m["t"], center=True)
                     return "break"
-        o = self._order_from_text_event(e)
-        c = self._clip(o)
-        if c is not None:
-            self.select(c.order)
-            self.seek(c.start, center=True)
+        hit = self._tx_hit(e.x, e.y)
+        if hit is None:
+            return "break"
+        o, i, head = hit
+        if head or i is None:
+            # The pull's number: the whole pull, for the track and the keys.
+            self._range = None
+            self._tx_clear()
+            c = self._clip(o)
+            if c is not None:
+                self.select(c.order)
+                self.seek(c.start, center=True)
+            return "break"
+        if e.state & 0x0001 and self._tx_click is not None:
+            self._tx_anchor, self._tx_head = self._tx_click, (o, i)
+            self._tx_apply()
+            self._tdrag = {"from": self._tx_click, "moved": True, "x": e.x, "y": e.y}
+            return "break"
+        self._tx_click = (o, i)
+        self._tdrag = {"from": (o, i), "moved": False, "x": e.x, "y": e.y,
+                       "x0": e.x, "y0": e.y}
         return "break"
+
+    def _on_text_drag(self, e):
+        d = self._tdrag
+        if d is None:
+            return "break"
+        d["x"], d["y"] = e.x, e.y
+        self._tx_extend()
+        self._tx_autoscroll()
+        return "break"
+
+    def _tx_extend(self):
+        d = self._tdrag
+        if d is None:
+            return
+        hit = self._tx_hit(d["x"], d["y"])
+        if hit is None or hit[1] is None:
+            return
+        at = hit[:2]
+        if not d["moved"]:
+            if at == d["from"] and \
+                    abs(d["x"] - d["x0"]) + abs(d["y"] - d["y0"]) < DRAG_PX:
+                return
+            d["moved"] = True
+            self._tx_anchor, self._tx_head = d["from"], None
+            self._script_touched()
+        if at != self._tx_head:
+            self._tx_head = at
+            self._tx_apply()
+
+    def _tx_autoscroll(self):
+        """Dragged off the top or bottom of the pane: it scrolls under you."""
+        d = self._tdrag
+        if d is None or self._tx_scroll_after is not None:
+            return
+        step = -1 if d["y"] < 0 else (1 if d["y"] > self.text.winfo_height() else 0)
+        if step:
+            self.text.yview_scroll(step, "units")
+            self._script_touched()
+            self._tx_extend()
+            self._tx_scroll_after = self.win.after(60, self._tx_scroll_tick)
+
+    def _tx_scroll_tick(self):
+        self._tx_scroll_after = None
+        self._tx_autoscroll()
+
+    def _on_text_release(self, _e):
+        d, self._tdrag = self._tdrag, None
+        if self._tx_scroll_after is not None:
+            try:
+                self.win.after_cancel(self._tx_scroll_after)
+            except tk.TclError:
+                pass
+            self._tx_scroll_after = None
+        if d is None:
+            return "break"
+        if d["moved"]:
+            self._tx_settle()
+        else:
+            self._tx_place(*d["from"])
+        return "break"
+
+    def _tx_settle(self):
+        """A highlight finished: the insertion point goes to its start."""
+        if self._range is not None:
+            self.set_insert(min(self._range[1:]))
+        self._status_text_sel()
+
+    def _tx_place(self, o, i):
+        """A click on a word: the insertion point, just ahead of it."""
+        self._range = self.sel_region = None
+        self._tx_clear()
+        c = self._clip(o)
+        if c is None:
+            self.sel_order = None
+            self._mark_selected_in_script()
+            self.status.config(fg=SUB, text="#{:03d} is not in the cut   ·   "
+                               "triple-click it and press H to bring it back".format(o))
+            self.redraw()
+            return
+        line = self._line(o)
+        j = i
+        while j < len(line.tokens) and not line.tokens[j].kept:
+            j += 1                       # a cut word: where the audio resumes
+        t = self._word_in(c, line, j) if j < len(line.tokens) else c.end
+        self.sel_order = o
+        self._mark_selected_in_script()
+        self.set_insert(t)
+        if not self._playing and not self.view0 <= t <= self.view0 + self._span():
+            self.view0 = t - self._span() * 0.1
+        self.redraw()
+
+    def _on_text_double(self, e):
+        """Double-click: the word (or name a mark)."""
+        self._tdrag = None
+        idx = self.text.index("@{},{}".format(e.x, e.y))
+        for tag in self.text.tag_names(idx):
+            if tag.startswith("mk") and "_" in tag:
+                o, i = (int(v) for v in tag[2:].split("_"))
+                if self._marker((o, i)) is not None:
+                    self._begin_rename((o, i))
+                    return "break"
+        hit = self._tx_hit(e.x, e.y)
+        if hit is None or hit[1] is None:
+            return "break"
+        o, i, head = hit
+        if head:
+            return self._on_text_triple(e)
+        self._tx_click = (o, i)
+        self._tx_anchor = self._tx_head = (o, i)
+        self._tx_apply()
+        self._tx_settle()
+        return "break"
+
+    def _on_text_triple(self, e):
+        """Triple-click: every word of the pull."""
+        self._tdrag = None
+        hit = self._tx_hit(e.x, e.y)
+        if hit is None or hit[1] is None:
+            return "break"
+        o = hit[0]
+        self._tx_click = (o, 0)
+        self._tx_anchor = (o, 0)
+        self._tx_head = (o, len(self._line(o).tokens) - 1)
+        self._tx_apply()
+        self._tx_settle()
+        return "break"
+
+    def _tx_in_selection(self, o, i):
+        for so, _c, _line, i0, i1 in self._tx_selected():
+            if so == o and i0 <= i <= i1:
+                return True
+        if self._tx_anchor is None and self._range is not None:
+            line = self._line(o)
+            tok = line.tokens[i] if line is not None else None
+            if tok is not None and tok.kept:
+                a, b = sorted(self._range[1:])
+                return a <= (tok.t0 + tok.t1) / 2.0 <= b
+        return False
+
+    def _on_text_menu(self, e):
+        """Everything that can be done to the highlighted words."""
+        self.text.focus_set()
+        self._end_rename(commit=True)
+        hit = self._tx_hit(e.x, e.y)
+        if hit is not None and hit[1] is not None and not hit[2] \
+                and not self._tx_in_selection(hit[0], hit[1]):
+            self._tx_click = hit[:2]
+            self._tx_anchor = self._tx_head = hit[:2]
+            self._tx_apply()
+            self._tx_settle()
+        has = self._range is not None
+        can_heal = any(not tok.kept for _o, _c, line, i0, i1 in self._tx_selected()
+                       for tok in line.tokens[i0:i1 + 1])
+        on = lambda ok: "normal" if ok else "disabled"
+        m = tk.Menu(self.text, tearoff=0, bg=SURF2, fg=TEXT,
+                    activebackground=ACCENT, activeforeground=TEXT, bd=0)
+        m.add_command(label="Play selection (Space)", command=self.toggle_play,
+                      state=on(has))
+        m.add_command(label="Delete (Del)", command=self.delete_range, state=on(has))
+        m.add_command(label="Restore (H)", command=self.restore, state=on(can_heal))
+        m.add_command(label="Split (B)", command=self.split)
+        m.add_separator()
+        m.add_command(label="Music in (I)", command=lambda: self.drop_marker("music_in"))
+        m.add_command(label="Music out (O)", command=lambda: self.drop_marker("music_out"))
+        m.add_command(label="Inflection (U)",
+                      command=lambda: self.drop_marker("music_inflection"))
+        m.add_command(label="SFX (M)", command=lambda: self.drop_marker("sfx"))
+        m.add_command(label="Note (K)", command=lambda: self.drop_marker("note"))
+        m.add_separator()
+        m.add_command(label="Copy (Ctrl+C)", command=self.copy_words,
+                      state=on(has or can_heal))
+        m.add_command(label="Open in editor (Enter)", command=self.open_selected)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def _selected_text(self):
+        """The highlighted words that are in the cut, a line per pull."""
+        groups = []
+        if self._tx_anchor is not None:
+            for _o, _c, line, i0, i1 in self._tx_selected():
+                groups.append((line, [t for t in line.tokens[i0:i1 + 1] if t.kept]))
+        elif self._range is not None:
+            a, b = sorted(self._range[1:])
+            for c in self._clips_in(a, b):
+                line = self._line(c.order)
+                if line is not None:
+                    groups.append((line, [t for t in line.kept
+                                          if a <= (t.t0 + t.t1) / 2.0 <= b]))
+        out = []
+        for line, toks in groups:
+            text, prev = "", None
+            for tok in toks:
+                if prev is not None:
+                    text += "" if prev.ce == tok.cs else " "
+                text += line.body[tok.cs:tok.ce]
+                prev = tok
+            if text:
+                out.append(text)
+        return "\n".join(out)
+
+    def copy_words(self):
+        text = self._selected_text()
+        if text:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+            self.status.config(fg=SUB, text="Copied {} word{}".format(
+                len(text.split()), "" if len(text.split()) == 1 else "s"))
+
+    def _cut_spans(self, c, line, i0, i1):
+        """The source tape behind the cut words among i0..i1, one span a run:
+        each end meets the kept tape it borders, else stops just short of the
+        next word left out."""
+        toks, out, i = line.tokens, [], i0
+        while i <= i1:
+            if toks[i].kept or toks[i].s0 is None:
+                i += 1
+                continue
+            j = i
+            while j < i1 and not toks[j + 1].kept:
+                j += 1
+            a, b = toks[i].s0, toks[j].s1
+            p = toks[i - 1] if i > 0 else None
+            n = toks[j + 1] if j + 1 < len(toks) else None
+            if p is None:
+                a -= SEL_PAD
+            elif p.kept:
+                a = c.segments[p.k][1]
+            else:
+                a = max((p.s1 + a) / 2.0, a - SEL_PAD)
+            if n is None:
+                b += SEL_PAD
+            elif n.kept:
+                b = c.segments[n.k][0]
+            else:
+                b = min((b + n.s0) / 2.0, b + SEL_PAD)
+            b = min(b, self._file_end.get(c.play_path, float("inf")))
+            if b > a:
+                out.append((max(0.0, a), b))
+            i = j + 1
+        return out
+
+    def restore(self):
+        """Put the highlighted words that are out of the cut back into it, as
+        Pro Tools' heal does; a pull IGNOREd out of the cut comes back whole."""
+        edits, back, lost = {}, [], False
+        for o, c, line, i0, i1 in self._tx_selected():
+            if c is None:
+                if any(e["res"].get("order") == o and e["skip_var"].get()
+                       for e in getattr(self.app, "_rv", ())):
+                    back.append(o)
+                else:
+                    lost = True
+                continue
+            spans = self._cut_spans(c, line, i0, i1)
+            if spans:
+                edits[o] = (_segments_with(c.segments, spans), None)
+        if not edits and not back:
+            self.status.config(fg=SUB, text=(
+                "No audio was found for these lines: Enter opens the waveform "
+                "editor to look for it." if lost else
+                "Highlight words that are struck through to put them back."))
+            return
+        self._range = self.sel_region = None
+        self._tx_clear()
+        self.app._assembly_edit_many(edits, (), back)
+        self.refresh()
+
+    def toggle_transcript(self):
+        _MONITOR["transcript"] = not _MONITOR["transcript"]
+        self._tx_clear()
+        self._show_monitor()
+        self._render_script()
+        self.redraw()
+
+    def toggle_cut_words(self):
+        _MONITOR["cut_words"] = not _MONITOR["cut_words"]
+        self._show_monitor()
+        if _MONITOR["transcript"]:
+            self._render_script()
+            self.redraw()
 
     def _highlight_script(self, order, see=True):
         if order == self._cur_order:
@@ -1241,17 +2199,6 @@ class AssemblyWindow(object):
         if rng:
             t.tag_add("sel_pull", rng[0], rng[-1])
 
-    def _script_words(self, c):
-        """(starts, spans) of _script_timing for a pull's line, worked out
-        once per set of words it has on the timeline."""
-        memo = self._karaoke.get(c.order)
-        if memo is None or memo[0] is not c.words:
-            spans = _script_timing((c.res.get("quote_text") or "").strip(),
-                                   c.words or [])
-            memo = (c.words, ([s[0] for s in spans], spans))
-            self._karaoke[c.order] = memo
-        return memo[1]
-
     def _light_script_word(self):
         """Karaoke: light the script word being said at the playhead.  A
         lookup per tick, and two tag calls only when the word changes, so
@@ -1259,14 +2206,14 @@ class AssemblyWindow(object):
         hit = None
         i = bisect.bisect_right(self._starts, self.playhead) - 1
         c = self.clips[i] if 0 <= i < len(self.clips) else None
-        if c is not None and c.words:
-            starts, spans = self._script_words(c)
-            j = bisect.bisect_right(starts, self.playhead) - 1
+        line = self._line(c.order) if c is not None else None
+        if line is not None and line.kept:
+            j = bisect.bisect_right(line.kept_t0, self.playhead) - 1
             if j >= 0:
-                _t0, t1, cs, ce = spans[j]
-                nxt = starts[j + 1] if j + 1 < len(starts) else c.end
-                if self.playhead < max(t1, min(nxt, t1 + WORD_HOLD_S)):
-                    hit = (c.order, cs, ce)
+                tok = line.kept[j]
+                nxt = line.kept_t0[j + 1] if j + 1 < len(line.kept) else c.end
+                if self.playhead < max(tok.t1, min(nxt, tok.t1 + WORD_HOLD_S)):
+                    hit = (c.order, tok.cs, tok.ce)
         if hit == self._lit_script:
             return
         t = self.text
@@ -1295,7 +2242,18 @@ class AssemblyWindow(object):
         return self.view0 + x / self.pps
 
     def _clip(self, order):
-        return next((c for c in self.clips if c.order == order), None)
+        return self._by_order.get(order)
+
+    def _clips_in(self, a, b):
+        """The pulls a timeline span touches."""
+        i = max(0, bisect.bisect_right(self._starts, a) - 1)
+        out = []
+        for c in self.clips[i:]:
+            if c.start >= b:
+                break
+            if c.end > a:
+                out.append(c)
+        return out
 
     def _clip_at(self, t):
         i = bisect.bisect_right(self._starts, t) - 1
@@ -1324,6 +2282,7 @@ class AssemblyWindow(object):
     def redraw(self):
         if self._closed:
             return
+        self._paint_tx_sel()
         cv = self.cv
         cv.delete("all")
         self._word_items = []
@@ -1816,6 +2775,7 @@ class AssemblyWindow(object):
         t = self._t(e.x)
         kind, c, k = self._hit(e.x, e.y)
         self._end_rename(commit=True)
+        self._tx_anchor = self._tx_head = None
         if kind == "marker":
             self._range = None
             self.select_marker((c["order"], c["index"]))
@@ -1837,7 +2797,7 @@ class AssemblyWindow(object):
         if kind == "select":
             # Selector: highlight from here; Shift extends the span.
             a = min(max(t, c.start), c.end)
-            if e.state & 0x0001 and self._range and self._range[0] == c.order:
+            if e.state & 0x0001 and self._range:
                 o, ra, rb = self._range
                 anchor = ra if abs(a - rb) < abs(a - ra) else rb
                 self._range = (o, anchor, a)
@@ -1882,11 +2842,9 @@ class AssemblyWindow(object):
             if self._range is None:
                 return
             o, a, _b = self._range
-            c = self._clip(o)
-            if c is not None:
-                self._range = (o, a, min(max(self._t(e.x), c.start), c.end))
-                self.redraw()
-                self._status_range()
+            self._range = (o, a, min(max(self._t(e.x), 0.0), self.total_s))
+            self.redraw()
+            self._status_range()
             return
         dx = e.x - d["x0"]
         if not d["moved"]:
@@ -1990,6 +2948,7 @@ class AssemblyWindow(object):
                 self.set_insert(d["t"])
             else:
                 self.set_insert(min(a, b))   # a span starts where it starts
+                self._status_range()
             self.redraw()
             return
         if not d.get("moved") or "value" not in d:
@@ -2045,6 +3004,12 @@ class AssemblyWindow(object):
 
     def _status_range(self):
         o, a, b = self._range
+        hit = self._clips_in(*sorted((a, b)))
+        if len(hit) > 1:
+            self.status.config(fg=TEXT, text="{} pulls   {:.2f}s selected   ·   "
+                               "Space plays it   ·   Delete takes it out   ·   "
+                               "B splits at both ends".format(len(hit), abs(b - a)))
+            return
         c = self._clip(o)
         whole = c is not None and abs(b - a) >= c.end - c.start - MIN_SEG_S
         reg = self.sel_region
@@ -2059,20 +3024,26 @@ class AssemblyWindow(object):
                                "   ·   B splits at both ends"))
 
     def delete_range(self):
+        """Take the highlighted span out, from every pull it touches: one
+        undo step, and a pull with nothing left is IGNOREd."""
         if self._range is None:
             return
-        o, a, b = self._range
+        _o, a, b = self._range
         a, b = min(a, b), max(a, b)
-        c = self._clip(o)
         self._range = self.sel_region = None
-        if c is None or b - a < MIN_SEG_S:
+        self._tx_clear()
+        if b - a < MIN_SEG_S:
             self.redraw()
             return
-        segs, gaps = _segments_without(c, a, b)
-        if segs:
-            self.app._assembly_set_segments(o, segs, gaps)
-        else:
-            self.app._assembly_ignore(o)
+        edits, gone = {}, []
+        for c in self._clips_in(a, b):
+            segs, gaps = _segments_without(c, a, b)
+            if segs:
+                edits[c.order] = (segs, gaps)
+            else:
+                gone.append(c.order)
+        if edits or gone:
+            self.app._assembly_edit_many(edits, gone)
         self.refresh()
         self.set_insert(a)
 
@@ -2085,35 +3056,48 @@ class AssemblyWindow(object):
         r = self._range
         if r is not None and self.sel_region is None and \
                 abs(r[2] - r[1]) >= MIN_SEG_S:
-            c, points = self._clip(r[0]), sorted(r[1:])
+            points = sorted(r[1:])
         else:
-            t = self.playhead if self._playing else self.insert
-            c, points = self._clip_at(t), [t]
-        if c is None:
+            points = [self.playhead if self._playing else self.insert]
+        by_clip = {}
+        for t in points:
+            c = self._clip_at(t)
+            if c is not None:
+                by_clip.setdefault(c.order, []).append(t)
+        if not by_clip:
             self.status.config(fg=SUB, text="Nothing to split here: put the "
                                "insertion point inside a pull.")
             return
-        segs, gaps, first = list(c.segments), list(c.seg_gaps), None
-        for t in sorted(points, reverse=True):   # later first: indices hold
-            k = c.piece_at(t)
-            if k is None:
-                continue
-            tl, du, _si = c.pieces[k]
-            if t - tl < MIN_SEG_S or tl + du - t < MIN_SEG_S:
-                continue                       # already a region edge
-            s, e = segs[k]
-            cut = s + (t - tl)
-            segs[k:k + 1] = [(s, cut), (cut, e)]
-            gaps.insert(k, 0.0)
-            first = k
-        if first is None:
+        edits, first = {}, None
+        for order, pts in by_clip.items():
+            c = self._clip(order)
+            segs, gaps, low = list(c.segments), list(c.seg_gaps), None
+            for t in sorted(pts, reverse=True):   # later first: indices hold
+                k = c.piece_at(t)
+                if k is None:
+                    continue
+                tl, du, _si = c.pieces[k]
+                if t - tl < MIN_SEG_S or tl + du - t < MIN_SEG_S:
+                    continue                       # already a region edge
+                s, e = segs[k]
+                cut = s + (t - tl)
+                segs[k:k + 1] = [(s, cut), (cut, e)]
+                gaps.insert(k, 0.0)
+                low = k
+            if low is not None:
+                edits[order] = (segs, gaps)
+                first = (order, low + 1)
+        if not edits:
+            c = self._clip(next(iter(by_clip)))
             self.status.config(fg=SUB, text="{}   ·   already a region edge "
                                "here".format(c.label))
             return
         self._range = None
-        self.app._assembly_set_segments(c.order, segs, gaps)
+        self._tx_clear()
+        self.app._assembly_edit_many(edits)
         self.refresh()
-        self._select_region(c.order, first + 1)
+        if len(edits) == 1:
+            self._select_region(*first)
         self.redraw()
         self._update_status()
 
@@ -2211,8 +3195,15 @@ class AssemblyWindow(object):
     def drop_marker(self, kind):
         """A mark at the playhead -- the spotting keys, so it works while
         the cut plays.  An SFX spot opens straight into naming it: Enter
-        keeps the name, Esc leaves it as its count (SFX 7)."""
-        order, anchor = self._anchor_at(self.playhead)
+        keeps the name, Esc leaves it as its count (SFX 7).  With words or
+        audio highlighted it goes on the highlight: a music out at its end,
+        anything else at its start."""
+        at = self.playhead
+        if self._range is not None and not self._playing \
+                and abs(self._range[2] - self._range[1]) > 1e-3:
+            a, b = sorted(self._range[1:])
+            at = b if kind == "music_out" else a
+        order, anchor = self._anchor_at(at)
         if order is None:
             return
         marks = self._pull_marks(order)
@@ -2505,6 +3496,9 @@ class AssemblyWindow(object):
         self.return_key.set_on(_MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
+        self.tx_key.set_text("Transcript" if _MONITOR["transcript"] else "Script")
+        self.tx_key.set_on(_MONITOR["transcript"])
+        self.cut_key.set_on(_MONITOR["cut_words"])
 
     def step_rate(self, d):
         rates = match_review._PLAY_RATES
@@ -2544,6 +3538,7 @@ class AssemblyWindow(object):
         elif k == "Home":
             self.seek(0.0)
             self._range = self.sel_region = None
+            self._tx_clear()
         elif k == "End":
             self.seek(self.total_s)
         elif k == "Right":
@@ -2589,12 +3584,19 @@ class AssemblyWindow(object):
             (self.app._s4_redo if e.state & 0x0001 else self.app._s4_undo)()
         elif ctrl and k.lower() == "y":
             self.app._s4_redo()
-        elif ctrl and k.lower() == "c" and e.widget is self.text:
-            return None                      # let the script copy
+        elif ctrl and k.lower() == "c":
+            self.copy_words()
+        elif k.lower() == "h":
+            self.restore()                   # Pro Tools' heal is Ctrl+H
+        elif not ctrl and k == "W":
+            self.toggle_cut_words()
+        elif not ctrl and k.lower() == "w":
+            self.toggle_transcript()
         elif k.lower() == "f" and not ctrl:
             self.fit()
         elif k == "Escape":
             self._range = self.sel_region = None
+            self._tx_clear()
             self.sel_marker = None
             self.redraw()
             self._update_status()
@@ -2618,7 +3620,8 @@ class AssemblyWindow(object):
         if self.player is not None:
             self.player.close()
         self._pool.shutdown(wait=False, cancel_futures=True)
-        for aid in (self._refresh_after,):
+        for aid in (self._refresh_after, self._tx_render_after,
+                    self._tx_scroll_after):
             if aid is not None:
                 try:
                     self.win.after_cancel(aid)

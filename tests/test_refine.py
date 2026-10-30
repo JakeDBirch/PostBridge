@@ -1,0 +1,651 @@
+"""Two passes: tiny first, then the chosen model behind the screen.
+
+The engine half runs a stand-in Whisper; the refine half a stand-in
+transcribe_file that hands words over a few at a time.  The app is the real
+merge code (main.App's Step 4 methods) on a plain object, without a screen.
+"""
+import json
+import os
+import queue
+import sys
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import engines  # noqa: E402
+import monolog  # noqa: E402
+from refine import RefineMixin  # noqa: E402
+
+
+def _seg(words, start=None, end=None):
+    ws = [SimpleNamespace(word=w, start=a, end=b) for w, a, b in words]
+    return SimpleNamespace(words=ws, start=start if start is not None else words[0][1],
+                           end=end if end is not None else words[-1][2],
+                           text="".join(w for w, _a, _b in words))
+
+
+class _Model(object):
+    def __init__(self, segments):
+        self.segments = segments
+        self.calls = []
+
+    def transcribe(self, path, **kw):
+        self.calls.append(path)
+        return iter(self.segments), None
+
+
+@pytest.fixture
+def whisper(monkeypatch):
+    """engines.get_model hands back a stand-in, and remembers the size asked for."""
+    asked = []
+    model = _Model([_seg([(" In", 1.0, 1.2), (" 1876,", 1.3, 1.9), (" he", 2.0, 2.2)]),
+                    _seg([(" Rode", 3.0, 3.3), (" on.", 3.4, 3.8)])])
+
+    def _get(size=None):
+        asked.append(size)
+        return model
+    monkeypatch.setattr(engines, "get_model", _get)
+    return SimpleNamespace(asked=asked, model=model)
+
+
+# ── Engines ──────────────────────────────────────────────────────────────
+def test_transcribe_clip_keeps_both_forms_of_a_word(whisper):
+    words = engines.transcribe_clip("x.wav", model_size="tiny")
+    assert whisper.asked == ["tiny"]
+    assert [w["word"] for w in words] == ["in", "he", "rode", "on"]
+    assert [w["text"] for w in words] == [" In", " he", " Rode", " on."]
+    assert {w["_src"] for w in words} == {"tiny"}
+    # A figure means nothing to a matcher; it rides on the word before.
+    assert words[0]["extras"] == [{"text": " 1876,", "start": 1.3, "end": 1.9}]
+
+
+def test_transcribe_clip_streams_and_stops(whisper):
+    heard = []
+    engines.transcribe_clip("x.wav", segment_cb=heard.append)
+    assert [[w["word"] for w in seg] for seg in heard] == [["in", "he"], ["rode", "on"]]
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(engines.TranscriptionCancelled):
+        engines.transcribe_clip("x.wav", cancel_event=stop)
+
+
+def test_transcribe_in_chunks_puts_words_in_file_time(whisper, monkeypatch):
+    monkeypatch.setattr(engines, "extract_window", lambda *a, **k: (True, ""))
+    heard = []
+    words = engines.transcribe_in_chunks("x.wav", [(100.0, 110.0)], model_size="tiny",
+                                         segment_cb=heard.extend)
+    assert words[0]["start"] == 101.0
+    assert words[0]["extras"][0]["start"] == 101.3
+    assert heard[0]["start"] == 101.0 and heard[0]["_src"] == "tiny"
+
+
+def test_draft_model_is_tiny_unless_tiny_is_chosen(monkeypatch):
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    assert engines.draft_model() == "tiny"
+    monkeypatch.setattr(engines, "_active_model_override", "tiny")
+    assert engines.draft_model() is None
+
+
+def test_saved_transcripts_say_which_model_made_them(tmp_path, monkeypatch):
+    wav = tmp_path / "read.wav"
+    wav.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    assert engines.transcript_model(str(wav)) is None
+    words = [{"word": "w", "start": 0.0, "end": 0.1}]
+    engines.pb_transcript_save(str(wav), words, model="tiny")
+    assert engines.transcript_model(str(wav)) == "tiny"
+    engines.pb_transcript_save(str(wav), words)            # the active one
+    assert engines.transcript_model(str(wav)) == "medium"
+    os.remove(engines.pb_transcript_path(str(wav)))
+    engines.cache_save(str(wav), words, model="tiny")
+    assert engines.transcript_model(str(wav)) == "tiny"
+    assert engines.cache_load(str(wav)) == words
+
+
+def test_a_draft_pull_is_labelled_and_not_cached(whisper, tmp_path, monkeypatch):
+    monkeypatch.setattr(engines, "extract_window", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(engines, "detect_speech_blobs", lambda *a, **k: None)
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path))
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    wav = tmp_path / "guest.wav"
+    wav.write_bytes(b"\x00" * 64)
+    saved = []
+    monkeypatch.setattr(engines, "pull_result_cache_save",
+                        lambda *a: saved.append(a))
+    pull = _pull(1, 5.0, 10.0, "he rode on")
+    r = engines.reconcile_interview_pull(pull, str(wav), pad=1.0, model_size="tiny")
+    assert r["_tx_model"] == "tiny" and r["status"] == "ok"
+    assert r["words"][0]["start"] == pytest.approx(5.0)    # window starts 4 s in
+    assert r["words"][0]["extras"][0]["start"] == pytest.approx(5.3)
+    assert not saved
+    r = engines.reconcile_interview_pull(pull, str(wav), pad=1.0)
+    assert r["_tx_model"] == "medium"
+    assert saved
+
+
+# ── A stand-in app ───────────────────────────────────────────────────────
+class _Var(object):
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+
+class _Bin(object):
+    def __init__(self, paths):
+        self.paths = paths
+
+    def get_paths(self):
+        return list(self.paths)
+
+
+class _View(object):
+    """What the Assembly shows the app."""
+
+    def __init__(self):
+        self.changed, self.statuses, self.refreshed = [], 0, 0
+        self.is_busy = False
+
+    def busy(self):
+        return self.is_busy
+
+    def capture_place(self):
+        return "place"
+
+    def restore_place(self, place):
+        assert place == "place"
+
+    def refresh(self):
+        self.refreshed += 1
+
+    def transcript_changed(self, path):
+        self.changed.append(path)
+
+    def show_refine_status(self):
+        self.statuses += 1
+
+
+def _make_app():
+    import main
+
+    class _App(RefineMixin):
+        _S4_OWNED_KEYS = main.App._S4_OWNED_KEYS
+        _PRE_MATCH_STATUSES = main.App._PRE_MATCH_STATUSES
+        _segs_same = staticmethod(main.App._segs_same)
+    for n in ("_bg_apply_batch", "_bg_merge_row", "_bg_patch_undo", "_bg_patch_cards",
+              "_bg_strip_refresh", "_bg_finish_live"):
+        setattr(_App, n, getattr(main.App, n))
+    app = _App()
+    app.q = queue.Queue()
+    app._ui = app.q.put
+    app.later = []
+    app.after = lambda ms, cb: app.later.append(cb)
+    app._s4_is_live = lambda: False
+    app._s4_undo_stack, app._s4_redo_stack = [], []
+    app._s4_editing_row = None
+    app._assembly = None
+    app._reconcile_busy = False
+    app._script_path = "script.txt"
+    app._monolog = False
+    app.vo_bins, app.vo_blocks, app.pulls, app.results = {}, [], [], []
+    app.pad_var = _Var(1.0)
+    app._rv = []
+    app.patched = {}
+    app._conform_baseline_patch = app.patched.update
+    return app
+
+
+def _pump(app, until, secs=3.0):
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            app.q.get(timeout=0.02)()
+        except queue.Empty:
+            pass
+        if until():
+            # Drain what the finish posted.
+            while True:
+                try:
+                    app.q.get_nowait()()
+                except queue.Empty:
+                    return True
+    return False
+
+
+def _word(text, a, b, src="medium"):
+    return {"word": text, "text": " " + text, "start": a, "end": b, "_src": src}
+
+
+def _draft_words():
+    return [_word("we", 1.0, 1.2, "tiny"), _word("waked", 1.3, 1.6, "tiny"),
+            _word("the", 1.7, 1.8, "tiny"), _word("rich", 1.9, 2.2, "tiny")]
+
+
+@pytest.fixture
+def media(tmp_path, monkeypatch):
+    wav = tmp_path / "guest.wav"
+    wav.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    monkeypatch.setattr(engines, "get_media_duration", lambda p: 10.0)
+    monkeypatch.setattr(engines, "_is_model_cached", lambda s: True)
+    engines.cache_save(str(wav), _draft_words(), model="tiny")
+    engines.pb_transcript_save(str(wav), _draft_words(), model="tiny")
+    return str(wav)
+
+
+class _Stream(object):
+    """A stand-in transcribe_file a test feeds a segment at a time."""
+
+    def __init__(self, monkeypatch):
+        self.feed = queue.Queue()
+        self.sizes = []
+        monkeypatch.setattr(engines, "transcribe_file", self)
+
+    def __call__(self, path, model_size=None, segment_cb=None, cancel_event=None,
+                 blobs=None, progress_cb=None):
+        self.sizes.append(model_size)
+        words = []
+        while True:
+            seg = self.feed.get(timeout=5)
+            if cancel_event is not None and cancel_event.is_set():
+                raise engines.TranscriptionCancelled()
+            if seg is None:
+                return words, []
+            words.extend(seg)
+            segment_cb(seg)
+
+
+def _pull(order, a, b, quote):
+    return {"order": order, "token": "G", "in_seconds": a, "out_seconds": b,
+            "quote_text": quote, "in_tc": "", "out_tc": "", "part_index": 0}
+
+
+def _row(order, a, b, src, **kw):
+    return dict(dict(order=order, token="G", status="ok", segments=[(a, b)],
+                     source_audio=src, quote_text="q", rec_in_tc="", rec_out_tc=""),
+                **kw)
+
+
+# ── The pass ─────────────────────────────────────────────────────────────
+def test_a_draft_is_found_and_refined_with_the_words_streaming_in(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    view = app._assembly = _View()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert stream.sizes == ["medium"]
+    assert app._refine_running()
+    assert "Refining with medium" in app._refine_status()
+    assert [w["word"] for w in app._refine_words(media)] == ["we", "waked", "the", "rich"]
+
+    # First segment: refined up to its end, the draft beyond it.
+    stream.feed.put([_word("we", 1.0, 1.2), _word("walked", 1.3, 1.6)])
+    assert _pump(app, lambda: len(app._refine_words(media)) and
+                 app._refine_words(media)[1]["word"] == "walked")
+    assert [(w["word"], w["_src"]) for w in app._refine_words(media)] == [
+        ("we", "medium"), ("walked", "medium"), ("the", "tiny"), ("rich", "tiny")]
+    assert media in view.changed
+    assert "16%" in app._refine_status()
+
+    # Done: saved, labelled, and no longer running.
+    stream.feed.put([_word("the", 1.7, 1.8), _word("ridge", 1.9, 2.2)])
+    stream.feed.put(None)
+    assert _pump(app, lambda: not app._refine_running())
+    assert [w["word"] for w in app._refine_words(media)] == ["we", "walked", "the", "ridge"]
+    assert engines.transcript_model(media) == "medium"
+    assert [w["word"] for w in engines.pb_transcript_load(media)[0]][-1] == "ridge"
+    assert [w["word"] for w in engines.cache_load(media)][-1] == "ridge"
+    assert "refined with medium" in app._refine_status()
+
+
+def test_nothing_runs_when_tiny_is_the_model_chosen(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    monkeypatch.setattr(engines, "_active_model_override", "tiny")
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    time.sleep(0.1)
+    assert not stream.sizes and not app._refine_running()
+
+
+def test_a_finished_transcript_is_left_alone(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    engines.pb_transcript_save(media, _draft_words(), model="medium")
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    _pump(app, lambda: False, secs=0.2)
+    assert not stream.sizes and not app._refine_running()
+
+
+def test_refine_again_takes_a_better_model_over_a_finished_transcript(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    engines.pb_transcript_save(media, _draft_words(), model="small")
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_again()
+    assert _pump(app, lambda: bool(stream.sizes))
+    stream.feed.put(None)
+    assert _pump(app, lambda: not app._refine_running())
+    # Already there: says so instead of running.
+    engines.pb_transcript_save(media, _draft_words(), model="medium")
+    app._refine_again()
+    assert _pump(app, lambda: "already transcribed" in app._refine_status())
+    assert len(stream.sizes) == 1
+
+
+def test_stopping_leaves_the_draft_and_it_starts_over_on_resume(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    stream.feed.put([_word("we", 1.0, 1.2)])
+    assert _pump(app, lambda: app._refine_words(media)[0]["_src"] == "medium")
+    app._refine_stop()
+    stream.feed.put([_word("walked", 1.3, 1.6)])         # wakes it to see the event
+    assert not app._refine_running()
+    assert app._refine_words(media) is None
+    assert engines.transcript_model(media) == "tiny"     # the draft still stands
+    app._refine_resume()
+    assert _pump(app, lambda: len(stream.sizes) == 2)
+    stream.feed.put(None)
+    assert _pump(app, lambda: not app._refine_running())
+
+
+def test_only_the_session_on_screen_is_touched(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    app.results = [_row(1, 1.0, 2.5, media)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    app._script_path = "other.txt"
+    app.results = [_row(1, 1.0, 2.5, "other.wav")]
+    app._refine_resume()                 # a new session: the old pass is stopped
+    stream.feed.put(None)
+    assert _pump(app, lambda: not app._refine_running())
+
+
+# ── Matching again ───────────────────────────────────────────────────────
+def _finish(app, stream, words):
+    stream.feed.put(words)
+    stream.feed.put(None)
+    return _pump(app, lambda: not app._refine_running() and app.q.empty())
+
+
+def test_script_pulls_take_the_new_match_and_your_work_stays(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    view = app._assembly = _View()
+    app.pulls = [_pull(1, 1.0, 2.5, "we walked the ridge"),
+                 _pull(2, 5.0, 6.0, "then quiet"),
+                 _pull(3, 7.0, 8.0, "and on")]
+    app.results = [
+        _row(1, 1.0, 2.2, media, markers=[{"kind": "sfx", "src": 1.5}], gap_after_s=2.0),
+        _row(2, 5.0, 5.5, media, _s4_accepted=True, status="manual"),
+        _row(3, 7.0, 7.5, media, status="low_confidence"),
+    ]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [
+        _word("we", 1.1, 1.2), _word("walked", 1.3, 1.6), _word("the", 1.7, 1.8),
+        _word("ridge", 1.9, 2.4), _word("then", 5.2, 5.3), _word("quiet", 5.4, 5.8),
+        _word("and", 7.2, 7.3), _word("on", 7.4, 7.7)])
+    by = {r["order"]: r for r in app.results}
+    # Untouched: takes the new match, keeps its marks and its gap.
+    assert by[1]["segments"][-1][1] == pytest.approx(2.4)
+    assert by[1]["markers"] == [{"kind": "sfx", "src": 1.5}]
+    assert by[1]["gap_after_s"] == 2.0
+    # Accepted: your cut stands, with a note and the better words.
+    assert by[2]["segments"] == [(5.0, 5.5)]
+    assert by[2]["_s4_accepted"] and "kept your edit" in by[2]["_bg_note"]
+    assert [w["word"] for w in by[2]["words"]] == ["then", "quiet"]
+    # A row the draft matched poorly comes good.
+    assert by[3]["status"] == "ok"
+    # They are the algorithm's output now, not the user's edits.
+    assert set(app.patched) == {1, 2, 3}
+    assert view.refreshed
+
+
+def test_undo_does_not_bring_the_draft_match_back(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    app = _make_app()
+    app.pulls = [_pull(1, 1.0, 2.5, "we walked the ridge")]
+    app.results = [_row(1, 1.0, 2.2, media)]
+    app._s4_undo_stack = [{"1": {"segments": [(1.0, 2.2)], "status": "ok"}}]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [_word("we", 1.1, 1.2), _word("walked", 1.3, 1.6),
+                                 _word("the", 1.7, 1.8), _word("ridge", 1.9, 2.4)])
+    assert app._s4_undo_stack[0]["1"]["segments"][-1][1] == pytest.approx(2.4)
+
+
+def test_a_usable_row_is_never_replaced_by_no_match(media, monkeypatch):
+    app = _make_app()
+    cur = _row(1, 1.0, 2.2, media)
+    assert app._refine_merge_row(cur, dict(order=1, token="G", status="no_match",
+                                           segments=[])) == "kept"
+    assert cur["segments"] == [(1.0, 2.2)] and cur["status"] == "ok"
+    assert "no match" in cur["_bg_note"]
+
+
+def test_a_reassigned_row_is_left_alone(media):
+    app = _make_app()
+    cur = _row(1, 1.0, 2.2, media, _s4_reassigned=True)
+    assert app._refine_merge_row(cur, dict(_row(1, 3.0, 4.0, media))) == "kept"
+    assert cur["segments"] == [(1.0, 2.2)]
+
+
+def test_a_new_match_waits_while_the_assembly_is_in_use(media, monkeypatch):
+    app = _make_app()
+    view = app._assembly = _View()
+    view.is_busy = True
+    app.results = [_row(1, 1.0, 2.2, media)]
+    fresh = _row(1, 1.0, 2.4, media)
+    app._refine_apply([fresh], media)
+    assert app.results[0]["segments"] == [(1.0, 2.2)]
+    assert len(app.later) == 1
+    view.is_busy = False
+    app.later.pop()()
+    assert app.results[0]["segments"] == [(1.0, 2.4)]
+    assert view.refreshed == 1
+
+
+def test_pulls_matched_from_their_own_windows_run_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    wav = str(tmp_path / "guest.wav")
+    open(wav, "wb").close()
+    runs = []
+
+    def _rip(pull, path, pad=1.0, min_start_s=0.0, model_size=None):
+        runs.append((pull["order"], pad, model_size))
+        return dict(_row(pull["order"], pull["in_seconds"], pull["out_seconds"] + 1, path),
+                    _tx_model="medium", words=[_word("better", 1.0, 1.2)])
+    monkeypatch.setattr(engines, "reconcile_interview_pull", _rip)
+    app = _make_app()
+    app.pulls = [_pull(1, 1.0, 2.0, "a"), _pull(2, 3.0, 4.0, "b")]
+    app.results = [_row(1, 1.0, 2.0, wav, _tx_model="tiny"),
+                   _row(2, 3.0, 4.0, wav, _tx_model="medium", _s4_accepted=True)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(runs) and not app._refine_running())
+    assert runs == [(1, 1.0, None)]      # the one still on a draft
+    assert app.results[0]["segments"] == [(1.0, 3.0)]
+    assert app.results[0]["_tx_model"] == "medium"
+    assert app.results[0]["words"][0]["word"] == "better"
+
+
+def test_a_session_reopened_at_step_4_finds_its_vo_parts_in_the_pool(media, monkeypatch):
+    monkeypatch.setattr(engines, "pair_takes", lambda paths: [(None, p) for p in paths])
+    stream = _Stream(monkeypatch)
+    matched = []
+
+    def _rvp(blocks, takes):
+        matched.append([t[3] for t in takes])
+        return []
+    monkeypatch.setattr(engines, "reconcile_vo_part", _rvp)
+    app = _make_app()
+    app._pool = SimpleNamespace(
+        get_vo_assets=lambda: {0: {"audios": [media], "videos": ["cam.mp4"]}})
+    app.vo_blocks = [{"order": 1, "part_index": 0, "id": "v", "text": "t"}]
+    app.results = [dict(_row(1, 1.0, 1.5, media), is_vo=True, token="VO_PART_00",
+                        part_index=0)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [_word("we", 1.0, 1.2)])
+    assert matched == [[media]]
+
+
+def test_a_vo_part_waits_for_all_its_takes(tmp_path, monkeypatch):
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setattr(engines, "_active_model_override", "medium")
+    monkeypatch.setattr(engines, "get_media_duration", lambda p: 10.0)
+    monkeypatch.setattr(engines, "_is_model_cached", lambda s: True)
+    monkeypatch.setattr(engines, "pair_takes", lambda paths: [(None, p) for p in paths])
+    paths = []
+    for name in ("take1.wav", "take2.wav"):
+        p = tmp_path / name
+        p.write_bytes(b"\x00" * 64)
+        engines.cache_save(str(p), _draft_words(), model="tiny")
+        engines.pb_transcript_save(str(p), _draft_words(), model="tiny")
+        paths.append(str(p))
+    stream = _Stream(monkeypatch)
+    matched = []
+
+    def _rvp(blocks, takes):
+        matched.append([t[3] for t in takes])
+        return [dict(_row(1, 1.0, 2.0, takes[0][3]), is_vo=True, token="VO_PART_00",
+                     part_index=0, takes_data=[])]
+    monkeypatch.setattr(engines, "reconcile_vo_part", _rvp)
+    app = _make_app()
+    app.vo_bins = {0: _Bin(paths)}
+    app.vo_blocks = [{"order": 1, "part_index": 0, "id": "v", "text": "t"}]
+    app.results = [dict(_row(1, 1.0, 1.5, paths[0]), is_vo=True, token="VO_PART_00",
+                        part_index=0)]
+    app._refine_resume()
+    assert _pump(app, lambda: len(stream.sizes) == 1)
+    stream.feed.put([_word("we", 1.0, 1.2)])
+    stream.feed.put(None)
+    assert _pump(app, lambda: len(stream.sizes) == 2)
+    assert not matched                   # the second take is still a draft
+    stream.feed.put([_word("we", 1.0, 1.2)])
+    stream.feed.put(None)
+    assert _pump(app, lambda: not app._refine_running() and bool(matched))
+    assert matched == [paths]
+    assert app._vo_takes_by_part[0][0][3] == paths[0]
+
+
+# ── A monolog ────────────────────────────────────────────────────────────
+def _monolog_app(wav, monkeypatch):
+    monkeypatch.setattr(engines, "pair_takes", lambda paths: [(None, p) for p in paths])
+    app = _make_app()
+    app._monolog = True
+    app.vo_bins = {0: _Bin([wav])}
+    app.vo_blocks = [{"order": 1, "part_index": 0, "id": "p1", "text": "t"}]
+    built = []
+    app._step4 = lambda: built.append(list(app.results))
+    app.built = built
+    app._write_conform_baseline = lambda: None
+    app._open_assembly = lambda: None
+    return app
+
+
+def _cut_row(order, span, a, b, wav, **kw):
+    return dict(order=order, token="VO_PART_00", status="ok", is_vo=True, part_index=0,
+                monolog=True, script_span=span, segments=[(a, b)], source_audio=wav,
+                gap_after_s=0.0, quote_text="q", **kw)
+
+
+def _new_cut(wav):
+    return [_cut_row(1, (0, 9), 0.5, 2.0, wav), _cut_row(2, (10, 19), 3.0, 4.0, wav),
+            _cut_row(3, (20, 29), 5.0, 6.0, wav)]
+
+
+def test_an_untouched_monolog_takes_the_new_cut_at_once(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes: _new_cut(media))
+    app = _monolog_app(media, monkeypatch)
+    app.results = [_cut_row(1, (0, 29), 0.5, 6.0, media)]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [_word("we", 1.0, 1.2)])
+    assert _pump(app, lambda: len(app.results) == 3)
+    assert [r["order"] for r in app.results] == [1, 2, 3]
+    assert not app._refine_held()
+
+
+def test_a_monolog_you_have_edited_waits_to_be_asked(media, monkeypatch):
+    stream = _Stream(monkeypatch)
+    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes: _new_cut(media))
+    app = _monolog_app(media, monkeypatch)
+    view = app._assembly = _View()
+    view.pps, view.view0, view.playhead = 30.0, 0.0, 0.0
+    view.restore_view = lambda *a: None
+    edited = _cut_row(1, (0, 9), 0.5, 1.5, media, _s4_accepted=True)
+    app.results = [edited, _cut_row(2, (10, 29), 3.0, 6.0, media)]
+    app._s4_undo_stack = [{"1": {}}]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [_word("we", 1.0, 1.2)])
+    assert _pump(app, app._refine_held)
+    assert len(app.results) == 2                 # nothing moved under you
+    assert "update" in app._refine_status()
+
+    app._s4_is_live = lambda: True
+    app._refine_update_the_cut()
+    assert not app._refine_held()
+    assert app.built                             # Step 4's cards built anew
+    assert app.results[0] is edited              # your pull stands
+    assert [r["order"] for r in app.results] == [1, 2, 3]
+    assert [r["script_span"] for r in app.results] == [(0, 9), (10, 19), (20, 29)]
+
+
+def test_merge_recut_keeps_worked_on_pulls_and_flags_an_overlap():
+    old = [dict(order=1, script_span=(0, 9), marked=True, status="ok"),
+           dict(order=2, script_span=(10, 19), status="ok"),
+           dict(order=3, script_span=(20, 39), marked=True, status="ok")]
+    fresh = [dict(order=1, script_span=(0, 5), status="ok"),        # inside a kept one
+             dict(order=2, script_span=(6, 15), status="ok"),       # runs past one
+             dict(order=3, script_span=(16, 19), status="ok"),      # free
+             dict(order=4, script_span=(40, 49), status="ok")]      # free
+    rows = monolog.merge_recut(old, fresh, lambda r: r.get("marked"))
+    assert [r["script_span"] for r in rows] == [(0, 9), (6, 15), (16, 19), (20, 39), (40, 49)]
+    assert [r["order"] for r in rows] == [1, 2, 3, 4, 5]
+    assert rows[1]["status"] == "low_confidence" and "overlaps" in rows[1]["diag"]
+    assert rows[2]["status"] == "ok"
+
+
+def test_monolog_results_say_which_script_they_cover():
+    import parsers
+    blocks = parsers.parse_plain_script(
+        "Title\nThe first line of the script is here.\nAnd now the second line follows it.")[3]
+    t, words = 0.0, []
+    for w in "the first line of the script is here and now the second line follows it".split():
+        words.append({"word": w, "start": t, "end": t + 0.3})
+        t += 0.4
+    rows = monolog.reconcile(blocks, [(words, 0.0, None, None)])
+    assert rows and all(r.get("script_span") for r in rows)
+    assert rows[0]["script_span"][0] == 0
+
+
+def test_the_baseline_takes_the_new_match(tmp_path):
+    import main
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"1": {"segments": [[1.0, 2.0]]},
+                                "2": {"segments": [[3.0, 4.0]]}}))
+
+    class _A(object):
+        _conform_baseline_path = lambda self: str(path)
+        _conform_baseline_entry = staticmethod(main.App._conform_baseline_entry)
+    main.App._conform_baseline_patch(_A(), {1: dict(segments=[[1.0, 2.5]], status="ok")})
+    snap = json.loads(path.read_text())
+    assert snap["1"]["segments"] == [[1.0, 2.5]] and snap["1"]["accepted"] is False
+    assert snap["2"]["segments"] == [[3.0, 4.0]]

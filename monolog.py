@@ -723,6 +723,7 @@ def reconcile(vo_blocks, takes):
                 j += 1
             if j - a + 1 >= 4:            # a word or three is not a missing line
                 r = _base(S.blocks[S.blk[a]], S.text(a, j))
+                r["script_span"] = (a, j)
                 r["status"] = "no_match"
                 r["diag"] = "not found in the recording"
                 if tk:
@@ -741,6 +742,7 @@ def reconcile(vo_blocks, takes):
                 s[1] = nxt[0] = (s[1] + nxt[0]) / 2.0
         segs = _join(segs)
         r = _base(S.blocks[S.blk[a0]], S.text(a0, b1))
+        r["script_span"] = (a0, b1)
         n_tok = b1 - a0 + 1
         cover = sum(dels[pc.k].matched(pc.a, pc.b) for pc in pl) / float(n_tok)
         heard = " ".join(R.word(i)["word"] for i in range(pl[0].i_a, pl[-1].i_b + 1)
@@ -772,6 +774,34 @@ def reconcile(vo_blocks, takes):
     _missing_before(len(S.tok))
     results.sort(key=lambda r: r["order"])
     return results
+
+
+def merge_recut(old, fresh, touched):
+    """A new cut of the same script (from a better transcript), keeping the
+    pulls of the old one that touched(row) says were worked on.  Pulls are
+    numbered by the cut, so the rows come back renumbered.
+
+    A new pull wholly inside a kept one's lines goes.  One that reaches
+    beyond them stays, flagged for review: it repeats some words, but
+    dropping it would lose the rest without a word."""
+    kept = [r for r in old if r.get("script_span") and touched(r)]
+    spans = [tuple(r["script_span"]) for r in kept]
+    rows = list(kept)
+    for r in fresh:
+        a, b = r.get("script_span") or (0, -1)
+        over = [(x, y) for x, y in spans if x <= b and a <= y]
+        if not over:
+            rows.append(r)
+        elif any(x <= a and b <= y for x, y in over):
+            continue
+        else:
+            rows.append(dict(r, status="low_confidence",
+                             diag="overlaps a pull you edited -- check for "
+                                  "repeated words"))
+    rows.sort(key=lambda r: tuple(r.get("script_span") or (0, -1)))
+    for n, r in enumerate(rows, 1):
+        r["order"] = n
+    return rows
 
 
 def tk_index(tk, apath):
