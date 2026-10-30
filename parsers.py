@@ -177,6 +177,9 @@ def _normalize_tc(s):
     return s
 
 
+DEFAULT_DOC_TITLE = "PostBridge Episode"
+
+
 def parse_script(text):
     """Parse a script in the bracketed syntax.
 
@@ -191,17 +194,28 @@ def parse_script(text):
     """
     tokens, parts, pulls, vo_blocks, warnings = [], [], [], [], []
 
-    # Doc title: first non-empty, non-header, non-comment, non-[TOKENS] line.
-    doc_title = "PostBridge Episode"
+    # A BOM would otherwise end up in the title, or hide a header on line 1.
+    text = text.lstrip("﻿")
+
+    # Doc title: the first loose line above the first header.  Anything below
+    # a header is that block's text, and the names in [TOKENS] are not titles.
+    doc_title = DEFAULT_DOC_TITLE
+    in_tokens = False
     for ln in text.split("\n"):
-        s = ln.strip()
+        s = _strip_comment(ln).strip()
         if not s:
             continue
-        if s.startswith("//"):
+        if s.upper() == "[TOKENS]":
+            in_tokens = True
             continue
+        if s.upper() == "[/TOKENS]":
+            in_tokens = False
+            continue
+        if in_tokens:
+            continue
+        if _HEADER_RE.match(s):
+            break
         if s.startswith("[") and s.endswith("]"):
-            continue
-        if s.upper() in ("[TOKENS]", "[/TOKENS]"):
             continue
         doc_title = s
         break
@@ -305,16 +319,18 @@ def parse_script(text):
             i += 1
             continue
 
-        key = (tok, in_s, out_s)
+        paragraphs, end_i, last_blank = _collect_paragraphs(i + 1)
+        i = end_i
+
+        # A repeat of the same pull is dropped.  The same timecodes on a
+        # different quote is a mistake in the script, not a repeat: keep it, so
+        # the quote still reaches reconcile and Script Check can name it.
+        key = (tok, in_s, out_s, " ".join(" ".join(paragraphs).split()))
         if key in seen:
-            i += 1
             continue
         seen.add(key)
         if tok not in tokens:
             tokens.append(tok)
-
-        paragraphs, end_i, last_blank = _collect_paragraphs(i + 1)
-        i = end_i
 
         # Strip surrounding quote chars from each paragraph
         cleaned = []
@@ -344,6 +360,15 @@ def parse_script(text):
         parts.append({"index": 1, "name": "Episode VO"})
         for vb in vo_blocks:
             vb["part_index"] = 1
+
+    # A part's number comes from its VO ids (PART_3_NARRATOR is part 3), which
+    # is what a narrator file named "Part 3" matches when the name has none.
+    for p in parts:
+        for vb in vo_blocks:
+            vm = re.match(r"^PART_(\d+)_", vb["id"])
+            if vm and vb["part_index"] == p["index"]:
+                p["vo_num"] = int(vm.group(1))
+                break
 
     return tokens, parts, pulls, vo_blocks, doc_title, warnings
 

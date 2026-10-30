@@ -17,7 +17,9 @@ import os
 import re
 
 from episode import read_pq_session
-from parsers import parse_script, discover_pq_sessions, _HEADER_RE
+from parsers import (parse_script, discover_pq_sessions, _HEADER_RE, _normalize_tc,
+                     DEFAULT_DOC_TITLE)
+import script_normalize
 
 # Severity ordering is also the display ordering.
 ERROR, WARN, INFO = "error", "warn", "info"
@@ -125,7 +127,9 @@ def _check_unparsed_brackets(lines, out):
             continue
         if in_tokens or not s or raw[:1].isspace():
             continue
-        if _BRACKET_LINE_RE.match(s) and not _HEADER_RE.match(s):
+        if (_BRACKET_LINE_RE.match(s) and not _HEADER_RE.match(s)
+                and not script_normalize._LOOSE_PULL_RE.match(s)
+                and not script_normalize._PLACEHOLDER_RE.match(s)):
             out.append(Finding(
                 WARN, "Structure", "Bracketed line is not a valid header",
                 "%s\nIt will be absorbed into the surrounding block as body text.  "
@@ -171,8 +175,96 @@ def _consumed_map(lines):
     return orphans
 
 
-def _check_orphan_prose(lines, out):
-    orphans = sorted(_consumed_map(lines))
+def _check_structure(text, out):
+    """What the script's text says it is but the parser will read as body:
+    narration running on under a pull, section lines, dividers, pulls without a
+    proper header.  Aggregated, because one cause can touch a hundred lines.
+    Returns the pulls with narration under them, and the lines it has reported."""
+    walked = script_normalize.walk(text)
+    fix = "\nFIX FORMAT repairs this without touching the wording."
+
+    def _sample(items):
+        shown = ["  line %d:  %s%s" % (l.n, l.s[:90], "…" if len(l.s) > 90 else "")
+                 for l in items[:5]]
+        more = len(items) - len(shown)
+        return "\n".join(shown + (["  …and %d more" % more] if more > 0 else []))
+
+    def _of(kind):
+        return [l for l in walked if l.kind == kind]
+
+    swallowed = _of("swallowed")
+    if swallowed:
+        pulls = {l.pull for l in swallowed}
+        out.append(Finding(
+            ERROR, "Structure",
+            "%d paragraph%s of narration %s inside interview pulls"
+            % (len(swallowed), "" if len(swallowed) == 1 else "s",
+               "is" if len(swallowed) == 1 else "are"),
+            "Text after a closing quote, with no [VO …] header above it, reads as "
+            "more of that quote.  It would be lost from the narration and throw off "
+            "the match on %d pull%s:\n%s%s"
+            % (len(pulls), "" if len(pulls) == 1 else "s", _sample(swallowed), fix),
+            swallowed[0].n))
+
+    sections = _of("section")
+    if sections:
+        out.append(Finding(
+            ERROR, "Structure",
+            "%d section line%s %s not [PART …] header%s"
+            % (len(sections), "" if len(sections) == 1 else "s",
+               "is" if len(sections) == 1 else "are",
+               "" if len(sections) == 1 else "s"),
+            "They read as text, so the sections and their VO bins don't exist:\n%s%s"
+            % (_sample(sections), fix), sections[0].n))
+
+    loose = _of("loose_pull")
+    if loose:
+        out.append(Finding(
+            ERROR, "Structure",
+            "%d pull%s %s no valid header"
+            % (len(loose), "" if len(loose) == 1 else "s",
+               "has" if len(loose) == 1 else "have"),
+            "These look like pulls but don't match [TOKEN HH:MM:SS-HH:MM:SS], so "
+            "they never reach the timeline:\n%s%s" % (_sample(loose), fix), loose[0].n))
+
+    for l in _of("placeholder"):
+        out.append(Finding(
+            ERROR, "Structure", "Placeholder with no clip behind it: %s" % l.s[:60],
+            "It reads as narration and no clip goes on the timeline.  Replace it with "
+            "a pull: [TOKEN HH:MM:SS-HH:MM:SS], with the quote underneath if you have it.",
+            l.n))
+
+    for l in _of("comment"):
+        if "NEEDS TIMECODES" in l.s.upper():
+            out.append(Finding(
+                ERROR, "Structure", "A clip is waiting on its timecodes",
+                "%s\nThis clip isn't on the timeline until it has a pull header." % l.s[:120],
+                l.n))
+
+    for l in walked:
+        if l.bare_quote:
+            out.append(Finding(
+                WARN, "Structure", "A whole paragraph of narration is a quote",
+                "%s%s\nIf this is a clip rather than something the narrator reads, "
+                "it needs a pull header with its timecodes."
+                % (l.s[:120], "…" if len(l.s) > 120 else ""), l.n))
+
+    dividers = _of("divider")
+    if dividers:
+        out.append(Finding(
+            WARN, "Structure",
+            "%d divider line%s in the script"
+            % (len(dividers), "" if len(dividers) == 1 else "s"),
+            "A dash on its own line reads as text in the block above it:\n%s%s"
+            % (_sample(dividers), fix), dividers[0].n))
+
+    skip = {l.n for l in walked
+            if l.kind in ("section", "divider", "loose_pull", "placeholder")}
+    return {l.pull for l in swallowed}, skip
+
+
+def _check_orphan_prose(lines, out, skip=()):
+    orphans = sorted(set(_consumed_map(lines)) - set(skip))
     if not orphans:
         return
     # Group consecutive line numbers so a dropped paragraph reports once.
@@ -198,8 +290,15 @@ def _check_doc_title(doc_title, tokens, out):
     t = (doc_title or "").strip()
     if not t:
         return
+    if t == DEFAULT_DOC_TITLE:
+        out.append(Finding(
+            WARN, "Structure", "The script has no episode title",
+            "The title is the first loose line above the first header.  Without "
+            "one, the episode takes the name of the script file."))
+        return
     bad = (t.startswith("---") or t.upper() in ("[TOKENS]", "[/TOKENS]")
-           or t in tokens or _BRACKET_LINE_RE.match(t))
+           or t in tokens or _BRACKET_LINE_RE.match(t)
+           or not script_normalize.looks_like_title(t))
     if bad:
         out.append(Finding(
             WARN, "Structure", "Episode title looks wrong: %r" % t[:60],
@@ -222,29 +321,42 @@ def _check_empty_blocks(pulls, out):
 
 # ── timecodes ───────────────────────────────────────────────────────────────
 
-def _check_duplicate_headers(lines, out):
-    """Duplicate (token, in, out) pulls must be found in the raw text: the
-    parser silently drops them, so by the time we have `pulls` they are gone."""
+def _check_duplicate_headers(lines, pulls, out):
+    """The same (token, in, out) twice.  An exact repeat must be found in the
+    raw text: the parser drops it, so by the time we have `pulls` it is gone.
+    A different quote on the same timecodes is kept, and one of them is wrong."""
     seen = {}
+    counts = {}
+    for p in pulls:
+        k = (p["token"], p["in_tc"], p["out_tc"])
+        counts[k] = counts.get(k, 0) + 1
     for i, raw in enumerate(lines, 1):
         if raw[:1].isspace():
             continue
         m = _HEADER_RE.match(raw.split("//")[0].strip())
         if not m or m.group("tok") is None:
             continue
-        key = (m.group("tok"), m.group("intc"), m.group("outtc"))
-        if key in seen:
+        key = (m.group("tok"), _normalize_tc(m.group("intc")),
+               _normalize_tc(m.group("outtc")))
+        if key in seen and counts.get(key, 0) > 1:
             out.append(Finding(
-                WARN, "Timecode", "Duplicate pull is dropped without warning",
-                "[%s %s-%s] also appears on line %d.  The parser keeps only the "
-                "first, so the second block of quote text never reaches the "
-                "timeline." % (key[0], key[1], key[2], seen[key]),
+                ERROR, "Timecode", "Two different quotes have the same timecodes",
+                "[%s %s-%s] also appears on line %d.  One of them was copied from "
+                "the other, so this quote will be looked for in the wrong place.  "
+                "Correct its timecodes." % (key[0], key[1], key[2], seen[key]),
+                i))
+        elif key in seen:
+            out.append(Finding(
+                WARN, "Timecode", "This pull is an exact repeat and is dropped",
+                "[%s %s-%s] with the same quote also appears on line %d.  If it's "
+                "meant to play twice, it needs a slightly different in or out."
+                % (key[0], key[1], key[2], seen[key]),
                 i))
         else:
             seen[key] = i
 
 
-def _check_timecodes(pulls, out):
+def _check_timecodes(pulls, out, swallowed=()):
     for p in pulls:
         if p["out_seconds"] <= p["in_seconds"]:
             out.append(Finding(
@@ -253,6 +365,10 @@ def _check_timecodes(pulls, out):
 
     # A span that cannot physically hold its own quote.
     for p in pulls:
+        # Narration running on under a pull is already reported, and is the
+        # reason its span looks short.
+        if (p["token"], p["in_tc"], p["out_tc"]) in swallowed:
+            continue
         words = len((p.get("quote_text") or "").split())
         if words < 4:
             continue
@@ -272,6 +388,8 @@ def _check_timecodes(pulls, out):
     for tok, ps in sorted(by_token.items()):
         ps = sorted(ps, key=lambda x: x["in_seconds"])
         for a, b in zip(ps, ps[1:]):
+            if a["in_seconds"] == b["in_seconds"] and a["out_seconds"] == b["out_seconds"]:
+                continue                # reported as a duplicate
             if b["in_seconds"] < a["out_seconds"]:
                 same_out = a["out_seconds"] == b["out_seconds"]
                 out.append(Finding(
@@ -304,6 +422,9 @@ def _declared_tokens(text):
 
 
 def _edit_distance_1(a, b):
+    # KATHY / KATHY2, TESTIMONY1 / TESTIMONY2: separate recordings of one person.
+    if a.rstrip("0123456789") == b.rstrip("0123456789"):
+        return False
     if abs(len(a) - len(b)) > 1:
         return False
     if a == b:
@@ -596,11 +717,12 @@ def run_checks(text, script_path=None):
     _check_shape(parts, pulls, vo_blocks, out, legacy=_legacy)
     _check_indented_headers(lines, out)
     _check_unparsed_brackets(lines, out)
-    _check_orphan_prose(lines, out)
+    swallowed, structure_lines = _check_structure(text, out)
+    _check_orphan_prose(lines, out, structure_lines)
     _check_doc_title(doc_title, tokens, out)
     _check_empty_blocks(pulls, out)
-    _check_duplicate_headers(lines, out)
-    _check_timecodes(pulls, out)
+    _check_duplicate_headers(lines, pulls, out)
+    _check_timecodes(pulls, out, swallowed)
     _check_tokens(text, tokens, pulls, out)
     _check_sessions(script_path, tokens, pulls, out)
 

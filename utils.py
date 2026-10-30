@@ -317,17 +317,28 @@ def _extract_part_number(text):
         return int(m.group(1))
     return None
 
+_OUTRO_RE = re.compile(r"\b(outro|closing)\b", re.IGNORECASE)
+
 def suggest_vo_part(filename, parts):
     if not parts:
         return None
 
-    fn_num = _extract_part_number(os.path.splitext(filename)[0])
+    stem = os.path.splitext(filename)[0].replace("_", " ")
+    if _OUTRO_RE.search(stem):
+        for p in parts:
+            if _OUTRO_RE.search(p["name"]):
+                return "VO: {}".format(p["name"])
+
+    fn_num = _extract_part_number(stem)
     if fn_num is None:
         return None
 
     if fn_num == 0:
         for p in parts:
             if any(kw in p["name"].lower() for kw in ("intro", "open")):
+                return "VO: {}".format(p["name"])
+        for p in parts:
+            if p.get("vo_num") == 0:
                 return "VO: {}".format(p["name"])
         return "VO: {}".format(parts[0]["name"])
 
@@ -336,8 +347,16 @@ def suggest_vo_part(filename, parts):
         if p_num is not None and p_num == fn_num:
             return "VO: {}".format(p["name"])
 
-    if 1 <= fn_num <= len(parts):
-        return "VO: {}".format(parts[fn_num - 1]["name"])
+    # The script's own numbering: PART_3_NARRATOR is part 3, whatever it's named.
+    for p in parts:
+        if p.get("vo_num") == fn_num:
+            return "VO: {}".format(p["name"])
+
+    # By position, where an Intro in front is part 0 and so doesn't count.
+    first = _extract_part_number(parts[0]["name"]) == 0
+    k = fn_num if first else fn_num - 1
+    if 0 <= k < len(parts):
+        return "VO: {}".format(parts[k]["name"])
 
     return None
 

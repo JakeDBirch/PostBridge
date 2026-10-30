@@ -1,5 +1,7 @@
 import os
+import difflib
 import script_check
+import script_normalize
 from utils import app_state_dir as _app_state_dir
 import sys
 import re
@@ -52,7 +54,7 @@ from config import *
 from config import _SANS
 from utils import (basename, secs_tc, tc_secs, is_video, is_audio, is_media,
                    MEDIA_EXTS, VIDEO_EXTS, parse_dnd, run_hidden)
-from parsers import (parse_script, parse_pt_session_text, dedupe_pt_tracks,
+from parsers import (parse_script, DEFAULT_DOC_TITLE, parse_pt_session_text, dedupe_pt_tracks,
                      match_pt_clip_to_media, get_clip_base_name,
                      parse_aaf_session, match_source_to_video,
                      detect_sync_offset, verify_sync_at_offset,
@@ -952,6 +954,19 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "breaks — feel free to use them.\n"
             "  • The next block starts only when another `[…]` header "
             "appears.  Any other text is body.\n"
+            "  • EVERY stretch of narration needs its own [VO] header, "
+            "including narration that comes right after a pull.  Without "
+            "one, it reads as more of the quote above it.\n"
+            "  • A section heading like `Part 1: The Lake` becomes "
+            "[PART Part 1: The Lake].  Keep the number in the name.\n"
+            "  • VO ids follow the part: PART_1_NARRATOR throughout Part 1.  "
+            "Do not leave `—` dividers or other rule lines; a [PART] or [VO] "
+            "header replaces them.\n"
+            "  • Every clip needs a pull header with timecodes.  If a clip has "
+            "no timecodes, leave a line starting `// NEEDS TIMECODES:` and "
+            "say so in your reply.  Never invent timecodes.\n"
+            "  • Do not change the wording of any quote or narration, and do "
+            "not put two different quotes on the same timecodes.\n"
             "  • Timecodes must be HH:MM:SS (zero-padded).  Use a "
             "single hyphen between in/out (no space).\n"
             "  • Comments: `// comment` from a whitespace-prefixed "
@@ -971,6 +986,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "line.\n\n"
             "[JENA 00:02:14-00:02:30]\n"
             "Next pull from the same session.\n\n"
+            "[VO PART_0_NARRATOR]\n"
+            "Narration after a pull gets a new [VO] header.\n\n"
+            "[PART Part 1: The Trip]\n\n"
+            "[VO PART_1_NARRATOR]\n"
+            "The next section's narration.\n\n"
             "Please reformat the following script:\n\n"
             "[PASTE YOUR SCRIPT HERE]"
         )
@@ -1411,7 +1431,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         tokens, parts, pulls, vo_blocks, doc_title, warnings = parse_script(text)
         # No markers at all: a finished narration script (Gunfighters),
         # cut from one raw read by monolog.reconcile instead of from pulls.
-        self._monolog = not pulls and not vo_blocks and is_plain_script(text)
+        self._monolog = (not pulls and not vo_blocks and is_plain_script(text)
+                         and not script_normalize.has_loose_pulls(text))
         if self._monolog:
             tokens, parts, pulls, vo_blocks, doc_title, warnings =                 parse_plain_script(text)
             if not vo_blocks:
@@ -1431,6 +1452,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 "The older @PULL / @VO / @PART markers are no longer read.\n"
                 "Use Script Formatter \u2192 Copy AI Prompt to convert a script.")
             return
+
+        if doc_title == DEFAULT_DOC_TITLE:
+            doc_title = os.path.splitext(os.path.basename(path))[0]
 
         no_quote = sum(1 for p in pulls if not p["quote_text"])
         self.tokens    = tokens
@@ -1526,6 +1550,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._btn(nav, "NEXT  →  ASSIGN MEDIA",
                   self._step2, color=ACCENT).pack(side="right")
 
+        # What Fix Format would do, worked out now so the button only shows
+        # when there is something for it to repair.
+        _stem = os.path.splitext(os.path.basename(
+            getattr(self, "_script_path", "") or "Episode"))[0]
+        _fixed, _changes = script_normalize.normalize(
+            getattr(self, "_script_text", "") or "", title=_stem)
+        if _changes:
+            self._btn(nav, "FIX FORMAT",
+                      lambda: self._fix_format_dialog(_fixed, _changes),
+                      small=True, color=ACCENT).pack(side="left", padx=(8, 0))
+
         # ── Headline ────────────────────────────────────────────────────────
         if n_err:
             head, head_fg = "%d blocking issue%s found" % (n_err, "" if n_err == 1 else "s"), ERR
@@ -1589,6 +1624,69 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                              anchor="w", padx=10, pady=(2, 8))
             else:
                 tk.Frame(card, bg=SURF, height=6).pack()
+
+    def _fix_format_save(self, fixed):
+        """Write a repaired script beside the original, never over it, and
+        load it.  Returns the new path."""
+        base, _ext = os.path.splitext(self._script_path)
+        path, k = base + "_fixed.txt", 2
+        while os.path.exists(path):
+            path, k = "{}_fixed{}.txt".format(base, k), k + 1
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(fixed)
+        self._load_script(path, navigate=False)
+        return path
+
+    def _fix_format_dialog(self, fixed, changes):
+        """Show what Fix Format would change before anything is written."""
+        win = tk.Toplevel(self)
+        win.title("Fix Format")
+        win.configure(bg=BG)
+        win.geometry("980x680")
+        win.transient(self)
+
+        tk.Label(win, text="Fix Format", font=FBT, bg=BG, fg=TEXT).pack(
+            anchor="w", padx=14, pady=(12, 2))
+        tk.Label(win,
+                 text="Headers only.  Quote text, narration and timecodes are not "
+                      "changed.  This saves a new copy and leaves your script as it is.",
+                 font=FB, bg=BG, fg=SUB, wraplength=940, justify="left").pack(
+                     anchor="w", padx=14)
+        tk.Label(win, text="\n".join("• " + c for c in changes),
+                 font=FB, bg=BG, fg=TEXT, wraplength=940, justify="left").pack(
+                     anchor="w", padx=14, pady=(8, 8))
+
+        nav = tk.Frame(win, bg=BG)
+        nav.pack(side="bottom", fill="x", padx=14, pady=10)
+
+        frame = tk.Frame(win, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=14)
+        sb = tk.Scrollbar(frame)
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(frame, font=("Courier New", 10), bg=SURF, fg=SUB, bd=0,
+                      wrap="none", yscrollcommand=sb.set)
+        txt.pack(fill="both", expand=True)
+        sb.config(command=txt.yview)
+        txt.tag_config("add", foreground=SUCCESS)
+        txt.tag_config("del", foreground=ERR)
+
+        old = (getattr(self, "_script_text", "") or "").lstrip("﻿").replace(
+            "\r\n", "\n").split("\n")
+        for ln in difflib.unified_diff(old, fixed.split("\n"), lineterm="", n=0):
+            if ln.startswith(("---", "+++")):
+                continue
+            tag = {"+": "add", "-": "del"}.get(ln[:1], "")
+            txt.insert("end", ln[:150] + "\n", tag)
+        txt.config(state="disabled")
+
+        def _save():
+            win.destroy()
+            self._fix_format_save(fixed)
+            self._ui(self._step_check)
+
+        self._btn(nav, "CANCEL", win.destroy, small=True).pack(side="left")
+        self._btn(nav, "SAVE FIXED COPY", _save, color=ACCENT).pack(side="right")
+        return win
 
     def _step2(self):
         self._clear()
