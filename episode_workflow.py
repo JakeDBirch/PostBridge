@@ -381,10 +381,10 @@ class EpisodeWorkflowMixin:
             r.pack(fill="x", pady=2)
             b = self._btn(r, label, cmd, small=True, width=18)
             b.pack(side="left")
-            if cmd is self._ep_launch_aaf:
+            if cmd == self._ep_launch_aaf:
                 self._ep_aaf_btn = b      # says "opening" while the AAF is read
             tk.Label(r, text=note, font=FB, bg=SURF, fg=SUB).pack(side="left", padx=(12, 0))
-            if cmd is self._ep_launch_s2s:
+            if cmd == self._ep_launch_s2s:
                 # The script can live in Google Docs: link it once, then
                 # every launch fetches the latest text and checks it.
                 gd = links.get("gdoc") or {}

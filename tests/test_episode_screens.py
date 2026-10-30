@@ -378,12 +378,13 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     monkeypatch.setattr(gdocs, "write_notes", lambda creds, doc_id, notes, docs=None: (
         calls.update(doc_id=doc_id, notes=notes) or (len(notes), [])))
 
-    # Link through the (faked) picker.
-    app._ep_gdoc_link()
+    # Link through the (faked) picker, from the button on the Stages card.
+    assert _click(app, app, "LINK GOOGLE DOC…")
     assert _wait(app, lambda: (app._ep["links"].get("gdoc") or {}).get("id") == "doc123", secs=10)
+    _pump(app, 3)
 
     # Fetch: the Doc becomes the episode's script, version-stamped, checked.
-    app._ep_gdoc_fetch()
+    assert _click(app, app, "FETCH & CHECK")
     assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
     _pump(app, 3)
     script = os.path.join(project, "Ep 7 script.txt")

@@ -5,6 +5,7 @@
 ## October 30, 2026
 
 ### Google Docs: plain scripts pass Script Check, and notes land by the pull they concern
+- **LINK GOOGLE DOC… now appears on the Stages card.** The Google Doc buttons on the Script → Session row were never drawn, so there was no way to link a Doc. The same mistake stopped the AAF → XML button from saying **OPENING AAF…** while a large AAF is read; it does now.
 - **A plain narration script no longer reports errors.** Script Check called a Gunfighters script broken ("No pulls and no VO blocks were parsed") even though it loads and cuts correctly, and **WRITE NOTES INTO DOC** would have written that into the Doc. It now reports nothing to fix.
 - **Notes go under the pull they are about.** A finding that names a pull or a token now sits under that pull, where most used to pile up at the top of the Doc. On a long script with transcripts next to it, that took the notes at the top from 137 of 142 to 14. Only findings about the whole script stay at the top.
 - **One line can hold several notes,** in the order Script Check lists them.
