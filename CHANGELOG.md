@@ -4,6 +4,23 @@
 
 ## October 30, 2026
 
+### Plain scripts: a continuous read stays in one piece
+- **A read that carries on across a paragraph is one region.** Every paragraph used to start a new pull, so a straight read was chopped into clips with nothing removed between them. On Ep 10, 44 of the 115 joins removed nothing. On Ep 6, 34 of 40 such joins sat inside one continuous region of the finished edit. A new pull now starts only where the tape breaks, so a pull can cover several paragraphs.
+- **A cut has to be earned by a retake.** A line reworded as it was read was being cut out of the middle of its sentence. Ep 10's script says "a memoir from 1912" and the narrator read "a memoir he published years later in 1912", which came out as "a memoir he Siringo claimed". Now a short removal (6 s and 12 words at most) goes back in unless its words are said again right beside it, or the narrator stopped before saying them. "[That fall, he complained,] that fall, he complained to the mayor" is still cut.
+- **Pauses inside a reading are left alone up to 4 s** (was 2 s). Longer ones are still taken down to about a second.
+- Scored against the finished Ep 6 edit: 118 regions down to 73, with precision unchanged at 98.6% and recall up from 99.3% to 99.4%. Ep 10 went from 116 regions to 61. Re-run the reconcile to get the new cut; an opened session keeps the cut it was saved with.
+
+### Pull Quotes: cancel a transcription, and step away from one
+- **Cancel.** While a session transcribes, its TRANSCRIBE button reads **■ CANCEL TRANSCRIPTION** and its row in the project list has **■ CANCEL**. The session goes back to the transcript it had before the run, including one the re-transcribe dialog had cleared. It stops at the next segment, so within a few seconds.
+- **A transcription you've stepped away from is still there.** Leaving Pull Quotes and coming back reloaded each session from its file, so a running transcription showed neither its progress nor its transcript, and an edit after it finished could save the empty copy over the result. The running session now comes back as itself, and a run that finishes while another project is open still saves to its own episode.
+- **Part of a transcript no longer passes for all of it.** A save during a run could write what had been decoded so far beside the audio, where a later reconcile would take it for the whole recording.
+
+### Script → Session: cancelling and starting over
+- **Opening Script → Session could crash after a Step 1 screen had come and gone**, leaving the workflow unable to start until the app was restarted (`invalid command name …!label`).
+- **Cancel stops the transcription.** Step 3's CANCEL used to wait for Whisper to finish the file. It now stops within a segment.
+- **A cancelled run can't pull you off another screen.** Its return to Step 2 used to fire whenever it finished winding down, wherever you were by then.
+- **Two reconciles can't overlap.** Starting a new one while the last was still stopping cleared the cancel, which set the old run's workers going again. The new one now waits on screen for the old one to stop, with **← BACK** to leave.
+
 ### Assembly view: edit by highlighting the transcript; tiny first, your model behind it
 - **The text beside the controls is now the transcript of the cut.** It reads as Whisper wrote it, with casing, punctuation and figures. **W** swaps the script back in; a pull with no transcript shows its script line either way.
 - **Highlight words to select their audio.** Drag across them, double-click a word, triple-click a whole pull, Shift-click to extend. The selection shows on the track, and a selection made on the track lights its words in the text. Space, Del, B and the spotting keys all work on it, and so does the right-click menu. Ctrl+C copies the words. A music in lands at the start of the highlight and a music out at its end. An edge sits halfway to the neighbouring word (0.15 s at most), or at the region's edge when nothing is said between. This edits the audio, not the words: there is no typing corrections into the transcript.

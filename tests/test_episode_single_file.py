@@ -419,3 +419,218 @@ def test_pull_quotes_sessions_live_in_the_episode(stage_app, project):
     assert len(app._pq_project["sessions"]) == n0
     assert saved["sources"]["Ep 7 pt 2"]["session"] is None
     assert not app._errors, "\n".join(app._errors)
+
+
+# ── Stepping away from work that is still running ─────────────────────────
+
+class _Whisper(object):
+    """Stands in for a Pull Quotes transcription: streams a few words, then
+    holds until it is cancelled or released."""
+
+    def __init__(self, monkeypatch):
+        import threading
+        import engines
+        self.release = threading.Event()
+        self.engines = engines
+        monkeypatch.setattr(engines, "get_model", lambda size=None: None)
+        monkeypatch.setattr(engines, "_is_model_cached", lambda size: True)
+        monkeypatch.setattr(engines, "is_cuda_available", lambda: False)
+        monkeypatch.setattr(engines, "transcribe_clip_verbatim", self._run)
+
+    def _run(self, wav, progress_cb=None, cancel_event=None, model_size=None,
+             segment_cb=None):
+        import time
+        words = [{"word": " Partial", "start": 1.0, "end": 1.2,
+                  "_src": model_size or "small"}]
+        if segment_cb:
+            segment_cb(words)
+        while not self.release.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                raise self.engines.TranscriptionCancelled(partial_words=words)
+            time.sleep(0.01)
+        return words + [{"word": " whole", "start": 1.3, "end": 1.5,
+                         "_src": model_size or "small"}]
+
+
+def _pq_session(app):
+    from test_episode_screens import _pump
+    app._ep_launch_pq(); _pump(app, 5)
+    made = app._pq_create_session_from_source("Ep 7 pt 2", "narr 2", open_view=False)
+    media = made["media"][0]
+    sidecar = os.path.splitext(media)[0] + ".pb_transcript.json"
+    if os.path.exists(sidecar):
+        os.remove(sidecar)
+    return made, media
+
+
+def _running(s):
+    return (s.get("_progress") or {}).get("active")
+
+
+def test_cancel_stops_a_transcription_and_leaves_no_partial_transcript(
+        stage_app, monkeypatch):
+    from test_episode_screens import _pump, _wait
+    import engines
+    app, ep_file = stage_app
+    _Whisper(monkeypatch)
+    session, media = _pq_session(app)
+    app._pq_open_session_view(session); _pump(app, 5)
+    assert app._pq_retx_btn.cget("text") == "⟳ TRANSCRIBE"
+
+    app._pq_retx_clicked(session)
+    assert _running(session)
+    assert app._is_transcription_running(refine=False)
+    assert app._pq_retx_btn.cget("text") == app._PQ_CANCEL_LABEL
+
+    app._pq_retx_clicked(session)           # the same button now cancels
+    assert session.get("_cancel_requested")
+    assert app._pq_retx_btn.cget("text") == "CANCELLING…"
+    assert _wait(app, lambda: not _running(session), secs=20)
+    _pump(app, 5)
+    assert session["transcript"] == []
+    assert app._pq_retx_btn.cget("text") == "⟳ TRANSCRIBE"
+    assert app._pq_status_lbl.cget("text") == "cancelled"
+    assert not app._is_transcription_running(refine=False)
+    app._ep_save_flush()
+    # Nothing partial anywhere a later reconcile would take for the whole file.
+    assert engines.pb_transcript_load(media)[0] is None
+    assert EP.pq_sessions(EP.load(ep_file))[session["id"]]["transcript"] == []
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_cancel_puts_back_the_transcript_it_was_replacing(stage_app, monkeypatch):
+    from test_episode_screens import _pump, _wait
+    app, ep_file = stage_app
+    _Whisper(monkeypatch)
+    session, _media = _pq_session(app)
+    old = [{"word": " Earlier", "start": 0.0, "end": 0.3, "_src": "small"}]
+    session["transcript"] = list(old)
+    app._pq_save_session_file(session)
+
+    def _wipes(s, *a):                      # what the dialog's RE-TRANSCRIBE does
+        s["transcript"] = []
+        app._pq_save_session_file(s)
+        return "transcribe", False
+    monkeypatch.setattr(app, "_pq_confirm_retranscribe", _wipes)
+    app._pq_open_session_view(session); _pump(app, 5)
+    app._pq_run_transcription(session)
+    assert _running(session) and session["transcript"] == []
+    app._pq_cancel_transcription(session)
+    assert _wait(app, lambda: not _running(session), secs=20)
+    _pump(app, 5)
+    assert session["transcript"] == old
+    assert app._pq_retx_btn.cget("text") == "⟳ RE-TRANSCRIBE"
+    app._ep_save_flush()
+    assert EP.pq_sessions(EP.load(ep_file))[session["id"]]["transcript"] == old
+
+
+def test_a_running_transcription_is_still_there_after_stepping_away(
+        stage_app, monkeypatch):
+    """The user's sequence: start Pull Quotes, go to the episode, come back.
+    The run must still show, cancel from its row, and on finishing leave its
+    transcript -- which a reloaded copy of the session would save over."""
+    from test_episode_screens import _pump, _wait
+    import engines
+    app, ep_file = stage_app
+    w = _Whisper(monkeypatch)
+    session, media = _pq_session(app)
+    app._pq_run_transcription(session)
+    assert _running(session)
+
+    app._ep_enter(); _pump(app, 3)
+    assert app.workflow == "episode"
+    assert app._is_transcription_running(refine=False)
+    app._ep_launch_pq(); _pump(app, 5)
+    again = [s for s in app._pq_project["sessions"] if s.get("id") == session["id"]]
+    assert again and again[0] is session
+    refs = app._pq_row_widgets[id(session)]
+    assert refs["status_lbl"].cget("text").startswith("●")
+    assert refs["cancel_lbl"].winfo_manager() == "pack"
+
+    # Elsewhere when it lands: it still reaches this episode.
+    app._ep_enter(); _pump(app, 3)
+    w.release.set()
+    assert _wait(app, lambda: not _running(session), secs=20)
+    _pump(app, 5)
+    app._ep_save_flush()
+    held = EP.pq_sessions(EP.load(ep_file))[session["id"]]
+    assert [x["word"] for x in held["transcript"]] == [" Partial", " whole"]
+    # Finished: now it is mirrored for Script -> Session.
+    assert engines.pb_transcript_load(media)[0]
+    os.remove(os.path.splitext(media)[0] + ".pb_transcript.json")
+
+    app._ep_launch_pq(); _pump(app, 5)
+    shown = next(s for s in app._pq_project["sessions"] if s["id"] == session["id"])
+    assert [x["word"] for x in shown["transcript"]] == [" Partial", " whole"]
+    assert app._pq_row_widgets[id(shown)]["cancel_lbl"].winfo_manager() == ""
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_a_run_finishing_under_another_project_still_saves_home(stage_app, monkeypatch):
+    from test_episode_screens import _pump, _wait
+    app, ep_file = stage_app
+    w = _Whisper(monkeypatch)
+    session, media = _pq_session(app)
+    app._pq_run_transcription(session)
+    app._pq_open_home(); _pump(app, 3)     # a standalone project takes the screen
+    assert "episode_file" not in app._pq_project
+    w.release.set()
+    assert _wait(app, lambda: not _running(session), secs=20)
+    _pump(app, 3)
+    app._ep_save_flush()
+    held = EP.pq_sessions(EP.load(ep_file))[session["id"]]
+    assert [x["word"] for x in held["transcript"]] == [" Partial", " whole"]
+    os.remove(os.path.splitext(media)[0] + ".pb_transcript.json")
+
+
+def test_launch_survives_a_step_1_screen_that_has_gone(stage_app):
+    """The crash in the report: a Step 1 had come and gone earlier in the run,
+    so _load_script configured a dead label and the launch stopped dead."""
+    import tkinter as tk
+    app, _ep_file = stage_app
+    app._s1 = tk.Label(app)
+    app._step1_nav = tk.Frame(app)
+    app._step1_next_added = False
+    app._s1.destroy(); app._step1_nav.destroy()
+    _s2s_up(app)                            # reaches Step 2's pool
+    assert app.workflow == "script_session"
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_a_cancelled_run_winding_down_does_not_pull_you_off_another_screen(stage_app):
+    import tkinter as tk
+    from test_episode_screens import _pump
+    app, _ep_file = stage_app
+    went = []
+    app._step2 = lambda: went.append(True)
+    try:
+        app._log = tk.Text(app.body)
+        app._reconcile_cancelled()          # Step 3 still showing: back to Step 2
+        assert went == [True]
+        went.clear()
+        app._ep_view(); _pump(app, 3)       # the user moved on; the log is gone
+        app._reconcile_cancelled()
+        assert went == [] and app.workflow == "episode"
+    finally:
+        del app._step2
+
+
+def test_a_new_reconcile_waits_for_the_last_one_to_stop(stage_app):
+    from test_episode_screens import _pump, _wait
+    app, _ep_file = stage_app
+    _s2s_up(app)
+    app._cancel.clear()
+    app._reconcile_busy = True
+    started = []
+    try:
+        app._start_reconcile()              # asked for while the last still runs
+        assert app._cancel.is_set()         # it is told to stop, not restarted
+        app._start_reconcile = lambda: started.append(True)
+        _pump(app, 15)
+        assert not started
+        app._reconcile_busy = False
+        assert _wait(app, lambda: bool(started), secs=5)
+    finally:
+        app._reconcile_busy = False
+        app.__dict__.pop("_start_reconcile", None)
+        app._cancel.clear()

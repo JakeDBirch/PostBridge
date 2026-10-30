@@ -677,13 +677,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         model mid-transcription can segfault the CTranslate2 backend
         (confirmed crash with small -> tiny swap on GPU).  `refine=False`
         leaves out the second pass, whose draft stands if it is stopped."""
-        # Pull Quotes: every session carries a _progress.active flag
-        # while its Whisper worker is running.
-        proj = getattr(self, "_pq_project", None)
-        if proj is not None:
-            for s in proj.get("sessions", []):
-                if (s.get("_progress") or {}).get("active"):
-                    return True
+        # Pull Quotes: wherever its sessions are now -- a run outlives the
+        # project view it was started from.
+        if self._pq_running_sessions():
+            return True
         # Script -> Session: tracked by the global busy flag the
         # reconcile launcher sets (see _start_reconcile / _finish_reconcile).
         if getattr(self, "_reconcile_busy", False):
@@ -771,17 +768,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         of lag (one segment) on cancel — but the GPU is freed and the
         worker exits cleanly with no transcript saved.
         """
-        proj = getattr(self, "_pq_project", None)
-        if proj is not None:
-            for s in proj.get("sessions", []):
-                if (s.get("_progress") or {}).get("active"):
-                    s["_cancel_requested"] = True
-                    ev = s.get("_cancel_event")
-                    if ev is not None:
-                        try:
-                            ev.set()
-                        except Exception:
-                            pass
+        for s in self._pq_running_sessions():
+            self._pq_cancel_transcription(s)
         if getattr(self, "_reconcile_busy", False):
             try:
                 self._cancel.set()
@@ -1462,12 +1450,16 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         self.seq_name.set("{} (AUTO)".format(doc_title))
 
-        if hasattr(self, "_s1") and self._monolog:
+        # Step 1's label and nav exist only while Step 1 is on screen.  A
+        # launch from an episode loads with no Step 1 showing, maybe after one
+        # has come and gone, and configuring the dead label stopped the launch.
+        on_step1 = self._s1_alive("_s1")
+        if on_step1 and self._monolog:
             self._s1.config(
                 text="✓  {}  ·  plain script, cut as a monolog  ·  {} paragraphs".format(
                     doc_title, len(vo_blocks)),
                 fg=SUCCESS)
-        elif hasattr(self, "_s1"):
+        elif on_step1:
             self._s1.config(
                 text="✓  {}  ·  {} pulls  ·  {} VO  ·  {} parts  ·  {} tokens: {}{}".format(
                     doc_title, len(pulls), len(vo_blocks), len(parts), len(tokens),
@@ -1481,7 +1473,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             return
 
         # If we're on the step-1 screen, add the NEXT button; otherwise advance directly.
-        if hasattr(self, "_step1_nav") and not getattr(self, "_step1_next_added", False):
+        if self._s1_alive("_step1_nav") and not getattr(self, "_step1_next_added", False):
             # Script Check reads the bracketed markers a plain script has none of.
             if self._monolog:
                 self._btn(self._step1_nav, "NEXT  →  ASSIGN MEDIA",
@@ -1492,6 +1484,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._step1_next_added = True
         else:
             self._ui(self._step2)
+
+    def _s1_alive(self, attr):
+        """True when Step 1's widget `attr` exists and is still on screen."""
+        w = getattr(self, attr, None)
+        try:
+            return w is not None and bool(w.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _step_check(self):
         """STEP 1 — Script Check.
@@ -4933,6 +4933,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         return results
 
     def _start_reconcile(self):
+        if getattr(self, "_reconcile_busy", False):
+            self._reconcile_wait_then_start()
+            return
         # A fresh reconcile always produces new results — discard any loaded results.
         self._pending_results = None
         # ...and picks up any draft still waiting for its second pass.
@@ -6359,7 +6362,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                     pi, take_i + 1, len(chunks),
                                     "s" if len(chunks) != 1 else ""), INFO)
                             audio_words = engines.transcribe_in_chunks(
-                                ap, chunks, model_size=_first)
+                                ap, chunks, model_size=_first,
+                                cancel_event=self._cancel)
                             self._log_line(
                                 "  Part {} Take {}: chunked done in {:.1f}s "
                                 "({} words)".format(
@@ -6385,7 +6389,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                 self._log_line(msg, ERR)
                                 continue
                             audio_words = engines.transcribe_clip(
-                                tmp_a, model_size=_first)
+                                tmp_a, model_size=_first,
+                                cancel_event=self._cancel)
                             self._log_line(
                                 "  Part {} Take {}: full-file done in {:.1f}s "
                                 "({} words)".format(
@@ -6597,7 +6602,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                 self._log_line(
                                     "  [{}] {}".format(_tok, msg), SUB)
                             _full_words, _full_blobs = engines.transcribe_file(
-                                tsrc, progress_cb=_prog_cb, model_size=_first)
+                                tsrc, progress_cb=_prog_cb, model_size=_first,
+                                cancel_event=self._cancel)
                             if _full_words:
                                 engines.pb_transcript_save(
                                     tsrc, _full_words, blobs=_full_blobs,
@@ -6615,6 +6621,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                         token, len(_full_words),
                                         time.perf_counter() - _t_full),
                                     SUCCESS)
+                    except engines.TranscriptionCancelled:
+                        pass                  # the pull loop below marks them
                     except Exception as e:
                         self._log_line(
                             "  [{}] full-audio transcribe failed ({}); falling back "
@@ -7074,7 +7082,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # mid-reconcile, but the spinner dots / resource poller /
             # busy flag must still be released.
             self._ui(self._stop_reconcile_runners)
-            self._ui(self._step2)
+            self._ui(self._reconcile_cancelled)
             return
 
         # ── Compute summary (pure Python, no Tk) ──────────────────────────────
@@ -7223,6 +7231,43 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._pending_summary = sum_lines   # consumed by _finish_reconcile
 
         self._ui(self._finish_reconcile)
+
+    def _reconcile_cancelled(self):
+        """A cancelled run has wound down: back to Step 2 -- if Step 3 is still
+        what is showing.  A run can take a while to stop, and by then the user
+        may be somewhere else, which this must not pull them away from."""
+        log = getattr(self, "_log", None)
+        try:
+            if log is not None and log.winfo_exists():
+                self._step2()
+        except tk.TclError:
+            pass
+
+    def _reconcile_wait_then_start(self):
+        """A reconcile asked for while the last one is still stopping.  Two
+        must not overlap: the new run clears the cancel flag, which would set
+        the old run's workers going again.  So wait here, on screen, then go."""
+        self._cancel.set()
+        self._clear()
+        self._section("STEP 3 — RECONCILING")
+        msg = tk.Label(self.body, text="Waiting for the last run to stop…",
+                       font=FB, bg=BG, fg=SUB, anchor="w")
+        msg.pack(fill="x", pady=(0, 10))
+        nav = tk.Frame(self.body, bg=BG)
+        nav.pack(side="bottom", fill="x", pady=(8, 0))
+        self._btn(nav, "← BACK", self._step2).pack(side="left")
+
+        def _check():
+            try:
+                if not msg.winfo_exists():
+                    return                # the user went back meanwhile
+            except tk.TclError:
+                return
+            if getattr(self, "_reconcile_busy", False):
+                self.after(250, _check)
+            else:
+                self._start_reconcile()
+        self.after(250, _check)
 
     def _stop_reconcile_runners(self):
         """Clear the four flags that gate the spinner / resource poller /

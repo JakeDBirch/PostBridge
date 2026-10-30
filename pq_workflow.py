@@ -154,7 +154,10 @@ class PqWorkflowMixin:
     def _pq_save_session_file(self, session):
         """Save a session: into the episode when the project was opened from
         one, else to its `_file_path`."""
-        in_episode = (getattr(self, "_pq_project", None) or {}).get("episode_file")
+        # A running transcription can finish after the user has opened some
+        # other project, so the session says where it belongs.
+        in_episode = (session.get("_ep_file")
+                      or (getattr(self, "_pq_project", None) or {}).get("episode_file"))
         path = session.get("_file_path")
         if not path and not in_episode:
             return False
@@ -178,9 +181,10 @@ class PqWorkflowMixin:
         """Mirror the word list as a .pb_transcript.json sidecar next to each
         source audio file so the Script→Session reconcile workflow can re-use
         this transcript without re-running Whisper.  No-op if the transcript
-        is empty."""
+        is empty -- or still coming in: reconcile takes a sidecar as the whole
+        recording, so part of one would silently lose the rest."""
         words = session.get("transcript") or []
-        if words:
+        if words and not session.get("_streaming"):
             for media_path in session.get("media", []):
                 try:
                     if os.path.isfile(media_path):
@@ -554,6 +558,7 @@ class PqWorkflowMixin:
             refs["status_lbl"].config(text=text, fg=fg)
             refs["words_lbl"].config(
                 text="{:,}".format(len(session.get("transcript", []))))
+            self._pq_update_row_cancel(session)
         except tk.TclError:
             try:
                 self._pq_render_project_view()
@@ -584,6 +589,7 @@ class PqWorkflowMixin:
                     text="{:,}".format(len(session.get("transcript", []))))
             except tk.TclError:
                 continue
+            self._pq_update_row_cancel(session)
             if session.get("_progress", {}).get("active"):
                 any_active = True
 
@@ -639,6 +645,10 @@ class PqWorkflowMixin:
                                padx=12, pady=8)
         status_lbl.pack(side="left", fill="x", expand=True)
 
+        # Only packed while this session is transcribing.
+        cancel_lbl = tk.Label(row, text="■ CANCEL", font=FB, bg=SURF, fg=ERR,
+                              cursor="hand2", padx=12, pady=8)
+
         if not hasattr(self, "_pq_row_widgets"):
             self._pq_row_widgets = {}
         self._pq_row_widgets[id(session)] = {
@@ -648,8 +658,10 @@ class PqWorkflowMixin:
             "words_lbl":   words_lbl,
             "status_lbl":  status_lbl,
             "rm_lbl":      rm_lbl,
+            "cancel_lbl":  cancel_lbl,
             "session":     session,
         }
+        self._pq_update_row_cancel(session)
 
         def _open_handler(sess=session):
             return lambda e: self._pq_open_session_view(sess)
@@ -657,9 +669,11 @@ class PqWorkflowMixin:
         # Click anywhere in the row except the ✕ → open the session.
         row.bind("<Button-1>", handler)
         for child in row.winfo_children():
-            if child is rm_lbl:
+            if child in (rm_lbl, cancel_lbl):
                 continue
             child.bind("<Button-1>", handler)
+        cancel_lbl.bind("<Button-1>",
+                        lambda e, s=session: self._pq_cancel_transcription(s))
 
         def _on_remove(_e=None, sess=session):
             self._pq_remove_session(sess)
@@ -927,7 +941,9 @@ class PqWorkflowMixin:
             "transcript": [],
         }
         # From an episode it lives in the episode file; on its own, in a file.
-        if not self._pq_project.get("episode_file"):
+        if self._pq_project.get("episode_file"):
+            session["_ep_file"] = self._pq_project["episode_file"]
+        else:
             session_path = self._pq_default_session_path(token, media_paths)
             if not session_path:
                 messagebox.showerror("Save path",
@@ -1169,10 +1185,11 @@ class PqWorkflowMixin:
         self._btn(btn_row, "+ ADD MEDIA",
                   lambda s=session: self._pq_add_media_to_session(s),
                   small=True).pack(side="left")
+        # One button: TRANSCRIBE, and while that runs, CANCEL.
         self._pq_retx_btn = self._btn(
             btn_row,
             ("⟳ RE-TRANSCRIBE" if session.get("transcript") else "⟳ TRANSCRIBE"),
-            lambda s=session: self._pq_run_transcription(s),
+            lambda s=session: self._pq_retx_clicked(s),
             small=True, color=ACCENT)
         self._pq_retx_btn.pack(side="left", padx=(8, 0))
 
@@ -1802,7 +1819,7 @@ class PqWorkflowMixin:
             # (kicked off earlier and they navigated back).  Resume the
             # animation and show the placeholder pane.
             if (btn := getattr(self, "_pq_retx_btn", None)):
-                btn.config(text="TRANSCRIBING…", fg=SUB)
+                btn.config(text=self._PQ_CANCEL_LABEL, fg=ERR)
             self._pq_render_progress_placeholder()
             self._pq_animate_progress()
 
@@ -3666,12 +3683,17 @@ class PqWorkflowMixin:
                        n_words, h, m, s), fg=SUB)
 
     def _pq_remove_session(self, session):
+        in_episode = self._pq_project.get("episode_file")
         if not messagebox.askyesno(
                 "Remove from project",
+                "Remove '{}' from this episode?\n\n"
+                "Its transcript goes from the episode file when you save.".format(
+                    session.get("token", "?")) if in_episode else
                 "Remove '{}' from this Episode Project?\n\n"
                 "The session JSON on disk will not be deleted.".format(
                     session.get("token", "?"))):
             return
+        self._pq_cancel_transcription(session)
         self._pq_project["sessions"] = [
             s for s in self._pq_project["sessions"] if s is not session]
         self._pq_render_project_view()
@@ -4163,6 +4185,61 @@ class PqWorkflowMixin:
         merged.sort(key=lambda w: float(w.get("start", 0.0)))
         return merged
 
+    _PQ_CANCEL_LABEL = "■ CANCEL TRANSCRIPTION"
+
+    def _pq_running_sessions(self):
+        """Every session with a transcription running, whether or not its
+        project is the one showing: a run outlives the view it started from."""
+        return [s for s in getattr(self, "_pq_running", ())
+                if (s.get("_progress") or {}).get("active")]
+
+    def _pq_retx_clicked(self, session):
+        if (session.get("_progress") or {}).get("active"):
+            self._pq_cancel_transcription(session)
+        else:
+            self._pq_run_transcription(session)
+
+    def _pq_cancel_transcription(self, session):
+        """Stop a running transcription and put the session back as it was
+        before the run.  The worker stops at the next segment boundary, so
+        it reads as cancelling for a few seconds (see _pq_run_transcription's
+        error path, which finishes the job)."""
+        prog = session.get("_progress") or {}
+        if not prog.get("active"):
+            return
+        session["_cancel_requested"] = True
+        ev = session.get("_cancel_event")
+        if ev is not None:
+            ev.set()
+        prog["phase"], prog["extra"] = "cancelling", ""
+        if getattr(self, "_pq_current_session", None) is session:
+            try:
+                if (btn := getattr(self, "_pq_retx_btn", None)):
+                    btn.config(text="CANCELLING…", fg=SUB)
+                if (lbl := getattr(self, "_pq_status_lbl", None)):
+                    lbl.config(text="cancelling…", fg=WARN)
+            except tk.TclError:
+                pass
+        self._pq_update_row_cancel(session)
+
+    def _pq_update_row_cancel(self, session):
+        """Show a session row's CANCEL only while it is transcribing."""
+        refs = (getattr(self, "_pq_row_widgets", None) or {}).get(id(session))
+        if not refs:
+            return
+        prog = session.get("_progress") or {}
+        try:
+            lbl = refs["cancel_lbl"]
+            if not prog.get("active"):
+                lbl.pack_forget()
+                return
+            lbl.config(text="cancelling…" if session.get("_cancel_requested")
+                       else "■ CANCEL")
+            if not lbl.winfo_manager():
+                lbl.pack(side="right", before=refs["status_lbl"])
+        except tk.TclError:
+            pass
+
     def _pq_run_transcription(self, session):
         """Kick off (or refuse to start) a transcription for `session`.
 
@@ -4207,6 +4284,8 @@ class PqWorkflowMixin:
         # the sidecar transcript into this session without re-running
         # Whisper.
         has_session_transcript = bool(session.get("transcript"))
+        # What a cancelled run goes back to: the dialog below wipes this.
+        prior_transcript = list(session.get("transcript") or [])
         sidecar_paths = []
         for p in media:
             try:
@@ -4262,13 +4341,17 @@ class PqWorkflowMixin:
             "started":    time.perf_counter(),
             "total_secs": 0.0,   # filled in by the worker once it probes
         }
+        session["_streaming"] = True     # its words aren't the whole recording yet
+        session.pop("_cancel_requested", None)
+        self.__dict__.setdefault("_pq_running", []).append(session)
+        self._pq_update_row_cancel(session)
 
         # Update UI for THIS session only if it's the one on screen.
         is_current = (getattr(self, "_pq_current_session", None) is session)
         if is_current:
             btn = getattr(self, "_pq_retx_btn", None)
             lbl = getattr(self, "_pq_status_lbl", None)
-            if btn: btn.config(text="TRANSCRIBING…", fg=SUB)
+            if btn: btn.config(text=self._PQ_CANCEL_LABEL, fg=ERR)
             if lbl: lbl.config(text="starting…", fg=ACCENT)
             self._pq_render_progress_placeholder()
             self._pq_animate_progress()
@@ -4279,7 +4362,8 @@ class PqWorkflowMixin:
 
         def _set_phase(phase, extra=""):
             prog = session.get("_progress")
-            if not prog or not prog.get("active"):
+            if not prog or not prog.get("active") \
+                    or session.get("_cancel_requested"):
                 return
             prog["phase"] = phase
             prog["extra"] = extra
@@ -4793,6 +4877,7 @@ class PqWorkflowMixin:
                     words = PqWorkflowMixin._pq_merge_refine(_latest, words)
 
                 session["transcript"] = list(words or [])
+                session.pop("_streaming", None)
                 self._pq_save_session_file(session)
 
                 elapsed = round(time.perf_counter() - t0, 1)
@@ -4837,13 +4922,18 @@ class PqWorkflowMixin:
                     prog = session.get("_progress")
                     if prog is not None:
                         prog["active"] = False
+                    # Back to the transcript from before the run, which the
+                    # retranscribe dialog wiped.  What the stopped run streamed
+                    # is part of a recording: saved, it would pass for all of it.
+                    session["transcript"] = list(prior_transcript)
+                    session.pop("_streaming", None)
+                    session.pop("_cancel_requested", None)
+                    self._pq_save_session_file(session)
+                    self._pq_update_row_cancel(session)
                     if getattr(self, "_pq_current_session", None) is session:
                         if (btn := getattr(self, "_pq_retx_btn", None)):
-                            btn.config(text="⟳ TRANSCRIBE", fg=TEXT)
-                        if (lbl := getattr(self, "_pq_status_lbl", None)):
-                            lbl.config(
-                                text=("cancelled" if is_cancel else "error"),
-                                fg=(SUB if is_cancel else ERR))
+                            btn.config(text=("⟳ RE-TRANSCRIBE" if prior_transcript
+                                             else "⟳ TRANSCRIBE"), fg=TEXT)
                         # Preserve cursor / selection / scroll on the
                         # error-path render too — cancel mid-read
                         # shouldn't jump the user away from where they
@@ -4851,6 +4941,11 @@ class PqWorkflowMixin:
                         _err_state = self._pq_capture_text_state()
                         self._pq_render_transcript_text(session)
                         self._pq_restore_text_state(_err_state)
+                        # After the render, which sets its own status.
+                        if (lbl := getattr(self, "_pq_status_lbl", None)):
+                            lbl.config(
+                                text=("cancelled" if is_cancel else "error"),
+                                fg=(SUB if is_cancel else ERR))
                     elif getattr(self, "_pq_current_session", None) is None:
                         self._pq_update_project_row(session)
                     if is_mem:
@@ -4897,7 +4992,8 @@ class PqWorkflowMixin:
                 # Clear cancel state regardless of how the worker
                 # exited; the next TRANSCRIBE click will recreate it.
                 session.pop("_cancel_event", None)
-                session.pop("_cancel_requested", None)
+                if session in self._pq_running:
+                    self._pq_running.remove(session)
 
         threading.Thread(target=_worker, daemon=True).start()
 

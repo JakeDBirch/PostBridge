@@ -56,9 +56,11 @@ ALT_COVER     = 0.6    # coverage an earlier delivery needs to be an alternative
 HEAD_S        = 0.15   # lead-in before a word's start, when there is no waveform
 PRE_S         = 0.05   # in this far ahead of the voice
 TAIL_S        = 0.6    # out this far after it has died away
-LONG_PAUSE_S  = 2.0    # a silence inside a reading longer than this...
+LONG_PAUSE_S  = 4.0    # a silence inside a reading longer than this...
 PAUSE_SIDE_S  = 0.5    # ...is cut down to this either side of it
 GUARD_S       = 0.05   # never reach this close to a word that is cut
+HEAL_MAX_S    = 6.0    # a removal from a reading this short or shorter...
+HEAL_MAX_WORDS = 12    # ...of this many words or fewer goes back in, unless retaken
 
 _HYPHEN_RE = re.compile(r"(?<=[a-z])[-‐‑](?=[a-z])")
 _SENT_END_RE = re.compile(r"[.!?][\"'”’)\]]*$")
@@ -140,9 +142,14 @@ class _Script(object):
         return a, b
 
     def text(self, a, b):
-        """The script as written, tokens a..b inclusive (within a block)."""
-        bi = self.blk[a]
-        return " ".join(self.words[bi][self.word[a]:self.word[b] + 1])
+        """The script as written, tokens a..b inclusive, its paragraphs on
+        lines of their own."""
+        out = []
+        for bi in range(self.blk[a], self.blk[b] + 1):
+            w0 = self.word[a] if bi == self.blk[a] else 0
+            w1 = self.word[b] + 1 if bi == self.blk[b] else len(self.words[bi])
+            out.append(" ".join(self.words[bi][w0:w1]))
+        return "\n".join(out)
 
 
 class _Read(object):
@@ -492,6 +499,39 @@ def _pieces(dels, owner, S, R):
     return out
 
 
+def _said_again(x, nearby):
+    """Are the removed tokens x, for the most part, what was said beside them?
+    That is what tells a retake from a line reworded as it was read."""
+    if not x or not nearby:
+        return False
+    sm = SequenceMatcher(None, [_key(t) for t in x],
+                         [_key(t) for t in nearby if t is not None], autojunk=False)
+    return sum(m.size for m in sm.get_matching_blocks()) * 2 > len(x)
+
+
+def _heal(pieces, dels, R):
+    """A cut is only earned by a retake.  Where a read runs on past the script
+    -- reworded, or an ad-lib -- the matcher ends one stretch and starts the
+    next, and cutting between them lost words nobody said twice ("a memoir he
+    [published years later in 1912.] Siringo claimed").  So tape between two
+    stretches goes back when it is short, was read straight on from the words
+    before it, and is not said again beside them.  The two stretches are then
+    one, across a paragraph too: nothing was taken out, so nothing to mark."""
+    T = R.tok
+    for prev, pc in zip(pieces, pieces[1:]):
+        if pc.joined or dels[prev.k].take != dels[pc.k].take \
+                or pc.i_a <= prev.i_b:
+            continue
+        x = [t for t in T[prev.i_b + 1:pc.i_a] if t is not None]
+        span = R.word(pc.i_a)["start"] - R.word(prev.i_b)["end"]
+        retaken = (_said_again(x, T[pc.i_a:pc.i_a + len(x) + 4])
+                   or _said_again(x, T[max(0, prev.i_b - len(x) - 3):prev.i_b + 1]))
+        if (span <= HEAL_MAX_S and len(x) <= HEAL_MAX_WORDS and not retaken
+                and _pauses(R, prev.i_b, pc.i_a - 1) <= TALK_PAUSE_S):
+            prev.i_b = pc.i_a - 1
+            pc.joined = True
+
+
 class _Envelope(object):
     """A recording's loudness, 10 ms a frame, for placing edits where the
     voice starts and stops -- Whisper's word times run early or late by a
@@ -673,6 +713,7 @@ def reconcile(vo_blocks, takes):
     _extend(dels, S, R)
     owner = _claims(dels, S)
     pieces = _pieces(dels, owner, S, R)
+    _heal(pieces, dels, R)
 
     for pc in pieces:
         pc.segs = _edges(R, pc.i_a, pc.i_b, tk)
@@ -681,13 +722,16 @@ def reconcile(vo_blocks, takes):
             mid = (R.word(prev.i_b)["end"] + R.word(pc.i_a)["start"]) / 2.0
             prev.segs[-1][1] = pc.segs[0][0] = mid
 
-    # Group into pulls: same paragraph, same recording, and forward in it,
-    # so each pull plays as one stretch of one take.
+    # Group into pulls: same recording and forward in it, so each pull plays
+    # as one stretch of one take.  A paragraph break starts a new one only
+    # where the tape breaks there too: a read that carries straight on is one
+    # region, however many paragraphs of the script it covers.
     pulls = []
     for pc in pieces:
         if pulls:
             last = pulls[-1][-1]
-            if (S.blk[pc.a] == S.blk[last.a] and dels[pc.k].take == dels[last.k].take
+            if ((pc.joined or S.blk[pc.a] == S.blk[last.a])
+                    and dels[pc.k].take == dels[last.k].take
                     and pc.i_a > last.i_b):
                 pulls[-1].append(pc)
                 continue

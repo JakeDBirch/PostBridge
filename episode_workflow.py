@@ -225,7 +225,7 @@ class EpisodeWorkflowMixin:
             self._ui(lambda: self._ep_embed_session(session, payload))
             return
         proj = getattr(self, "_pq_project", None) or {}
-        ep = self._ep_bound(proj.get("episode_file"))
+        ep = self._ep_bound(session.get("_ep_file") or proj.get("episode_file"))
         if not ep:
             return
         EP.pq_sessions(ep)[payload["id"]] = payload
@@ -851,7 +851,7 @@ class EpisodeWorkflowMixin:
         """Pull Quotes saved an interview session while opened from an
         episode: its token and media become (or update) a source."""
         proj = getattr(self, "_pq_project", None) or {}
-        ep = self._ep_bound(proj.get("episode_file"))
+        ep = self._ep_bound(session.get("_ep_file") or proj.get("episode_file"))
         if not ep or not session.get("token"):
             return
         token = session["token"]
@@ -1017,9 +1017,16 @@ class EpisodeWorkflowMixin:
             return
         ep = self._ep
         self.workflow = "pull_quotes"
+        # A session still transcribing comes back as itself, not as a copy
+        # from the file: the run reports to that dict, and a copy would show
+        # neither the run nor its transcript, then save over the result.
+        running = {s.get("id"): s for s in self._pq_running_sessions()}
+        sessions = [running.get(s.get("id"), s) for s in EP.pq_session_list(ep)]
+        for s in sessions:
+            s["_ep_file"] = ep["file_path"]
         # Saves go back into the episode file, not over it.
         self._pq_load_project({"title": ep["title"], "episode_file": ep["file_path"],
-                               "sessions": EP.pq_session_list(ep)}, None)
+                               "sessions": sessions}, None)
 
     def _ep_launch_s2s(self):
         if not self._ep_ready():
