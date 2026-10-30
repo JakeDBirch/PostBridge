@@ -30,6 +30,9 @@
 - **Opening a saved session no longer throws "bad window path name".** A session that goes straight to Step 4 left Step 2 while its media pool was still filling, and the rest of the pool failed to load. Step 4 now waits until the pool is full. That also fixes what the error was hiding: rows that hadn't loaded were missing from the pool, so going back to Step 2 or saving could drop those files' assignments.
 - **`/` in the Assembly view nudges later by the default gap,** in place of the big nudge. `,` and `.` still use the Nudge by value.
 
+### Google Docs: SEND TO SCRIPT asks which section
+A pull sent from Pull Quotes used to land at the very end of the Doc, to be moved by hand. **SEND TO SCRIPT** now lists the Doc's sections and adds the pull at the end of the one you choose. It reads draft section lines as well as `[PART …]` headers, highlights the section you used last, and goes to the end of the Doc only when the Doc has no sections.
+
 ### Google Docs: Fix Format works in the Doc
 **FIX FORMAT IN DOC** in the findings window makes Fix Format's structure repairs in the Doc itself, so there is no `_fixed.txt` to paste back. It asks first and lists what it will do, changes only the lines that need it, removes PostBridge's notes, then fetches and checks again. Wording and timecodes never change, and the Doc's version history can undo it.
 

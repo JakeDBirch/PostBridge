@@ -499,6 +499,62 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     assert not app._errors, "\n".join(app._errors)
 
 
+def _send_setup(app, monkeypatch, parts):
+    """A pull selected, a Doc linked with *parts*; records what gets sent."""
+    import gdocs
+    sent = []
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "list_parts", lambda creds, doc_id, docs=None: parts)
+    monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, docs=None:
+                        sent.append((doc_id, text, part)))
+    monkeypatch.setattr(gdocs, "append_block", lambda creds, doc_id, text, after_marker=None, docs=None:
+                        sent.append((doc_id, text, None)))
+    monkeypatch.setattr(app, "_pq_build_pull_block", lambda: (
+        "[BUTLER 00:00:05-00:00:20]\nWe went out.\n", "00:00:05", "00:00:20"))
+    app._ep_save()
+    app._ep["links"]["gdoc"] = {"id": "doc123", "name": "Ep 7 script"}
+    monkeypatch.setattr(app, "_ep_bound", lambda path: app._ep)
+    app._pq_project = {"episode_file": app._ep["file_path"]}
+    return sent
+
+
+def test_send_to_script_asks_which_section(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    sent = _send_setup(app, monkeypatch, ["Open", "Part 1: The Lake"])
+    app._pq_part_win = None
+
+    # Cancel sends nothing.
+    app._pq_send_to_script()
+    assert _wait(app, lambda: app._pq_part_win is not None, secs=10)
+    _pump(app, 3)
+    assert _click(app, app._pq_part_win, "CANCEL")
+    _pump(app, 3)
+    assert not sent
+
+    # A section sends it there, and is remembered for the next pull.
+    app._pq_part_win = None
+    app._pq_send_to_script()
+    assert _wait(app, lambda: app._pq_part_win is not None, secs=10)
+    _pump(app, 3)
+    assert _click(app, app._pq_part_win, "Part 1: The Lake")
+    assert _wait(app, lambda: bool(sent), secs=10)
+    assert sent == [("doc123", "[BUTLER 00:00:05-00:00:20]\nWe went out.\n", "Part 1: The Lake")]
+    assert app._pq_last_part == "Part 1: The Lake"
+    assert not app._pq_part_win.winfo_exists()
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_send_to_script_with_no_sections_goes_to_the_end(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    sent = _send_setup(app, monkeypatch, [])
+    app._pq_part_win = None
+    app._pq_send_to_script()
+    assert _wait(app, lambda: bool(sent), secs=10)
+    assert sent[0][2] is None and app._pq_part_win is None
+    assert not app._errors, "\n".join(app._errors)
+
+
 def test_send_to_script_needs_a_selection_and_a_doc(app, monkeypatch, project):
     _open_fresh(app, monkeypatch, project)
     app._ep_launch_pq(); _pump(app, 5)

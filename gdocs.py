@@ -14,7 +14,8 @@ What this gives the episode:
   its own notes and removes the ones whose problem is gone.  (The Docs API
   cannot make *suggestions*; these are ordinary edits, attributed to the
   account that signed in.)
-* **Send to script** -- a pull block appended to the Doc from Pull Quotes.
+* **Send to script** -- a pull block added from Pull Quotes, at the end of
+  the section chosen (the end of the Doc, if it has no sections).
 * **Fix format** -- Fix Format's structure repairs made in the Doc, line by
   line.  Wording and timecodes stay; Docs' version history can undo it.
 
@@ -445,6 +446,67 @@ def plan_text_edits(doc, new_text):
     return reqs
 
 
+def _walk_doc(doc):
+    """(lines, walked): the Doc's script lines, and script_normalize's reading
+    of them.  Each walked line's ``n`` is 1 past its index in *lines*."""
+    import script_normalize
+    lines = script_lines(doc)
+    return lines, script_normalize.walk("\n".join(t for t, _s, _e in lines))
+
+
+def _sections(walked):
+    """[(name, index in walked)]: [PART …] headers, and section lines like
+    "Part 1: The Lake" in a draft not yet marked up.  A title under a header
+    is that section, not another one: "Part 1: The Shots" under [PART Part 1],
+    with a [VO] between them or not.  A section line right under a header is
+    named as Fix Format would name the two, so it keeps that name afterwards."""
+    import script_normalize
+    from parsers import _HEADER_RE
+    out = []
+    for i, l in enumerate(walked):
+        if l.kind not in ("part", "section"):
+            continue
+        name = _HEADER_RE.match(l.s).group("part").strip() if l.kind == "part" else l.s
+        k, vo = i - 1, False
+        while k >= 0 and (walked[k].kind == "vo" or walked[k].s.startswith(NOTE_PREFIX)):
+            vo = vo or walked[k].kind == "vo"
+            k -= 1
+        under = bool(out) and k >= 0 and walked[k].kind == "part" and out[-1][1] == k
+        if under and name.lower().startswith(out[-1][0].lower() + ":"):
+            out[-1] = (name, k)
+        elif under and l.kind == "section" and not vo:
+            out[-1] = (out[-1][0] if name.lower() == out[-1][0].lower() else
+                       _HEADER_RE.match(script_normalize._section_header(name, out[-1][0])).group("part"), k)
+        else:
+            out.append((name, i))
+    return out
+
+
+def doc_parts(doc):
+    """The names of the sections of the script in *doc*, in order."""
+    _lines, walked = _walk_doc(doc)
+    return [name for name, _i in _sections(walked)]
+
+
+def plan_append_to_part(doc, text, part):
+    """Request adding *text* at the end of the section called *part*, or None
+    if the Doc has no such section.  It goes inside the section's last line,
+    before its newline, so it takes that line's style and not the next
+    section's heading.  PostBridge's notes are passed over: inserting inside
+    one would stretch its named range, and clearing the notes would then
+    delete the pull.  A divider stays below it, with the section it closes."""
+    lines, walked = _walk_doc(doc)
+    heads = _sections(walked)
+    for k, (name, i) in enumerate(heads):
+        if name == part:
+            stop = heads[k + 1][1] if k + 1 < len(heads) else len(walked)
+            last = next(l for l in reversed(walked[i:stop])
+                        if l.kind != "divider" and not l.s.startswith(NOTE_PREFIX))
+            return [{"insertText": {"location": {"index": lines[last.n - 1][2] - 1},
+                                    "text": "\n\n" + text.strip("\n")}}]
+    return None
+
+
 # ── Writing ───────────────────────────────────────────────────────────────
 
 def _batch(docs, doc_id, reqs, revision_id=None):
@@ -512,6 +574,31 @@ def append_block(creds, doc_id, text, after_marker=None, docs=None):
         _drive, docs = services(creds)
     doc = docs.documents().get(documentId=doc_id).execute()
     _batch(docs, doc_id, plan_append(doc, text, after_marker), doc.get("revisionId"))
+
+
+def list_parts(creds, doc_id, docs=None):
+    if docs is None:
+        _drive, docs = services(creds)
+    return doc_parts(docs.documents().get(documentId=doc_id).execute())
+
+
+def append_to_part(creds, doc_id, text, part, docs=None):
+    """Add a pull at the end of section *part*.  Each write is pinned to the
+    revision it was planned against; if the Doc changed underneath, the plan
+    is redone, because someone is likely writing in it."""
+    if docs is None:
+        _drive, docs = services(creds)
+    for attempt in range(3):
+        doc = docs.documents().get(documentId=doc_id).execute()
+        reqs = plan_append_to_part(doc, text, part)
+        if reqs is None:
+            raise RuntimeError('The Doc no longer has a section called "{}".'.format(part))
+        try:
+            _batch(docs, doc_id, reqs, doc.get("revisionId"))
+            return
+        except Exception as e:
+            if attempt == 2 or "revision" not in str(e).lower():
+                raise
 
 
 # ── Change detection ──────────────────────────────────────────────────────

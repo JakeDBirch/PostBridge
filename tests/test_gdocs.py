@@ -204,6 +204,105 @@ def test_fix_format_clears_notes_then_repairs_the_structure():
     assert not [f for f in run_checks(fixed) if f.severity == ERROR]
 
 
+PARTS = ["Ep 7", "", "[PART Open]", "[VO PART_0_NARRATOR]", "A quiet morning.", "",
+         "[PART Part 1: The Lake]", "[VO PART_1_NARRATOR]", "The water was still.", "", ""]
+PULL = "[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n"
+
+
+def test_doc_parts_finds_headers_and_draft_section_lines():
+    assert gdocs.doc_parts(_doc(PARTS)) == ["Open", "Part 1: The Lake"]
+    assert gdocs.doc_parts(_doc(["Ep 7", "Intro", "Words.", "Part 1: The Lake", "More."])) == [
+        "Intro", "Part 1: The Lake"]
+    assert gdocs.doc_parts(_doc(["Episode 9", "A paragraph read aloud."])) == []
+
+
+def test_a_title_line_under_a_header_is_the_same_section():
+    lines = ["Ep 7", "[PART Part 1]", "Part 1: The Shots", "[VO A]", "Words.", "",
+             "[PART Part 2]", "Part 2: The Fires", "[VO B]", "More."]
+    assert gdocs.doc_parts(_doc(lines)) == ["Part 1: The Shots", "Part 2: The Fires"]
+    fixed = _applied(lines, gdocs.plan_append_to_part(_doc(lines), PULL, "Part 1: The Shots"))
+    assert fixed.index("Words.") < fixed.index("We went out") < fixed.index("[PART Part 2]")
+    # Same name before and after Fix Format, so a send isn't lost to it.
+    import script_normalize
+    new, _changes = script_normalize.normalize("\n".join(lines))
+    assert gdocs.doc_parts(_doc(new.rstrip("\n").split("\n"))) == gdocs.doc_parts(_doc(lines))
+    # A plain number takes the header's name, as Fix Format does.
+    assert gdocs.doc_parts(_doc(["[PART Bill]", "Part 1", "[VO A]", "Words."])) == ["Part 1: Bill"]
+    # The title under the VO header, as many real scripts have it: same section,
+    # before and after Fix Format, and the pull lands after the section's text.
+    lines = ["Ep 7", "[PART Part 1]", "[VO A]", "Part 1: The Shots", "Words.", "",
+             "[PART Part 2]", "[VO B]", "More."]
+    assert gdocs.doc_parts(_doc(lines)) == ["Part 1: The Shots", "Part 2"]
+    new, _changes = script_normalize.normalize("\n".join(lines))
+    assert gdocs.doc_parts(_doc(new.rstrip("\n").split("\n"))) == gdocs.doc_parts(_doc(lines))
+    fixed = _applied(lines, gdocs.plan_append_to_part(_doc(lines), PULL, "Part 1: The Shots"))
+    assert fixed.index("Words.") < fixed.index("We went out") < fixed.index("[PART Part 2]")
+    # Different names under one another are two sections, even if one is empty.
+    assert gdocs.doc_parts(_doc(["[PART Open]", "[VO A]", "[PART Close]", "[VO B]", "More."])) == [
+        "Open", "Close"]
+
+
+def test_pull_lands_at_the_end_of_its_section():
+    reqs = gdocs.plan_append_to_part(_doc(PARTS), PULL, "Open")
+    assert _applied(PARTS, reqs).split("\n")[:10] == [
+        "Ep 7", "", "[PART Open]", "[VO PART_0_NARRATOR]", "A quiet morning.", "",
+        "[BUTLER 00:00:05-00:00:20]", "We went out at four.", "", "[PART Part 1: The Lake]"]
+
+
+def test_pull_in_the_last_section_stays_inside_the_doc():
+    reqs = gdocs.plan_append_to_part(_doc(PARTS), PULL, "Part 1: The Lake")
+    assert _applied(PARTS, reqs).split("\n")[8:12] == [
+        "The water was still.", "", "[BUTLER 00:00:05-00:00:20]", "We went out at four."]
+    no_blank_end = ["[PART Open]", "[VO A]", "Last."]
+    reqs = gdocs.plan_append_to_part(_doc(no_blank_end), PULL, "Open")
+    assert _applied(no_blank_end, reqs).endswith(
+        "Last.\n\n[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n")
+
+
+def test_pull_in_an_empty_section_goes_under_its_header():
+    lines = ["[PART Open]", "", "[PART Next]", "[VO A]", "Words."]
+    reqs = gdocs.plan_append_to_part(_doc(lines), PULL, "Open")
+    assert _applied(lines, reqs).startswith("[PART Open]\n\n[BUTLER 00:00:05-00:00:20]")
+
+
+def test_pull_stays_above_a_divider_and_out_of_a_note():
+    lines = ["Ep 7", "Intro", "Words.", "---", "Part 1", "More."]
+    reqs = gdocs.plan_append_to_part(_doc(lines), PULL, "Intro")
+    assert _applied(lines, reqs).index("We went out") < _applied(lines, reqs).index("---")
+
+    note = gdocs.NOTE_PREFIX + "WARN Format: old"
+    lines = ["[PART Open]", "[VO A]", "Words.", note, "", "[PART Next]", "[VO B]", "More."]
+    para = gdocs.paragraphs(_doc(lines))
+    reqs = gdocs.plan_append_to_part(_doc(lines), PULL, "Open")
+    # Inside the line above the note, so the note's named range doesn't grow.
+    assert reqs[0]["insertText"]["location"]["index"] == para[2][2] - 1
+
+
+def test_a_section_that_is_gone_is_an_error_not_a_guess():
+    assert gdocs.plan_append_to_part(_doc(PARTS), PULL, "No such part") is None
+    with pytest.raises(RuntimeError, match="No such part"):
+        gdocs.append_to_part(None, "doc1", PULL, "No such part", docs=_Docs(_doc(PARTS)))
+
+
+def test_append_to_part_redoes_the_plan_if_the_doc_changed():
+    docs = _Docs(_doc(PARTS))
+    send = docs.batchUpdate
+    tries = []
+
+    def _batch(documentId, body):
+        tries.append(body)
+        if len(tries) == 1:
+            def _fail():
+                raise RuntimeError("The required revision ID does not match")
+            return _Exec(_fail)
+        return send(documentId, body)
+    docs.batchUpdate = _batch
+    gdocs.append_to_part(None, "doc1", PULL, "Open", docs=docs)
+    assert len(tries) == 2 and len(docs.batches) == 1
+    assert docs.batches[0]["writeControl"] == {"requiredRevisionId": "r1"}
+    assert gdocs.list_parts(None, "doc1", docs=docs) == ["Open", "Part 1: The Lake"]
+
+
 def test_append_after_marker_or_at_end():
     doc = _doc(SCRIPT)
     reqs = gdocs.plan_append(doc, "[BUTLER 00:00:30-00:00:40]\nAnd then.\n", after_marker="[PART Open]")

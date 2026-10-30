@@ -5456,7 +5456,8 @@ class PqWorkflowMixin:
             self.after(secs, lambda: lbl.config(text=prev_text, fg=prev_fg))
 
     def _pq_send_to_script(self):
-        """Append the selected pull to the episode's Google Doc."""
+        """Send the selected pull to the episode's Google Doc, at the end of
+        the section chosen, or at the end if the Doc has no sections."""
         built = self._pq_build_pull_block()
         if built is None:
             messagebox.showinfo("Send to script", "Select the words of the pull first.")
@@ -5474,9 +5475,48 @@ class PqWorkflowMixin:
         if not gdocs.is_configured():
             messagebox.showinfo("Google Docs", gdocs.setup_message())
             return
+
+        def _send(part):
+            def _work():
+                if part is None:
+                    gdocs.append_block(gdocs.get_credentials(), gd["id"], block)
+                else:
+                    gdocs.append_to_part(gdocs.get_credentials(), gd["id"], block, part)
+            self._ep_gdoc_bg(_work, lambda _r: self._pq_flash_status(
+                "\u2713 Sent to {}  [{}\u2013{}]".format(part or "script", in_tc, out_tc)))
+
+        self._pq_flash_status("Reading the Doc\u2026")
         self._ep_gdoc_bg(
-            lambda: gdocs.append_block(gdocs.get_credentials(), gd["id"], block),
-            lambda _r: self._pq_flash_status("\u2713 Sent to script  [{}\u2013{}]".format(in_tc, out_tc)))
+            lambda: gdocs.list_parts(gdocs.get_credentials(), gd["id"]),
+            lambda parts: self._pq_choose_part(parts, in_tc, out_tc, _send)
+            if parts else _send(None))
+
+    def _pq_choose_part(self, parts, in_tc, out_tc, send):
+        """Ask which section of the script a pull goes in.  The one used last
+        stands out, since pulls tend to come in runs for one section."""
+        win = tk.Toplevel(self)
+        win.title("Send to script")
+        win.configure(bg=BG)
+        win.transient(self)
+        self._pq_part_win = win
+        tk.Label(win, text="Which section does this pull go in?", font=FH,
+                 bg=BG, fg=TEXT).pack(anchor="w", padx=20, pady=(14, 2))
+        tk.Label(win, text="It goes at the end of the section  \u00b7  [{}\u2013{}]".format(in_tc, out_tc),
+                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 10))
+        last = getattr(self, "_pq_last_part", None)
+
+        def _pick(part):
+            self._pq_last_part = part
+            win.destroy()
+            send(part)
+
+        for part in parts:
+            self._btn(win, part, lambda p=part: _pick(p), small=True,
+                      color=ACCENT if part == last else None
+                      ).pack(fill="x", padx=20, pady=2)
+        self._btn(win, "CANCEL", win.destroy, small=True).pack(anchor="e", padx=20, pady=(10, 14))
+        win.bind("<Escape>", lambda e: win.destroy())
+        self._center_dialog(win, min_w=460, min_h=200)
 
     def _pq_build_pull_block(self):
         """(block, in_tc, out_tc) for the transcript selection, or None."""
