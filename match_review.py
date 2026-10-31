@@ -201,6 +201,9 @@ class MatchReviewDialog:
     on_next, on_prev : callable()
         Bring the next / previous clip into this window (see load_clip).
         None means there isn't one, and dims the button.
+    auto_snap : bool
+        Snap IN/OUT to the speech edges on opening.  For points the matcher
+        guessed; False for points someone has set, which stay where they are.
     fps : float
         Sequence frame rate — used for nudge step size.
     """
@@ -210,7 +213,8 @@ class MatchReviewDialog:
                  context_before="", context_after="",
                  scripted_tc="",
                  on_accept=None, fps=24.0,
-                 pool_by_token=None, on_next=None, on_prev=None):
+                 pool_by_token=None, on_next=None, on_prev=None,
+                 auto_snap=True):
         self._parent          = parent
         self._fps             = fps
         self._frame_s         = 1.0 / max(1.0, fps)
@@ -227,7 +231,7 @@ class MatchReviewDialog:
         self._full_loading    = set()   # files with a Phase 2 still running
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev)
+                       on_accept, pool_by_token, on_next, on_prev, auto_snap)
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -354,8 +358,9 @@ class MatchReviewDialog:
 
     def _set_clip(self, source_audio, segments, title, quote_text, matched_text,
                   words, context_before, context_after, scripted_tc,
-                  on_accept, pool_by_token, on_next, on_prev):
+                  on_accept, pool_by_token, on_next, on_prev, auto_snap):
         """What belongs to one clip, as opposed to the window."""
+        self._auto_snap       = auto_snap
         self._audio_path      = source_audio
         self._on_accept       = on_accept
         self._on_next         = on_next
@@ -416,7 +421,8 @@ class MatchReviewDialog:
                   context_before="", context_after="",
                   scripted_tc="",
                   on_accept=None,
-                  pool_by_token=None, on_next=None, on_prev=None):
+                  pool_by_token=None, on_next=None, on_prev=None,
+                  auto_snap=True):
         """Bring another clip into this window, which stays open.  Takes what
         __init__ takes.  A file already loaded whole isn't loaded again."""
         self._stop()
@@ -429,7 +435,7 @@ class MatchReviewDialog:
             self._player = None
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev)
+                       on_accept, pool_by_token, on_next, on_prev, auto_snap)
         self._load_gen += 1
         self._playhead_s       = self._in_s
         self._drag             = None
@@ -2032,9 +2038,11 @@ class MatchReviewDialog:
         Uses directional search so IN snaps to speech onsets and OUT to speech
         offsets, biased to avoid cutting into the clip rather than away from it.
 
-        Does nothing if already run, or if silence data isn't available.
+        Does nothing if already run, if silence data isn't available, or on
+        points someone has set: the offsets below would move them every time
+        the clip was opened.
         """
-        if self._auto_snapped:
+        if self._auto_snapped or not self._auto_snap:
             return
         if not self._sil_ends and not self._sil_starts:
             return

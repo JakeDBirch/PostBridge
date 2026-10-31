@@ -495,6 +495,7 @@ def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
             assert card[1]["res"].get("_s4_accepted") is None
             assert card[1]["res"]["segments"] == [[2.0, 4.0]]
 
+            assert d._auto_snap                 # the matcher's guess
             d._in_s += 0.5                      # edited
             d._on_step(-1)
             app.update()
@@ -504,6 +505,8 @@ def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
 
             d._on_step(1)
             app.update()
+            assert not d._auto_snap             # back on the edit: left alone
+            assert (d._in_s, d._out_s) == (10.5, 12.0)
             d._win.focus_force()
             app.update()
             d._win.event_generate("<Control-Return>")

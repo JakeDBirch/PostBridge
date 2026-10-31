@@ -8780,7 +8780,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                      acc(*a, apath=_sa, **k),
                                  pool_by_token=_pool_by_token,
                                  on_next=self._s4_step_fn(_this_order, 1),
-                                 on_prev=self._s4_step_fn(_this_order, -1))
+                                 on_prev=self._s4_step_fn(_this_order, -1),
+                                 auto_snap=not r.get("_s4_accepted"))
                     # NEXT / PREVIOUS: the same window, showing another clip.
                     _open = self._s4_open_editor()
                     if _open is not None:

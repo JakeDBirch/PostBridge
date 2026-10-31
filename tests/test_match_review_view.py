@@ -98,6 +98,14 @@ def test_the_automatic_snap_does_not_count_as_an_edit(dlg):
     assert dlg._edited_segments() != dlg._opened_segs
 
 
+def test_points_someone_has_set_stay_where_they_are(dlg):
+    dlg._auto_snap = False
+    dlg._sil_ends, dlg._sil_starts = [50.0], [60.0]
+    dlg._auto_snap_boundaries()
+    assert (dlg._in_s, dlg._out_s) == (50.0, 60.0)
+    assert dlg._edited_segments() == [(50.0, 60.0)]
+
+
 def _labels(w):
     for c in w.winfo_children():
         if c.winfo_class() == "Label":
