@@ -6,6 +6,7 @@ Needs tkinter and a display; skips otherwise.
 import os
 import sys
 import time
+from concurrent.futures import Future
 
 import numpy as np
 import pytest
@@ -104,16 +105,18 @@ def _labels(w):
         yield from _labels(c)
 
 
-def _next_button(d):
-    return next((b for b in _labels(d._win)
-                 if b.cget("text").startswith("NEXT CLIP")), None)
+def _button(d, text):
+    return next(b for b in _labels(d._win) if text in b.cget("text"))
 
 
-def test_the_last_clip_has_no_next_button(dlg):
-    assert _next_button(dlg) is None
+def _pump(root, secs=0.2):
+    settle = time.monotonic() + secs
+    while time.monotonic() < settle:
+        root.update()
 
 
-def test_the_next_button_is_on_screen_and_moves_on(monkeypatch):
+@pytest.fixture
+def walking(monkeypatch):
     monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
                         lambda self: None)
     try:
@@ -121,21 +124,110 @@ def test_the_next_button_is_on_screen_and_moves_on(monkeypatch):
     except tk.TclError as exc:
         pytest.skip("Tk unavailable: {}".format(exc))
     root.withdraw()
-    went, accepted = [], []
-    d = match_review.MatchReviewDialog(root, "no_such_file.wav", [[50.0, 60.0]],
-                                       on_accept=accepted.append,
-                                       on_next=lambda: went.append(True))
-    try:
-        settle = time.monotonic() + 0.2
-        while time.monotonic() < settle:
-            root.update()
-        b = _next_button(d)
+    log = []
+    d = match_review.MatchReviewDialog(root, "a.wav", [[50.0, 60.0]],
+                                       title="BUTLER", quote_text="first line",
+                                       on_accept=lambda s: log.append(("accept", s)),
+                                       on_next=lambda: log.append("next"),
+                                       on_prev=lambda: log.append("prev"))
+    _pump(root)
+    yield root, d, log
+    d._on_cancel()
+    root.destroy()
+
+
+def test_the_buttons_are_on_screen_and_only_accept_and_next_accepts(walking):
+    root, d, log = walking
+    for text, want in (("PREVIOUS", "prev"), ("NEXT  ", "next")):
+        b = _button(d, text)
         assert b.winfo_viewable()
-        bottom = b.winfo_rooty() + b.winfo_height()
-        assert bottom <= d._win.winfo_rooty() + d._win.winfo_height()
+        assert (b.winfo_rooty() + b.winfo_height()
+                <= d._win.winfo_rooty() + d._win.winfo_height())
+        log.clear()
         b.event_generate("<ButtonRelease-1>")
         root.update()
-        assert went == [True] and accepted == []
-        assert not d._win.winfo_exists()
-    finally:
-        root.destroy()
+        assert log == [want]
+    log.clear()
+    _button(d, "ACCEPT AND NEXT").event_generate("<ButtonRelease-1>")
+    root.update()
+    assert log == [("accept", [(50.0, 60.0)]), "next"]
+    assert d._win.winfo_exists()
+
+
+def test_with_nothing_that_way_the_button_is_dim_and_does_nothing(walking):
+    root, d, log = walking
+    d._on_prev = None
+    d._sync_step_btns()
+    b = _button(d, "PREVIOUS")
+    assert b.cget("fg") == match_review.BORDER
+    b.event_generate("<ButtonRelease-1>")
+    root.update()
+    assert log == []
+    assert d._win.winfo_exists()
+
+
+def test_loading_a_clip_replaces_everything_about_the_last_one(walking):
+    root, d, log = walking
+    d._samples = np.zeros(d._sr * SECS, np.float32)
+    d._push_undo()
+    d._search_var.set("first")
+    d.load_clip("b.wav", [[5.0, 6.0]], title="MILLER", quote_text="second line",
+                scripted_tc="00:00:05 -> 00:00:06",
+                words=[{"word": "hello", "start": 5.0, "end": 5.4}])
+    root.update()
+    assert d._win.title().endswith("MILLER")
+    assert (d._in_s, d._out_s, d._playhead_s) == (5.0, 6.0, 5.0)
+    assert d._samples is None and d._undo_stack == []
+    assert d._search_var.get() == ""
+    assert "second line" in d._script_text.get("1.0", "end")
+    assert "first line" not in d._script_text.get("1.0", "end")
+    assert d._scripted_val.cget("text") == "00:00:05 -> 00:00:06"
+    assert d._word_frame.winfo_manager() == "pack"
+    assert d._on_next is None and d._on_prev is None
+
+    d.load_clip("c.wav", [[7.0, 8.0]])          # no script text, no words
+    root.update()
+    assert not d._script_frame.winfo_manager()
+    assert not d._word_frame.winfo_manager()
+    assert d._scripted_head.cget("text") == ""
+
+
+def test_a_preview_for_the_last_clip_is_dropped(walking):
+    root, d, log = walking
+    stale = Future()
+    stale.set_result((np.ones(800, np.float32), 40.0, 0.5, 100.0))
+    gen = d._load_gen
+    d.load_clip("b.wav", [[5.0, 6.0]])
+    d._preview_done(stale, gen)
+    _pump(root, 0.1)
+    assert d._samples is None and d._file_dur_s == 0.0
+
+
+def test_a_whole_file_that_arrives_late_only_lands_on_its_own_file(walking):
+    root, d, log = walking
+    whole = Future()
+    whole.set_result((np.zeros(d._sr * SECS, np.float32), 0.5, True))
+    d.load_clip("b.wav", [[5.0, 6.0]])
+    d._full_done(whole, "a.wav")
+    _pump(root, 0.1)
+    assert d._samples is None and not d._full_file
+    d._full_done(whole, "b.wav")
+    _pump(root, 0.1)
+    assert d._full_file and len(d._samples) == d._sr * SECS
+
+
+def test_another_clip_of_a_file_already_loaded_does_not_load_it_again(walking,
+                                                                      monkeypatch):
+    root, d, log = walking
+    d._samples = samples = np.zeros(d._sr * SECS, np.float32)
+    d._full_file, d._ctx_start, d._ctx_dur = True, 0.0, float(SECS)
+    started = []
+    monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
+                        lambda self: started.append(True))
+    d.load_clip("a.wav", [[70.0, 75.0]])
+    root.update()
+    assert d._samples is samples and started == []
+    view_s = d._view_start / d._sr
+    assert view_s <= 70.0 and view_s + d._canvas_w * d._spp / d._sr >= 75.0
+    d.load_clip("b.wav", [[5.0, 6.0]])
+    assert d._samples is None and started == [True]

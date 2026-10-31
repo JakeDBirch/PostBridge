@@ -442,9 +442,10 @@ def test_editor_accept_edits_its_own_card(tmp_path):
         app.destroy()
 
 
-def test_next_clip_walks_the_sequence_keeping_only_real_edits(tmp_path):
-    """NEXT CLIP opens the next pull that's in the cut.  A pull only looked at
-    stays unaccepted, a pull edited is kept, and the last one has no button."""
+def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
+    """NEXT / PREVIOUS bring the neighbouring pull that's in the cut into the
+    same window.  A pull only looked at stays unaccepted, a pull edited is kept,
+    Ctrl+Enter accepts either way, and accepting the last one closes the window."""
     import wave
     import main
     wav = str(tmp_path / "GUEST.wav")
@@ -483,26 +484,40 @@ def test_next_clip_walks_the_sequence_keeping_only_real_edits(tmp_path):
         try:
             card[1]["open_review_fn"]()
             app.update()
-            first = dialogs[-1]
-            first._on_next_click()          # only looked at
+            d = dialogs[-1]
+            assert d._on_prev is None           # nothing before the first
+            d._on_step(1)                       # only looked at
             app.update()
-            assert not first._win.winfo_exists()
-            assert len(dialogs) == 2 and dialogs[-1]._current_token == "GUEST"
-            assert dialogs[-1]._quote_text == "line 2"
+            assert d._win.winfo_exists() and dialogs == [d]
+            assert d._quote_text == "line 2"
+            assert (d._in_s, d._out_s) == (10.0, 12.0)
+            assert app._s4_editing_row is card[2]["res"]
             assert card[1]["res"].get("_s4_accepted") is None
             assert card[1]["res"]["segments"] == [[2.0, 4.0]]
 
-            second = dialogs[-1]
-            second._in_s += 0.5             # edited
-            second._on_next_click()
+            d._in_s += 0.5                      # edited
+            d._on_step(-1)
             app.update()
+            assert d._quote_text == "line 1"
             assert card[2]["res"]["_s4_accepted"] is True
             assert [list(s) for s in card[2]["res"]["segments"]] == [[10.5, 12.0]]
 
-            last = dialogs[-1]              # past the ignored pull
-            assert last._quote_text == "line 4"
-            assert last._on_next is None
-            last._on_cancel()
+            d._on_step(1)
+            app.update()
+            d._win.focus_force()
+            app.update()
+            d._win.event_generate("<Control-Return>")
+            app.update()
+            assert d._win.winfo_exists() and dialogs == [d]
+            assert d._quote_text == "line 4"    # past the ignored pull
+            assert d._on_next is None
+
+            d._on_accept_next()                 # accepted, nothing left
+            app.update()
+            assert card[4]["res"]["_s4_accepted"] is True
+            assert not d._win.winfo_exists()
+            assert app._s4_editing_row is None
+            assert app._s4_open_editor() is None
         finally:
             match_review.MatchReviewDialog.__init__ = orig
     finally:

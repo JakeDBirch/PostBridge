@@ -8711,7 +8711,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         _msg += ("\nUse the REASSIGN button on this card to point "
                                  "it at a valid file, or add the missing file to "
                                  "the pool via Step 2.")
-                        messagebox.showwarning("No source available", _msg, parent=self)
+                        _open = self._s4_open_editor()
+                        messagebox.showwarning(
+                            "No source available", _msg,
+                            parent=_open._win if _open is not None else self)
                         return
                     segs_r = r.get("segments") or [(0.0, 30.0)]
                     fps    = getattr(self, "_seq_fps", 24.0)
@@ -8762,29 +8765,34 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     # A background match for this row waits until the editor
                     # closes (_bg_flush_deferred) instead of changing the
                     # data out from under it.
+                    _prev_row = getattr(self, "_s4_editing_row", None)
                     self._s4_editing_row = r
-                    _dlg = MatchReviewDialog(self, sa, segs_r,
-                                      title=r.get("token", ""),
-                                      quote_text=r.get("quote_text", ""),
-                                      matched_text=r.get("matched_text", ""),
-                                      context_before=_ctx_before,
-                                      context_after=_ctx_after,
-                                      scripted_tc=_scripted_tc,
-                                      words=_words,
-                                      on_accept=lambda *a, _sa=sa, **k:
-                                          acc(*a, apath=_sa, **k),
-                                      fps=fps,
-                                      pool_by_token=_pool_by_token,
-                                      on_next=(
-                                          (lambda o=_this_order:
-                                              self._s4_open_next_card(o))
-                                          if self._s4_next_card(_this_order)
-                                          else None))
+                    if _prev_row is not None and _prev_row is not r:
+                        self._bg_flush_deferred(_prev_row)
+                    _clip = dict(title=r.get("token", ""),
+                                 quote_text=r.get("quote_text", ""),
+                                 matched_text=r.get("matched_text", ""),
+                                 context_before=_ctx_before,
+                                 context_after=_ctx_after,
+                                 scripted_tc=_scripted_tc,
+                                 words=_words,
+                                 on_accept=lambda *a, _sa=sa, **k:
+                                     acc(*a, apath=_sa, **k),
+                                 pool_by_token=_pool_by_token,
+                                 on_next=self._s4_step_fn(_this_order, 1),
+                                 on_prev=self._s4_step_fn(_this_order, -1))
+                    # NEXT / PREVIOUS: the same window, showing another clip.
+                    _open = self._s4_open_editor()
+                    if _open is not None:
+                        _open.load_clip(sa, segs_r, **_clip)
+                        return
+                    _dlg = MatchReviewDialog(self, sa, segs_r, fps=fps, **_clip)
+                    self._s4_editor = _dlg
                     try:
                         _w = _dlg._win
                         _w.bind("<Destroy>",
-                                lambda ev, w=_w, row=r:
-                                    ev.widget is w and self._bg_flush_deferred(row),
+                                lambda ev, w=_w:
+                                    ev.widget is w and self._s4_editor_closed(),
                                 add="+")
                     except Exception:
                         self._s4_editing_row = None
@@ -9079,18 +9087,40 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if e is not None and e.get("open_review_fn"):
             e["open_review_fn"]()
 
-    def _s4_next_card(self, order):
-        """The card after `order` in the sequence.  Ignored pulls are passed
-        over: they aren't in the cut, and their cards don't open."""
-        later = [e for e in getattr(self, "_rv", [])
-                 if e["res"].get("order", 0) > order and not e["skip_var"].get()]
-        return min(later, key=lambda e: e["res"].get("order", 0), default=None)
+    def _s4_step_card(self, order, direction):
+        """The card next to `order` in the sequence, after it or before it.
+        Ignored pulls are passed over: they aren't in the cut, and their
+        cards don't open."""
+        rows = [e for e in getattr(self, "_rv", [])
+                if not e["skip_var"].get()
+                and (e["res"].get("order", 0) - order) * direction > 0]
+        return min(rows, key=lambda e: abs(e["res"].get("order", 0) - order),
+                   default=None)
 
-    def _s4_open_next_card(self, order):
-        """NEXT CLIP in the waveform editor, once it has closed."""
-        e = self._s4_next_card(order)
-        if e is not None:
-            e["open_review_fn"]()
+    def _s4_step_fn(self, order, direction):
+        """What the waveform editor's NEXT / PREVIOUS does from the pull at
+        `order`, or None if there's nothing that way."""
+        if self._s4_step_card(order, direction) is None:
+            return None
+        def _go():
+            e = self._s4_step_card(order, direction)
+            if e is not None:
+                e["open_review_fn"]()
+        return _go
+
+    def _s4_open_editor(self):
+        """The waveform editor, if its window is open."""
+        dlg = getattr(self, "_s4_editor", None)
+        try:
+            return dlg if dlg is not None and dlg._win.winfo_exists() else None
+        except tk.TclError:
+            return None
+
+    def _s4_editor_closed(self):
+        self._s4_editor = None
+        row = getattr(self, "_s4_editing_row", None)
+        if row is not None:
+            self._bg_flush_deferred(row)
 
     def _assembly_set_segments(self, order, segments, gaps=None):
         """An edit on the Assembly track: the pull's new kept source

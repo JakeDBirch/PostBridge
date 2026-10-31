@@ -198,9 +198,9 @@ class MatchReviewDialog:
         The matched text — shown as context above the waveform.
     on_accept : callable(segments)
         Called with the (possibly adjusted) segments list on accept.
-    on_next : callable()
-        Opens the next clip in the sequence.  None (the last clip, or a
-        caller with no sequence) leaves the NEXT CLIP button off.
+    on_next, on_prev : callable()
+        Bring the next / previous clip into this window (see load_clip).
+        None means there isn't one, and dims the button.
     fps : float
         Sequence frame rate — used for nudge step size.
     """
@@ -210,69 +210,24 @@ class MatchReviewDialog:
                  context_before="", context_after="",
                  scripted_tc="",
                  on_accept=None, fps=24.0,
-                 pool_by_token=None, on_next=None):
+                 pool_by_token=None, on_next=None, on_prev=None):
         self._parent          = parent
-        self._audio_path      = source_audio
-        self._on_accept       = on_accept
-        self._on_next         = on_next
         self._fps             = fps
         self._frame_s         = 1.0 / max(1.0, fps)
         self._sr              = _SR
-        self._matched_text    = matched_text or ""
-        self._context_before  = context_before or ""
-        self._context_after   = context_after  or ""
-        self._scripted_tc     = scripted_tc or ""
-        # Retained for the "copy corrected pull header" action in the
-        # cross-token search: the current pull's token label and the
-        # scripted quote text.
-        self._current_token   = title or ""
-        self._quote_text      = quote_text or ""
-        # Optional {token: [audio_paths]} map so the search bar can
-        # cross-check phrases against every OTHER pool file's
-        # .pb_transcript.json sidecar — used when the assigned token is
-        # itself wrong.  Falls back to the just-this-file default.
-        self._pool_by_token   = pool_by_token or {title: [source_audio]}
-        self._words           = [w for w in (words or [])
-                                  if isinstance(w, dict) and "start" in w]
-        # Cached start-time array for O(log N) visible-word slicing in
-        # _draw_words.  Long-form interview transcripts run 10-20K
-        # words; walking the whole list on every _draw was 50-200 ms
-        # per redraw and _draw fires 3-5× during initial open.
-        self._word_starts     = [float(w.get("start", 0.0))
-                                  for w in self._words]
-        # Cached lowercase-first-token array for the transcript search
-        # box.  Sibling of _word_starts — same lifecycle (self._words
-        # is immutable over the dialog's lifetime), same eager pattern.
-        # Was a lazy getattr(..., None) dance inside _search_update,
-        # inconsistent with _word_starts for no reason.
-        _w_texts              = [self._search_norm(w.get("word", ""))
-                                  for w in self._words]
-        self._search_w_first  = [t.split()[0] if t else "" for t in _w_texts]
-        # Same idea for the OTHER pool files, but populated lazily —
-        # {abspath: (words, w_first)}.  Only the cross-token search
-        # ("all pulls") touches these, so most dialogs never pay for
-        # them at all.  See _xtok_words.
+        # Same idea as _search_w_first for the OTHER pool files, but
+        # populated lazily — {abspath: (words, w_first)}.  Only the
+        # cross-token search ("all pulls") touches these, so most dialogs
+        # never pay for them at all.  See _xtok_words.
         self._xtok_cache      = {}
-
-        # Working copy — we edit the overall span (first in / last out).
-        # Interior segment boundaries stay fixed; on accept we shift
-        # the first-in and last-out by the same deltas the user applied.
-        self._segments   = [list(s) for s in segments]  # mutable copy
-        # Sweep zero-duration segments from any prior session's saved
-        # state before we compute _in_s / _out_s — otherwise the span
-        # inherits an artefactual boundary at the empty segment's
-        # position and the visible edit area expands to include it.
-        # (Method may not exist yet during first-run tests; be defensive.)
-        _fps_for_prune = float(fps) if fps else 24.0
-        _eps = 1.0 / max(1.0, _fps_for_prune)
-        _clean = [list(s) for s in self._segments
-                   if (float(s[1]) - float(s[0])) >= _eps]
-        if _clean:
-            self._segments = _clean
-        self._in_s       = self._segments[0][0]  if self._segments else 0.0
-        self._out_s      = self._segments[-1][1] if self._segments else 0.0
-        # What the clip opened as, so NEXT CLIP can tell whether it was edited.
-        self._opened_segs = self._edited_segments()
+        # Bumped for each clip: a worker started for an earlier one finds
+        # its number out of date and its result is dropped.
+        self._load_gen        = 0
+        self._full_file       = False   # _samples holds the whole source file
+        self._full_loading    = set()   # files with a Phase 2 still running
+        self._set_clip(source_audio, segments, title, quote_text, matched_text,
+                       words, context_before, context_after, scripted_tc,
+                       on_accept, pool_by_token, on_next, on_prev)
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -358,10 +313,7 @@ class MatchReviewDialog:
 
         # ── Build window ──────────────────────────────────────────────────
         self._win = tk.Toplevel(parent)
-        disp_title = "MATCH REVIEW"
-        if title:
-            disp_title += "  \u2014  " + title
-        self._win.title(disp_title)
+        self._win.title(self._window_title(title))
         self._win.configure(bg=BG)
         self._win.resizable(True, True)
         self._win.protocol("WM_DELETE_WINDOW", self._on_cancel)
@@ -384,8 +336,7 @@ class MatchReviewDialog:
             self._win.geometry("{}x{}+{}+{}".format(
                 w, h, max(0, px + (pw - w) // 2), max(0, py + (ph - h) // 2)))
 
-        self._build_ui(quote_text, self._context_before, self._context_after,
-                       self._scripted_tc)
+        self._build_ui()
         # Focus the window so keyboard shortcuts work immediately, but
         # DON'T grab_set() until the preview lands — the multi-second
         # main-thread stalls during Phase-2 silence-boundary computation
@@ -395,88 +346,250 @@ class MatchReviewDialog:
         self._win.bind("<MouseWheel>", lambda e: "break")
         self._start_extraction()
 
+    # ── The clip on show ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _window_title(title):
+        return "MATCH REVIEW  —  " + title if title else "MATCH REVIEW"
+
+    def _set_clip(self, source_audio, segments, title, quote_text, matched_text,
+                  words, context_before, context_after, scripted_tc,
+                  on_accept, pool_by_token, on_next, on_prev):
+        """What belongs to one clip, as opposed to the window."""
+        self._audio_path      = source_audio
+        self._on_accept       = on_accept
+        self._on_next         = on_next
+        self._on_prev         = on_prev
+        self._matched_text    = matched_text or ""
+        self._context_before  = context_before or ""
+        self._context_after   = context_after  or ""
+        self._scripted_tc     = scripted_tc or ""
+        # Retained for the "copy corrected pull header" action in the
+        # cross-token search: the current pull's token label and the
+        # scripted quote text.
+        self._current_token   = title or ""
+        self._quote_text      = quote_text or ""
+        # Optional {token: [audio_paths]} map so the search bar can
+        # cross-check phrases against every OTHER pool file's
+        # .pb_transcript.json sidecar — used when the assigned token is
+        # itself wrong.  Falls back to the just-this-file default.
+        self._pool_by_token   = pool_by_token or {title: [source_audio]}
+        self._words           = [w for w in (words or [])
+                                  if isinstance(w, dict) and "start" in w]
+        # Cached start-time array for O(log N) visible-word slicing in
+        # _draw_words.  Long-form interview transcripts run 10-20K
+        # words; walking the whole list on every _draw was 50-200 ms
+        # per redraw and _draw fires 3-5× during initial open.
+        self._word_starts     = [float(w.get("start", 0.0))
+                                  for w in self._words]
+        # Cached lowercase-first-token array for the transcript search
+        # box.  Sibling of _word_starts — same lifecycle (self._words
+        # is immutable while a clip is on show), same eager pattern.
+        # Was a lazy getattr(..., None) dance inside _search_update,
+        # inconsistent with _word_starts for no reason.
+        _w_texts              = [self._search_norm(w.get("word", ""))
+                                  for w in self._words]
+        self._search_w_first  = [t.split()[0] if t else "" for t in _w_texts]
+
+        # Working copy — we edit the overall span (first in / last out).
+        # Interior segment boundaries stay fixed; on accept we shift
+        # the first-in and last-out by the same deltas the user applied.
+        self._segments   = [list(s) for s in segments]  # mutable copy
+        # Sweep zero-duration segments from any prior session's saved
+        # state before we compute _in_s / _out_s — otherwise the span
+        # inherits an artefactual boundary at the empty segment's
+        # position and the visible edit area expands to include it.
+        # (Method may not exist yet during first-run tests; be defensive.)
+        _fps_for_prune = float(self._fps) if self._fps else 24.0
+        _eps = 1.0 / max(1.0, _fps_for_prune)
+        _clean = [list(s) for s in self._segments
+                   if (float(s[1]) - float(s[0])) >= _eps]
+        if _clean:
+            self._segments = _clean
+        self._in_s       = self._segments[0][0]  if self._segments else 0.0
+        self._out_s      = self._segments[-1][1] if self._segments else 0.0
+        # What the clip opened as, so moving on can tell whether it was edited.
+        self._opened_segs = self._edited_segments()
+
+    def load_clip(self, source_audio, segments, title="",
+                  quote_text="", matched_text="", words=None,
+                  context_before="", context_after="",
+                  scripted_tc="",
+                  on_accept=None,
+                  pool_by_token=None, on_next=None, on_prev=None):
+        """Bring another clip into this window, which stays open.  Takes what
+        __init__ takes.  A file already loaded whole isn't loaded again."""
+        self._stop()
+        same_file = source_audio == self._audio_path
+        if not same_file and self._player is not None:
+            try:
+                self._player.close()    # its buffer is the last file's
+            except Exception:
+                pass
+            self._player = None
+        self._set_clip(source_audio, segments, title, quote_text, matched_text,
+                       words, context_before, context_after, scripted_tc,
+                       on_accept, pool_by_token, on_next, on_prev)
+        self._load_gen += 1
+        self._playhead_s       = self._in_s
+        self._drag             = None
+        self._drag_undo_pushed = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._auto_snapped     = False
+        self._words_draw_key   = None
+        self._remove_hit_areas = []
+        self._remove_seg_areas = []
+        self._snap_lbl.config(text="")
+        self._search_var.set("")
+        self._win.title(self._window_title(title))
+        self._show_script()
+        self._show_scripted_tc()
+        self._show_word_row()
+        self._refresh_displays()
+        self._sync_step_btns()
+        self._cv.delete("all")
+        self._word_cv.delete("all")
+
+        if same_file and self._full_file:
+            self._auto_snap_boundaries()
+            self._refresh_displays()
+            self._zoom_to_clip()
+            self._draw()
+            return
+
+        self._full_file      = False
+        self._samples        = None
+        self._src_peak       = None
+        self._display_gain   = 1.0
+        self._ctx_start      = 0.0
+        self._ctx_dur        = self._out_s + _CONTEXT_S * 4
+        self._file_dur_s     = 0.0
+        self._loaded_start_s = 0.0
+        self._loaded_end_s   = 0.0
+        self._loading_left   = False
+        self._loading_right  = False
+        self._need_initial_zoom = True
+        self._silence_boundaries = []
+        self._sil_starts     = []
+        self._sil_ends       = []
+        self._show_loading()
+        self._start_extraction()
+
+    def _show_loading(self):
+        try:
+            self._loading_lbl.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+        self._loading_lbl = tk.Label(self._cv,
+                                     text="Extracting waveform…",
+                                     font=FBT, fg=SUB, bg=SURF)
+        self._loading_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _show_script(self):
+        """The script text above the waveform; hidden when a clip has none."""
+        qf, qt = self._script_frame, self._script_text
+        quote_text, scripted_tc = self._quote_text, self._scripted_tc
+        context_before, context_after = self._context_before, self._context_after
+        if not (quote_text or context_before or context_after):
+            qf.pack_forget()
+            return
+        qf.pack(fill="x", padx=12, pady=(10, 2), before=self._wave_frame)
+
+        # Helper: truncate context to ~300 chars at a word boundary
+        def _trunc(text, maxch=300):
+            text = text.strip()
+            if len(text) <= maxch:
+                return text
+            cut = text.rfind(" ", 0, maxch)
+            return text[:cut if cut > 0 else maxch] + "…"
+
+        _rule = "─" * 60 + "\n"   # ────────────── divider
+
+        qt.config(state="normal")
+        qt.delete("1.0", "end")
+        # Scripted timecode header — first line so the user always has
+        # a reference for where the edit was originally placed in script.
+        if scripted_tc:
+            qt.insert("end", "SCRIPTED  {}\n".format(scripted_tc), "tc")
+            qt.insert("end", _rule, "rule")
+        if context_before:
+            qt.insert("end", _trunc(context_before) + "\n", "ctx")
+            qt.insert("end", _rule, "rule")
+        if quote_text:
+            qt.insert("end", quote_text, "main")
+        if context_after:
+            qt.insert("end", "\n" + _rule, "rule")
+            qt.insert("end", _trunc(context_after), "ctx")
+        qt.config(state="disabled")
+
+        # Scroll so the main quote text is visible (skip past the before-context)
+        if context_before and quote_text:
+            try:
+                # "main" tag starts right after the rule — scroll to it
+                ranges = qt.tag_ranges("main")
+                if ranges:
+                    qt.see(ranges[0])
+            except Exception:
+                pass
+
+    def _show_scripted_tc(self):
+        self._scripted_head.config(text="SCRIPTED" if self._scripted_tc else "")
+        self._scripted_val.config(text=self._scripted_tc)
+
+    def _show_word_row(self):
+        # Only shown when transcription data is available for this file.
+        if self._words:
+            self._word_frame.pack(fill="x", padx=12, pady=(0, 2),
+                                  after=self._wave_frame)
+        else:
+            self._word_frame.pack_forget()
+
     # ── UI ────────────────────────────────────────────────────────────────
 
-    def _build_ui(self, quote_text, context_before="", context_after="",
-                  scripted_tc=""):
+    def _build_ui(self):
         win = self._win
 
         # ── Script text — scrollable, capped height so controls always visible ──
-        _has_any_text = quote_text or context_before or context_after
-        if _has_any_text:
-            import tkinter.font as _tkfont
-            _font_main = _tkfont.Font(family="Segoe UI", size=12)
-            _font_ctx  = _tkfont.Font(family="Segoe UI", size=11, slant="italic")
+        import tkinter.font as _tkfont
+        _font_main = _tkfont.Font(family="Segoe UI", size=12)
+        _font_ctx  = _tkfont.Font(family="Segoe UI", size=11, slant="italic")
 
-            qf = tk.Frame(win, bg=SURF2,
-                          highlightbackground=BORDER, highlightthickness=1)
-            qf.pack(fill="x", padx=12, pady=(10, 2))
-            qt = tk.Text(qf, font=_font_main, bg=SURF2, fg=TEXT,
-                         relief="flat", bd=0, padx=8, pady=6,
-                         wrap="word", height=16, state="normal",
-                         highlightthickness=0)
+        qf = tk.Frame(win, bg=SURF2,
+                      highlightbackground=BORDER, highlightthickness=1)
+        qt = tk.Text(qf, font=_font_main, bg=SURF2, fg=TEXT,
+                     relief="flat", bd=0, padx=8, pady=6,
+                     wrap="word", height=16, state="disabled",
+                     highlightthickness=0)
 
-            # Tag for context text: dimmer colour, italic, slightly smaller
-            import tkinter.font as _tkfont2
-            _font_tc = _tkfont2.Font(family="Segoe UI", size=10)
-            qt.tag_config("ctx",  font=_font_ctx,  foreground=SUB)
-            qt.tag_config("rule", font=_font_ctx,  foreground=BORDER)
-            qt.tag_config("main", font=_font_main, foreground=TEXT)
-            qt.tag_config("tc",   font=_font_tc,   foreground=SUB)
+        # Tag for context text: dimmer colour, italic, slightly smaller
+        _font_tc = _tkfont.Font(family="Segoe UI", size=10)
+        qt.tag_config("ctx",  font=_font_ctx,  foreground=SUB)
+        qt.tag_config("rule", font=_font_ctx,  foreground=BORDER)
+        qt.tag_config("main", font=_font_main, foreground=TEXT)
+        qt.tag_config("tc",   font=_font_tc,   foreground=SUB)
+        # Held on to: Tk font objects go away with their last reference.
+        self._script_fonts = (_font_main, _font_ctx, _font_tc)
 
-            # Helper: truncate context to ~300 chars at a word boundary
-            def _trunc(text, maxch=300):
-                text = text.strip()
-                if len(text) <= maxch:
-                    return text
-                cut = text.rfind(" ", 0, maxch)
-                return text[:cut if cut > 0 else maxch] + "\u2026"
-
-            _rule = "\u2500" * 60 + "\n"   # ────────────── divider
-
-            # Scripted timecode header — first line so the user always has
-            # a reference for where the edit was originally placed in script.
-            if scripted_tc:
-                qt.insert("end", "SCRIPTED  {}\n".format(scripted_tc), "tc")
-                qt.insert("end", _rule, "rule")
-            if context_before:
-                qt.insert("end", _trunc(context_before) + "\n", "ctx")
-                qt.insert("end", _rule, "rule")
-            if quote_text:
-                qt.insert("end", quote_text, "main")
-            if context_after:
-                qt.insert("end", "\n" + _rule, "rule")
-                qt.insert("end", _trunc(context_after), "ctx")
-
-            qt.config(state="disabled")
-            _qsb = tk.Scrollbar(qf, orient="vertical", command=qt.yview,
-                                width=10, bg=SURF2, troughcolor=SURF2,
-                                highlightthickness=0, bd=0)
-            qt.config(yscrollcommand=_qsb.set)
-            _qsb.pack(side="right", fill="y")
-            qt.pack(side="left", fill="x", expand=True)
-
-            # Scroll so the main quote text is visible (skip past the before-context)
-            if context_before and quote_text:
-                try:
-                    # "main" tag starts right after the rule — scroll to it
-                    ranges = qt.tag_ranges("main")
-                    if ranges:
-                        qt.see(ranges[0])
-                except Exception:
-                    pass
+        _qsb = tk.Scrollbar(qf, orient="vertical", command=qt.yview,
+                            width=10, bg=SURF2, troughcolor=SURF2,
+                            highlightthickness=0, bd=0)
+        qt.config(yscrollcommand=_qsb.set)
+        _qsb.pack(side="right", fill="y")
+        qt.pack(side="left", fill="x", expand=True)
+        self._script_frame = qf
+        self._script_text  = qt
 
         # ── Canvas ────────────────────────────────────────────────────────
         cf = tk.Frame(win, bg=BORDER, bd=1, relief="solid")
         cf.pack(fill="both", expand=True, padx=12, pady=(4, 2))
+        self._wave_frame = cf
+        self._show_script()
         self._cv = tk.Canvas(cf, bg=SURF, highlightthickness=0,
                              height=self._canvas_h)
         self._cv.pack(fill="both", expand=True)
 
-        self._loading_lbl = tk.Label(self._cv,
-                                     text="Extracting waveform\u2026",
-                                     font=FBT, fg=SUB, bg=SURF)
-        self._loading_lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self._show_loading()
 
         self._cv.bind("<ButtonPress-1>",   self._on_press)
         self._cv.bind("<B1-Motion>",       self._on_drag_motion)
@@ -486,11 +599,10 @@ class MatchReviewDialog:
         self._cv.bind("<Motion>",          self._on_hover)
 
         # ── Word timeline — words positioned by timestamp below waveform ────────
-        # Only shown when transcription data is available for this file.
         wf = tk.Frame(win, bg=SURF,
                       highlightbackground=BORDER, highlightthickness=1)
-        if self._words:
-            wf.pack(fill="x", padx=12, pady=(0, 2))
+        self._word_frame = wf
+        self._show_word_row()
         self._word_cv = tk.Canvas(wf, bg=SURF, highlightthickness=0, height=36)
         self._word_cv.pack(fill="x")
 
@@ -528,11 +640,11 @@ class MatchReviewDialog:
 
         # Scripted TC reference — shown on the right side of the same row so
         # the user always has the original script position for comparison.
-        if scripted_tc:
-            tk.Label(tc_row, text="SCRIPTED", font=FB, bg=BG, fg=SUB,
-                     padx=0).pack(side="right")
-            tk.Label(tc_row, text=scripted_tc, font=FBT, bg=BG, fg=SUB,
-                     padx=6).pack(side="right")
+        self._scripted_head = tk.Label(tc_row, font=FB, bg=BG, fg=SUB, padx=0)
+        self._scripted_head.pack(side="right")
+        self._scripted_val = tk.Label(tc_row, font=FBT, bg=BG, fg=SUB, padx=6)
+        self._scripted_val.pack(side="right")
+        self._show_scripted_tc()
 
         self._refresh_displays()
 
@@ -788,15 +900,42 @@ class MatchReviewDialog:
         accept.bind("<Leave>", lambda e: accept.config(bg=SUCCESS))
         accept.bind("<ButtonRelease-1>", lambda e: self._on_accept_click())
 
-        if self._on_next:
-            nxt = tk.Label(bot, text="NEXT CLIP  ▶", font=FBT,
-                           bg=SURF3, fg=TEXT, cursor="hand2",
-                           padx=16, pady=6, bd=0,
-                           highlightbackground=BORDER, highlightthickness=1)
-            nxt.pack(side="right", padx=(0, 8))
-            nxt.bind("<Enter>", lambda e: nxt.config(bg=ACCENT, fg=BG))
-            nxt.bind("<Leave>", lambda e: nxt.config(bg=SURF3, fg=TEXT))
-            nxt.bind("<ButtonRelease-1>", lambda e: self._on_next_click())
+        acc_next = tk.Label(bot, text="ACCEPT AND NEXT", font=FBT,
+                            bg=SUCCESS, fg=TEXT, cursor="hand2",
+                            padx=16, pady=6, bd=0,
+                            highlightbackground=BORDER, highlightthickness=1)
+        acc_next.pack(side="right", padx=(0, 8))
+        acc_next.bind("<Enter>", lambda e: acc_next.config(bg="#4a9a51"))
+        acc_next.bind("<Leave>", lambda e: acc_next.config(bg=SUCCESS))
+        acc_next.bind("<ButtonRelease-1>", lambda e: self._on_accept_next())
+        # "break": not the plain Return (accept and close) as well.
+        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
+            win.bind(seq, lambda e: (self._on_accept_next(), "break")[1])
+
+        def _step_btn(text, direction):
+            b = tk.Label(bot, text=text, font=FBT, bg=SURF3, fg=TEXT,
+                         padx=16, pady=6, bd=0,
+                         highlightbackground=BORDER, highlightthickness=1)
+            b.pack(side="right", padx=(0, 8))
+            b.bind("<Enter>", lambda e: self._step_fn(direction)
+                   and b.config(bg=ACCENT, fg=BG))
+            b.bind("<Leave>", lambda e: (b.config(bg=SURF3),
+                                         self._sync_step_btns()))
+            b.bind("<ButtonRelease-1>", lambda e: self._on_step(direction))
+            return b
+        # Packed from the right, so NEXT sits nearest the accept buttons.
+        self._next_btn = _step_btn("NEXT  ▶", 1)
+        self._prev_btn = _step_btn("◀  PREVIOUS", -1)
+        self._sync_step_btns()
+
+    def _step_fn(self, direction):
+        return self._on_next if direction > 0 else self._on_prev
+
+    def _sync_step_btns(self):
+        """Dim the way that has run out, as the speed stepper does."""
+        for btn, fn in ((self._prev_btn, self._on_prev),
+                        (self._next_btn, self._on_next)):
+            btn.config(fg=TEXT if fn else BORDER, cursor="hand2" if fn else "")
 
     # ── Extraction ────────────────────────────────────────────────────────
     #
@@ -813,14 +952,16 @@ class MatchReviewDialog:
         # immediately (typically ~1 s) regardless of file length or cache state.
         # Phase 2 (_phase2_worker) runs in the background and will swap in the
         # full file once ready — either from the disk cache or by re-extracting.
+        gen = self._load_gen
         ex = ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(self._extract_preview)
-        fut.add_done_callback(self._preview_done)
+        fut = ex.submit(self._extract_preview, self._audio_path, self._in_s,
+                        self._ctx_dur, gen)
+        fut.add_done_callback(lambda f: self._preview_done(f, gen))
         ex.shutdown(wait=False)
 
     # ── Phase 1: small window around the match ──────────────────────────
 
-    def _extract_preview(self):
+    def _extract_preview(self, path, in_s, ctx_dur, gen):
         import numpy as _np
         import wave as _wave
         # Probe the real file duration here on the bg thread — the
@@ -828,35 +969,40 @@ class MatchReviewDialog:
         # blocking the parent app on ffprobe.  Result gets applied
         # in _preview_done under the Tk main thread.
         try:
-            real_dur = float(get_media_duration(self._audio_path) or 0.0)
+            real_dur = float(get_media_duration(path) or 0.0)
         except Exception:
             real_dur = 0.0
         pad   = 10.0
-        start = max(0.0, self._in_s - pad)
-        dur   = min(self._PREVIEW_S, max(0.1, self._ctx_dur - start))
+        start = max(0.0, in_s - pad)
+        dur   = min(self._PREVIEW_S, max(0.1, ctx_dur - start))
         _log.info("preview extract: %s  start=%.2f  dur=%.2f",
-                  self._audio_path, start, dur)
-        wav = os.path.join(self._tmp_dir, "_preview.wav")
-        extract_audio_segment(self._audio_path, start, dur, wav,
+                  path, start, dur)
+        wav = os.path.join(self._tmp_dir, "_preview{}.wav".format(gen))
+        extract_audio_segment(path, start, dur, wav,
                               sample_rate=_SR)
         with _wave.open(wav, "rb") as wf:
             data = wf.readframes(wf.getnframes())
+        try:
+            os.remove(wav)      # a long session walks through many clips
+        except OSError:
+            pass
         arr  = _np.frombuffer(data, _np.int16).astype(_np.float32) / 32768.0
         peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
         if peak > 1e-6:
             arr = arr / peak * 0.85
         return arr, start, peak, real_dur
 
-    def _preview_done(self, fut):
+    def _preview_done(self, fut, gen):
         try:
-            if not self._win.winfo_exists():
+            if gen != self._load_gen or not self._win.winfo_exists():
                 return
         except Exception:
             return
         try:
             samples, preview_start, src_peak, real_dur = fut.result()
-            self._src_peak     = src_peak if src_peak > 1e-6 else None
-            self._display_gain = (0.85 / src_peak) if src_peak > 1e-6 else 1.0
+            if not self._full_file:
+                self._src_peak     = src_peak if src_peak > 1e-6 else None
+                self._display_gain = (0.85 / src_peak) if src_peak > 1e-6 else 1.0
             # Refine _ctx_dur AND _file_dur_s from the real probe now
             # that ffprobe has run off-thread.  Both fall back to
             # whatever coarse estimate __init__ set if the probe
@@ -881,14 +1027,17 @@ class MatchReviewDialog:
 
         def _show():
             try:
-                if not self._win.winfo_exists():
+                if gen != self._load_gen or not self._win.winfo_exists():
                     return
-                # ctx_start shifts so sample-0 == preview_start in file time
-                self._samples        = samples
-                self._ctx_start      = preview_start
-                self._loaded_start_s = preview_start
-                self._loaded_end_s   = preview_start + len(samples) / self._sr
-                self._compute_silence_boundaries()
+                # This clip's file may have finished loading whole, for the
+                # clip before: then there's nothing for the preview to add.
+                if not self._full_file:
+                    # ctx_start shifts so sample-0 == preview_start in file time
+                    self._samples        = samples
+                    self._ctx_start      = preview_start
+                    self._loaded_start_s = preview_start
+                    self._loaded_end_s   = preview_start + len(samples) / self._sr
+                    self._compute_silence_boundaries()
                 self._auto_snap_boundaries()
                 # Preview + boundaries ready — now safe to grab modal
                 # focus.  If a later Phase-2 stall happens, the user
@@ -902,36 +1051,45 @@ class MatchReviewDialog:
                     self._loading_lbl.destroy()
                 except Exception:
                     pass
-                cw = self._cv.winfo_width()
-                ch = self._cv.winfo_height()
-                if cw > 10:
-                    self._canvas_w = cw
-                    self._canvas_h = max(50, ch)
-                    pad = 3.0
-                    view_start_s = max(self._ctx_start, self._in_s - pad)
-                    view_end_s   = min(self._ctx_start + self._ctx_dur,
-                                       self._out_s + pad)
-                    view_dur_s   = max(0.1, view_end_s - view_start_s)
-                    self._spp        = max(1, int(view_dur_s * self._sr /
-                                                  self._canvas_w))
-                    self._view_start = int((view_start_s - self._ctx_start) *
-                                           self._sr)
-                    self._need_initial_zoom = False
-                else:
-                    self._need_initial_zoom = True
+                self._zoom_to_clip()
                 self._draw()
                 # Phase 2: load full file in background (cache hit or re-extract).
-                # Lazy chunks serve scroll requests while Phase 2 runs.
-                ex2 = ThreadPoolExecutor(max_workers=1)
-                fut2 = ex2.submit(self._phase2_worker)
-                fut2.add_done_callback(self._full_done)
-                ex2.shutdown(wait=False)
+                # Lazy chunks serve scroll requests while Phase 2 runs.  One
+                # already running for this file (the clip before's) will do:
+                # it comes to gigabytes for a long interview.
+                path = self._audio_path
+                if not self._full_file and path not in self._full_loading:
+                    self._full_loading.add(path)
+                    ex2 = ThreadPoolExecutor(max_workers=1)
+                    fut2 = ex2.submit(self._phase2_worker, path)
+                    fut2.add_done_callback(lambda f: self._full_done(f, path))
+                    ex2.shutdown(wait=False)
                 # Kick off lazy expansion for any already-visible unloaded regions
                 self._check_and_expand()
             except Exception:
                 _log.exception("_show failed")
 
         self._win.after(0, _show)
+
+    def _zoom_to_clip(self):
+        """The view on the clip's edit points, with a little either side."""
+        cw = self._cv.winfo_width()
+        ch = self._cv.winfo_height()
+        if cw > 10:
+            self._canvas_w = cw
+            self._canvas_h = max(50, ch)
+            pad = 3.0
+            view_start_s = max(self._ctx_start, self._in_s - pad)
+            view_end_s   = min(self._ctx_start + self._ctx_dur,
+                               self._out_s + pad)
+            view_dur_s   = max(0.1, view_end_s - view_start_s)
+            self._spp        = max(1, int(view_dur_s * self._sr /
+                                          self._canvas_w))
+            self._view_start = int((view_start_s - self._ctx_start) *
+                                   self._sr)
+            self._need_initial_zoom = False
+        else:
+            self._need_initial_zoom = True
 
     # ── Phase 2: full file (background, for scrolling) ──────────────────
     #
@@ -940,22 +1098,23 @@ class MatchReviewDialog:
     # files are handled exactly like uncached ones from the user's perspective:
     # Phase 1 preview always appears first, and the full file swaps in quietly.
 
-    def _phase2_worker(self):
+    def _phase2_worker(self, path):
         """Try disk cache first; fall back to full file extraction."""
-        cached = _wave_cache_load(self._audio_path)
+        cached = _wave_cache_load(path)
         if cached is not None:
-            _log.info("phase2 cache hit: %s", self._audio_path)
+            _log.info("phase2 cache hit: %s", path)
             samples, peak = cached
             return samples, peak, True   # True = came from cache, no re-write needed
         import numpy as _np
-        _log.info("phase2 full extract: %s", self._audio_path)
-        arr  = extract_mono_pcm(self._audio_path, _SR)
+        _log.info("phase2 full extract: %s", path)
+        arr  = extract_mono_pcm(path, _SR)
         peak = float(_np.max(_np.abs(arr))) if len(arr) else 0.0
         if peak > 1e-6:
             arr = arr / peak * 0.85
         return arr, peak, False          # False = freshly extracted, write cache
 
-    def _full_done(self, fut):
+    def _full_done(self, fut, path):
+        self._full_loading.discard(path)
         try:
             if not self._win.winfo_exists():
                 return
@@ -972,8 +1131,12 @@ class MatchReviewDialog:
         # file we just read back from cache moments ago).
         if not from_cache:
             _cache_ex = ThreadPoolExecutor(max_workers=1)
-            _cache_ex.submit(_wave_cache_save, self._audio_path, samples, src_peak)
+            _cache_ex.submit(_wave_cache_save, path, samples, src_peak)
             _cache_ex.shutdown(wait=False)
+
+        # Moved on to another file: cached for when you come back, no more.
+        if path != self._audio_path:
+            return
 
         # ── Do the amplitude rescale HERE (on the bg thread) ─────────
         # Was in _swap on the main thread — samples * (p2/p1) is an
@@ -1009,7 +1172,7 @@ class MatchReviewDialog:
 
         def _swap():
             try:
-                if not self._win.winfo_exists():
+                if path != self._audio_path or not self._win.winfo_exists():
                     return
                 # Preserve the current viewport centre in absolute time
                 centre_t = (self._ctx_start +
@@ -1017,6 +1180,7 @@ class MatchReviewDialog:
                              self._canvas_w * self._spp / 2) / self._sr)
 
                 self._samples   = display_samples
+                self._full_file = True
                 # Update to whole-file peak for accurate playback gain
                 self._src_peak  = src_peak if src_peak > 1e-6 else self._src_peak
                 self._ctx_start = 0.0
@@ -1088,18 +1252,19 @@ class MatchReviewDialog:
             return
         _log.info("lazy chunk %s: start=%.2f  dur=%.2f", side, start, dur)
         ex = ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(self._extract_chunk, start, dur)
+        gen = self._load_gen
+        fut = ex.submit(self._extract_chunk, start, dur, self._audio_path, gen)
         fut.add_done_callback(
-            lambda f, s=side, ss=start: self._chunk_done(f, s, ss))
+            lambda f, s=side, ss=start: self._chunk_done(f, s, ss, gen))
         ex.shutdown(wait=False)
 
-    def _extract_chunk(self, start_s, dur_s):
+    def _extract_chunk(self, start_s, dur_s, path, gen):
         """Extract a chunk of the source file and return a float32 display array."""
         import numpy as _np
         import wave as _wave
         wav = os.path.join(self._tmp_dir,
-                           "_chunk_{:.0f}.wav".format(start_s * 10))
-        extract_audio_segment(self._audio_path, start_s, dur_s, wav,
+                           "_chunk{}_{:.0f}.wav".format(gen, start_s * 10))
+        extract_audio_segment(path, start_s, dur_s, wav,
                               sample_rate=_SR)
         with _wave.open(wav, "rb") as wf:
             data = wf.readframes(wf.getnframes())
@@ -1109,10 +1274,10 @@ class MatchReviewDialog:
         arr  = arr * gain
         return arr
 
-    def _chunk_done(self, fut, side, chunk_start_s):
+    def _chunk_done(self, fut, side, chunk_start_s, gen):
         """Callback (background thread) — merge the loaded chunk into samples."""
         try:
-            if not self._win.winfo_exists():
+            if gen != self._load_gen or not self._win.winfo_exists():
                 return
         except Exception:
             return
@@ -1127,6 +1292,8 @@ class MatchReviewDialog:
             return
 
         def _merge(arr=arr, side=side, chunk_start_s=chunk_start_s):
+            if gen != self._load_gen:
+                return
             try:
                 import numpy as _np
                 if self._samples is None:
@@ -2226,9 +2393,9 @@ class MatchReviewDialog:
         # for a run of consecutive transcript words that match.
         q_words = q.split()
         n_q = len(q_words)
-        # _search_w_first built eagerly in __init__ (sibling of
-        # _word_starts) — self._words is immutable over the dialog's
-        # lifetime, so building once at open is cheaper than a lazy
+        # _search_w_first built eagerly in _set_clip (sibling of
+        # _word_starts) — self._words is immutable while a clip is on
+        # show, so building once at open is cheaper than a lazy
         # getattr dance on every keystroke.
         w_first = self._search_w_first
         for i in range(len(w_first) - n_q + 1):
@@ -2752,6 +2919,7 @@ class MatchReviewDialog:
         self._stop()
         self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
         self._playback_end_file = seg_list[-1][0] + seg_list[-1][1]
+        gen = self._load_gen
 
         def _do():
             import numpy as _np
@@ -2795,6 +2963,8 @@ class MatchReviewDialog:
                 _log.exception("play_stitched failed")
                 return
             def _do_play():
+                if gen != self._load_gen:
+                    return
                 try:
                     import winsound
                     winsound.PlaySound(path,
@@ -3117,6 +3287,7 @@ class MatchReviewDialog:
         self._stop()
         self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
         self._playback_end_file = start_s + duration_s
+        gen = self._load_gen
         import numpy as _np
         import wave as _wave
         out_wav = os.path.join(self._tmp_dir, "_play.wav")
@@ -3151,6 +3322,8 @@ class MatchReviewDialog:
                 _log.exception("play extract failed")
                 return
             def _do_play():
+                if gen != self._load_gen:
+                    return
                 try:
                     import winsound
                     winsound.PlaySound(path,
@@ -3285,14 +3458,32 @@ class MatchReviewDialog:
         if self._on_accept:
             self._on_accept(new_segs)
 
-    def _on_next_click(self):
-        """On to the next clip.  An edit made here is kept, as ACCEPT would
-        keep it; a clip only looked at stays as it was, not accepted."""
+    def _commit(self):
+        """Accept what's on show, with the window staying open."""
+        segs = self._edited_segments()
+        if self._on_accept:
+            self._on_accept(segs)
+        self._opened_segs = segs
+
+    def _on_step(self, direction):
+        """NEXT / PREVIOUS.  An edit made here is kept, as ACCEPT would keep
+        it; a clip only looked at stays as it was, not accepted."""
+        fn = self._step_fn(direction)
+        if not fn:
+            return
         if self._edited_segments() != self._opened_segs:
-            self._on_accept_click()
+            self._commit()
+        fn()
+
+    def _on_accept_next(self):
+        """Accept this clip, edited or not, and on to the next; after the
+        last one there's nothing left to do here, so the window closes."""
+        fn = self._on_next
+        self._commit()
+        if fn:
+            fn()
         else:
             self._cleanup()
-        self._on_next()
 
     def _on_cancel(self):
         self._cleanup()
