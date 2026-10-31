@@ -385,7 +385,11 @@ def _ffprobe_csv(path, entries, select=None, timeout=10):
     timeout boilerplate every scalar probe used to repeat verbatim.
 
     None (failure) is kept distinct from "" (probe ran, value empty)
-    so callers like _probe_codec can avoid caching a transient miss."""
+    so callers like _probe_codec can avoid caching a transient miss.
+
+    Only the first row comes back.  ffprobe 9 lists a stream once under any
+    stream group that holds it and again under the streams, so a camera file
+    with a timecode track answers "2\\n\\n2" to a query for one value."""
     cmd = _ffprobe_cmd() + ["-v", "quiet"]
     if select:
         cmd += ["-select_streams", select]
@@ -401,7 +405,8 @@ def _ffprobe_csv(path, entries, select=None, timeout=10):
     # such stream", which _probe_codec then cached for the session.
     if r.returncode != 0:
         return None
-    return (r.stdout or "").strip()
+    return next((ln.strip() for ln in (r.stdout or "").splitlines()
+                 if ln.strip()), "")
 
 
 def get_media_duration(path):
@@ -423,7 +428,9 @@ def probe_audio_channels(path):
     refuses to relink the real file: "the selected file cannot be linked
     because it has 1 audio channel(s) and the clip was created with 2 audio
     channel(s) with a different channel type."  Leaving the element out lets
-    Premiere read the count off the media instead of trusting a wrong one."""
+    Premiere read the count off the media when it finds the media; when it
+    imports offline with no count, it builds a mono clip, so a stereo file
+    won't relink either.  A real count is the only thing that relinks."""
     key = os.path.normcase(os.path.abspath(path))
     if key in _channel_cache:
         return _channel_cache[key]
@@ -4252,7 +4259,7 @@ def _make_clipitem(cid, fid, filepath, start_fr, end_fr,
         # stereo, and any later relink of the real mono file is rejected with
         # "Cannot Link Media".  Mono camera/interview sources (isolated
         # participant tracks, Riverside "raw-audio" exports) hit this every
-        # time.  None = unknown; omit the element and let Premiere read it.
+        # time.  None = unknown; omit the element rather than guess.
         n_ch = (file_audio_channels if file_audio_channels is not None
                 else probe_audio_channels(filepath))
 
