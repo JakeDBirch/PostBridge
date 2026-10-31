@@ -5731,12 +5731,17 @@ class AafWorkflowMixin:
                 self._aaf_build_progress(95, "Writing file\u2026")
                 engines.write_xml(xmeml, out)
                 engines.clear_rx_cache()
+                _no_channels = engines.channels_unknown(xmeml)
 
                 def _finish():
                     self.out_path.set(out)
                     self._aaf_done(matched, unmatched,
                                    len(clips_with_media), clip_results,
                                    gaps_closed=_gaps_closed)
+                    if _no_channels:
+                        messagebox.showwarning(
+                            "Audio channels unknown",
+                            engines.channels_unknown_warning(_no_channels))
                     # Surface any clips whose sync offset placed them
                     # outside their media \u2014 clamped (not dropped), but
                     # they need a re-sync.

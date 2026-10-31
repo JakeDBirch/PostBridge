@@ -77,6 +77,7 @@ class BuildCancelled(Exception):
 # ── Globals ────────────────────────────────────────────────────────────────────
 _cache_dir = None   # Will be set by App when script is loaded
 _channel_cache = {}   # normcased path -> first audio stream's channel count
+_channel_failed = set()   # paths whose latest channel probe got no answer
 _model_cache = {}
 _model_lock  = threading.Lock()
 
@@ -419,8 +420,9 @@ def get_media_duration(path):
 def probe_audio_channels(path):
     """Real channel count of a file's first audio stream, memoised per path.
 
-    Returns None when the count cannot be determined — the file is missing,
-    unreadable, or carries no audio stream at all.
+    Returns 0 when the file carries no audio stream, and None when the count
+    cannot be determined — the file is missing, unreadable, or too slow to
+    answer.  channels_unknown() names the files that ended up None.
 
     Callers that write a channel count into an NLE interchange file must keep
     "unknown" distinct from a guess.  Media that imports offline (moved drive,
@@ -434,10 +436,14 @@ def probe_audio_channels(path):
     key = os.path.normcase(os.path.abspath(path))
     if key in _channel_cache:
         return _channel_cache[key]
-    out = _ffprobe_csv(path, "stream=channels", select="a:0")
-    if not (out and out.isdigit()):
+    # A big camera file nothing has read lately can take minutes to answer
+    # for the first time; only the export builders ask, off the UI thread.
+    out = _ffprobe_csv(path, "stream=channels", select="a:0", timeout=60)
+    if out is None or (out and not out.isdigit()):
+        _channel_failed.add(path)
         return None          # unknown — do NOT cache, the file may appear later
-    n = int(out)
+    _channel_failed.discard(path)
+    n = int(out or 0)
     _channel_cache[key] = n
     return n
 
@@ -446,6 +452,31 @@ def get_audio_channels(path):
     """Channel count with a stereo fallback, for callers that need a number
     no matter what.  Use probe_audio_channels() where "unknown" matters."""
     return probe_audio_channels(path) or 2
+
+
+def channels_unknown(xmeml):
+    """Names of the files an XML leaves without a channel count because the
+    probe got no answer, as opposed to files with no audio to count."""
+    uncounted = {f.findtext("pathurl") for f in xmeml.iter("file")
+                 if f.find("media/audio") is not None
+                 and f.find("media/audio/channelcount") is None}
+    return sorted(basename(p) for p in _channel_failed
+                  if pathurl(p) in uncounted)
+
+
+def channels_unknown_warning(names):
+    """What to tell the user about channels_unknown()'s list."""
+    shown = names[:12]
+    more  = len(names) - len(shown)
+    return ("PostBridge couldn't read the audio channels of these files, so "
+            "the XML doesn't declare them:\n\n"
+            + "\n".join("• " + n for n in shown)
+            + ("\n…and {} more".format(more) if more else "")
+            + "\n\nThe XML is fine if Premiere finds these files when you "
+              "import it. If they come in offline, stereo files won't relink "
+              "(\"Cannot Link Media\"). To be safe, make sure the files are on "
+              "this drive (in Dropbox: Make available offline) and export "
+              "again.")
 
 
 def has_audio_track(path):

@@ -10136,6 +10136,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 seq_w, seq_h, seq_fps, seq_sr = engines.probe_media_settings(
                     [p for p in all_paths if p])
 
+                _no_channels = []
                 if is_aaf:
                     _, skipped = engines.build_aaf(
                         edited, int_assets, vo_bin_data, parts,
@@ -10156,6 +10157,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         vo_takes_with_offset=vo_takes)
                     _set_status("Writing XML file…")
                     engines.write_xml(xmeml, out_path)
+                    _no_channels = engines.channels_unknown(xmeml)
                     _set_status("Generating report…")
                     _, report_path = engines.generate_report(
                         edited, skipped, parts, seq_name, out_path)
@@ -10183,6 +10185,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     pbar.stop()
                     _disable_cancel()
                     self._done(n_inc, n_skip, report_path)
+                    if _no_channels:
+                        messagebox.showwarning(
+                            "Audio channels unknown",
+                            engines.channels_unknown_warning(_no_channels))
                 self._ui(_finish)
 
             except engines.BuildCancelled:

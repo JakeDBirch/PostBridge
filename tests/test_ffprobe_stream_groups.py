@@ -14,7 +14,52 @@ def _answers(monkeypatch, stdout, returncode=0):
         engines, "_run",
         lambda *a, **k: SimpleNamespace(stdout=stdout, returncode=returncode))
     engines._channel_cache.clear()
+    engines._channel_failed.clear()
     engines._codec_cache.clear()
+
+
+def _xml_for(path):
+    root = engines.Element("xmeml")
+    root.append(engines._make_clipitem("clip-1", "file-1", path, 0, 24, 0, 24,
+                                       24.0, True, True, 1920, 1080, 48000))
+    return root
+
+
+def test_failed_probe_is_named_for_the_warning(monkeypatch):
+    _answers(monkeypatch, "", returncode=1)
+    assert engines.channels_unknown(_xml_for("F:/cam.mp4")) == ["cam.mp4"]
+
+
+def test_slow_probe_counts_as_unknown(monkeypatch):
+    def _slow(*a, **k):
+        assert k["timeout"] >= 60
+        raise subprocess.TimeoutExpired("ffprobe", k["timeout"])
+    monkeypatch.setattr(engines, "_run", _slow)
+    engines._channel_cache.clear()
+    engines._channel_failed.clear()
+    assert engines.channels_unknown(_xml_for("F:/cam.mp4")) == ["cam.mp4"]
+
+
+def test_video_only_file_is_not_a_failed_probe(monkeypatch):
+    _answers(monkeypatch, "\n")
+    root = _xml_for("F:/raw-video.mp4")
+    assert engines.probe_audio_channels("F:/raw-video.mp4") == 0
+    assert root.find(".//file/media/audio/channelcount") is None
+    assert engines.channels_unknown(root) == []
+
+
+def test_counted_file_clears_an_earlier_failure(monkeypatch):
+    _answers(monkeypatch, "", returncode=1)
+    engines.probe_audio_channels("F:/cam.mp4")
+    monkeypatch.setattr(
+        engines, "_run",
+        lambda *a, **k: SimpleNamespace(stdout="2\n", returncode=0))
+    assert engines.channels_unknown(_xml_for("F:/cam.mp4")) == []
+
+
+def test_warning_names_the_files():
+    text = engines.channels_unknown_warning(["cam.mp4"])
+    assert "cam.mp4" in text and "Cannot Link Media" in text
 
 
 def test_channel_count_listed_twice_is_still_a_count(monkeypatch):
