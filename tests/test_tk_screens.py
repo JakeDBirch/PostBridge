@@ -168,3 +168,54 @@ def test_pull_quotes_session_view_shows_transcript(tmp_path):
         assert not errors, "\n".join(errors)
     finally:
         app.destroy()
+
+
+def _step4_on_two_parts(tmp_path, focus):
+    app = _app_or_skip()
+    app._prefs = dict(app._prefs, s4_focus_mode=focus)
+    app._save_prefs = lambda: None
+    app._refine_resume = lambda: None
+    script = tmp_path / "s.txt"
+    script.write_text("x", encoding="utf-8")
+    app._script_path = str(script)
+    app.workflow = "script_session"
+    app.parts = [{"index": 0, "name": "One"}, {"index": 1, "name": "Two"},
+                 {"index": 2, "name": "Three"}]
+    app.tokens = ["GUEST"]
+    app.results = [dict(order=i, token="GUEST", status="ok", part_index=i // 2,
+                        segments=[(float(i), i + 1.0)], rec_in_s=float(i),
+                        rec_out_s=i + 1.0, quote_text="line {}".format(i),
+                        confidence=0.9) for i in range(6)]
+    app.pulls = [{"token": "GUEST", "order": i} for i in range(6)]
+    app._step4()
+    app.update()
+    return app
+
+
+def _packed(app):
+    return [e["res"]["part_index"] for e in app._rv
+            if e["card"].winfo_manager() == "pack"]
+
+
+def test_step4_with_focus_opens_on_one_part(tmp_path):
+    app = _step4_on_two_parts(tmp_path, focus=True)
+    try:
+        assert app._s4_collapsed == {1, 2}
+        assert _packed(app) == [0, 0]
+    finally:
+        app.destroy()
+
+
+def test_step4_without_focus_lays_every_card_out(tmp_path):
+    app = _step4_on_two_parts(tmp_path, focus=False)
+    try:
+        assert app._s4_collapsed == set()
+        assert _packed(app) == [0, 0, 1, 1, 2, 2]
+        # In script order, each part's header above its cards.
+        sf = app._rv[0]["card"].master
+        kids = sf.pack_slaves()
+        assert [k for k in kids if k in [e["card"] for e in app._rv]] == \
+            [e["card"] for e in app._rv]
+        assert len(kids) == 9
+    finally:
+        app.destroy()

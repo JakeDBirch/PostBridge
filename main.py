@@ -8246,7 +8246,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     part_name = next((p["name"] for p in self.parts
                                       if p["index"] == pi), "Part {}".format(pi))
                     _div = tk.Frame(sf, bg=BG)
-                    _div.pack(fill="x", pady=(10, 2), padx=2)
                     tk.Frame(_div, bg=BORDER, height=1).pack(fill="x")
                     _plbl = tk.Label(_div, text="", font=FL, bg=BG, fg=ACCENT,
                                      anchor="w", cursor="hand2")
@@ -8266,10 +8265,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 # cursor mid-review.  Only the border COLOUR changes now; the
                 # cost is that an unconfirmed card carries the same 2px border
                 # in BORDER grey, which is exactly the trade asked for.
+                # Packed once they are all built, by _apply_filter.
                 card = tk.Frame(sf, bg=SURF,
                                 highlightbackground=BORDER,
                                 highlightthickness=_CARD_BORDER)
-                card.pack(fill="x", pady=(0, 4), padx=2)
 
                 # Left color stripe — 4px, reflects accept/ignore/normal state
                 _stripe = tk.Frame(card, bg=_STRIPE_DEF, width=4)
@@ -8903,18 +8902,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 _fbtns["confirmed"].config(
                     text="CONFIRMED  {}".format(_confirmed_count[0]))
 
-            # Restore scrollregion binding now that all cards are packed, then do
-            # one layout pass so the canvas knows the full scroll extent.
-            # Rebind _scroll_frame's own guarded handler rather than a fresh
-            # lambda, so the only-when-changed check survives the rebuild.
-            _cv = self._s4_scroll_canvas
-            _sr = getattr(sf, "_pb_sync_scrollregion", None)
-            if _sr is not None:
-                sf.bind("<Configure>", _sr)
-            sf.update_idletasks()
-            _cv.configure(scrollregion=_cv.bbox("all"))
+            # FOCUS means one part open, from the start: opening with them all
+            # laid out is most of what this screen costs.
+            if self._s4_focus_mode.get():
+                _open = [pi for pi in sorted(_part_dividers)
+                         if pi not in self._s4_collapsed]
+                self._s4_collapsed.update(_open[1:])
 
-            # Re-apply persisted filter mode (persisted via self._s4_fstate);
+            # Packs the cards, restores the scrollregion binding and does the
+            # one layout pass, with the persisted filter mode (self._s4_fstate);
             # falls back to "all" on first entry.  This is what stops a
             # mid-review rebuild (reassign apply, status change, etc.) from
             # bouncing the user back to the ALL/Script default.

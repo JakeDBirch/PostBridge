@@ -710,6 +710,12 @@ class AssemblyWindow(object):
         self._words_lock = threading.Lock()
         self._words_queued = set()
         self._tx_lines  = {}             # order -> its _Line in the text
+        self._tx_shape  = None           # the text's rows, headings and all
+        self._line_memo = {}             # order -> what its _Line was built from
+        self._sel_marked = None          # the pull sel_pull is on
+        self._words_moved = False        # words on the track changed under the view
+        self._redraw_idle = None         # a redraw waiting for the input to settle
+        self._ov_key    = None           # what the overview's strip was drawn from
         self._align_memo = {}            # order -> (script, said, _script_ops)
         self._tx_order  = []             # the orders down the text
         self._tx_seq    = {}             # order -> its place in that
@@ -746,6 +752,7 @@ class AssemblyWindow(object):
         # Every vertical measure on the track derives from the small font's
         # line height, so the layout holds at any display scaling.
         self._font = tkfont.Font(family=_SMALL[0], size=_SMALL[1])
+        self._widths = {}                # text -> its width in that font
         self._ls   = self._font.metrics("linespace")
         # Ruler rows: timecodes, Part flags, music / SFX marks, notes.
         self._ruler_h = 4 * self._ls + 10
@@ -1236,7 +1243,7 @@ class AssemblyWindow(object):
                    key=lambda j: abs(x - self._x(j["t"])))
         if near is None:
             return None
-        half = self._font.measure(self._joint_text(near)) / 2.0 + 4
+        half = self._measure(self._joint_text(near)) / 2.0 + 4
         return near if abs(x - self._x(near["t"])) <= half else None
 
     def _show_joint(self, j):
@@ -1384,10 +1391,13 @@ class AssemblyWindow(object):
         self._remap_words(path)
 
     def _remap_words(self, path):
+        t0, t1 = self.view0, self.view0 + self._span()
         for c in self.clips:
             if c.play_path == path:
                 words = self._map_words(c, load=False)
                 if words is not None:
+                    if c.start <= t1 and c.end >= t0 and words != c.words:
+                        self._words_moved = True
                     c.words = words
         self._schedule_tx_render()
 
@@ -1575,18 +1585,27 @@ class AssemblyWindow(object):
             tok = _Tok(0, len(script), None, None, None, None, False, None)
             return _Line(script, [tok] if script else [], [(script, "txstruck")])
         words = self._raw_words(c, load=False)
+        # Most pulls are as they were: words coming in or an edit changes a few.
+        # A file's words are a new list whenever they change.
+        kept = self._line_memo.get(c.order)
+        if kept is not None and kept[0] is words and kept[1] == script \
+                and kept[2] == c.pieces and kept[3] == fade:
+            return kept[4]
         units = _kept_units(c, words) if words else []
         if not units:
-            return _Line(script, [])     # nothing heard yet to set it against
-        if not script:
-            return _plain_line(units, fade)
-        # Lining them up is the only dear part, and most pulls are the same
-        # as last time: whichever word just came in, one pull has changed.
-        said = tuple(_norm_word(u[4]) for u in units)
-        memo = self._align_memo.get(c.order)
-        if memo is None or memo[0] != script or memo[1] != said:
-            memo = self._align_memo[c.order] = (script, said, _script_ops(script, said))
-        return _text_line(script, units, memo[2], fade)
+            line = _Line(script, [])     # nothing heard yet to set it against
+        elif not script:
+            line = _plain_line(units, fade)
+        else:
+            # Lining them up is the dearest part, and a shifted pull says what
+            # it said before.
+            said = tuple(_norm_word(u[4]) for u in units)
+            memo = self._align_memo.get(c.order)
+            if memo is None or memo[0] != script or memo[1] != said:
+                memo = self._align_memo[c.order] = (script, said, _script_ops(script, said))
+            line = _text_line(script, units, memo[2], fade)
+        self._line_memo[c.order] = (words, script, c.pieces, fade, line)
+        return line
 
     def _line(self, order):
         return self._tx_lines.get(order)
@@ -1608,13 +1627,24 @@ class AssemblyWindow(object):
         n = self.text.count(a, b, "chars")
         return (n[0] if isinstance(n, tuple) else n) or 0
 
+    @staticmethod
+    def _chunk_args(o, line):
+        """A line's runs as Text.insert takes them.  b<order>: where the line
+        starts, for finding its words."""
+        tag = "o{}".format(o)
+        args = []
+        for text, style in line.chunks:
+            if text:
+                args += [text, (tag, "b{}".format(o))
+                         + ((style,) if style else ())]
+        return args
+
     def _render_script(self):
-        t = self.text
-        y0 = t.yview()[0]
-        top = self._text_top()
+        """Bring the text up to date, touching only the pulls whose words
+        changed: Tk measures again every line it is handed, and this runs each
+        time words come in or an edit lands.  True if any text changed."""
         keep = self._tx_capture()
-        t.config(state="normal")
-        t.delete("1.0", "end")
+        was = self._tx_lines
         placed = {c.order: c for c in self.clips}
         names  = {p.get("index"): p.get("name", "") for p in (self.app.parts or [])}
         running = getattr(self.app, "_refine_running", None)
@@ -1622,45 +1652,91 @@ class AssemblyWindow(object):
         self._tx_lines, self._tx_order, self._tx_seq = {}, [], {}
         solo = bool(self.app._monolog)   # one narrator: nobody to name
         cur_part, speaker = object(), None
+        rows, shape = [], []
         for r in sorted(self.app.results, key=lambda r: r.get("order", 0)):
-            pi = r.get("part_index")
+            pi, part = r.get("part_index"), None
             if pi != cur_part and not solo:
                 cur_part, speaker = pi, None
-                t.insert("end", (names.get(pi) or "Part {}".format(pi)) + "\n",
-                         ("part",))
-            o   = r.get("order")
-            tag = "o{}".format(o)
+                part = names.get(pi) or "Part {}".format(pi)
+            o = r.get("order")
             line = self._build_line(r, placed.get(o), fade)
             self._tx_seq[o] = len(self._tx_order)
             self._tx_order.append(o)
             self._tx_lines[o] = line
-            if not line.body:
-                continue
-            who = "VO" if r.get("is_vo") else r.get("token", "")
-            if not solo and who and who != speaker:
-                t.insert("end", who + "\n", ("tok", tag))
-                speaker = who
-            # b<order>: where the line starts, for finding its words.
-            args = []
-            for text, style in line.chunks:
-                if text:
-                    args += [text, (tag, "b{}".format(o))
-                             + ((style,) if style else ())]
-            t.insert("end", *args)
-            t.insert("end", "\n", (tag,))
-        t.config(state="disabled")
-        t.yview_moveto(y0)
-        if top is not None:
-            try:
-                t.yview("{}.first + {} chars".format(*top))
-            except tk.TclError:
-                pass
+            who = None
+            if line.body:
+                who = "VO" if r.get("is_vo") else r.get("token", "")
+                if solo or not who or who == speaker:
+                    who = None
+                else:
+                    speaker = who
+            rows.append((o, part, who, line))
+            shape.append((o, part, who, bool(line.body)))
+        if shape == self._tx_shape:
+            changed = [(o, line) for o, _p, _w, line in rows if line.body
+                       and line.chunks != was[o].chunks]
+            if not changed:
+                self._tx_restore(keep)
+                self._highlight_script(self._order_at(self.playhead), see=False)
+                self._mark_selected_in_script()
+                return False
+            self._patch_lines(changed)
+        else:
+            self._tx_shape = shape
+            self._insert_rows(rows)
         self._cur_order = None
         self._lit_script = self._lit_range = None
         self._tx_restore(keep)
         self._tx_painted = None
         self._highlight_script(self._order_at(self.playhead), see=False)
+        self._sel_marked = None
         self._mark_selected_in_script()
+        return True
+
+    def _insert_rows(self, rows):
+        """The whole text, from nothing."""
+        t = self.text
+        y0 = t.yview()[0]
+        top = self._text_top()
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        for o, part, who, line in rows:
+            if part is not None:
+                t.insert("end", part + "\n", ("part",))
+            if not line.body:
+                continue
+            tag = "o{}".format(o)
+            if who is not None:
+                t.insert("end", who + "\n", ("tok", tag))
+            t.insert("end", *self._chunk_args(o, line))
+            t.insert("end", "\n", (tag,))
+        t.config(state="disabled")
+        t.yview_moveto(y0)
+        self._back_to_top(top)
+
+    def _patch_lines(self, changed):
+        """New words for these pulls, the rest of the text left alone.  Only a
+        pull above the top of the pane can move what is in view."""
+        t = self.text
+        top = self._text_top()
+        t.config(state="normal")
+        t.tag_remove("word", "1.0", "end")   # lit by range: those may have moved
+        for o, line in changed:
+            ends = t.tag_ranges("b{}".format(o))
+            t.delete(ends[0], ends[-1])
+            t.insert(ends[0], *self._chunk_args(o, line))
+        t.config(state="disabled")
+        if top is not None and any(
+                self._tx_seq[o] <= self._tx_seq.get(int(top[0][1:]), -1)
+                for o, _line in changed):
+            self._back_to_top(top)
+
+    def _back_to_top(self, top):
+        if top is not None:
+            try:
+                self.text.yview("{}.first + {} chars".format(*top))
+            except tk.TclError:
+                pass
 
     def _schedule_tx_render(self):
         """More words: draw them once this burst settles, and not under a
@@ -1676,8 +1752,12 @@ class AssemblyWindow(object):
         if self._tdrag is not None:
             self._tx_render_after = self.win.after(300, self._tx_render_now)
             return
-        self._render_script()
-        self.redraw()
+        changed = self._render_script()
+        if self._words_moved:            # the track shows them too
+            self.redraw()
+        elif changed:
+            self._paint_tx_sel()
+            self._light_script_word()
 
     # ── Highlighting the text ────────────────────────────────────────────
     def _tx_capture(self):
@@ -2209,6 +2289,9 @@ class AssemblyWindow(object):
             pass
 
     def _mark_selected_in_script(self):
+        if self.sel_order == self._sel_marked:
+            return
+        self._sel_marked = self.sel_order
         t = self.text
         t.tag_remove("sel_pull", "1.0", "end")
         if self.sel_order is None:
@@ -2293,13 +2376,32 @@ class AssemblyWindow(object):
         h = self.cv.winfo_height()
         return self._ruler_h + 4, h - self._gap_h
 
+    def _measure(self, text):
+        """The small font's width of `text`.  Each measure is a call into Tk,
+        and a redraw asks about the same few hundred words every time."""
+        w = self._widths.get(text)
+        if w is None:
+            w = self._widths[text] = self._font.measure(text)
+        return w
+
     def _fits(self, text, room):
-        return self._font.measure(text) <= room
+        return self._measure(text) <= room
 
     # ── Drawing ──────────────────────────────────────────────────────────
+    def _redraw_soon(self):
+        """Wheel notches and key repeats come faster than a redraw, and queue
+        up behind it: draw once the input waiting has been taken in."""
+        if self._redraw_idle is None and not self._closed:
+            self._redraw_idle = self.win.after_idle(self._redraw_settled)
+
+    def _redraw_settled(self):
+        self._redraw_idle = None
+        self.redraw()
+
     def redraw(self):
         if self._closed:
             return
+        self._words_moved = False
         self._paint_tx_sel()
         cv = self.cv
         cv.delete("all")
@@ -2321,7 +2423,7 @@ class AssemblyWindow(object):
         def _places(s):
             return next((n for n, u in enumerate((1, 0.1, 0.01, 0.001)) if s >= u), 4)
         step = next((s for s in RULER_STEPS
-                     if self._font.measure(_fmt_tc(t1, _places(s))) + 24 <= s * self.pps),
+                     if self._measure(_fmt_tc(t1, _places(s))) + 24 <= s * self.pps),
                     1200)
         n = math.floor(t0 / step)
         while n * step <= t1:
@@ -2412,7 +2514,7 @@ class AssemblyWindow(object):
             jx = self._x(j["t"])
             cv.create_line(jx, y1 - 6, jx, y1 + 3, fill=WARN)
             txt = self._joint_text(j)
-            half = self._font.measure(txt) / 2.0
+            half = self._measure(txt) / 2.0
             if jx - half > free_x + 6:
                 cv.create_text(jx, y1 + self._gap_h / 2.0, text=txt,
                                font=self._font, fill=WARN if j is getattr(
@@ -2610,14 +2712,14 @@ class AssemblyWindow(object):
         start time; one that would run into the last is left out."""
         cv = self.cv
         last = -1e9
-        space = self._font.measure(" ")
+        space = self._measure(" ")
         for ws, we, word in c.words:
             x = self._x(ws)
             if x > w:
                 break
             if x < last or x < xs or x < -200:
                 continue
-            ww = self._font.measure(word)
+            ww = self._measure(word)
             if x + 2 + ww > xe - 2:
                 continue
             item = cv.create_text(x + 2, y, text=word, anchor="sw",
@@ -2642,23 +2744,31 @@ class AssemblyWindow(object):
 
     def _draw_overview(self):
         ov = self.ov
-        ov.delete("all")
         w = max(1, ov.winfo_width()); h = max(1, ov.winfo_height())
         if self.total_s <= 0:
+            ov.delete("all")
+            self._ov_key = None
             return
         k = w / self.total_s
-        for c in self.clips:
-            ov.create_rectangle(c.start * k, 7, max(c.start * k + 1, c.end * k),
-                                h - 7, fill=c.colour(), outline="")
-        for pt, _ in self.part_marks:
-            ov.create_line(pt * k, 0, pt * k, h, fill=_C_PART)
-        for m in self.markers:
-            ov.create_line(m["t"] * k, 0, m["t"] * k, 6,
-                           fill=self._mark_colour(m))
-        ov.create_rectangle(self.view0 * k, 1, (self.view0 + self._span()) * k,
-                            h - 1, outline=TEXT)
-        ov.create_line(self.playhead * k, 0, self.playhead * k, h,
-                       fill=_C_PLAYHEAD, width=2, tags=("ph",))
+        # The strip only changes with the cut; a redraw mostly just moves the
+        # view box.
+        key = (w, h, self.total_s, [(c.start, c.end, c.colour()) for c in self.clips],
+               self.part_marks, [(m["t"], m["kind"]) for m in self.markers])
+        if key != self._ov_key:
+            self._ov_key = key
+            ov.delete("all")
+            for c in self.clips:
+                ov.create_rectangle(c.start * k, 7, max(c.start * k + 1, c.end * k),
+                                    h - 7, fill=c.colour(), outline="")
+            for pt, _ in self.part_marks:
+                ov.create_line(pt * k, 0, pt * k, h, fill=_C_PART)
+            for m in self.markers:
+                ov.create_line(m["t"] * k, 0, m["t"] * k, 6,
+                               fill=self._mark_colour(m))
+            ov.create_rectangle(0, 1, 0, h - 1, outline=TEXT, tags=("view",))
+            ov.create_line(0, 0, 0, h, fill=_C_PLAYHEAD, width=2, tags=("ph",))
+        ov.coords("view", self.view0 * k, 1, (self.view0 + self._span()) * k, h - 1)
+        ov.coords("ph", self.playhead * k, 0, self.playhead * k, h)
 
     def _tc_text(self):
         """The playhead's time, to the millisecond once zoomed in that far."""
@@ -3513,7 +3623,7 @@ class AssemblyWindow(object):
             self.view0 = t - e.x / self.pps
         else:
             self.view0 -= notches * self._span() * 0.15
-        self.redraw()
+        self._redraw_soon()
 
     def _on_overview(self, e):
         if self.total_s <= 0:
@@ -3533,7 +3643,7 @@ class AssemblyWindow(object):
         frac = (anchor - self.view0) / self._span()
         self.pps = min(max(self.pps * factor, self._min_pps()), MAX_PPS)
         self.view0 = anchor - frac * self._span()
-        self.redraw()
+        self._redraw_soon()
 
     def return_to_zero(self):
         """Back to the top of the cut, as Pro Tools' Return to Zero: the
@@ -3804,6 +3914,24 @@ class AssemblyWindow(object):
         except tk.TclError:
             pass
 
+    def _cancel_timers(self):
+        """Every timer of this window's.  Tk would keep them after it is gone
+        and run them by a name a new widget's handler can since have been given:
+        that handler then gets called with no event, and the TypeError is all
+        anyone sees of it."""
+        win = self.win
+        try:
+            mine = set(win._tclCommands or ())
+            for job in win.tk.splitlist(win.tk.call("after", "info")):
+                try:
+                    script = win.tk.splitlist(win.tk.call("after", "info", job))[0]
+                except tk.TclError:
+                    continue             # ran or went while looking
+                if script in mine:
+                    win.after_cancel(job)
+        except tk.TclError:
+            pass
+
     def close(self):
         if self._closed:
             return
@@ -3813,13 +3941,7 @@ class AssemblyWindow(object):
         if self.player is not None:
             self.player.close()
         self._pool.shutdown(wait=False, cancel_futures=True)
-        for aid in (self._refresh_after, self._tx_render_after,
-                    self._tx_scroll_after):
-            if aid is not None:
-                try:
-                    self.win.after_cancel(aid)
-                except tk.TclError:
-                    pass
+        self._cancel_timers()
         try:
             self.win.destroy()
         except tk.TclError:

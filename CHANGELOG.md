@@ -4,6 +4,13 @@
 
 ## October 30, 2026
 
+### Assembly and Step 4: rendering speed
+- **The script pane no longer redraws all of itself every time words come in.** While a transcript pass ran, the whole pane was rebuilt every 1.2 seconds, and that stalled the whole window. Now only the pulls whose words changed are replaced. On a real 248-pull episode, one of those updates went from about 400 ms to about 16 ms, and the time an edit takes to show went from about 200 ms to about 55 ms.
+- **The track redraws less, and more cheaply.** It redraws only when words in view have changed, and a burst of wheel notches or held-down zoom keys draws once. The overview strip is redrawn only when the cut changes. A redraw went from about 60 ms to about 36 ms.
+- **Step 4 opens faster:** about 3.5 seconds down to about 1.25 on the same episode. It was laying every card out twice.
+- **With FOCUS on, Step 4 now opens with one part open.** It used to open with every part open until you clicked one.
+- **Fixed the scrollbar error in the console window** (`_SlimScrollbar ... missing 1 required positional argument: 'e'`). Closing the Assembly left its timers running, and one could fire into a new screen's scrollbar. Closing now cancels them all.
+
 ### Assembly view: cancel the transcript refinement
 - **The Refine button becomes Cancel refining while a pass runs.** The pass stops at its next segment and stays stopped, including when you come back to Step 4 or pick another model, until you press Refine or reconcile the script again. What it had heard of the file it was on is dropped, so that file goes back to its draft; files it had finished keep their new words.
 

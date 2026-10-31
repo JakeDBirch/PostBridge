@@ -449,6 +449,7 @@ def test_selection_edges_stop_short_and_reach_the_region_edge(view):
     _drag(app, win, 1, "before", 1, "dawn.")
     assert win._range[2] == pytest.approx(4.0)      # nothing said after it
     # A long pause: only SEL_PAD of it goes with the word.
+    app.words = [dict(w) for w in app.words]   # new words come as a new list
     app.words[7]["start"] = 13.0
     app.words[7]["end"] = 13.5
     win.refresh()
@@ -804,3 +805,158 @@ def test_busy_while_listening_or_mid_gesture(view):
     assert win.busy()
     win._on_text_release(_E(x, y))
     assert not win.busy()
+
+
+# ── Drawing only what changed ───────────────────────────────────────────────
+def _dump(win):
+    """The text and every tag on it but the ones that come and go."""
+    t = win.text
+    tags = {g: [str(i) for i in t.tag_ranges(g)] for g in t.tag_names()
+            if g not in ("sel", "word", "cur", "sel_pull", "txsel")}
+    return t.get("1.0", "end"), {g: r for g, r in tags.items() if r}
+
+
+def _watch_inserts(win, monkeypatch):
+    calls = []
+    t = win.text
+    real_ins, real_del = t.insert, t.delete
+    monkeypatch.setattr(t, "insert", lambda *a: (calls.append(a), real_ins(*a))[1])
+    monkeypatch.setattr(t, "delete", lambda *a: (calls.append(a), real_del(*a))[1])
+    return calls
+
+
+def test_render_with_nothing_new_leaves_the_text_alone(view, monkeypatch):
+    _app, win = view
+    calls = _watch_inserts(win, monkeypatch)
+    assert win._render_script() is False
+    assert calls == []
+
+
+def test_new_words_replace_only_their_own_pull(view, monkeypatch):
+    app, win = view
+    calls = _watch_inserts(win, monkeypatch)
+    app.words = [dict(w) for w in app.words]
+    app.words[-1]["text"] = " afterwards."
+    assert win._render_script() is True
+    assert "afterwards." in _body(win, 2)
+    assert "We walked the ridge" in _body(win, 1)
+    # One delete and one insert, with pull 1 left where it was.
+    assert [len(c) > 2 for c in calls] == [False, True]
+    assert win.text.compare(calls[0][0], ">=", win.text.tag_ranges("o1")[-1])
+
+
+def test_patched_text_is_what_a_full_drawing_gives(view):
+    """Text and tags alike, or the words stop lining up with their timings."""
+    app, win = view
+    app.words = [dict(w) for w in app.words]
+    app.words[3]["text"] = " wandered"                 # pull 1
+    app.words[-2]["text"] = " shifted"                 # pull 2
+    win._render_script()
+    patched = _dump(win)
+    win._tx_shape = None
+    win._render_script()
+    assert _dump(win) == patched
+
+
+def test_a_pull_gaining_its_first_words_redraws_the_shape(view):
+    app, win = view
+    before = win._tx_shape
+    app.results.append(dict(order=4, token="HOST", status="ok", part_index=0,
+                            segments=[], quote_text="A new speaker's line."))
+    win._render_script()
+    assert win._tx_shape != before
+    assert "HOST\n" in _all_text(win)
+
+
+def test_karaoke_and_highlight_survive_a_patch(view):
+    app, win = view
+    _drag(app, win, 2, "Nothing", 2, "moved")
+    win.playhead = win._clip(1).start + 0.8
+    win._light_script_word()
+    assert win._lit_script is not None
+    app.words = [dict(w) for w in app.words]
+    app.words[-1]["text"] = " afterwards."
+    win._tx_render_now()
+    assert _highlighted(win) == "Nothing moved"
+    t = win.text
+    assert t.tag_ranges("word")                        # lit again, not lost
+
+
+def test_words_off_screen_do_not_redraw_the_track(view, monkeypatch):
+    app, win = view
+    drawn = []
+    monkeypatch.setattr(win, "redraw", lambda: drawn.append(True))
+    win.view0, win.pps = 1000.0, 100.0                 # well past the cut
+    app.words = [dict(w) for w in app.words]
+    app.words[-1]["text"] = " afterwards."
+    win.transcript_changed(win.clips[0].play_path)
+    win._tx_render_now()
+    assert drawn == []
+    win.view0 = 0.0
+    app.words = [dict(w) for w in app.words]
+    app.words[3]["text"] = " wandered"
+    win.transcript_changed(win.clips[0].play_path)
+    win._tx_render_now()
+    assert drawn == [True]
+
+
+def test_scrolling_stays_put_when_a_pull_below_changes(view):
+    """And with one above it changing, the same words stay at the top."""
+    app, win = view
+    win.text.config(height=2)
+    app.update()
+    win.text.yview("o2.first")
+    app.update()
+    top = win._text_top()
+    app.words = [dict(w) for w in app.words]
+    app.words[3]["text"] = " wandered off along"       # pull 1, above
+    win._render_script()
+    app.update()
+    assert win._text_top() == top
+
+
+def test_wheel_notches_make_one_redraw(view, monkeypatch):
+    app, win = view
+    app.update()
+    drawn = []
+    monkeypatch.setattr(win, "redraw", lambda: drawn.append(True))
+
+    class _W(object):
+        delta, state, x = -120, 0, 10
+    for _ in range(6):
+        win._on_wheel(_W())
+    assert drawn == []
+    app.update()
+    assert drawn == [True]
+
+
+def test_overview_strip_is_only_drawn_again_when_the_cut_changes(view):
+    app, win = view
+    win.pps = 2000.0                                   # zoomed in: room to scroll
+    win.redraw()
+    box = win.ov.find_withtag("view")
+    win.view0 += 1.0
+    win.redraw()
+    assert win.ov.find_withtag("view") == box          # moved, not remade
+    x0 = win.ov.coords("view")[0]
+    win.view0 += 1.0
+    win.redraw()
+    assert win.ov.coords("view")[0] != x0
+    _res(app, 1)["segments"] = [(10.0, 13.0)]
+    win.refresh()
+    assert win.ov.find_withtag("view") != box
+
+
+def test_closing_takes_every_timer_with_it(view):
+    """One left behind fires by a command name a new widget's handler may have
+    been given since: the TypeError from _SlimScrollbar's <Configure> lambda."""
+    app, win = view
+    w = win.win
+    job = w.after(60000, lambda: None)
+    glide = w.after_idle(lambda: None)
+    other = app.after(60000, lambda: None)
+    win.close()
+    pending = app.tk.splitlist(app.tk.call("after", "info"))
+    assert job not in pending and glide not in pending
+    assert other in pending
+    app.after_cancel(other)
