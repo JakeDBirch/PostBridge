@@ -198,6 +198,9 @@ class MatchReviewDialog:
         The matched text — shown as context above the waveform.
     on_accept : callable(segments)
         Called with the (possibly adjusted) segments list on accept.
+    on_next : callable()
+        Opens the next clip in the sequence.  None (the last clip, or a
+        caller with no sequence) leaves the NEXT CLIP button off.
     fps : float
         Sequence frame rate — used for nudge step size.
     """
@@ -207,10 +210,11 @@ class MatchReviewDialog:
                  context_before="", context_after="",
                  scripted_tc="",
                  on_accept=None, fps=24.0,
-                 pool_by_token=None):
+                 pool_by_token=None, on_next=None):
         self._parent          = parent
         self._audio_path      = source_audio
         self._on_accept       = on_accept
+        self._on_next         = on_next
         self._fps             = fps
         self._frame_s         = 1.0 / max(1.0, fps)
         self._sr              = _SR
@@ -267,6 +271,8 @@ class MatchReviewDialog:
             self._segments = _clean
         self._in_s       = self._segments[0][0]  if self._segments else 0.0
         self._out_s      = self._segments[-1][1] if self._segments else 0.0
+        # What the clip opened as, so NEXT CLIP can tell whether it was edited.
+        self._opened_segs = self._edited_segments()
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -781,6 +787,16 @@ class MatchReviewDialog:
         accept.bind("<Enter>", lambda e: accept.config(bg="#4a9a51"))
         accept.bind("<Leave>", lambda e: accept.config(bg=SUCCESS))
         accept.bind("<ButtonRelease-1>", lambda e: self._on_accept_click())
+
+        if self._on_next:
+            nxt = tk.Label(bot, text="NEXT CLIP  ▶", font=FBT,
+                           bg=SURF3, fg=TEXT, cursor="hand2",
+                           padx=16, pady=6, bd=0,
+                           highlightbackground=BORDER, highlightthickness=1)
+            nxt.pack(side="right", padx=(0, 8))
+            nxt.bind("<Enter>", lambda e: nxt.config(bg=ACCENT, fg=BG))
+            nxt.bind("<Leave>", lambda e: nxt.config(bg=SURF3, fg=TEXT))
+            nxt.bind("<ButtonRelease-1>", lambda e: self._on_next_click())
 
     # ── Extraction ────────────────────────────────────────────────────────
     #
@@ -1891,6 +1907,8 @@ class MatchReviewDialog:
             sl = self._segments[-1]
             self._segments[0]  = [new_in,  s0[1]]
             self._segments[-1] = [sl[0],   new_out]
+        # The snap isn't an edit of the user's.
+        self._opened_segs = self._edited_segments()
 
         # Re-anchor the playhead to the snapped IN.  __init__ parked it
         # on the ORIGINAL in-point, but the IN candidate window reaches
@@ -3249,18 +3267,32 @@ class MatchReviewDialog:
 
     # ── Accept / Cancel ───────────────────────────────────────────────────
 
-    def _on_accept_click(self):
+    def _edited_segments(self):
         # _in_s / _out_s hold the user-adjusted outer boundaries.
         # Interior boundaries are stored directly in _segments (modified on drag).
         new_segs = [list(s) for s in self._segments]
-        new_segs[0][0]  = self._in_s
-        new_segs[-1][1] = self._out_s
+        if new_segs:
+            new_segs[0][0]  = self._in_s
+            new_segs[-1][1] = self._out_s
         for seg in new_segs:
             if seg[1] <= seg[0]:
                 seg[1] = seg[0] + self._frame_s
+        return [(s[0], s[1]) for s in new_segs]
+
+    def _on_accept_click(self):
+        new_segs = self._edited_segments()
         self._cleanup()
         if self._on_accept:
-            self._on_accept([(s[0], s[1]) for s in new_segs])
+            self._on_accept(new_segs)
+
+    def _on_next_click(self):
+        """On to the next clip.  An edit made here is kept, as ACCEPT would
+        keep it; a clip only looked at stays as it was, not accepted."""
+        if self._edited_segments() != self._opened_segs:
+            self._on_accept_click()
+        else:
+            self._cleanup()
+        self._on_next()
 
     def _on_cancel(self):
         self._cleanup()

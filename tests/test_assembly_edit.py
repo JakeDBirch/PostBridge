@@ -442,6 +442,73 @@ def test_editor_accept_edits_its_own_card(tmp_path):
         app.destroy()
 
 
+def test_next_clip_walks_the_sequence_keeping_only_real_edits(tmp_path):
+    """NEXT CLIP opens the next pull that's in the cut.  A pull only looked at
+    stays unaccepted, a pull edited is kept, and the last one has no button."""
+    import wave
+    import main
+    wav = str(tmp_path / "GUEST.wav")
+    with wave.open(wav, "w") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000 * 40)
+    try:
+        app = main.App()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        app.results = [
+            dict(order=o, token="GUEST", status="ok", part_index=0,
+                 segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
+                 rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
+                 source_audio=wav)
+            for o, a in ((1, 2.0), (2, 10.0), (3, 20.0), (4, 30.0))]
+        app.parts = [{"index": 0, "name": "Part 0"}]
+        app.tokens, app.workflow = ["GUEST"], "script_session"
+        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2, 3, 4)]
+        app._script_path = str(tmp_path / "script.txt")
+        app.update()
+        app._step4()
+        for _ in range(60):
+            app.update()
+        card = {e["res"]["order"]: e for e in app._rv}
+        card[3]["toggle_ignore_fn"]()
+        import match_review
+        dialogs = []
+        orig = match_review.MatchReviewDialog.__init__
+
+        def _init(self, *a, **k):
+            orig(self, *a, **k)
+            dialogs.append(self)
+        match_review.MatchReviewDialog.__init__ = _init
+        try:
+            card[1]["open_review_fn"]()
+            app.update()
+            first = dialogs[-1]
+            first._on_next_click()          # only looked at
+            app.update()
+            assert not first._win.winfo_exists()
+            assert len(dialogs) == 2 and dialogs[-1]._current_token == "GUEST"
+            assert dialogs[-1]._quote_text == "line 2"
+            assert card[1]["res"].get("_s4_accepted") is None
+            assert card[1]["res"]["segments"] == [[2.0, 4.0]]
+
+            second = dialogs[-1]
+            second._in_s += 0.5             # edited
+            second._on_next_click()
+            app.update()
+            assert card[2]["res"]["_s4_accepted"] is True
+            assert [list(s) for s in card[2]["res"]["segments"]] == [[10.5, 12.0]]
+
+            last = dialogs[-1]              # past the ignored pull
+            assert last._quote_text == "line 4"
+            assert last._on_next is None
+            last._on_cancel()
+        finally:
+            match_review.MatchReviewDialog.__init__ = orig
+    finally:
+        app.destroy()
+
+
 def test_default_gap_is_set_in_the_assembly(view):
     app, win = view
     _res(app, 2)["gap_after_s"] = 1.0       # a gap set by hand

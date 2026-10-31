@@ -8774,7 +8774,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                       on_accept=lambda *a, _sa=sa, **k:
                                           acc(*a, apath=_sa, **k),
                                       fps=fps,
-                                      pool_by_token=_pool_by_token)
+                                      pool_by_token=_pool_by_token,
+                                      on_next=(
+                                          (lambda o=_this_order:
+                                              self._s4_open_next_card(o))
+                                          if self._s4_next_card(_this_order)
+                                          else None))
                     try:
                         _w = _dlg._win
                         _w.bind("<Destroy>",
@@ -9072,6 +9077,19 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         e = next((e for e in getattr(self, "_rv", [])
                   if e["res"].get("order") == order), None)
         if e is not None and e.get("open_review_fn"):
+            e["open_review_fn"]()
+
+    def _s4_next_card(self, order):
+        """The card after `order` in the sequence.  Ignored pulls are passed
+        over: they aren't in the cut, and their cards don't open."""
+        later = [e for e in getattr(self, "_rv", [])
+                 if e["res"].get("order", 0) > order and not e["skip_var"].get()]
+        return min(later, key=lambda e: e["res"].get("order", 0), default=None)
+
+    def _s4_open_next_card(self, order):
+        """NEXT CLIP in the waveform editor, once it has closed."""
+        e = self._s4_next_card(order)
+        if e is not None:
             e["open_review_fn"]()
 
     def _assembly_set_segments(self, order, segments, gaps=None):
