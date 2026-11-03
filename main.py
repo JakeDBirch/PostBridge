@@ -4572,8 +4572,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                 removed, "s" if removed != 1 else ""))
 
     def _refresh_pool(self):
-        """Sync pool with disk: remove missing entries and add any new files
-        found in the same directories as existing pool entries."""
+        """Sync the pool with disk: offer to drop entries whose file is gone
+        and to add media found in the folders the pool's files are in.
+
+        Nothing changes until the user says so, and what is added comes in
+        unassigned: the pool's assignments are what the export carries, and
+        a whole folder auto-assigned by name once flooded a session with
+        tracks it was never meant to have."""
         if not self._pool:
             return
 
@@ -4588,53 +4593,68 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
             ".wma", ".caf",
         }
+        pool = self._pool
+        UNASSIGNED = "— unassigned —"
 
         # Collect source directories BEFORE removing anything so we don't
         # lose track of folders if all their files happened to be stale.
-        source_dirs = {os.path.dirname(r["path"]) for r in self._pool._rows}
-
-        # ── 1. Remove stale entries ───────────────────────────────────────
-        stale = [r for r in self._pool._rows if not os.path.isfile(r["path"])]
-        for rec in stale:
-            self._pool._remove(rec)
-
-        # ── 2. Add new files from the same directories ────────────────────
-        added = 0
+        source_dirs = {os.path.dirname(r["path"]) for r in pool._rows}
+        stale = [r for r in pool._rows if not os.path.isfile(r["path"])]
+        have = {os.path.normcase(r["path"]) for r in pool._rows}
+        found = []
         for d in sorted(source_dirs):
             if not os.path.isdir(d):
                 continue
             for fn in sorted(os.listdir(d)):
-                if os.path.splitext(fn)[1].lower() not in MEDIA_EXTS:
+                if os.path.splitext(fn)[1].lower() not in MEDIA_EXTS                         or fn.startswith("._"):
                     continue
                 fp = os.path.join(d, fn)
-                if not os.path.isfile(fp):
-                    continue
-                before = len(self._pool._rows)
-                self._pool._add(fp)          # _add() deduplicates & auto-assigns
-                if len(self._pool._rows) > before:
-                    added += 1
+                if os.path.normcase(fp) not in have and os.path.isfile(fp):
+                    found.append(fp)
 
-        # ── 3. For AAF, prune video rows that now have audio counterparts ────
-        pruned = 0
-        if self.workflow in ("script_aaf", "script_session"):
-            pruned = self._pool.prune_redundant_videos()
-
-        # ── 4. Report ─────────────────────────────────────────────────────
-        parts = []
-        if stale:
-            parts.append("Removed {} missing file{}.".format(
-                len(stale), "s" if len(stale) != 1 else ""))
-        if added:
-            parts.append("Added {} new file{}.".format(
-                added, "s" if added != 1 else ""))
-        if pruned:
-            parts.append("Removed {} redundant video file{} (audio present).".format(
-                pruned, "s" if pruned != 1 else ""))
-        if not parts:
+        if not stale and not found:
             messagebox.showinfo("Pool Refresh",
                                 "Pool is current — nothing to add or remove.")
-        else:
-            messagebox.showinfo("Pool Refresh", "\n".join(parts))
+            return
+        def _names(paths):
+            shown = [os.path.basename(p) for p in paths[:8]]
+            more = len(paths) - len(shown)
+            return "\n".join("   " + n for n in shown) + (
+                "\n   … and {} more".format(more) if more > 0 else "")
+        what = []
+        if stale:
+            what.append("Remove {} file{} no longer on disk, with {} assignment{}:\n{}".format(
+                len(stale), "s" if len(stale) != 1 else "",
+                "its" if len(stale) == 1 else "their",
+                "" if len(stale) == 1 else "s", _names([r["path"] for r in stale])))
+        if found:
+            what.append("Add {} file{} found in the same folders, unassigned:\n{}".format(
+                len(found), "s" if len(found) != 1 else "", _names(found)))
+        if not messagebox.askyesno("Pool Refresh", "\n\n".join(what) + "\n\nGo ahead?",
+                                   default="no", parent=self):
+            return
+
+        for rec in stale:
+            pool._remove(rec)
+        added = 0
+        pool._bulk_loading = True        # no re-pairing by name as they land
+        try:
+            for fp in found:
+                before = len(pool._rows)
+                pool._add(fp)
+                if len(pool._rows) > before:
+                    rec = pool._rows[-1]
+                    pool._auto_assigned.discard(fp)
+                    if rec["var"].get() != UNASSIGNED:
+                        rec["var"].set(UNASSIGNED)
+                    added += 1
+        finally:
+            pool._bulk_loading = False
+        pool._refresh_count()
+
+        # For AAF, prune video rows that now have audio counterparts
+        if self.workflow in ("script_aaf", "script_session"):
+            pool.prune_redundant_videos()
 
     def _preflight_memory_check(self):
         """Return True to proceed, False to abort.

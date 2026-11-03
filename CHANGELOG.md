@@ -4,6 +4,11 @@
 
 ## November 3, 2026
 
+### Step 2's REFRESH asks first, and adds files unassigned
+- **REFRESH now says what it found and asks before changing the pool.** It used to add every media file in every folder holding a pool file, which on Mike Williams meant 45 more, and assign each one to a token guessed from its name. Since the export carries every assigned file, that could add tracks to a session, and saving kept them.
+- **What it adds comes in unassigned,** so a refresh never changes what the export carries. Assign the ones you want yourself.
+- **A file no longer on disk is named before it is removed,** with its assignment, so a drive that isn't mounted can't quietly empty the pool.
+
 ### Export says when a side of a conversation has gone missing
 - **Export now warns before building when a token has lost a recording since it was matched.** Scott's side had dropped out of Mike Williams' Step 2 pool after his pulls were matched in the mix of both sides, so the export carried only Jordan's. The warning names each token and the files Step 2 still gives it. Add the missing recording in Step 2, assign it to the token, and export again. It also shows if a recording has changed on disk since it was matched.
 - **A token with no files in Step 2 no longer exports from the mix it was transcribed from.** That mix is for Whisper only, so those pulls are left out and the warning says why.
