@@ -9986,6 +9986,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             return
         edited, int_assets, vo_bin_data, all_paths = self._collect_export_inputs()
         order = res.get("order")
+        if not self._export_sides_ok([r for r in edited if r.get("order") == order],
+                                     int_assets):
+            return
         if not any(r.get("order") == order for r in edited):
             messagebox.showwarning(
                 "Can't export this pull",
@@ -10062,12 +10065,33 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _export_sides_ok(self, edited, int_assets):
+        """A token matched in a mix of its recordings that has since lost one
+        from Step 2 would export without that side: say so first."""
+        short = engines.tokens_short_of_their_match(edited, int_assets)
+        if not short:
+            return True
+        lines = "\n".join("{}:  {}".format(tok, ", ".join(
+            os.path.basename(p) for p in files) or "no files")
+            for tok, files in sorted(short.items()))
+        return messagebox.askyesno(
+            "A side may be missing",
+            "These were matched in a mix of their recordings that Step 2 no "
+            "longer gives them all of, so the export would leave a side "
+            "out.  What Step 2 gives them now:\n\n{}\n\nTo put it back, add "
+            "the missing recording in Step 2 and assign it to the token.  "
+            "(This also shows if a recording has changed on disk since it "
+            "was matched.)\n\nExport anyway?".format(lines),
+            default="no", parent=self)
+
     def _build(self):
         if not self.out_path.get():
             messagebox.showwarning("No Path", "Choose a save location first.")
             return
 
         edited, int_assets, vo_bin_data, all_paths = self._collect_export_inputs()
+        if not self._export_sides_ok(edited, int_assets):
+            return
 
         seq_name = self.seq_name.get()
         gap_secs = self.gap_var.get()

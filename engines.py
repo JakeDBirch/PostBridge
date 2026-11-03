@@ -4618,7 +4618,7 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             # As interview_export_paths: a token Step 2 gave no files to plays
             # the file the pull was matched in.
             paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok)
-                                  or [res.get("source_audio"), res.get("source_video")])
+                                  or _matched_files(res))
                       if p and not _is_temp_mix_path(p)]
 
             host_vpaths, guest_vpaths = split_host_guest(
@@ -5587,6 +5587,42 @@ def _is_temp_mix_path(p):
     return bool(p) and os.path.basename(p).startswith("_pb_mix_")
 
 
+def _is_cached_mix_path(p):
+    """The same mix, kept in the transcript cache (_stable_mix_cache_path):
+    something to transcribe, never anything to export."""
+    return bool(p) and bool(re.match(r"mix_[0-9a-f]{16}\.wav$", os.path.basename(p)))
+
+
+def _matched_files(res):
+    """The file a pull was matched in, as a last resort to export from: not
+    when that was a token's mix of its recordings."""
+    return [p for p in (res.get("source_audio"), res.get("source_video"))
+            if p and not _is_cached_mix_path(p)]
+
+
+def tokens_short_of_their_match(results, int_assets):
+    """Tokens whose pulls were matched in a mix of their recordings that Step 2
+    no longer gives them all of: {token: the audio files it has now}.  The mix
+    is named from exactly what went into it, so a side that has since gone
+    missing from the pool -- and would be missing from the export -- shows.
+    A recording changed on disk since shows too: the name takes in its size
+    and time.  Nothing is said without a transcript cache to name mixes by."""
+    out, seen = {}, set()
+    if not _cache_dir:
+        return out
+    for r in results or []:
+        tok, src = r.get("token"), r.get("source_audio") or ""
+        if r.get("is_vo") or tok in seen or not _is_cached_mix_path(src):
+            continue
+        seen.add(tok)
+        now = [p for p in (int_assets or {}).get(tok, [])
+               if p and not is_video(p) and not _is_temp_mix_path(p)]
+        want = _stable_mix_cache_path(now) if now else None
+        if not want or os.path.basename(want) != os.path.basename(src):
+            out[tok] = now
+    return out
+
+
 def interview_export_paths(res, int_assets):
     """The files an interview pull is exported from, in track order.
 
@@ -5598,7 +5634,7 @@ def interview_export_paths(res, int_assets):
     """
     paths = [p for p in (res.get("_export_paths")
                          or (int_assets or {}).get(res.get("token"))
-                         or [res.get("source_audio"), res.get("source_video")])
+                         or _matched_files(res))
              if p and not _is_temp_mix_path(p)]
     apaths = [p for p in paths if p and is_audio(p)]
     if not apaths:

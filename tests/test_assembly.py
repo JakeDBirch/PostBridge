@@ -75,6 +75,30 @@ def test_a_token_with_no_files_in_step_2_plays_the_file_it_was_matched_in():
     assert placed[0]["paths"] == ["guest.wav"]
 
 
+def test_a_token_that_lost_a_side_since_it_was_matched_is_named(tmp_path, monkeypatch):
+    """Scott's side went missing from Step 2's pool after his pulls were
+    matched in the mix of both sides, and the export left it out unremarked."""
+    monkeypatch.setattr(engines, "_cache_dir", str(tmp_path / ".pb_cache"))
+    host, guest = tmp_path / "jordan.wav", tmp_path / "scott.wav"
+    host.write_bytes(b"h" * 100)
+    guest.write_bytes(b"g" * 200)
+    both = engines._stable_mix_cache_path([str(host), str(guest)])
+    rows = [_int(1, [(0.0, 1.0)], token="SCOTT", source_audio=both),
+            _int(2, [(0.0, 1.0)], source_audio=str(tmp_path / "guest.wav")),
+            _vo(3, [(0.0, 1.0)])]
+    assert engines.tokens_short_of_their_match(
+        rows, {"SCOTT": [str(guest), str(host)], "GUEST": ["guest.wav"]}) == {}
+    assert engines.tokens_short_of_their_match(
+        rows, {"SCOTT": [str(host)]}) == {"SCOTT": [str(host)]}
+    # A camera beside them is no side; with no files at all it still says so.
+    assert engines.tokens_short_of_their_match(
+        rows, {"SCOTT": [str(host), str(guest), "cam.mp4"]}) == {}
+    assert engines.tokens_short_of_their_match(rows, {}) == {"SCOTT": []}
+    # And a token with no files never exports the transcription mix.
+    placed, skipped, _ = engines.layout_timeline(rows[:1], 0.5, SR, {})
+    assert not placed and [r["order"] for r in skipped] == [1]
+
+
 def test_vo_without_audio_still_holds_its_gap():
     placed, _, _ = engines.layout_timeline(
         [_vo(1, [(1.0, 2.0)], apath=None), _vo(2, [(1.0, 2.0)])],

@@ -4,6 +4,10 @@
 
 ## November 3, 2026
 
+### Export says when a side of a conversation has gone missing
+- **Export now warns before building when a token has lost a recording since it was matched.** Scott's side had dropped out of Mike Williams' Step 2 pool after his pulls were matched in the mix of both sides, so the export carried only Jordan's. The warning names each token and the files Step 2 still gives it. Add the missing recording in Step 2, assign it to the token, and export again. It also shows if a recording has changed on disk since it was matched.
+- **A token with no files in Step 2 no longer exports from the mix it was transcribed from.** That mix is for Whisper only, so those pulls are left out and the warning says why.
+
 ### Google Docs: no README to read before it works
 - **The installer can carry the Google set-up.** With the repository secrets `GOOGLE_CLIENT_JSON` and `GOOGLE_PICKER_KEY` set, the Windows and macOS builds include the team's OAuth client file and Picker key, so Google Docs works straight after installing.
 - **Otherwise PostBridge walks you through it.** The first time you use Google Docs, it says which of the two files it needs, lets you choose each one, checks it is the right kind of file (a Desktop app client, a real API key) and copies it where it belongs. It used to point you to the README.
