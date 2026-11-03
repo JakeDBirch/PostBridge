@@ -2,6 +2,11 @@
 
 ---
 
+## November 3, 2026
+
+### Pulls whose recording isn't assigned in Step 2 are back in the cut
+- **A pull now plays from the file it was matched in when Step 2 gives its token no files.** Every one of that token's pulls was left out of the Assembly, and out of the AAF and XML exports, though Step 4 listed them. On Mike Williams that was all ten BRIAN_WINCHESTER_CONFESSION pulls. When Step 2 does give the token files, those are still what plays.
+
 ## October 30, 2026
 
 ### Assembly and Step 4: rendering speed

@@ -4615,8 +4615,11 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
         else:
             tok    = res["token"]
-            paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok, []))
-                      if not _is_temp_mix_path(p)]
+            # As interview_export_paths: a token Step 2 gave no files to plays
+            # the file the pull was matched in.
+            paths  = [p for p in (res.get("_export_paths") or int_assets.get(tok)
+                                  or [res.get("source_audio"), res.get("source_video")])
+                      if p and not _is_temp_mix_path(p)]
 
             host_vpaths, guest_vpaths = split_host_guest(
                 [p for p in paths if p and is_video(p)])
@@ -5590,11 +5593,13 @@ def interview_export_paths(res, int_assets):
     _export_paths means the pull was pointed at other audio than its token's
     files (set by the app's export-input collection).  Pure-audio files are
     preferred; video files are the fallback, their embedded audio extracted
-    by ffmpeg (-vn).  Empty means the pull has nothing to place.
+    by ffmpeg (-vn).  A token Step 2 gave no files to falls back to the file
+    the pull was matched in.  Empty means the pull has nothing to place.
     """
     paths = [p for p in (res.get("_export_paths")
-                         or (int_assets or {}).get(res.get("token"), []))
-             if not _is_temp_mix_path(p)]
+                         or (int_assets or {}).get(res.get("token"))
+                         or [res.get("source_audio"), res.get("source_video")])
+             if p and not _is_temp_mix_path(p)]
     apaths = [p for p in paths if p and is_audio(p)]
     if not apaths:
         apaths = [p for p in paths if p and is_video(p)]

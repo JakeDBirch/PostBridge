@@ -55,6 +55,26 @@ def test_gap_overrides_and_skips():
     assert [r["order"] for r in skipped] == [3]
 
 
+def test_a_token_with_no_files_in_step_2_plays_the_file_it_was_matched_in():
+    """All ten of a token's pulls went missing from the Assembly and the
+    export: Step 2 had given its recording to no one, though every pull knew
+    which file it was matched in."""
+    placed, skipped, _ = engines.layout_timeline(
+        [_int(1, [(0.0, 1.0)]),
+         _int(2, [(5.0, 6.0)], token="CONFESSION", source_audio="confession.wav"),
+         _int(3, [(7.0, 8.0)], token="CONFESSION",
+              source_audio=os.path.join("tmp", "_pb_mix_CONFESSION.wav")),
+         _int(4, [(9.0, 9.5)], token="CONFESSION", source_video="confession.mp4")],
+        0.5, SR, ASSETS)
+    assert [(e["res"]["order"], e["paths"]) for e in placed] == [
+        (1, ["guest.wav"]), (2, ["confession.wav"]), (4, ["confession.mp4"])]
+    assert [r["order"] for r in skipped] == [3]     # a temporary mix never exports
+    # Step 2's files still win when it has some.
+    placed, _, _ = engines.layout_timeline(
+        [_int(1, [(0.0, 1.0)], source_audio="other.wav")], 0.5, SR, ASSETS)
+    assert placed[0]["paths"] == ["guest.wav"]
+
+
 def test_vo_without_audio_still_holds_its_gap():
     placed, _, _ = engines.layout_timeline(
         [_vo(1, [(1.0, 2.0)], apath=None), _vo(2, [(1.0, 2.0)])],
@@ -285,6 +305,18 @@ def test_xml_places_silence_at_a_join(tmp_path):
               int(ci.find("in").text))
              for tr in xmeml.iter("track") for ci in tr.iter("clipitem")]
     assert clips == [(0, 24, 24), (36, 84, 48), (96, 120, 120)]
+
+
+def test_xml_exports_a_token_with_no_files_from_its_matched_file(tmp_path):
+    wav = _guest_wav(tmp_path)
+    xmeml, _ = engines.build_xml(
+        [_int(1, [(1.0, 2.0)], token="CONFESSION", source_audio=wav,
+              rec_in_s=1.0, rec_out_s=2.0)],
+        {"GUEST": [str(tmp_path / "someone_else.wav")]}, {}, [], "cut", 0.5,
+        seq_fps=24)
+    files = {os.path.normcase(f.find("pathurl").text.split("/")[-1])
+             for f in xmeml.iter("file") if f.find("pathurl") is not None}
+    assert os.path.normcase(os.path.basename(wav)) in files
 
 
 def test_inflections_and_notes_are_counted_and_get_their_tracks(tmp_path):
