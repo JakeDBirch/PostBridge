@@ -35,6 +35,7 @@ import http.server
 import json
 import os
 import re
+import sys
 import threading
 import urllib.parse
 import webbrowser
@@ -54,8 +55,11 @@ NOTE_BG     = {"red": 1.0, "green": 0.86, "blue": 0.62}
 # ── Configuration ─────────────────────────────────────────────────────────
 
 def _candidates(name):
+    """Where set-up files are looked for: the app-data folder (set up on this
+    machine) first, then the installed app's own copy, then the source."""
     here = os.path.dirname(os.path.abspath(__file__))
-    return [os.path.join(app_state_dir(), name), os.path.join(here, name)]
+    bundle = getattr(sys, "_MEIPASS", None)
+    return [os.path.join(d, name) for d in (app_state_dir(), bundle, here) if d]
 
 
 def client_config_path():
@@ -99,11 +103,44 @@ def project_number():
         return ""
 
 
-def setup_message():
-    return ("Google Docs is not set up on this machine.\n\n"
-            "Put the OAuth client file as {} and the picker key as {} in\n"
-            "{}\n\nThe README's 'Google Docs' section says how to get them."
-            .format(CLIENT_FILE, PICKER_FILE, app_state_dir()))
+def is_ready():
+    """Both set-up files present: sign-in and the picker can both work."""
+    return is_configured() and bool(picker_key())
+
+
+def install_setup(client_src=None, key_src=None):
+    """Check the chosen set-up files and copy them into the app-data folder.
+    Raises ValueError saying what is wrong with a file, before copying any."""
+    client = key = None
+    if client_src:
+        try:
+            with open(client_src, encoding="utf-8-sig") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            raise ValueError("{} isn't a Google client file (it isn't JSON)."
+                             .format(os.path.basename(client_src)))
+        if "web" in d:
+            raise ValueError("That client is a Web application. PostBridge needs an "
+                             "OAuth client of type Desktop app.")
+        c = d.get("installed") or {}
+        if not (c.get("client_id") and c.get("client_secret")):
+            raise ValueError("{} isn't a Google OAuth client file."
+                             .format(os.path.basename(client_src)))
+        client = json.dumps(d, indent=2)
+    if key_src:
+        try:
+            with open(key_src, encoding="utf-8-sig") as f:
+                key = f.read().strip()
+        except OSError as e:
+            raise ValueError(str(e))
+        if not re.fullmatch(r"AIza[0-9A-Za-z_\-]{35}", key):
+            raise ValueError("{} doesn't hold a Google API key (one starts with AIza)."
+                             .format(os.path.basename(key_src)))
+    os.makedirs(app_state_dir(), exist_ok=True)
+    for text, name in ((client, CLIENT_FILE), (key, PICKER_FILE)):
+        if text is not None:
+            with open(os.path.join(app_state_dir(), name), "w", encoding="utf-8") as f:
+                f.write(text + ("" if text.endswith("\n") else "\n"))
 
 
 # ── Sign-in ───────────────────────────────────────────────────────────────

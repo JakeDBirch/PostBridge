@@ -52,6 +52,26 @@ jobs:
           Invoke-WebRequest "$base/ffmpeg-win-x64.exe"  -OutFile "ffmpeg-bin\ffmpeg.exe"
           Invoke-WebRequest "$base/ffprobe-win-x64.exe" -OutFile "ffmpeg-bin\ffprobe.exe"
 
+      - name: Google Docs set-up (from repository secrets, when set)
+        # GOOGLE_CLIENT_JSON and GOOGLE_PICKER_KEY: the team's OAuth client
+        # file and Picker API key, which the spec bundles.  Without them the
+        # app asks for the files the first time Google Docs is used.
+        shell: python
+        env:
+          GOOGLE_CLIENT_JSON: ${{ secrets.GOOGLE_CLIENT_JSON }}
+          GOOGLE_PICKER_KEY: ${{ secrets.GOOGLE_PICKER_KEY }}
+        run: |
+          import os
+          for name, var in (("google_client.json", "GOOGLE_CLIENT_JSON"),
+                            ("google_picker_key.txt", "GOOGLE_PICKER_KEY")):
+              value = os.environ.get(var, "").strip()
+              if value:
+                  with open(name, "w", encoding="utf-8") as f:
+                      f.write(value)
+                  print("wrote", name)
+              else:
+                  print("::warning::" + var + " is not set; this build asks for Google Docs set-up on first use")
+
       - name: Build with PyInstaller
         run: pyinstaller PostBridge.spec --noconfirm
 

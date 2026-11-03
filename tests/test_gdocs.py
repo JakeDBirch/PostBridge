@@ -4,6 +4,7 @@ A Docs API document is a list of paragraphs with character ranges; notes
 are inserted right under the line they concern, highest index first so
 nothing shifts, each under a named range so the next pass can remove it.
 """
+import json
 import os
 import sys
 
@@ -301,6 +302,70 @@ def test_append_to_part_redoes_the_plan_if_the_doc_changed():
     assert len(tries) == 2 and len(docs.batches) == 1
     assert docs.batches[0]["writeControl"] == {"requiredRevisionId": "r1"}
     assert gdocs.list_parts(None, "doc1", docs=docs) == ["Open", "Part 1: The Lake"]
+
+
+CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",
+                        "client_secret": "s", "redirect_uris": ["http://localhost"]}}
+KEY = "AIza" + "B" * 35
+
+
+@pytest.fixture
+def setup_dirs(tmp_path, monkeypatch):
+    """An empty app-data folder, and no bundled or source copies."""
+    appdata = tmp_path / "appdata"
+    appdata.mkdir()
+    monkeypatch.setattr(gdocs, "app_state_dir", lambda: str(appdata))
+    monkeypatch.setattr(gdocs, "_candidates", lambda name: [str(appdata / name)])
+    return tmp_path, appdata
+
+
+def test_install_setup_checks_and_copies_both_files(setup_dirs):
+    tmp, appdata = setup_dirs
+    assert not gdocs.is_ready()
+    client, key = tmp / "client_secret_123.json", tmp / "key.txt"
+    client.write_text(json.dumps(CLIENT), encoding="utf-8-sig")     # a BOM is fine
+    key.write_text(KEY + "\n", encoding="utf-8")
+    gdocs.install_setup(str(client), str(key))
+    assert gdocs.is_ready()
+    assert json.loads((appdata / gdocs.CLIENT_FILE).read_text(encoding="utf-8")) == CLIENT
+    assert gdocs.picker_key() == KEY
+    assert gdocs.project_number() == "123"
+
+
+@pytest.mark.parametrize("content,why", [
+    ("not json", "isn't JSON"),
+    (json.dumps({"web": CLIENT["installed"]}), "Desktop app"),
+    (json.dumps({"installed": {"client_id": "x"}}), "isn't a Google OAuth client"),
+])
+def test_install_setup_refuses_a_wrong_client_file(setup_dirs, content, why):
+    tmp, appdata = setup_dirs
+    bad = tmp / "c.json"
+    bad.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=why):
+        gdocs.install_setup(str(bad), None)
+    assert not list(appdata.iterdir())
+
+
+def test_install_setup_refuses_a_wrong_key_and_copies_nothing(setup_dirs):
+    tmp, appdata = setup_dirs
+    client, key = tmp / "c.json", tmp / "k.txt"
+    client.write_text(json.dumps(CLIENT), encoding="utf-8")
+    key.write_text("not a key", encoding="utf-8")
+    with pytest.raises(ValueError, match="AIza"):
+        gdocs.install_setup(str(client), str(key))
+    assert not list(appdata.iterdir())
+
+
+def test_an_installed_copy_is_found_in_the_bundle(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / gdocs.CLIENT_FILE).write_text(json.dumps(CLIENT), encoding="utf-8")
+    (bundle / gdocs.PICKER_FILE).write_text(KEY, encoding="utf-8")
+    monkeypatch.setattr(gdocs, "app_state_dir", lambda: str(tmp_path / "empty"))
+    monkeypatch.setattr(gdocs.sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setattr(gdocs.os.path, "abspath", lambda p: str(tmp_path / "src" / "gdocs.py"))
+    assert gdocs.client_config_path() == str(bundle / gdocs.CLIENT_FILE)
+    assert gdocs.picker_key() == KEY
 
 
 def test_append_after_marker_or_at_end():

@@ -401,6 +401,7 @@ def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch
     doc = {"text": broken}
     calls = []
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
     monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id: (
         doc["text"], {"name": "Ep 7 script", "version": "3", "modifiedTime": "t"}))
@@ -447,6 +448,7 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
                 "[JENA 00:00:05-00:00:20]\nNo such session.\n")
     calls = {}
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
     monkeypatch.setattr(gdocs, "pick_document",
                         lambda creds, timeout=300: {"id": "doc123", "name": "Ep 7 script"})
@@ -504,6 +506,7 @@ def _send_setup(app, monkeypatch, parts):
     import gdocs
     sent = []
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
     monkeypatch.setattr(gdocs, "list_parts", lambda creds, doc_id, docs=None: parts)
     monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, docs=None:
@@ -553,6 +556,45 @@ def test_send_to_script_with_no_sections_goes_to_the_end(app, monkeypatch, proje
     assert _wait(app, lambda: bool(sent), secs=10)
     assert sent[0][2] is None and app._pq_part_win is None
     assert not app._errors, "\n".join(app._errors)
+
+
+def test_google_docs_setup_walks_through_choosing_the_files(app, monkeypatch, project, tmp_path):
+    import gdocs
+    from tkinter import filedialog, messagebox
+    _open_fresh(app, monkeypatch, project)
+    appdata = tmp_path / "appdata"
+    appdata.mkdir()
+    monkeypatch.setattr(gdocs, "app_state_dir", lambda: str(appdata))
+    monkeypatch.setattr(gdocs, "_candidates", lambda name: [str(appdata / name)])
+    client, key = tmp_path / "client.json", tmp_path / "key.txt"
+    client.write_text(json.dumps({"installed": {"client_id": "1-a", "client_secret": "s"}}),
+                      encoding="utf-8")
+    key.write_text("AIza" + "C" * 35, encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(messagebox, "askokcancel", lambda title, msg, **k: asked.append(msg) or True)
+    picks = iter([str(client), str(key)])
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **k: next(picks))
+
+    assert app._gdocs_ready()
+    assert "OAuth client file" in asked[0] and "Picker API key" in asked[0]
+    assert gdocs.is_ready()
+    # Set up once: the next time asks nothing.
+    assert app._gdocs_ready() and len(asked) == 1
+
+    # Cancelling a choice leaves it not set up, and says nothing more.
+    (appdata / gdocs.PICKER_FILE).unlink()
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **k: "")
+    assert not app._gdocs_ready()
+    assert "Picker API key" in asked[1] and "OAuth client" not in asked[1]
+
+    # A wrong file says what is wrong.
+    bad = tmp_path / "bad.txt"
+    bad.write_text("nope", encoding="utf-8")
+    monkeypatch.setattr(filedialog, "askopenfilename", lambda **k: str(bad))
+    shown = []
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg, **k: shown.append(msg))
+    assert not app._gdocs_ready()
+    assert "AIza" in shown[0]
 
 
 def test_send_to_script_needs_a_selection_and_a_doc(app, monkeypatch, project):

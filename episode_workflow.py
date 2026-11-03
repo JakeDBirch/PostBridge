@@ -677,12 +677,45 @@ class EpisodeWorkflowMixin:
             self._ui(lambda: done(res))
         threading.Thread(target=_run, daemon=True).start()
 
+    def _gdocs_ready(self):
+        """True when Google Docs is set up on this machine; otherwise walk
+        through choosing the two set-up files, once."""
+        if gdocs.is_ready():
+            return True
+        need = [n for n, ok in (("the OAuth client file (a .json)", gdocs.is_configured()),
+                                ("the Picker API key (a .txt)", bool(gdocs.picker_key())))
+                if not ok]
+        if not messagebox.askokcancel("Set up Google Docs", "\n".join(
+                ["Google Docs needs your team's set-up files on this machine, once:", ""]
+                + ["• " + n for n in need]
+                + ["", "Whoever made the team's Google Cloud project has them. "
+                   "Choose them now?"]), parent=self):
+            return False
+        client = key = None
+        if not gdocs.is_configured():
+            client = filedialog.askopenfilename(
+                parent=self, title="Choose the OAuth client file",
+                filetypes=[("Google client file", "*.json"), ("All files", "*.*")])
+            if not client:
+                return False
+        if not gdocs.picker_key():
+            key = filedialog.askopenfilename(
+                parent=self, title="Choose the Picker API key file",
+                filetypes=[("Text file", "*.txt"), ("All files", "*.*")])
+            if not key:
+                return False
+        try:
+            gdocs.install_setup(client, key)
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Set up Google Docs", str(e), parent=self)
+            return False
+        return gdocs.is_ready()
+
     def _ep_gdoc_link(self):
         """Pick the episode's script Doc through Google's picker."""
         if not self._ep_ready():
             return
-        if not gdocs.is_configured():
-            messagebox.showinfo("Google Docs", gdocs.setup_message())
+        if not self._gdocs_ready():
             return
         ep = self._ep
 
@@ -705,8 +738,7 @@ class EpisodeWorkflowMixin:
         gd = (ep.get("links", {}).get("gdoc") or {})
         if not gd.get("id"):
             return
-        if not gdocs.is_configured():
-            messagebox.showinfo("Google Docs", gdocs.setup_message())
+        if not self._gdocs_ready():
             return
         prev_text = ""
         prev_path = EP.absp(ep, ep["links"].get("script"))

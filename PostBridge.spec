@@ -111,6 +111,17 @@ for _fn in ("blood_trails_formatter.html",):
     if os.path.isfile(_fp):
         added_files.append((_fp, "."))
 
+# ── Google Docs set-up, when the build has it ─────────────────────────────────
+# The team's OAuth client and Picker key.  Never in the repository: a release
+# build writes them from repository secrets (see the workflows), and a local
+# build uses the copies next to main.py.  Without them the app asks for the
+# files the first time Google Docs is used.
+for _fn in ("google_client.json", "google_picker_key.txt"):
+    _fp = os.path.join(src_dir, _fn)
+    if os.path.isfile(_fp):
+        added_files.append((_fp, "."))
+        print("PostBridge build: bundling {}.".format(_fn))
+
 # ── Bundle pre-downloaded Whisper models when present ─────────────────────────
 # Build scripts may populate `models/` with tiny/base/small.  When the folder
 # exists, drop it whole into the bundle root so engines._bundled_models_root()

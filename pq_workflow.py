@@ -5472,8 +5472,7 @@ class PqWorkflowMixin:
                 "(Episode \u2192 STAGES \u2192 LINK GOOGLE DOC).")
             return
         import gdocs
-        if not gdocs.is_configured():
-            messagebox.showinfo("Google Docs", gdocs.setup_message())
+        if not self._gdocs_ready():
             return
 
         def _send(part):

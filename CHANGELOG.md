@@ -4,6 +4,10 @@
 
 ## November 3, 2026
 
+### Google Docs: no README to read before it works
+- **The installer can carry the Google set-up.** With the repository secrets `GOOGLE_CLIENT_JSON` and `GOOGLE_PICKER_KEY` set, the Windows and macOS builds include the team's OAuth client file and Picker key, so Google Docs works straight after installing.
+- **Otherwise PostBridge walks you through it.** The first time you use Google Docs, it says which of the two files it needs, lets you choose each one, checks it is the right kind of file (a Desktop app client, a real API key) and copies it where it belongs. It used to point you to the README.
+
 ### Pulls whose recording isn't assigned in Step 2 are back in the cut
 - **A pull now plays from the file it was matched in when Step 2 gives its token no files.** Every one of that token's pulls was left out of the Assembly, and out of the AAF and XML exports, though Step 4 listed them. On Mike Williams that was all ten BRIAN_WINCHESTER_CONFESSION pulls. When Step 2 does give the token files, those are still what plays.
 
