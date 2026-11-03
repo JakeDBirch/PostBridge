@@ -53,7 +53,9 @@ OutputBaseFilename={#OutputName}
 Compression=lzma2/fast
 SolidCompression=no
 LZMANumBlockThreads=4
-#if Span
+; /D values arrive as strings, and ISPP's #if treats any non-empty string
+; (even "0") as true, so convert before testing.
+#if Int(Span, 0)
 DiskSpanning=yes
 DiskSliceSize=max
 #endif

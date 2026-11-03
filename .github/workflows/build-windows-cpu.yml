@@ -75,6 +75,10 @@ jobs:
                   "/DOutputName=PostBridge-Setup" "/DSpan=0" installer\PostBridge.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem installer-out | Format-Table Name, Length
+          # The CPU build is one Setup.exe; a .bin means spanning switched on.
+          if (Get-ChildItem installer-out -Filter *.bin) {
+            Write-Host "::error::installer was split into .bin files"; exit 1
+          }
 
       - name: Self-test the installed app
         # Silent per-user install into a temp folder, then the same
