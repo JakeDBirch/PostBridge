@@ -218,9 +218,9 @@ function cb(d){
       .then(function(){done('Linked "'+f.name+'". You can close this tab.');});}
   else if(d.action==='cancel'){fetch('/cancel');done('Cancelled. You can close this tab.');}}
 function init(){gapi.load('picker',function(){
-  var v=new google.picker.DocsView(google.picker.ViewId.DOCUMENTS).setIncludeFolders(true);
+  var v=new google.picker.DocsView(google.picker.ViewId.DOCUMENTS).setIncludeFolders(true).setEnableDrives(true);
   var p=new google.picker.PickerBuilder().setOAuthToken(TOKEN).setDeveloperKey(KEY)
-    .addView(v).setCallback(cb).setTitle('Choose the episode script');
+    .enableFeature(google.picker.Feature.SUPPORT_DRIVES).addView(v).setCallback(cb).setTitle('Choose the episode script');
   if(APPID){p.setAppId(APPID);}
   p.build().setVisible(true);});}
 </script><script src="https://apis.google.com/js/api.js" onload="init()"></script>
@@ -285,14 +285,50 @@ def normalize_text(raw):
     return raw.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n").replace("\x0b", "\n")
 
 
-def fetch_text(creds, doc_id, drive=None):
-    """(text, meta) -- the Doc as script text and {"name", "modifiedTime",
-    "version"}."""
-    if drive is None:
-        drive, _docs = services(creds)
-    raw = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
-    meta = drive.files().get(fileId=doc_id, fields="name,modifiedTime,version").execute()
-    return normalize_text(raw), meta
+def _all_tabs(tabs, path=""):
+    """Every tab in order, child tabs after their parent: (id, title, tab)."""
+    for tb in tabs or []:
+        p = tb.get("tabProperties", {})
+        title = (path + " › " if path else "") + p.get("title", "")
+        yield p.get("tabId"), title, tb
+        yield from _all_tabs(tb.get("childTabs"), title)
+
+
+def _get_tab(docs, doc_id, tab=None):
+    """The Doc as one tab: {"body", "namedRanges", "revisionId", "tabId"}, so
+    the planning functions see a plain document.  *tab* is a tab id; None, or
+    one that is gone, is the first tab."""
+    d = docs.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+    tabs = list(_all_tabs(d.get("tabs")))
+    if not tabs:
+        return d                            # no tabs in the reply: already one body
+    tid, _title, tb = next((x for x in tabs if x[0] == tab), tabs[0])
+    dt = tb.get("documentTab", {})
+    return {"body": dt.get("body", {}), "namedRanges": dt.get("namedRanges", {}),
+            "revisionId": d.get("revisionId"), "tabId": tid}
+
+
+def list_tabs(creds, doc_id, docs=None):
+    """[(tab id, title)] of every tab in the Doc."""
+    if docs is None:
+        _drive, docs = services(creds)
+    d = docs.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+    return [(tid, title) for tid, title, _tb in _all_tabs(d.get("tabs"))]
+
+
+def fetch_text(creds, doc_id, tab=None, drive=None, docs=None):
+    """(text, meta) -- one tab of the Doc as script text, and {"name",
+    "modifiedTime", "version"}.  Read through the Docs API rather than
+    Drive's export, which runs every tab together, and line for line with
+    the paragraphs that notes and edits are planned on."""
+    if drive is None or docs is None:
+        drive, docs = services(creds)
+    doc = _get_tab(docs, doc_id, tab)
+    text = "\n".join(t for t, _s, _e in script_lines(doc)) + "\n"
+    # supportsAllDrives: without it a Doc on a shared drive is "not found".
+    meta = drive.files().get(fileId=doc_id, fields="name,modifiedTime,version",
+                             supportsAllDrives=True).execute()
+    return normalize_text(text), meta
 
 
 def paragraphs(doc):
@@ -546,28 +582,39 @@ def plan_append_to_part(doc, text, part):
 
 # ── Writing ───────────────────────────────────────────────────────────────
 
-def _batch(docs, doc_id, reqs, revision_id=None):
+def _in_tab(reqs, tab_id):
+    """*reqs* aimed at one tab: without a tabId, an edit goes to the first."""
+    if tab_id:
+        for r in reqs:
+            for v in r.values():
+                for key in ("location", "range", "endOfSegmentLocation"):
+                    if key in v:
+                        v[key]["tabId"] = tab_id
+    return reqs
+
+
+def _batch(docs, doc_id, reqs, revision_id=None, tab_id=None):
     if not reqs:
         return
-    body = {"requests": reqs}
+    body = {"requests": _in_tab(reqs, tab_id)}
     if revision_id:
         body["writeControl"] = {"requiredRevisionId": revision_id}
     docs.documents().batchUpdate(documentId=doc_id, body=body).execute()
 
 
-def write_notes(creds, doc_id, notes, docs=None):
+def write_notes(creds, doc_id, notes, tab=None, docs=None):
     """Replace PostBridge's notes in the Doc with *notes*.  Returns
     (placed, unplaced).  Each write is pinned to the revision it was
     planned against; if the Doc changed underneath, the plan is redone."""
     if docs is None:
         _drive, docs = services(creds)
     for attempt in range(3):
-        doc = docs.documents().get(documentId=doc_id).execute()
+        doc = _get_tab(docs, doc_id, tab)
         try:
-            _batch(docs, doc_id, plan_delete_notes(doc), doc.get("revisionId"))
-            doc = docs.documents().get(documentId=doc_id).execute()
+            _batch(docs, doc_id, plan_delete_notes(doc), doc.get("revisionId"), doc.get("tabId"))
+            doc = _get_tab(docs, doc_id, tab)
             reqs, unplaced = plan_notes(doc, notes)
-            _batch(docs, doc_id, reqs, doc.get("revisionId"))
+            _batch(docs, doc_id, reqs, doc.get("revisionId"), doc.get("tabId"))
             return len(notes) - len(unplaced), unplaced
         except Exception as e:
             if attempt == 2 or "revision" not in str(e).lower():
@@ -575,30 +622,30 @@ def write_notes(creds, doc_id, notes, docs=None):
     return 0, [m for _a, m in notes]
 
 
-def clear_notes(creds, doc_id, docs=None):
+def clear_notes(creds, doc_id, tab=None, docs=None):
     if docs is None:
         _drive, docs = services(creds)
-    doc = docs.documents().get(documentId=doc_id).execute()
+    doc = _get_tab(docs, doc_id, tab)
     reqs = plan_delete_notes(doc)
-    _batch(docs, doc_id, reqs, doc.get("revisionId"))
+    _batch(docs, doc_id, reqs, doc.get("revisionId"), doc.get("tabId"))
     return len(reqs)
 
 
-def fix_format(creds, doc_id, title=None, docs=None):
+def fix_format(creds, doc_id, title=None, tab=None, docs=None):
     """Run Fix Format on the Doc itself.  Returns what it changed, in plain
     words.  PostBridge's notes go first: they describe the script as it was."""
     import script_normalize
     if docs is None:
         _drive, docs = services(creds)
     for attempt in range(3):
-        doc = docs.documents().get(documentId=doc_id).execute()
+        doc = _get_tab(docs, doc_id, tab)
         try:
-            _batch(docs, doc_id, plan_delete_notes(doc), doc.get("revisionId"))
-            doc = docs.documents().get(documentId=doc_id).execute()
+            _batch(docs, doc_id, plan_delete_notes(doc), doc.get("revisionId"), doc.get("tabId"))
+            doc = _get_tab(docs, doc_id, tab)
             text = "\n".join(t for t, _s, _e in script_lines(doc))
             new, changes = script_normalize.normalize(text, title=title)
             if changes:
-                _batch(docs, doc_id, plan_text_edits(doc, new), doc.get("revisionId"))
+                _batch(docs, doc_id, plan_text_edits(doc, new), doc.get("revisionId"), doc.get("tabId"))
             return changes
         except Exception as e:
             if attempt == 2 or "revision" not in str(e).lower():
@@ -606,32 +653,32 @@ def fix_format(creds, doc_id, title=None, docs=None):
     return []
 
 
-def append_block(creds, doc_id, text, after_marker=None, docs=None):
+def append_block(creds, doc_id, text, after_marker=None, tab=None, docs=None):
     if docs is None:
         _drive, docs = services(creds)
-    doc = docs.documents().get(documentId=doc_id).execute()
-    _batch(docs, doc_id, plan_append(doc, text, after_marker), doc.get("revisionId"))
+    doc = _get_tab(docs, doc_id, tab)
+    _batch(docs, doc_id, plan_append(doc, text, after_marker), doc.get("revisionId"), doc.get("tabId"))
 
 
-def list_parts(creds, doc_id, docs=None):
+def list_parts(creds, doc_id, tab=None, docs=None):
     if docs is None:
         _drive, docs = services(creds)
-    return doc_parts(docs.documents().get(documentId=doc_id).execute())
+    return doc_parts(_get_tab(docs, doc_id, tab))
 
 
-def append_to_part(creds, doc_id, text, part, docs=None):
+def append_to_part(creds, doc_id, text, part, tab=None, docs=None):
     """Add a pull at the end of section *part*.  Each write is pinned to the
     revision it was planned against; if the Doc changed underneath, the plan
     is redone, because someone is likely writing in it."""
     if docs is None:
         _drive, docs = services(creds)
     for attempt in range(3):
-        doc = docs.documents().get(documentId=doc_id).execute()
+        doc = _get_tab(docs, doc_id, tab)
         reqs = plan_append_to_part(doc, text, part)
         if reqs is None:
             raise RuntimeError('The Doc no longer has a section called "{}".'.format(part))
         try:
-            _batch(docs, doc_id, reqs, doc.get("revisionId"))
+            _batch(docs, doc_id, reqs, doc.get("revisionId"), doc.get("tabId"))
             return
         except Exception as e:
             if attempt == 2 or "revision" not in str(e).lower():

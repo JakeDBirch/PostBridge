@@ -396,10 +396,15 @@ class EpisodeWorkflowMixin:
                 # every launch fetches the latest text and checks it.
                 gd = links.get("gdoc") or {}
                 if gd.get("id"):
-                    tk.Label(r, text="\u00b7  Google Doc: {}".format(gd.get("name", "")),
+                    tk.Label(r, text="\u00b7  Google Doc: {}{}".format(
+                                 gd.get("name", ""),
+                                 "  \u203a  " + gd["tab_name"] if gd.get("tab_name") else ""),
                              font=FB, bg=SURF, fg=SUCCESS).pack(side="left", padx=(12, 0))
                     self._btn(r, "FETCH & CHECK", self._ep_gdoc_fetch, small=True
                               ).pack(side="left", padx=(12, 0))
+                    if gd.get("tab_name"):
+                        self._btn(r, "CHANGE TAB\u2026", self._ep_gdoc_change_tab, small=True
+                                  ).pack(side="right", padx=(6, 0))
                     self._btn(r, "CHANGE DOC\u2026", self._ep_gdoc_link, small=True
                               ).pack(side="left", padx=(6, 0))
                 else:
@@ -728,8 +733,59 @@ class EpisodeWorkflowMixin:
                 return
             ep.setdefault("links", {})["gdoc"] = {"id": pick["id"], "name": pick["name"]}
             EP.save(ep)
-            self._ep_view()
+            self._ep_gdoc_with_tab(ep, self._ep_view)
         self._ep_gdoc_bg(_work, _done)
+
+    def _ep_gdoc_change_tab(self):
+        gd = self._ep.get("links", {}).get("gdoc") or {}
+        gd.pop("tab", None)
+        gd.pop("tab_name", None)
+        self._ep_gdoc_with_tab(self._ep, self._ep_view)
+
+    def _ep_gdoc_with_tab(self, ep, then):
+        """Run *then()* once it is known which tab of the linked Doc holds
+        the script.  A Doc with several tabs (notes, dramatizations) asks,
+        once; everything PostBridge reads or writes then uses only that tab."""
+        gd = ep.get("links", {}).get("gdoc") or {}
+        if "tab" in gd:
+            then()
+            return
+
+        def _keep(tab_id, title=None):
+            gd["tab"] = tab_id
+            if title:
+                gd["tab_name"] = title
+            EP.save(ep)
+            then()
+
+        def _got(tabs):
+            if len(tabs) <= 1:
+                _keep(tabs[0][0] if tabs else None)
+                return
+            win = tk.Toplevel(self)
+            win.title("Which tab is the script?")
+            win.configure(bg=BG)
+            win.transient(self)
+            self._ep_tab_win = win
+            tk.Label(win, text="Which tab holds the script?", font=FH, bg=BG, fg=TEXT
+                     ).pack(anchor="w", padx=20, pady=(14, 2))
+            tk.Label(win, text="{} has {} tabs. PostBridge reads, checks and writes only "
+                     "this one.".format(gd.get("name", "The Doc"), len(tabs)),
+                     font=FB, bg=BG, fg=SUB, wraplength=520, justify="left"
+                     ).pack(anchor="w", padx=20, pady=(0, 10))
+            likely = next((tid for tid, title in tabs if "script" in title.lower()), tabs[0][0])
+
+            def _pick(tid, title):
+                win.destroy()
+                _keep(tid, title)
+            for tid, title in tabs:
+                self._btn(win, title, lambda i=tid, n=title: _pick(i, n), small=True,
+                          color=ACCENT if tid == likely else None
+                          ).pack(fill="x", padx=20, pady=2)
+            self._btn(win, "CANCEL", win.destroy, small=True).pack(anchor="e", padx=20, pady=(10, 14))
+            win.bind("<Escape>", lambda e: win.destroy())
+            self._center_dialog(win, min_w=460, min_h=200)
+        self._ep_gdoc_bg(lambda: gdocs.list_tabs(gdocs.get_credentials(), gd["id"]), _got)
 
     def _ep_gdoc_fetch(self, then=None):
         """Fetch the linked Doc as the episode's script, run Script Check,
@@ -739,6 +795,10 @@ class EpisodeWorkflowMixin:
         if not gd.get("id"):
             return
         if not self._gdocs_ready():
+            return
+        if "tab" not in gd:
+            # Linked before tabs were asked about: settle the tab first.
+            self._ep_gdoc_with_tab(ep, lambda: self._ep_gdoc_fetch(then))
             return
         prev_text = ""
         prev_path = EP.absp(ep, ep["links"].get("script"))
@@ -751,7 +811,7 @@ class EpisodeWorkflowMixin:
 
         def _work():
             creds = gdocs.get_credentials()
-            text, meta = gdocs.fetch_text(creds, gd["id"])
+            text, meta = gdocs.fetch_text(creds, gd["id"], gd.get("tab"))
             return text, meta
 
         def _done(res):
@@ -813,7 +873,7 @@ class EpisodeWorkflowMixin:
         def _write():
             notes = gdocs.findings_to_notes(findings, text)
             def _work():
-                return gdocs.write_notes(gdocs.get_credentials(), gd["id"], notes)
+                return gdocs.write_notes(gdocs.get_credentials(), gd["id"], notes, tab=gd.get("tab"))
             def _done(res):
                 placed, unplaced = res
                 msg = "{} note{} written into the Doc.".format(placed, "" if placed == 1 else "s")
@@ -824,7 +884,7 @@ class EpisodeWorkflowMixin:
 
         def _clear():
             def _work():
-                return gdocs.clear_notes(gdocs.get_credentials(), gd["id"])
+                return gdocs.clear_notes(gdocs.get_credentials(), gd["id"], tab=gd.get("tab"))
             self._ep_gdoc_bg(_work, lambda n: messagebox.showinfo(
                 "Google Docs", "{} note{} removed from the Doc.".format(n, "" if n == 1 else "s")))
 
@@ -839,7 +899,7 @@ class EpisodeWorkflowMixin:
                        "File \u2192 Version history in the Doc can undo it."])):
                 return
             def _work():
-                return gdocs.fix_format(gdocs.get_credentials(), gd["id"], title=title)
+                return gdocs.fix_format(gdocs.get_credentials(), gd["id"], title=title, tab=gd.get("tab"))
             def _done(_changes):
                 try:
                     win.destroy()

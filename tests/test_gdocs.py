@@ -388,7 +388,7 @@ class _Docs:
     def documents(self):
         return self
 
-    def get(self, documentId):
+    def get(self, documentId, **kw):
         return _Exec(lambda: self.doc)
 
     def batchUpdate(self, documentId, body):
@@ -414,19 +414,82 @@ def test_write_notes_pins_the_revision_and_clears_first():
     assert "insertText" in docs.batches[1]["requests"][0]
 
 
-def test_fetch_text_normalizes_and_returns_meta():
-    class _Drive:
-        def files(self):
-            return self
+def _tabbed(**tabs):
+    """A Docs API reply with includeTabsContent: one tab per keyword, in
+    order, each holding those lines; tab ids are t.<name>."""
+    out = []
+    for name, lines in tabs.items():
+        d = _doc(lines)
+        out.append({"tabProperties": {"tabId": "t." + name, "title": name.title()},
+                    "documentTab": {"body": d["body"], "namedRanges": d.get("namedRanges", {})}})
+    return {"revisionId": "r9", "tabs": out}
 
-        def export(self, fileId, mimeType):
-            assert mimeType == "text/plain"
-            return _Exec(lambda: b"\xef\xbb\xbf[PART Open]\r\nhello\r\n")
 
-        def get(self, fileId, fields):
-            return _Exec(lambda: {"name": "Ep 7 script", "modifiedTime": "t", "version": "9"})
-    text, meta = gdocs.fetch_text(None, "doc1", drive=_Drive())
-    assert text == "[PART Open]\nhello\n" and meta["version"] == "9"
+TABS = dict(script=["Ep 11", "[PART Open]", "[VO A]", "Words."],
+            notes=["Production notes", "Call the archive."],
+            dramatizations=["SFX: hooves"])
+
+
+class _Drive:
+    """Fake Drive: files.get only works when asked for all drives, as for a
+    Doc on a shared drive."""
+    def __init__(self):
+        self.asked = []
+
+    def files(self):
+        return self
+
+    def export(self, fileId, mimeType):
+        raise AssertionError("the export runs every tab together; it must not be used")
+
+    def get(self, fileId, fields, supportsAllDrives=False):
+        self.asked.append(supportsAllDrives)
+        if not supportsAllDrives:
+            raise RuntimeError("HttpError 404: File not found")
+        return _Exec(lambda: {"name": "Ep 11", "modifiedTime": "t", "version": "9"})
+
+
+def test_fetch_reads_one_tab_and_finds_a_shared_drive_doc():
+    drive, docs = _Drive(), _Docs(_tabbed(**TABS))
+    text, meta = gdocs.fetch_text(None, "doc1", tab="t.script", drive=drive, docs=docs)
+    assert text == "Ep 11\n[PART Open]\n[VO A]\nWords.\n"
+    assert meta["version"] == "9" and drive.asked == [True]
+    # Another tab, chosen: only that tab.
+    text, _meta = gdocs.fetch_text(None, "doc1", tab="t.notes", drive=drive, docs=docs)
+    assert text == "Production notes\nCall the archive.\n"
+    # No tab chosen, or one since deleted: the first tab.
+    for tab in (None, "t.gone"):
+        assert gdocs.fetch_text(None, "doc1", tab=tab, drive=drive, docs=docs)[0].startswith("Ep 11")
+
+
+def test_list_tabs_includes_child_tabs():
+    d = _tabbed(**TABS)
+    d["tabs"][0]["childTabs"] = [{"tabProperties": {"tabId": "t.alt", "title": "Alt take"},
+                                  "documentTab": {"body": {"content": []}}}]
+    assert gdocs.list_tabs(None, "doc1", docs=_Docs(d)) == [
+        ("t.script", "Script"), ("t.alt", "Script › Alt take"),
+        ("t.notes", "Notes"), ("t.dramatizations", "Dramatizations")]
+
+
+def test_writes_go_to_the_chosen_tab():
+    docs = _Docs(_tabbed(notes=TABS["notes"], script=TABS["script"]))
+    gdocs.write_notes(None, "doc1", [("[PART Open]", "WARN: x")], tab="t.script", docs=docs)
+    gdocs.append_to_part(None, "doc1", "[BUTLER 00:00:05-00:00:20]\nWe went out.", "Open",
+                         tab="t.script", docs=docs)
+    gdocs.append_block(None, "doc1", "[BUTLER 00:00:30-00:00:40]\nLater.", tab="t.script", docs=docs)
+    reqs = [r for b in docs.batches for r in b["requests"]]
+    assert reqs
+    for r in reqs:
+        for v in r.values():
+            for key in ("location", "range", "endOfSegmentLocation"):
+                if key in v:
+                    assert v[key]["tabId"] == "t.script", r
+    # Indexes are planned on the script tab, not the first one.
+    script = gdocs.paragraphs(_doc(TABS["script"]))
+    note = next(r["insertText"] for r in docs.batches[0]["requests"] if "insertText" in r)
+    assert note["location"]["index"] == script[1][2]
+    assert gdocs.list_parts(None, "doc1", tab="t.script", docs=docs) == ["Open"]
+    assert gdocs.list_parts(None, "doc1", tab="t.notes", docs=docs) == []
 
 
 def test_diff_pulls_counts_changes():

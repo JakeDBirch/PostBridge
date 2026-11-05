@@ -2,6 +2,12 @@
 
 ---
 
+## November 5, 2026
+
+### Google Docs: shared drives, and Docs with tabs
+- **A Doc on a shared drive no longer fails with "File not found".** FETCH & CHECK could read the text but not the file's name and version, because Google hides shared-drive files from a request that doesn't ask for them. The picker now browses shared drives too.
+- **A Doc with several tabs asks which tab is the script.** The fetch used to run every tab together, so production notes and dramatizations were read as script. PostBridge now asks once, names the tab on the Stages card, and fetches, checks, writes notes, fixes format and sends pulls to that tab only. **CHANGE TAB…** picks another. A Doc linked before this asks the next time it is fetched.
+
 ## November 3, 2026
 
 ### Step 2's REFRESH asks first, and adds files unassigned

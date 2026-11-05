@@ -402,11 +402,12 @@ def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch
     calls = []
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
     monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
-    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id: (
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id, tab=None: (
         doc["text"], {"name": "Ep 7 script", "version": "3", "modifiedTime": "t"}))
 
-    def _fix(creds, doc_id, title=None, docs=None):
+    def _fix(creds, doc_id, title=None, tab=None, docs=None):
         calls.append((doc_id, title))
         doc["text"] = fixed
         return ["Removed 1 divider line"]
@@ -449,12 +450,13 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     calls = {}
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
     monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
     monkeypatch.setattr(gdocs, "pick_document",
                         lambda creds, timeout=300: {"id": "doc123", "name": "Ep 7 script"})
-    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id: (
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id, tab=None: (
         doc_text, {"name": "Ep 7 script", "version": "3", "modifiedTime": "t"}))
-    monkeypatch.setattr(gdocs, "write_notes", lambda creds, doc_id, notes, docs=None: (
+    monkeypatch.setattr(gdocs, "write_notes", lambda creds, doc_id, notes, tab=None, docs=None: (
         calls.update(doc_id=doc_id, notes=notes) or (len(notes), [])))
 
     # Link through the (faked) picker, from the button on the Stages card.
@@ -507,11 +509,12 @@ def _send_setup(app, monkeypatch, parts):
     sent = []
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
     monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
-    monkeypatch.setattr(gdocs, "list_parts", lambda creds, doc_id, docs=None: parts)
-    monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, docs=None:
+    monkeypatch.setattr(gdocs, "list_parts", lambda creds, doc_id, tab=None, docs=None: parts)
+    monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, tab=None, docs=None:
                         sent.append((doc_id, text, part)))
-    monkeypatch.setattr(gdocs, "append_block", lambda creds, doc_id, text, after_marker=None, docs=None:
+    monkeypatch.setattr(gdocs, "append_block", lambda creds, doc_id, text, after_marker=None, tab=None, docs=None:
                         sent.append((doc_id, text, None)))
     monkeypatch.setattr(app, "_pq_build_pull_block", lambda: (
         "[BUTLER 00:00:05-00:00:20]\nWe went out.\n", "00:00:05", "00:00:20"))
@@ -555,6 +558,54 @@ def test_send_to_script_with_no_sections_goes_to_the_end(app, monkeypatch, proje
     app._pq_send_to_script()
     assert _wait(app, lambda: bool(sent), secs=10)
     assert sent[0][2] is None and app._pq_part_win is None
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_a_doc_with_tabs_asks_which_is_the_script_once(app, monkeypatch, project):
+    import gdocs
+    _open_fresh(app, monkeypatch, project)
+    tabs = [("t.0", "Production Notes"), ("t.1", "Script"), ("t.2", "Dramatizations")]
+    fetched = []
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: tabs)
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id, tab=None: (
+        fetched.append(tab) or ("Ep 11\nA paragraph read aloud.\n",
+                                {"name": "Ep 11", "version": "1", "modifiedTime": "t"})))
+    app._ep_save()
+    # Linked before tabs were asked about: the next fetch asks first.
+    app._ep["links"]["gdoc"] = {"id": "doc123", "name": "Ep 11"}
+    app._ep_tab_win = None
+    app._ep_findings_win = None
+    app._ep_gdoc_fetch()
+    assert _wait(app, lambda: app._ep_tab_win is not None, secs=10)
+    _pump(app, 3)
+    assert not fetched
+    assert _click(app, app._ep_tab_win, "Script")
+    assert _wait(app, lambda: fetched == ["t.1"], secs=10)
+    gd = app._ep["links"]["gdoc"]
+    assert gd["tab"] == "t.1" and gd["tab_name"] == "Script"
+    assert EP.load(app._ep["file_path"])["links"]["gdoc"]["tab"] == "t.1"
+    assert _wait(app, lambda: app._ep_findings_win is not None, secs=10)
+    _click(app, app._ep_findings_win, "CLOSE")
+
+    # Asked once: the next fetch goes straight to that tab.
+    app._ep_tab_win = None
+    app._ep_findings_win = None
+    app._ep_gdoc_fetch()
+    assert _wait(app, lambda: len(fetched) == 2, secs=10)
+    assert fetched[1] == "t.1" and app._ep_tab_win is None
+    assert _wait(app, lambda: app._ep_findings_win is not None, secs=10)
+    _click(app, app._ep_findings_win, "CLOSE")
+
+    # The Stages card names the tab, and CHANGE TAB asks again.
+    app._ep_view(); _pump(app, 3)
+    assert _click(app, app, "CHANGE TAB…")
+    assert _wait(app, lambda: app._ep_tab_win is not None, secs=10)
+    _pump(app, 3)
+    assert _click(app, app._ep_tab_win, "Production Notes")
+    _pump(app, 5)
+    assert app._ep["links"]["gdoc"]["tab"] == "t.0"
     assert not app._errors, "\n".join(app._errors)
 
 

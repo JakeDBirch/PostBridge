@@ -5478,17 +5478,19 @@ class PqWorkflowMixin:
         def _send(part):
             def _work():
                 if part is None:
-                    gdocs.append_block(gdocs.get_credentials(), gd["id"], block)
+                    gdocs.append_block(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
                 else:
-                    gdocs.append_to_part(gdocs.get_credentials(), gd["id"], block, part)
+                    gdocs.append_to_part(gdocs.get_credentials(), gd["id"], block, part, tab=gd.get("tab"))
             self._ep_gdoc_bg(_work, lambda _r: self._pq_flash_status(
                 "\u2713 Sent to {}  [{}\u2013{}]".format(part or "script", in_tc, out_tc)))
 
-        self._pq_flash_status("Reading the Doc\u2026")
-        self._ep_gdoc_bg(
-            lambda: gdocs.list_parts(gdocs.get_credentials(), gd["id"]),
-            lambda parts: self._pq_choose_part(parts, in_tc, out_tc, _send)
-            if parts else _send(None))
+        def _read():
+            self._pq_flash_status("Reading the Doc\u2026")
+            self._ep_gdoc_bg(
+                lambda: gdocs.list_parts(gdocs.get_credentials(), gd["id"], tab=gd.get("tab")),
+                lambda parts: self._pq_choose_part(parts, in_tc, out_tc, _send)
+                if parts else _send(None))
+        self._ep_gdoc_with_tab(ep, _read)
 
     def _pq_choose_part(self, parts, in_tc, out_tc, send):
         """Ask which section of the script a pull goes in.  The one used last
