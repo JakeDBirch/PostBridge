@@ -442,6 +442,86 @@ def test_editor_accept_edits_its_own_card(tmp_path):
         app.destroy()
 
 
+@pytest.mark.parametrize("after_open", ["rebuild", "leave"])
+def test_editor_accept_after_step4_rebuilt_or_left(tmp_path, after_open):
+    """With the editor open, Step 4 rebuilt its cards (or was left), and
+    Accept raised TclError on the old card's label -- before the clip was
+    counted and saved, so the accept was lost."""
+    import wave
+    import main
+    wav = str(tmp_path / "GUEST.wav")
+    with wave.open(wav, "w") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000 * 30)
+    try:
+        app = main.App()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        app.results = [
+            dict(order=o, token="GUEST", status="review", part_index=0,
+                 segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
+                 rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
+                 source_audio=wav)
+            for o, a in ((1, 2.0), (2, 10.0))]
+        app.parts = [{"index": 0, "name": "Part 0"}]
+        app.tokens, app.workflow = ["GUEST"], "script_session"
+        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2)]
+        app._script_path = str(tmp_path / "script.txt")
+        app.update()
+        app._step4()
+        for _ in range(60):
+            app.update()
+        import match_review
+        dialogs = []
+        orig = match_review.MatchReviewDialog.__init__
+
+        def _init(self, *a, **k):
+            orig(self, *a, **k)
+            dialogs.append(self)
+        match_review.MatchReviewDialog.__init__ = _init
+        try:
+            next(e for e in app._rv if e["res"]["order"] == 1)["open_review_fn"]()
+            for _ in range(20):
+                app.update()
+        finally:
+            match_review.MatchReviewDialog.__init__ = orig
+        d = dialogs[-1]
+
+        if after_open == "rebuild":
+            app._step4()
+        else:
+            app._clear()
+            app._rv = []
+        for _ in range(30):
+            app.update()
+        saves = []
+        app._s4_save = lambda *a, **k: saves.append(True)
+
+        d._in_s += 0.5
+        d._on_accept_click()           # raised TclError here
+        app.update()
+        r = next(r for r in app.results if r["order"] == 1)
+        assert [list(s) for s in r["segments"]] == [[2.5, 4.0]]
+        assert r["_s4_accepted"] and r["status"] == "manual"
+        assert saves
+        if after_open == "rebuild":
+            # The card on screen now shows it.
+            live = next(e for e in app._rv if e["res"]["order"] == 1)
+            assert live["accepted_flag"][0]
+            assert "ACCEPTED" in live["stat_lbl"].master.winfo_children()[-1].cget("text") \
+                or any("ACCEPTED" in str(w.cget("text")) for w in _labels(live["card"]))
+    finally:
+        app.destroy()
+
+
+def _labels(w):
+    for c in w.winfo_children():
+        if isinstance(c, tk.Label):
+            yield c
+        yield from _labels(c)
+
+
 def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
     """NEXT / PREVIOUS bring the neighbouring pull that's in the cut into the
     same window.  A pull only looked at stays unaccepted, a pull edited is kept,

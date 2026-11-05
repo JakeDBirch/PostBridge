@@ -8652,13 +8652,20 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         # can decrement the correct tally bucket.
                         r["_original_status"] = old_status
                         r["status"] = "manual"
-                        sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
-                                  fg=STATUS_COLOR.get("manual", SUCCESS))
                     af[0] = True
-                    ss()
-                    rcl()   # refresh sub-clip count badge
-                    if not _was_accepted:
-                        _increment_confirmed(old_status)
+                    try:
+                        if old_status not in self.SUCCESS_STATUSES:
+                            sl.config(text=STATUS_LABEL.get("manual", "\u2713  adjusted"),
+                                      fg=STATUS_COLOR.get("manual", SUCCESS))
+                        ss()
+                        rcl()   # refresh sub-clip count badge
+                        if not _was_accepted:
+                            _increment_confirmed(old_status)
+                    except tk.TclError:
+                        # This card is gone: Step 4 was left, so there is
+                        # nothing on screen to update.  The edit above
+                        # stands and is saved; Step 4 shows it when rebuilt.
+                        pass
                     self._s4_save()
 
                 # ── Open waveform editor — primary card action ──────────────────────
@@ -8797,7 +8804,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                  scripted_tc=_scripted_tc,
                                  words=_words,
                                  on_accept=lambda *a, _sa=sa, **k:
-                                     acc(*a, apath=_sa, **k),
+                                     self._s4_live_accept(r, acc)(*a, apath=_sa, **k),
                                  pool_by_token=_pool_by_token,
                                  on_next=self._s4_step_fn(_this_order, 1),
                                  on_prev=self._s4_step_fn(_this_order, -1),
@@ -9117,6 +9124,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 and (e["res"].get("order", 0) - order) * direction > 0]
         return min(rows, key=lambda e: abs(e["res"].get("order", 0) - order),
                    default=None)
+
+    def _s4_live_accept(self, r, acc):
+        """The accept for pull `r` on the cards showing now.  The waveform
+        editor stays open while Step 4 rebuilds its cards (a refresh, an
+        undo), so the card it was opened from may be gone; its accept would
+        then update dead widgets.  `acc`, the opening card's, is the fallback
+        when Step 4 has no card for the pull."""
+        e = next((e for e in getattr(self, "_rv", []) if e["res"] is r), None) \
+            or next((e for e in getattr(self, "_rv", [])
+                     if e["res"].get("order") == r.get("order")), None)
+        return (e or {}).get("accept_fn") or acc
 
     def _s4_step_fn(self, order, direction):
         """What the waveform editor's NEXT / PREVIOUS does from the pull at
