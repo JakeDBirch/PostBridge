@@ -30,7 +30,8 @@ _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_s4_apply_state_rows", "_s4_push_undo", "_s4_undo", "_s4_redo",
                 "_assembly_set_default_gap",
                 "_assembly_set_segments", "_assembly_set_gap",
-                "_assembly_set_markers", "_assembly_set_reading",
+                "_assembly_set_markers", "_s4_open_editor",
+                "_s4_editor_markers_changed", "_assembly_set_reading",
                 "_assembly_edit_many", "_collect_export_inputs")
 
 
@@ -1290,3 +1291,42 @@ def test_playback_is_not_held_in_by_a_highlight(view):
     win.stop()
     assert win._range == (1, 1.0, 2.0)         # the highlight stays
     assert "plays it" not in win.status.cget("text")
+
+
+def test_a_mark_made_in_the_waveform_editor_is_the_assembly_tracks(
+        view, monkeypatch):
+    """One list: what the editor drops shows on the track and reaches the
+    export, and what the track takes away goes from the editor."""
+    import match_review
+    app, win = view
+    monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
+                        lambda self: None)
+    dlg = match_review.MatchReviewDialog(
+        app, WAV, [[10.0, 14.0]], title="GUEST",
+        get_markers=lambda: next((x.get("markers") for x in app.results
+                                  if x["order"] == 1), None),
+        set_markers=lambda m: app._assembly_set_markers({1: m}))
+    app._s4_editor = dlg
+    try:
+        depth = len(app._s4_undo_stack)
+        dlg._playhead_s = 11.2                     # on "ridge"
+        dlg.drop_mark("music_inflection")
+        assert len(app._s4_undo_stack) == depth + 1
+        win.refresh()
+        tl0, _du, si0 = win._clip(1).pieces[0]
+        assert [m["kind"] for m in win.markers] == ["music_inflection"]
+        assert win.markers[0]["t"] == pytest.approx(tl0 + 11.2 - si0, abs=1e-3)
+
+        edited, assets = app._collect_export_inputs()[:2]
+        placed, _s, _p = engines.layout_timeline(edited, 0.5, 48000, assets)
+        out = engines.place_markers(placed, 48000)
+        assert [(m["kind"], m["order"]) for m in out] == \
+            [("music_inflection", 1)]
+
+        win.select_marker((1, 0))
+        win.delete_marker()
+        assert dlg._marks() == [] and "markers" not in _res(app, 1)
+        app._s4_undo()                             # Step 4's undo, here too
+        assert [m["kind"] for m in dlg._marks()] == ["music_inflection"]
+    finally:
+        dlg._on_cancel()

@@ -2750,6 +2750,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._s4_redo_stack.append(self._s4_undo_snapshot())
         self._s4_apply_state(stack.pop())
         self._s4_save()
+        self._s4_editor_markers_changed()
 
     def _s4_redo(self, event=None):
         stack = getattr(self, "_s4_redo_stack", [])
@@ -2758,6 +2759,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._s4_undo_stack.append(self._s4_undo_snapshot())
         self._s4_apply_state(stack.pop())
         self._s4_save()
+        self._s4_editor_markers_changed()
 
     def _s4_x_toggle_ignore(self, event=None):
         """X key — toggle IGNORE on the most-recently-clicked Step 4 card."""
@@ -8808,7 +8810,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                                  pool_by_token=_pool_by_token,
                                  on_next=self._s4_step_fn(_this_order, 1),
                                  on_prev=self._s4_step_fn(_this_order, -1),
-                                 auto_snap=not r.get("_s4_accepted"))
+                                 auto_snap=not r.get("_s4_accepted"),
+                                 # The pull's spotting marks, the Assembly
+                                 # track's own: looked up by order, as a
+                                 # rebuild or an undo may replace the row.
+                                 get_markers=lambda o=_this_order: next(
+                                     (x.get("markers") for x in self.results
+                                      if x.get("order") == o), None),
+                                 set_markers=lambda m, o=_this_order:
+                                     self._assembly_set_markers({o: m}))
                     # NEXT / PREVIOUS: the same window, showing another clip.
                     _open = self._s4_open_editor()
                     if _open is not None:
@@ -9232,9 +9242,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._s4_undo_hold = False
 
     def _assembly_set_markers(self, changes):
-        """Spotting markers edited on the Assembly track: {order: [marker]}
-        for every pull whose list changed (a move touches two), as one
-        undo step."""
+        """Spotting markers edited on the Assembly track or in the waveform
+        editor: {order: [marker]} for every pull whose list changed (a move
+        touches two), as one undo step.  Both views show the change."""
         by_order = {r.get("order"): r for r in self.results}
         self._s4_push_undo()
         for order, markers in changes.items():
@@ -9246,6 +9256,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             else:
                 r.pop("markers", None)
         self._s4_save()
+        self._s4_editor_markers_changed()
+
+    def _s4_editor_markers_changed(self):
+        """The waveform editor redraws its pull's marks, wherever they were
+        changed (the Assembly track, Step 4's undo, the editor itself)."""
+        dlg = self._s4_open_editor()
+        if dlg is not None and hasattr(dlg, "markers_changed"):
+            dlg.markers_changed()
 
     def _assembly_set_default_gap(self, gap_s):
         """The cut's default gap -- the silence after every pull whose own

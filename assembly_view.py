@@ -53,7 +53,8 @@ with that audio through any retiming, and the AAF carries them as the MUSIC,
 SFX and NOTES marker tracks beside PARTS.  Drag a flag to move it, double-click
 to name it; Delete, Ctrl+click or its right-click menu removes it.  An SFX spot
 or a note opens for naming as it lands.  Music in and out marks from earlier
-sessions still show and still export.
+sessions still show and still export.  The waveform editor shows the
+same marks on its pull and edits them the same way, with the same keys.
 
 The text beside the controls is the cut as words, and nothing else: the
 script's own wording where it was said.  Only a difference gets a mark: script
@@ -135,9 +136,9 @@ _C_FLAG     = WARN        # a pull Step 4 still flags for review
 _C_PLAYHEAD = ERR
 _C_PART     = ACCENT
 _C_CLIP_BG  = SURF
-_C_MUSIC    = "#4f9be0"   # music cue in / out
-_C_SFX      = "#e0609a"   # SFX spot
-_C_NOTE     = "#c9c9a8"   # a note: anything else worth marking
+_C_MUSIC    = match_review.MARK_MUSIC   # the waveform editor draws marks
+_C_SFX      = match_review.MARK_SFX     # in the same colours
+_C_NOTE     = match_review.MARK_NOTE
 _C_STRUCK   = "#8a8a8a"   # script wording that wasn't said
 _C_SAID     = "#e8c98a"   # words said that aren't in the script
 _C_TXSEL    = "#35597a"   # highlighted words

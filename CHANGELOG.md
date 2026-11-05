@@ -4,6 +4,11 @@
 
 ## November 5, 2026
 
+### Waveform editor: spotting marks
+- **The waveform editor now has the Assembly track's spotting marks.** **M** drops a music inflection at the playhead, **X** an SFX spot and **N** a note, even while the clip plays. The MARK buttons beside UNDO do the same. Drag a flag to move it (it snaps like an edit point, and Ctrl places it freely). Double-click a flag to name it. Delete, Ctrl+click or the flag's right-click menu removes it. An SFX spot or a note opens for naming as soon as it lands.
+- **The editor and the Assembly track show the same marks.** Each mark belongs to the pull and is pinned to its moment in the recording. A mark set in either view shows in the other straight away and reaches the AAF's MUSIC, SFX and NOTES tracks the same way. A mark is saved as soon as you make it, like on the Assembly track, so CANCEL doesn't remove it. Ctrl+Z in the editor does, and so does Step 4's undo.
+- **A mark outside the kept audio is drawn hollow.** That shows where the export will put it: at the point where the pull's kept audio picks up again.
+
 ### Waveform editor: the script lights up as the clip plays
 - **The word being heard now lights up in the script above the waveform, and the script scrolls to keep it in view,** the way Pull Quotes does in its transcript. The script is lined up with the transcript of the clip, so a word the speaker skipped or said differently stays dark. The highlight clears when playback stops or another clip loads. Pull Quotes and the waveform editor now share the same highlight code.
 

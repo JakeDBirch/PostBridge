@@ -24,7 +24,8 @@ WAV = os.path.join(ROOT, "tests", "_no_such_guest.wav")   # never loaded
 _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_s4_apply_state_rows", "_s4_push_undo", "_s4_undo", "_s4_redo",
                 "_assembly_set_default_gap", "_assembly_set_segments",
-                "_assembly_set_gap", "_assembly_set_markers",
+                "_assembly_set_gap", "_assembly_set_markers", "_s4_open_editor",
+                "_s4_editor_markers_changed",
                 "_assembly_set_reading", "_assembly_edit_many",
                 "_assembly_ignore", "_assembly_unignore",
                 "_collect_export_inputs")

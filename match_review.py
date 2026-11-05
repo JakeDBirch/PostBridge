@@ -1688,6 +1688,9 @@ class MatchReviewDialog:
                     cv.tag_bind(_tag, "<ButtonRelease-1>",
                                 lambda e, i=_si: self._remove_segment(i))
 
+        # ── Spotting marks ─────────────────────────────────────────────────
+        self._draw_marks(cv, w)
+
         # ── Playhead cursor ────────────────────────────────────────────────
         ph_px = _t_to_px(self._playhead_s)
         if -2 <= ph_px <= w + 2:
@@ -1945,6 +1948,23 @@ class MatchReviewDialog:
                         for t in _tags):
                     self._drag = None
                     return
+        # A flag: choose it and drag it; Ctrl+click takes it away.
+        self._end_mark_rename(commit=True)
+        _mi = self._mark_hit(event.x, event.y)
+        if _mi is not None:
+            if event.state & 0x0004:
+                self._drag = None
+                self.delete_mark(_mi)
+                return
+            self._sel_mark = _mi
+            self._drag = "mark"
+            self._mark_drag = {"idx": _mi, "x0": event.x, "moved": False,
+                               "t": self._mark_t(self._marks()[_mi])}
+            self._draw()
+            return
+        if self._sel_mark is not None:
+            self._sel_mark = None
+            self._draw()
         # Check "× merge" buttons first (merge adjacent segments)
         for cx, cy, seg_idx in self._remove_hit_areas:
             if abs(event.x - cx) <= 28 and abs(event.y - cy) <= 8:
@@ -2219,6 +2239,17 @@ class MatchReviewDialog:
     def _on_drag_motion(self, event):
         if not self._drag or self._samples is None:
             return
+        if self._drag == "mark":
+            d = self._mark_drag
+            if not d["moved"] and abs(event.x - d["x0"]) <= _SLIP_DRAG_PX:
+                return
+            d["moved"] = True
+            self._last_drag_x = event.x
+            t = max(0.0, self._px_to_t(event.x))
+            # Ctrl places it freely; otherwise it snaps like an edge.
+            d["t"] = t if event.state & 0x0004 else self._snap(t)
+            self._draw()
+            return
         # Promote (blue-segment) slip_pending → slip only once the mouse
         # has moved enough.  Until then, suppress all motion handling so
         # a simple click doesn't accidentally shift the region.
@@ -2323,6 +2354,12 @@ class MatchReviewDialog:
         self._draw()
 
     def _on_release(self, event):
+        if self._drag == "mark":
+            d, self._mark_drag, self._drag = self._mark_drag, None, None
+            if d and d["moved"]:
+                self._move_mark(d["idx"], d["t"])
+            self._draw()
+            return
         if self._drag in ("slip_pending", "gap_slip_pending"):
             # Mouse was pressed in the region body / a red gap but never
             # dragged far enough to become a slip — treat it as a plain
@@ -2353,6 +2390,9 @@ class MatchReviewDialog:
     def _on_hover(self, event):
         """Update the canvas cursor to reflect what a click-drag would do."""
         if self._samples is None:
+            return
+        if self._mark_hit(event.x, event.y) is not None:
+            self._cv.config(cursor="sb_h_double_arrow")
             return
         in_px  = self._t_to_px(self._in_s)
         out_px = self._t_to_px(self._out_s)
@@ -3172,39 +3212,265 @@ class MatchReviewDialog:
         self._draw()
 
     def _push_undo(self):
-        """Save current edit state to the undo stack and clear redo."""
+        """Save current edit state to the undo stack and clear redo.  The
+        pull's marks go in with the edit points, so Ctrl+Z here takes back
+        a mark made here as it does a trim."""
         import copy
-        self._undo_stack.append(copy.deepcopy(
-            (self._segments, self._in_s, self._out_s)))
+        self._undo_stack.append(copy.deepcopy(self._undo_state()))
         self._redo_stack.clear()
+
+    def _undo_state(self):
+        return (self._segments, self._in_s, self._out_s, self._marks())
+
+    def _restore_state(self, state):
+        segs, in_s, out_s, marks = state
+        self._segments = segs
+        self._in_s  = in_s
+        self._out_s = out_s
+        if marks != self._marks():
+            self._write_marks(marks)
+        self._refresh_displays()
+        self._draw()
 
     def _undo_wf(self):
         """Restore previous edit state."""
         if not self._undo_stack:
             return
         import copy
-        self._redo_stack.append(copy.deepcopy(
-            (self._segments, self._in_s, self._out_s)))
-        segs, in_s, out_s = self._undo_stack.pop()
-        self._segments = segs
-        self._in_s  = in_s
-        self._out_s = out_s
-        self._refresh_displays()
-        self._draw()
+        self._redo_stack.append(copy.deepcopy(self._undo_state()))
+        self._restore_state(self._undo_stack.pop())
 
     def _redo_wf(self):
         """Re-apply a previously undone edit state."""
         if not self._redo_stack:
             return
         import copy
-        self._undo_stack.append(copy.deepcopy(
-            (self._segments, self._in_s, self._out_s)))
-        segs, in_s, out_s = self._redo_stack.pop()
-        self._segments = segs
-        self._in_s  = in_s
-        self._out_s = out_s
-        self._refresh_displays()
+        self._undo_stack.append(copy.deepcopy(self._undo_state()))
+        self._restore_state(self._redo_stack.pop())
+
+    # ── Spotting marks ────────────────────────────────────────────────────
+    # The pull's res["markers"], read through get_markers and written back
+    # whole through set_markers (Step 4's _assembly_set_markers: one Step 4
+    # undo step, saved, and the Assembly track redrawn).  Nothing is held
+    # here but which flag is chosen, so the two views can't disagree.
+
+    def _marks(self):
+        get = self._get_markers
+        return [dict(m) for m in ((get() if get else None) or [])]
+
+    def _write_marks(self, marks):
+        if self._set_markers is not None:
+            self._set_markers([dict(m) for m in marks])
+
+    def _mark_t(self, m):
+        """Where a mark sits in this file.  One in the gap after the pull
+        (dropped there on the Assembly track) sits at OUT."""
+        if "tail" in m:
+            return self._out_s
+        return float(m.get("src", 0.0))
+
+    @staticmethod
+    def _mark_lane(m):
+        return 1 if m.get("kind") == "note" else 0
+
+    @staticmethod
+    def mark_colour(m):
+        return {"sfx": MARK_SFX, "note": MARK_NOTE}.get(m.get("kind"), MARK_MUSIC)
+
+    @staticmethod
+    def mark_label(m):
+        return (m.get("name") or "").strip() or _MARK_WORDS.get(m.get("kind"), "Mark")
+
+    def _mark_row(self, lane):
+        """Top and bottom of a mark lane: just above the time axis, notes
+        above music and SFX."""
+        bot = self._canvas_h - 22 - lane * (_MARK_LANE_H + 2)
+        return bot - _MARK_LANE_H, bot
+
+    def _in_kept(self, t):
+        """Whether t is audio the pull keeps (a mark anywhere else lands
+        where the kept audio resumes, as engines.place_markers puts it)."""
+        n = len(self._segments)
+        for i, (a, b) in enumerate(self._segments):
+            a = self._in_s if i == 0 else a
+            b = self._out_s if i == n - 1 else b
+            if a <= t <= b:
+                return True
+        return False
+
+    def _mark_hit(self, x, y):
+        """Index of the flag at (x, y), the nearest one in its lane."""
+        best, best_d = None, _MARK_HIT + 1
+        for i, m in enumerate(self._marks()):
+            top, bot = self._mark_row(self._mark_lane(m))
+            if not top - 2 <= y <= bot + 2:
+                continue
+            d = abs(x - (self._t_to_px(self._mark_t(m)) + 3))
+            if d < best_d:
+                best, best_d = i, d
+        return best
+
+    def drop_mark(self, kind):
+        """A mark at the playhead, on this pull.  An SFX spot or a note
+        opens straight into naming it, as on the Assembly track."""
+        if self._set_markers is None:
+            return
+        self._end_mark_rename(commit=True)
+        self._push_undo()
+        marks = self._marks()
+        marks.append({"src": round(max(0.0, self._playhead_s), 4),
+                      "kind": kind, "name": ""})
+        self._write_marks(marks)
+        self._sel_mark = len(marks) - 1
         self._draw()
+        if kind in ("sfx", "note"):
+            self._begin_mark_rename(self._sel_mark)
+
+    def _move_mark(self, idx, t):
+        marks = self._marks()
+        if not 0 <= idx < len(marks):
+            return
+        m = marks[idx]
+        marks[idx] = {"src": round(max(0.0, t), 4), "kind": m.get("kind"),
+                      "name": m.get("name", "")}
+        self._push_undo()
+        self._write_marks(marks)
+        self._sel_mark = idx
+
+    def delete_mark(self, idx=None):
+        idx = self._sel_mark if idx is None else idx
+        marks = self._marks()
+        self._sel_mark = None
+        if idx is not None and 0 <= idx < len(marks):
+            self._push_undo()
+            del marks[idx]
+            self._write_marks(marks)
+        self._draw()
+
+    def markers_changed(self):
+        """The pull's marks were changed somewhere else (the Assembly
+        track, Step 4's undo): show them as they are now."""
+        n = len(self._marks())
+        if self._sel_mark is not None and self._sel_mark >= n:
+            self._sel_mark = None
+        if self._mark_rename is not None and self._mark_rename[1] >= n:
+            self._end_mark_rename(commit=False)
+        try:
+            self._draw()
+        except tk.TclError:
+            pass
+
+    def _draw_marks(self, cv, w):
+        marks = self._marks()
+        if self._sel_mark is not None and self._sel_mark >= len(marks):
+            self._sel_mark = None
+        drag = self._mark_drag
+        for i, m in enumerate(marks):
+            t = drag["t"] if drag and drag["moved"] and drag["idx"] == i \
+                else self._mark_t(m)
+            x = self._t_to_px(t)
+            if x < -300 or x > w:
+                continue
+            top, bot = self._mark_row(self._mark_lane(m))
+            col = self.mark_colour(m)
+            on = i == self._sel_mark
+            kept = self._in_kept(t)
+            cv.create_line(x, 0, x, top, fill=col if kept else BORDER,
+                           dash=(2, 4), tags=("mark",))
+            fill = col if kept else ""
+            edge = dict(outline=TEXT if on else col, width=2 if on else 1)
+            if m.get("kind") == "music_inflection":
+                mid, r = (top + bot) / 2.0, (bot - top) / 2.0 - 1
+                cv.create_polygon(x + 3, mid - r, x + 3 + r, mid,
+                                  x + 3, mid + r, x + 3 - r, mid,
+                                  fill=fill, tags=("mark",), **edge)
+            else:
+                cv.create_rectangle(x, top + 1, x + 6, bot - 1, fill=fill,
+                                    tags=("mark",), **edge)
+            cv.create_text(x + 10, (top + bot) / 2.0, text=self.mark_label(m),
+                           anchor="w", font=("Segoe UI", 8),
+                           fill=TEXT if on else SUB, tags=("mark",))
+        if self._mark_rename is not None:
+            entry, idx = self._mark_rename
+            if 0 <= idx < len(marks):
+                m = marks[idx]
+                top, _bot = self._mark_row(self._mark_lane(m))
+                cv.create_window(self._t_to_px(self._mark_t(m)) + 10, top - 4,
+                                 anchor="sw", window=entry)
+
+    def _begin_mark_rename(self, idx):
+        """Name a mark in place: Enter keeps it, Esc leaves it as it was.
+        An empty name goes back to the kind (and its count, on the
+        Assembly track and in the AAF)."""
+        self._end_mark_rename(commit=False)
+        marks = self._marks()
+        if not 0 <= idx < len(marks):
+            return
+        entry = tk.Entry(self._cv, font=FB, bg=SURF2, fg=TEXT,
+                         insertbackground=TEXT, relief="flat", width=28,
+                         highlightthickness=1, highlightbackground=ACCENT)
+        entry.insert(0, marks[idx].get("name") or "")
+
+        # "break": the key is the field's alone -- not also the window's
+        # Enter (accept) or Esc (close).
+        def _done(commit):
+            self._end_mark_rename(commit=commit)
+            return "break"
+        entry.bind("<Return>", lambda e: _done(True))
+        entry.bind("<KP_Enter>", lambda e: _done(True))
+        entry.bind("<Escape>", lambda e: _done(False))
+        self._mark_rename = (entry, idx)
+        self._sel_mark = idx
+        self._draw()
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+    def _end_mark_rename(self, commit):
+        if self._mark_rename is None:
+            return
+        entry, idx = self._mark_rename
+        self._mark_rename = None
+        try:
+            name = entry.get().strip()
+            entry.destroy()
+        except tk.TclError:
+            return
+        marks = self._marks()
+        if commit and 0 <= idx < len(marks) and \
+                name != (marks[idx].get("name") or ""):
+            self._push_undo()
+            marks[idx] = dict(marks[idx], name=name)
+            self._write_marks(marks)
+        try:
+            self._draw()
+            self._win.focus_set()
+        except tk.TclError:
+            pass
+
+    def _on_double(self, event):
+        idx = self._mark_hit(event.x, event.y)
+        if idx is not None:
+            self._mark_drag = None
+            self._drag = None
+            self._begin_mark_rename(idx)
+
+    def _on_mark_menu(self, event):
+        """Right-click on a flag: what can be done to it."""
+        idx = self._mark_hit(event.x, event.y)
+        if idx is None:
+            return
+        self._sel_mark = idx
+        self._draw()
+        m = tk.Menu(self._cv, tearoff=0, bg=SURF2, fg=TEXT,
+                    activebackground=ACCENT, activeforeground=TEXT, bd=0)
+        m.add_command(label="Name…",
+                      command=lambda: self._begin_mark_rename(idx))
+        m.add_command(label="Delete marker",
+                      command=lambda: self.delete_mark(idx))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
 
     def _add_cut(self):
         """Split the segment under the playhead, creating a new cut point.
