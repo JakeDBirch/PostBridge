@@ -49,6 +49,7 @@ from config import _SANS
 from utils import basename, is_video, is_media, secs_tc, parse_dnd
 from gui_components import _SlimScrollbar
 import engines
+import play_highlight
 
 
 # Module-scope diagnostic flag + log helpers, same shape as main.py.
@@ -1443,7 +1444,7 @@ class PqWorkflowMixin:
         # the periodic _pq_playback_highlight_tick poll while
         # _pq_playing.  The colour is ACCENT mixed ~25% into BG so
         # it reads as the same orange family without screaming.
-        tx_text.tag_configure("body_playing", background="#4a2a14")
+        tx_text.tag_configure("body_playing", background=play_highlight.PLAY_BG)
         tx_text.tag_raise("body_playing", "body")
         # Diagnostic on Ctrl+Shift+D — fast version: samples up to 30
         # logical lines spread evenly through the document and reports
@@ -5380,27 +5381,11 @@ class PqWorkflowMixin:
                 # session has 20-34k, so this was 5-9 ms of linear scan
                 # 16 times a second for the whole playback.
                 time_idx, line_starts = self._pq_playback_caches()
-                cur = None
-                if time_idx:
-                    j = bisect.bisect_right(
-                        time_idx, playhead, key=lambda it: it[0]) - 1
-                    if 0 <= j < len(time_idx):
-                        ws, we, s_abs, e_abs = time_idx[j]
-                        if ws <= playhead < we:
-                            cur = (s_abs, e_abs)
-                tx.tag_remove("body_playing", "1.0", "end")
-                if cur is not None:
-                    # Literal "line.column" indices — "1.0 + Nc" makes Tk
-                    # walk forward N chars from the buffer origin, and
-                    # this ran three times per tick.
-                    _i0 = self._pq_abs_index(cur[0], line_starts)
-                    _i1 = self._pq_abs_index(cur[1], line_starts)
-                    tx.tag_add("body_playing", _i0, _i1)
-                    # Keep the playing word on screen without
-                    # snapping the user back to it on every tick if
-                    # they intentionally scrolled away — tx.see only
-                    # scrolls if the index is offscreen.
-                    tx.see(_i0)
+                # Literal "line.column" indices — "1.0 + Nc" makes Tk
+                # walk forward N chars from the buffer origin.
+                play_highlight.show(
+                    tx, "body_playing", time_idx, playhead,
+                    lambda n: self._pq_abs_index(n, line_starts))
             except tk.TclError:
                 pass
         # Schedule next tick.  Cancel handle stored so stop can kill
@@ -5417,12 +5402,8 @@ class PqWorkflowMixin:
             try: self.after_cancel(after_id)
             except Exception: pass
             self._pq_play_hi_after = None
-        tx = getattr(self, "_pq_tx_text", None)
-        if tx is not None:
-            try:
-                tx.tag_remove("body_playing", "1.0", "end")
-            except tk.TclError:
-                pass
+        play_highlight.clear(getattr(self, "_pq_tx_text", None),
+                             "body_playing")
         if sys.platform == "win32":
             try:
                 import winsound

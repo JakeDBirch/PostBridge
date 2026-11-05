@@ -239,3 +239,133 @@ def test_another_clip_of_a_file_already_loaded_does_not_load_it_again(walking,
     assert view_s <= 70.0 and view_s + d._canvas_w * d._spp / d._sr >= 75.0
     d.load_clip("b.wav", [[5.0, 6.0]])
     assert d._samples is None and started == [True]
+
+
+# ── The script lights up as the clip plays ────────────────────────────────
+
+class _Player:
+    """Stands in for the live engine: _animate_playhead reads position()."""
+    def __init__(self):
+        self.t, self.playing = 0.0, True
+
+    def is_playing(self):
+        return self.playing
+
+    def position(self):
+        return self.t
+
+    def stop(self):
+        self.playing = False
+
+    def close(self):
+        pass
+
+
+N_WORDS = 300
+WORDS = [{"word": " w{}".format(i), "start": 50.0 + 0.3 * i,
+          "end": 50.0 + 0.3 * i + 0.25} for i in range(N_WORDS)]
+# What the script says: the read, except one word said differently.
+SCRIPT = " ".join("w{}".format(i) if i != 5 else "changed"
+                  for i in range(N_WORDS))
+
+
+@pytest.fixture
+def playing(monkeypatch):
+    monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
+                        lambda self: None)
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    root.withdraw()
+    d = match_review.MatchReviewDialog(
+        root, "a.wav", [[50.0, 50.0 + 0.3 * N_WORDS]], title="BUTLER",
+        quote_text=SCRIPT, context_before="before\n" * 40,
+        words=WORDS, auto_snap=False)
+    _pump(root)
+    d._samples = np.zeros(d._sr * 200, np.float32)
+    d._ctx_start, d._ctx_dur = 0.0, 200.0
+    p = d._player = _Player()
+    yield root, d, p
+    d._on_cancel()
+    root.destroy()
+
+
+def _lit(d):
+    r = d._script_text.tag_ranges("playing")
+    return d._script_text.get(r[0], r[1]) if r else None
+
+
+def _hear(root, d, p, t):
+    p.t = t
+    d._animate_playhead()
+    root.update()
+
+
+def test_the_script_word_being_heard_lights_up(playing):
+    root, d, p = playing
+    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    assert _lit(d) == "w3"
+    _hear(root, d, p, 50.0 + 0.3 * 4 + 0.1)
+    assert _lit(d) == "w4"
+    _hear(root, d, p, 50.0 + 0.3 * 4 + 0.28)     # between two words
+    assert _lit(d) is None
+
+
+def test_a_word_the_script_has_differently_stays_dark(playing):
+    root, d, p = playing
+    _hear(root, d, p, 50.0 + 0.3 * 5 + 0.1)
+    assert _lit(d) is None
+    _hear(root, d, p, 50.0 + 0.3 * 6 + 0.1)
+    assert _lit(d) == "w6"
+
+
+def test_the_script_scrolls_to_keep_the_word_in_view(playing):
+    root, d, p = playing
+    qt = d._script_text
+    qt.yview_moveto(0.0)                 # reading the lines before it
+    root.update()
+    word = qt.search("w3 ", "1.0")
+    assert qt.bbox(word) is None
+    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    assert _lit(d) == "w3"
+    assert qt.bbox(qt.tag_ranges("playing")[0]) is not None
+
+
+def test_stopping_clears_it(playing):
+    root, d, p = playing
+    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    d._stop()
+    root.update()
+    assert _lit(d) is None and d._playhead_anim is None
+
+
+def test_playback_ending_on_its_own_clears_it(playing):
+    root, d, p = playing
+    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    p.playing = False
+    d._animate_playhead()
+    assert _lit(d) is None
+
+
+def test_another_clip_starts_dark_and_lights_its_own_script(playing):
+    root, d, p = playing
+    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    d.load_clip("a.wav", [[50.0 + 0.3 * 10, 50.0 + 0.3 * 14]],
+                quote_text="w10 w11 w12 w13", words=WORDS, auto_snap=False)
+    assert _lit(d) is None
+    d._player = p
+    p.playing = True
+    _hear(root, d, p, 50.0 + 0.3 * 12 + 0.1)
+    assert _lit(d) == "w12"
+
+
+def test_a_lone_word_far_from_the_clip_is_not_taken_for_it():
+    import play_highlight
+    words = [{"word": "the", "start": 1.0, "end": 1.2},
+             {"word": "dog", "start": 19.0, "end": 19.2},
+             {"word": "cat", "start": 20.0, "end": 20.2},
+             {"word": "sat", "start": 20.3, "end": 20.5}]
+    idx = play_highlight.align_text_to_words("the cat sat", words,
+                                             span=(20.0, 20.5))
+    assert [(a, b) for _, _, a, b in idx] == [(4, 7), (8, 11)]

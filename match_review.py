@@ -29,6 +29,7 @@ from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     SUCCESS, WARN, ERR, FB, FBT, FH,
                     SNAP_IN_OFFSET, SNAP_OUT_OFFSET)
 import playback as _pb
+import play_highlight
 from engines import (extract_audio_segment, extract_mono_pcm,
                      get_media_duration,
                      time_stretch_wav as engines_time_stretch)
@@ -111,6 +112,17 @@ _CUT_HIT     = 18       # wider radius for interior CUT IN / CUT OUT lines —
                         # so they need to win against the fleur-slip zone
                         # even on a slightly-off click
 _SLIP_DRAG_PX = 4       # pixels mouse must move before a body-press becomes a slip
+
+# Spotting marks (engines.MARKER_KINDS), drawn as the Assembly track draws
+# them: music and SFX share a lane, notes have their own.  The Assembly view
+# takes its colours from here.
+MARK_MUSIC   = "#4f9be0"   # music cue in / out, inflection
+MARK_SFX     = "#e0609a"   # SFX spot
+MARK_NOTE    = "#c9c9a8"   # a note: anything else worth marking
+_MARK_LANE_H = 12          # height of a mark lane, above the time axis
+_MARK_HIT    = 8           # pixel radius for grabbing a flag
+_MARK_WORDS  = {"music_in": "Cue in", "music_out": "Cue out",
+                "music_inflection": "Inflection", "sfx": "SFX", "note": "Note"}
 _CHUNK_S          = 120.0   # seconds per lazy-load chunk (for scrolling beyond preview)
 _TRIGGER_S        = 15.0    # trigger next chunk when viewport is this close to a loaded edge
 _AUTO_SNAP_WINDOW = 0.35    # seconds: search radius for automatic boundary snap
@@ -204,6 +216,13 @@ class MatchReviewDialog:
     auto_snap : bool
         Snap IN/OUT to the speech edges on opening.  For points the matcher
         guessed; False for points someone has set, which stay where they are.
+    get_markers, set_markers : callable() -> list, callable(list)
+        The pull's spotting marks -- its res["markers"], the same list the
+        Assembly track edits and the AAF exports (engines.place_markers).
+        The editor reads it fresh on every draw and writes each change
+        straight back, so a mark made here is on the Assembly track at once
+        and the other way round.  A mark made here is pinned to the moment
+        of source audio it was dropped on ("src").  None: no marks.
     fps : float
         Sequence frame rate — used for nudge step size.
     """
@@ -214,8 +233,11 @@ class MatchReviewDialog:
                  scripted_tc="",
                  on_accept=None, fps=24.0,
                  pool_by_token=None, on_next=None, on_prev=None,
-                 auto_snap=True):
+                 auto_snap=True, get_markers=None, set_markers=None):
         self._parent          = parent
+        self._sel_mark        = None    # index of the chosen mark
+        self._mark_drag       = None    # {"idx", "x0", "t", "moved"} while dragging one
+        self._mark_rename     = None    # (Entry, index) while naming one
         self._fps             = fps
         self._frame_s         = 1.0 / max(1.0, fps)
         self._sr              = _SR
@@ -231,7 +253,8 @@ class MatchReviewDialog:
         self._full_loading    = set()   # files with a Phase 2 still running
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev, auto_snap)
+                       on_accept, pool_by_token, on_next, on_prev, auto_snap,
+                       get_markers, set_markers)
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -358,9 +381,12 @@ class MatchReviewDialog:
 
     def _set_clip(self, source_audio, segments, title, quote_text, matched_text,
                   words, context_before, context_after, scripted_tc,
-                  on_accept, pool_by_token, on_next, on_prev, auto_snap):
+                  on_accept, pool_by_token, on_next, on_prev, auto_snap,
+                  get_markers=None, set_markers=None):
         """What belongs to one clip, as opposed to the window."""
         self._auto_snap       = auto_snap
+        self._get_markers     = get_markers
+        self._set_markers     = set_markers
         self._audio_path      = source_audio
         self._on_accept       = on_accept
         self._on_next         = on_next
@@ -422,10 +448,12 @@ class MatchReviewDialog:
                   scripted_tc="",
                   on_accept=None,
                   pool_by_token=None, on_next=None, on_prev=None,
-                  auto_snap=True):
+                  auto_snap=True, get_markers=None, set_markers=None):
         """Bring another clip into this window, which stays open.  Takes what
         __init__ takes.  A file already loaded whole isn't loaded again."""
         self._stop()
+        self._end_mark_rename(commit=True)
+        self._sel_mark = self._mark_drag = None
         same_file = source_audio == self._audio_path
         if not same_file and self._player is not None:
             try:
@@ -435,7 +463,8 @@ class MatchReviewDialog:
             self._player = None
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev, auto_snap)
+                       on_accept, pool_by_token, on_next, on_prev, auto_snap,
+                       get_markers, set_markers)
         self._load_gen += 1
         self._playhead_s       = self._in_s
         self._drag             = None
@@ -497,6 +526,7 @@ class MatchReviewDialog:
         qf, qt = self._script_frame, self._script_text
         quote_text, scripted_tc = self._quote_text, self._scripted_tc
         context_before, context_after = self._context_before, self._context_after
+        self._script_play_idx = []
         if not (quote_text or context_before or context_after):
             qf.pack_forget()
             return
@@ -538,6 +568,35 @@ class MatchReviewDialog:
                     qt.see(ranges[0])
             except Exception:
                 pass
+        self._index_script_for_playback()
+
+    def _index_script_for_playback(self):
+        """Line the script quote up with the transcript, so playing the clip
+        can light up the script words as they are heard."""
+        qt, quote = self._script_text, self._quote_text
+        ranges = qt.tag_ranges("main") if quote else ()
+        if not ranges or not self._words:
+            return
+        line0, col0 = (int(x) for x in str(ranges[0]).split("."))
+        # Words around the clip: the matcher's span may be off, which is
+        # what this window is for, so look a little either side of it.
+        lo = bisect.bisect_left(self._word_starts, self._in_s - 10.0)
+        hi = bisect.bisect_right(self._word_starts, self._out_s + 10.0)
+        idx = play_highlight.align_text_to_words(
+            quote, self._words[lo:hi], span=(self._in_s, self._out_s))
+
+        def _tk(o):
+            nl = quote.count("\n", 0, o)
+            if not nl:
+                return "{}.{}".format(line0, col0 + o)
+            return "{}.{}".format(line0 + nl, o - quote.rfind("\n", 0, o) - 1)
+        self._script_play_idx = [(ws, we, _tk(a), _tk(b))
+                                 for ws, we, a, b in idx]
+
+    def _show_playing_word(self):
+        """The script word under the playhead, lit and kept in view."""
+        play_highlight.show(self._script_text, "playing",
+                            self._script_play_idx, self._playhead_s)
 
     def _show_scripted_tc(self):
         self._scripted_head.config(text="SCRIPTED" if self._scripted_tc else "")
@@ -574,6 +633,9 @@ class MatchReviewDialog:
         qt.tag_config("rule", font=_font_ctx,  foreground=BORDER)
         qt.tag_config("main", font=_font_main, foreground=TEXT)
         qt.tag_config("tc",   font=_font_tc,   foreground=SUB)
+        # The word being heard (see _show_playing_word); above the others.
+        qt.tag_config("playing", background=play_highlight.PLAY_BG)
+        qt.tag_raise("playing")
         # Held on to: Tk font objects go away with their last reference.
         self._script_fonts = (_font_main, _font_ctx, _font_tc)
 
@@ -603,6 +665,8 @@ class MatchReviewDialog:
         self._cv.bind("<MouseWheel>",      self._on_scroll)
         self._cv.bind("<Configure>",       self._on_resize)
         self._cv.bind("<Motion>",          self._on_hover)
+        self._cv.bind("<Double-Button-1>", self._on_double)
+        self._cv.bind("<Button-3>",        self._on_mark_menu)
 
         # ── Word timeline — words positioned by timestamp below waveform ────────
         wf = tk.Frame(win, bg=SURF,
@@ -706,6 +770,35 @@ class MatchReviewDialog:
             ub.bind("<Enter>",           lambda e, w=ub: w.config(bg=ACCENT))
             ub.bind("<Leave>",           lambda e, w=ub: w.config(bg=SURF3))
             ub.bind("<ButtonRelease-1>", lambda e, f=ucmd: f())
+
+        # Spotting marks at the playhead -- the Assembly track's keys.
+        tk.Frame(nrow, bg=BG, width=20).pack(side="left")
+        tk.Label(nrow, text="MARK", font=FB, bg=BG, fg=SUB).pack(
+            side="left", padx=(0, 4))
+        for mlbl, kind, col in (("MUSIC (M)", "music_inflection", MARK_MUSIC),
+                                ("SFX (X)", "sfx", MARK_SFX),
+                                ("NOTE (N)", "note", MARK_NOTE)):
+            mb = tk.Label(nrow, text=mlbl, font=FB, bg=SURF3, fg=col,
+                          cursor="hand2", padx=8, pady=2, bd=0,
+                          highlightbackground=BORDER, highlightthickness=1)
+            mb.pack(side="left", padx=1)
+            mb.bind("<Enter>", lambda e, w=mb: w.config(bg=ACCENT, fg=BG))
+            mb.bind("<Leave>", lambda e, w=mb, c=col: w.config(bg=SURF3, fg=c))
+            mb.bind("<ButtonRelease-1>", lambda e, k=kind: self.drop_mark(k))
+
+        # M / X / N drop a mark at the playhead, while it plays too; Delete
+        # takes the chosen one away.  Not while typing in a field.
+        def _mark_key(fn):
+            def _h(e):
+                if isinstance(e.widget, tk.Entry):
+                    return None
+                fn()
+                return "break"
+            return _h
+        win.bind("m", _mark_key(lambda: self.drop_mark("music_inflection")))
+        win.bind("x", _mark_key(lambda: self.drop_mark("sfx")))
+        win.bind("n", _mark_key(lambda: self.drop_mark("note")))
+        win.bind("<Delete>", _mark_key(self.delete_mark))
 
         # Keyboard nudge still works: ←/→ = IN, Shift-←/→ = OUT
         win.bind("<Left>",        lambda e: self._nudge("in",  -1))
@@ -3373,6 +3466,7 @@ class MatchReviewDialog:
             if self._drag != "playhead":
                 self._playhead_s = p.position()
             self._draw_playhead_only()
+            self._show_playing_word()
             try:
                 self._playhead_anim = self._win.after(40, self._animate_playhead)
             except Exception:
@@ -3385,6 +3479,7 @@ class MatchReviewDialog:
                 self._playhead_s   = self._pre_play_pos
                 self._pre_play_pos = None
             self._playhead_anim = None
+            play_highlight.clear(self._script_text, "playing")
             try:
                 self._draw()
             except Exception:
@@ -3412,6 +3507,7 @@ class MatchReviewDialog:
             self._stop()
             return
         self._draw_playhead_only()
+        self._show_playing_word()
         try:
             self._playhead_anim = self._win.after(40, self._animate_playhead)
         except Exception:
@@ -3436,6 +3532,7 @@ class MatchReviewDialog:
             except Exception:
                 pass
             self._playhead_anim = None
+        play_highlight.clear(getattr(self, "_script_text", None), "playing")
         try:
             import winsound
             winsound.PlaySound(None, winsound.SND_PURGE)

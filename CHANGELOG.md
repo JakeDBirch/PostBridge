@@ -4,6 +4,9 @@
 
 ## November 5, 2026
 
+### Waveform editor: the script lights up as the clip plays
+- **The word being heard now lights up in the script above the waveform, and the script scrolls to keep it in view,** the way Pull Quotes does in its transcript. The script is lined up with the transcript of the clip, so a word the speaker skipped or said differently stays dark. The highlight clears when playback stops or another clip loads. Pull Quotes and the waveform editor now share the same highlight code.
+
 ### Waveform editor: Accept works after Step 4 refreshes
 - **Accepting no longer throws "invalid command name … label".** With the editor open, anything that rebuilt Step 4's cards (a refresh, an undo) left the editor holding the card it was opened from. Accept then tried to update that card's label, failed, and stopped before the clip was counted and saved, so the accept could be lost. It now goes to the card on screen for that pull, and if Step 4 isn't showing at all, the edit is still kept and saved.
 
