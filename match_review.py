@@ -225,6 +225,11 @@ class MatchReviewDialog:
         of source audio it was dropped on ("src").  None: no marks.
     fps : float
         Sequence frame rate — used for nudge step size.
+    host : tk widget or None
+        None: the editor is its own full-screen window, with ACCEPT, CANCEL,
+        PREVIOUS / NEXT and its own keys.  A frame: the editor is built into
+        it as a view of a bigger window, which owns the keys, the window and
+        when the view goes (destroy()).
     """
 
     def __init__(self, parent, source_audio, segments, title="",
@@ -233,8 +238,10 @@ class MatchReviewDialog:
                  scripted_tc="",
                  on_accept=None, fps=24.0,
                  pool_by_token=None, on_next=None, on_prev=None,
-                 auto_snap=True, get_markers=None, set_markers=None):
+                 auto_snap=True, get_markers=None, set_markers=None,
+                 host=None):
         self._parent          = parent
+        self._dialog          = host is None
         self._sel_mark        = None    # index of the chosen mark
         self._mark_drag       = None    # {"idx", "x0", "t", "moved"} while dragging one
         self._mark_rename     = None    # (Entry, index) while naming one
@@ -339,6 +346,15 @@ class MatchReviewDialog:
         self._tmp_dir = tempfile.mkdtemp(prefix="pb_match_")
 
         # ── Build window ──────────────────────────────────────────────────
+        if host is not None:
+            # A view in someone else's window: everything goes in a frame
+            # there, and the window, its keys and its closing are theirs.
+            self._win  = host.winfo_toplevel()
+            self._body = tk.Frame(host, bg=BG)
+            self._body.pack(fill="both", expand=True)
+            self._build_ui()
+            self._start_extraction()
+            return
         self._win = tk.Toplevel(parent)
         self._win.title(self._window_title(title))
         self._win.configure(bg=BG)
@@ -363,6 +379,8 @@ class MatchReviewDialog:
             self._win.geometry("{}x{}+{}+{}".format(
                 w, h, max(0, px + (pw - w) // 2), max(0, py + (ph - h) // 2)))
 
+        self._body = tk.Frame(self._win, bg=BG)
+        self._body.pack(fill="both", expand=True)
         self._build_ui()
         # Focus the window so keyboard shortcuts work immediately, but
         # DON'T grab_set() until the preview lands — the multi-second
@@ -477,7 +495,8 @@ class MatchReviewDialog:
         self._remove_seg_areas = []
         self._snap_lbl.config(text="")
         self._search_var.set("")
-        self._win.title(self._window_title(title))
+        if self._dialog:
+            self._win.title(self._window_title(title))
         self._show_script()
         self._show_scripted_tc()
         self._show_word_row()
@@ -613,7 +632,12 @@ class MatchReviewDialog:
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        win = self._win
+        win = self._body
+
+        def bind(seq, fn):
+            # A view's keys are its host's to route (see `host`).
+            if self._dialog:
+                self._win.bind(seq, fn)
 
         # ── Script text — scrollable, capped height so controls always visible ──
         import tkinter.font as _tkfont
@@ -795,19 +819,19 @@ class MatchReviewDialog:
                 fn()
                 return "break"
             return _h
-        win.bind("m", _mark_key(lambda: self.drop_mark("music_inflection")))
-        win.bind("x", _mark_key(lambda: self.drop_mark("sfx")))
-        win.bind("n", _mark_key(lambda: self.drop_mark("note")))
-        win.bind("<Delete>", _mark_key(self.delete_mark))
+        bind("m", _mark_key(lambda: self.drop_mark("music_inflection")))
+        bind("x", _mark_key(lambda: self.drop_mark("sfx")))
+        bind("n", _mark_key(lambda: self.drop_mark("note")))
+        bind("<Delete>", _mark_key(self.delete_mark))
 
         # Keyboard nudge still works: ←/→ = IN, Shift-←/→ = OUT
-        win.bind("<Left>",        lambda e: self._nudge("in",  -1))
-        win.bind("<Right>",       lambda e: self._nudge("in",   1))
-        win.bind("<Shift-Left>",  lambda e: self._nudge("out", -1))
-        win.bind("<Shift-Right>", lambda e: self._nudge("out",  1))
+        bind("<Left>",        lambda e: self._nudge("in",  -1))
+        bind("<Right>",       lambda e: self._nudge("in",   1))
+        bind("<Shift-Left>",  lambda e: self._nudge("out", -1))
+        bind("<Shift-Right>", lambda e: self._nudge("out",  1))
 
         # Spacebar = toggle play/stop
-        win.bind("<space>", lambda e: self._toggle_play())
+        bind("<space>", lambda e: self._toggle_play())
 
         # Shift+S = toggle SKIP CUTS (matches the checkbox in the
         # transport row).  Both cases bound because Tk delivers
@@ -817,36 +841,36 @@ class MatchReviewDialog:
             v = self._play_edit_mode
             if v is not None:
                 v.set(not v.get())
-        win.bind("<Shift-S>", _toggle_skip_cuts)
-        win.bind("<Shift-s>", _toggle_skip_cuts)
+        bind("<Shift-S>", _toggle_skip_cuts)
+        bind("<Shift-s>", _toggle_skip_cuts)
 
         # [ / ] — playback speed down / up
-        win.bind("<bracketleft>",  lambda e: self._cycle_rate(-1))
-        win.bind("<bracketright>", lambda e: self._cycle_rate(1))
+        bind("<bracketleft>",  lambda e: self._cycle_rate(-1))
+        bind("<bracketright>", lambda e: self._cycle_rate(1))
 
         # + / - zoom in / out — centred on the cursor
-        win.bind("<plus>",      lambda e: self._zoom_by(1.0/1.5))
-        win.bind("<minus>",      lambda e: self._zoom_by(1.5))
-        win.bind("<equal>",      lambda e: self._zoom_by(1.0/1.5))
-        win.bind("<underscore>", lambda e: self._zoom_by(1.5))
+        bind("<plus>",      lambda e: self._zoom_by(1.0/1.5))
+        bind("<minus>",      lambda e: self._zoom_by(1.5))
+        bind("<equal>",      lambda e: self._zoom_by(1.0/1.5))
+        bind("<underscore>", lambda e: self._zoom_by(1.5))
 
         # I / O — set IN / OUT to playhead position
-        win.bind("i", lambda e: self._set_point_from_cursor("in"))
-        win.bind("o", lambda e: self._set_point_from_cursor("out"))
+        bind("i", lambda e: self._set_point_from_cursor("in"))
+        bind("o", lambda e: self._set_point_from_cursor("out"))
 
         # C — insert a cut at the current playhead position (works during playback)
-        win.bind("c", lambda e: self._add_cut())
+        bind("c", lambda e: self._add_cut())
 
         # R / T — zoom out / in (Pro Tools convention) — centred on the cursor
-        win.bind("r", lambda e: self._zoom_by(1.5))
-        win.bind("t", lambda e: self._zoom_by(1.0/1.5))
+        bind("r", lambda e: self._zoom_by(1.5))
+        bind("t", lambda e: self._zoom_by(1.0/1.5))
 
         # Undo/redo keyboard shortcuts — return "break" to stop propagation
         # to the Step 4 bind_all handlers on the parent window.
-        win.bind("<Control-z>", lambda e: (self._undo_wf(), "break")[1])
-        win.bind("<Control-Z>", lambda e: (self._redo_wf(), "break")[1])
-        win.bind("<Control-Shift-z>", lambda e: (self._redo_wf(), "break")[1])
-        win.bind("<Control-Shift-Z>", lambda e: (self._redo_wf(), "break")[1])
+        bind("<Control-z>", lambda e: (self._undo_wf(), "break")[1])
+        bind("<Control-Z>", lambda e: (self._redo_wf(), "break")[1])
+        bind("<Control-Shift-z>", lambda e: (self._redo_wf(), "break")[1])
+        bind("<Control-Shift-Z>", lambda e: (self._redo_wf(), "break")[1])
 
         # ── Transcript search row ─────────────────────────────────────────
         # Type a phrase, prev/next steps through matches on the word
@@ -972,6 +996,9 @@ class MatchReviewDialog:
                                 highlightthickness=0)
         _pe_cb.pack(side="right", padx=(6, 0))
 
+        self._next_btn = self._prev_btn = None
+        if not self._dialog:
+            return
         # ── Accept / Cancel ───────────────────────────────────────────────
         bot = tk.Frame(win, bg=BG)
         # side="bottom" so ACCEPT / CANCEL survive when the canvas
@@ -1009,7 +1036,7 @@ class MatchReviewDialog:
         acc_next.bind("<ButtonRelease-1>", lambda e: self._on_accept_next())
         # "break": not the plain Return (accept and close) as well.
         for seq in ("<Control-Return>", "<Control-KP_Enter>"):
-            win.bind(seq, lambda e: (self._on_accept_next(), "break")[1])
+            bind(seq, lambda e: (self._on_accept_next(), "break")[1])
 
         def _step_btn(text, direction):
             b = tk.Label(bot, text=text, font=FBT, bg=SURF3, fg=TEXT,
@@ -1027,11 +1054,21 @@ class MatchReviewDialog:
         self._prev_btn = _step_btn("◀  PREVIOUS", -1)
         self._sync_step_btns()
 
+    def _alive(self):
+        """The editor is still on screen (its window, or its frame in a
+        host's)."""
+        try:
+            return bool(self._body.winfo_exists())
+        except (AttributeError, tk.TclError):
+            return False
+
     def _step_fn(self, direction):
         return self._on_next if direction > 0 else self._on_prev
 
     def _sync_step_btns(self):
         """Dim the way that has run out, as the speed stepper does."""
+        if self._next_btn is None:
+            return
         for btn, fn in ((self._prev_btn, self._on_prev),
                         (self._next_btn, self._on_next)):
             btn.config(fg=TEXT if fn else BORDER, cursor="hand2" if fn else "")
@@ -1093,7 +1130,7 @@ class MatchReviewDialog:
 
     def _preview_done(self, fut, gen):
         try:
-            if gen != self._load_gen or not self._win.winfo_exists():
+            if gen != self._load_gen or not self._alive():
                 return
         except Exception:
             return
@@ -1126,7 +1163,7 @@ class MatchReviewDialog:
 
         def _show():
             try:
-                if gen != self._load_gen or not self._win.winfo_exists():
+                if gen != self._load_gen or not self._alive():
                     return
                 # This clip's file may have finished loading whole, for the
                 # clip before: then there's nothing for the preview to add.
@@ -1142,7 +1179,8 @@ class MatchReviewDialog:
                 # focus.  If a later Phase-2 stall happens, the user
                 # can still Escape (or the parent app can dismiss).
                 try:
-                    self._win.grab_set()
+                    if self._dialog:
+                        self._win.grab_set()
                 except tk.TclError:
                     pass
                 self._refresh_displays()
@@ -1215,7 +1253,7 @@ class MatchReviewDialog:
     def _full_done(self, fut, path):
         self._full_loading.discard(path)
         try:
-            if not self._win.winfo_exists():
+            if not self._alive():
                 return
         except Exception:
             return
@@ -1271,7 +1309,7 @@ class MatchReviewDialog:
 
         def _swap():
             try:
-                if path != self._audio_path or not self._win.winfo_exists():
+                if path != self._audio_path or not self._alive():
                     return
                 # Preserve the current viewport centre in absolute time
                 centre_t = (self._ctx_start +
@@ -1376,7 +1414,7 @@ class MatchReviewDialog:
     def _chunk_done(self, fut, side, chunk_start_s, gen):
         """Callback (background thread) — merge the loaded chunk into samples."""
         try:
-            if gen != self._load_gen or not self._win.winfo_exists():
+            if gen != self._load_gen or not self._alive():
                 return
         except Exception:
             return
@@ -3885,9 +3923,13 @@ class MatchReviewDialog:
         except Exception:
             pass
         try:
-            self._win.destroy()
+            (self._win if self._dialog else self._body).destroy()
         except Exception:
             pass
+
+    def destroy(self):
+        """Take the editor away: its window, or as a view its frame."""
+        self._cleanup()
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

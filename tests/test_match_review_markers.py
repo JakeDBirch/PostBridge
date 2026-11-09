@@ -114,9 +114,11 @@ def test_x_and_n_open_for_naming_and_enter_keeps_the_name(ed):
 
 def test_typing_in_a_field_drops_nothing(ed):
     d, res, _w, root = ed
-    entries = [w for w in d._win.winfo_children()
-               for w in [w] + list(w.winfo_children())
-               if isinstance(w, tk.Entry)]
+    def _all(w):
+        for c in w.winfo_children():
+            yield c
+            yield from _all(c)
+    entries = [w for w in _all(d._win) if isinstance(w, tk.Entry)]
     _key(root, entries[-1], "m")
     assert "markers" not in res
 
