@@ -1,4 +1,17 @@
-"""Assembly view -- the reconciled episode as one continuous track.
+"""Assembly view -- the reconciled episode as one continuous track, and
+the recording behind any pull of it.
+
+Two views of the one cut.  The CUT view is the track described below.
+Shift+S (or Enter) flips to the SOURCE view: the pull at the insertion
+point drawn against its whole recording, with its edit points, cuts and
+marks on it -- the waveform editor (match_review.MatchReviewDialog), built
+into this window.  The playhead stays on the same moment of audio either
+way.  Each view plays what it shows: the cut, or the recording straight
+through.  An edit in the source view is saved as it is made, like one on
+the track, through the same accept and undo.  The keys are the same in
+both: Space plays, B splits at the playhead, C takes half a second out
+from it, M / X / N drop marks, , and . nudge the edge or region last
+taken, arrows step to the next pull, Ctrl+Z is Step 4's undo.
 
 Step 4 reviews one pull at a time.  This is the other way of looking at the
 same data: every placed pull laid end to end, exactly where build_aaf will
@@ -114,6 +127,7 @@ LEAD_S      = 0.5     # silence ahead of 0:00 so playback can start at the top
 LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
+CUT_OUT_S   = 0.5     # C takes this much out from the insertion point
 ROLL_PX     = 3       # Shift on a seam this near its line rolls it
 CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
 WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
@@ -742,6 +756,9 @@ class AssemblyWindow(object):
         self.markers    = []             # place_markers' list, plus "t" (s)
         self.sel_marker = None           # (order, index) of the chosen mark
         self._rename    = None           # (entry widget, (order, index))
+        self.view       = "cut"          # "cut" | "source" (see toggle_view)
+        self.src        = None           # the source view: the waveform editor
+        self._src_order = None           # the pull it shows
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=LOAD_WORKERS, thread_name_prefix="pb_assembly")
 
@@ -827,16 +844,21 @@ class AssemblyWindow(object):
         self._top.add(self._side, minsize=180, stretch="never")
         self._build_panels()
 
-        # Track pane
+        # Track pane: the cut view's track, or the source view, over the
+        # status line (_show_view packs one or the other).
         bottom = tk.Frame(self._outer, bg=BG)
-        self.ov = tk.Canvas(bottom, height=24, bg=SURF2, highlightthickness=0,
-                            cursor="hand2")
+        self._track_frame = tk.Frame(bottom, bg=BG)
+        self._track_frame.pack(fill="both", expand=True)
+        self._src_frame = tk.Frame(bottom, bg=BG)
+        self.ov = tk.Canvas(self._track_frame, height=24, bg=SURF2,
+                            highlightthickness=0, cursor="hand2")
         self.ov.pack(fill="x", pady=(6, 0))
-        self.cv = tk.Canvas(bottom, bg=BG, highlightthickness=0,
+        self.cv = tk.Canvas(self._track_frame, bg=BG, highlightthickness=0,
                             cursor="arrow")
         self.cv.pack(fill="both", expand=True, pady=(2, 0))
         foot = tk.Frame(bottom, bg=BG)
         foot.pack(fill="x", pady=(0, 4))
+        self._foot = foot
         self.load_lbl = tk.Label(foot, text="", font=(FB[0], 10), bg=BG,
                                  fg=SUB, padx=10)
         self.load_lbl.pack(side="right")
@@ -914,7 +936,7 @@ class AssemblyWindow(object):
                               self.toggle_return, toggle=True)
         self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
                               toggle=True)
-        self.script_key = key(p, "Script follows words", "Shift+S",
+        self.script_key = key(p, "Script follows words", "Shift+F",
                               self.toggle_script_follow, toggle=True)
 
         p = self._panel("EDIT")
@@ -922,6 +944,7 @@ class AssemblyWindow(object):
         self.reading_key = None
         key(p, "Delete selection", "Del", self._delete_key)
         key(p, "Split", "B", self.split)
+        key(p, "Cut ½ s out", "C", self.cut_out)
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
         key(p, "Nudge later by default gap", "/", self.nudge_gap)
@@ -938,7 +961,8 @@ class AssemblyWindow(object):
         p.add(amount)
         key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
-        key(p, "Open in editor", "Enter", self.open_selected)
+        self.view_key = key(p, "Source view", "Shift+S", self.toggle_view,
+                            toggle=True)
         gap = tk.Frame(p, bg=SURF)
         tk.Label(gap, text="Default gap", font=(FB[0], 10), bg=SURF,
                  fg=TEXT).pack(side="left", padx=(0, 4))
@@ -1120,6 +1144,7 @@ class AssemblyWindow(object):
                 pass
         self._refresh_after = None
         self._layout()
+        self._sync_source()
         clips = self.clips
         self.audio.keep_only({c.order for c in clips})
         self._env = {o: v for o, v in self._env.items() if o in self._by_order}
@@ -2049,8 +2074,8 @@ class AssemblyWindow(object):
             self.status.config(fg=SUB, text=(
                 "Not in the cut   ·   right-click to bring it back"
                 if self._is_ignored(o) else
-                "No audio was found for these lines   ·   Enter opens the "
-                "waveform editor to look for it"))
+                "No audio was found for these lines   ·   Enter shows the "
+                "recording to look in"))
             self.redraw()
             return
         line = self._line(o)
@@ -2138,7 +2163,7 @@ class AssemblyWindow(object):
         m.add_command(label="Note (N)", command=lambda: self.drop_marker("note"))
         m.add_separator()
         m.add_command(label="Copy (Ctrl+C)", command=self.copy_words, state=on(has))
-        m.add_command(label="Open in editor (Enter)", command=self.open_selected)
+        m.add_command(label="Source view (Enter)", command=self.open_selected)
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
@@ -3765,12 +3790,159 @@ class AssemblyWindow(object):
             self._status_range()
 
     def open_card(self, order):
-        """The pull in Step 4's waveform editor, which shows its whole
-        source file -- for finding an edit outside what was pulled."""
+        """The pull in the source view: its whole recording, for finding
+        an edit outside what was pulled."""
         if order is None:
             return
+        self.show_source(order)
+
+    # ── The source view ──────────────────────────────────────────────────
+    def toggle_view(self):
+        """Shift+S: the recording behind the pull at the insertion point,
+        or back to the cut.  The playhead stays on the same moment of audio."""
+        if self.view == "source":
+            self._leave_source()
+            return
+        o = self.sel_order
+        if o is None:
+            o = self._order_at(self.insert)
+        if o is None:
+            self.status.config(fg=SUB, text="Nothing here to show the "
+                               "recording of: put the insertion point on a pull.")
+            return
+        self.show_source(o)
+
+    def show_source(self, order, at=None):
+        """The pull in the source view, with the playhead at source time
+        `at` -- else at the insertion point's moment of it.  The editor is
+        built once and reloaded for each pull; the same pull again only
+        moves the playhead."""
+        c = self._clip(order)
+        r = c.res if c is not None else next(
+            (r for r in self.app.results if r.get("order") == order), None)
+        if r is None:
+            return
+        sa = self.app._s4_editor_source(r)[0] or (c.play_path if c else None)
+        if not sa:
+            self.status.config(fg=ERR, text="#{:03d}  {}   ·   no recording to "
+                               "show".format(order, r.get("token", "?")))
+            return
         self.stop()
-        self.app._assembly_open_card(order)
+        if c is not None and c.segments:
+            segs = [list(sg) for sg in c.segments]
+            if at is None:
+                at = c.src_at(self.insert)
+                if at is None:           # in a gap: where its audio resumes
+                    at = next((si for tl, _du, si in c.pieces
+                               if tl > self.insert), segs[0][0])
+        else:
+            # A line never found (or not in the cut): the start of the
+            # recording, to look for it in.  Nothing is saved until an
+            # edit point is moved.
+            segs = [list(sg) for sg in (r.get("segments") or [(0.0, 30.0)])]
+            if at is None:
+                at = segs[0][0]
+        kw = dict(self.app._s4_editor_clip(r, sa), auto_snap=False,
+                  on_edit=lambda s, o=order: self._src_edited(o, s))
+        if self.src is None:
+            self.src = match_review.MatchReviewDialog(
+                self.app, sa, segs, fps=getattr(self.app, "_seq_fps", 24.0),
+                host=self._src_frame, **kw)
+            # A click on the waveform takes the keys back from a field.
+            self.src._cv.bind("<Button-1>",
+                              lambda e: self.src._cv.focus_set(), add="+")
+        elif self._src_order != order or self.src._audio_path != sa:
+            self.src.load_clip(sa, segs, **kw)
+        self._src_order = order
+        self.src._playhead_s = at
+        self.src._play_rate = self._rate
+        self.src._sync_rate_btn()
+        if self.sel_order != order:
+            self.select(order)
+        self._show_view("source")
+        self.src._draw()
+
+    def _leave_source(self):
+        src = self.src
+        src._stop()
+        t = self._timeline_time(self._src_order, src._playhead_s)
+        self._show_view("cut")
+        if t is not None:
+            self.seek(t)
+
+    def _timeline_time(self, order, s):
+        """Where source time s of a pull falls on the timeline: in a piece,
+        or where its kept audio resumes; past the last, the pull's end."""
+        c = self._clip(order)
+        if c is None or not c.pieces:
+            return None
+        for tl, du, si in c.pieces:
+            if s < si:
+                return tl
+            if s < si + du:
+                return tl + (s - si)
+        return c.end
+
+    def _show_view(self, view):
+        self.view = view
+        if view == "source":
+            self._track_frame.pack_forget()
+            self._src_frame.pack(fill="both", expand=True, before=self._foot)
+            self.src._cv.focus_set()
+            c = self._clip(self._src_order)
+            self.status.config(fg=SUB, text="SOURCE   {}   ·   the whole "
+                               "recording, the pull's edit points on it   ·   "
+                               "Shift+S back to the cut".format(
+                                   c.label if c else ""))
+        else:
+            self._src_frame.pack_forget()
+            self._track_frame.pack(fill="both", expand=True, before=self._foot)
+            self.cv.focus_set()
+            self.redraw()
+            self._update_status()
+        self._show_monitor()
+
+    def _src_edited(self, order, segs):
+        """An edit in the source view: the pull's new segments, saved as
+        the track's edits are (one undo step; the join silences carried
+        over).  The track follows on Step 4's refresh."""
+        if self._closed:
+            return
+        segs = [(float(a), float(b)) for a, b in segs]
+        c = self._clip(order)
+        if c is not None and segs == c.segments:
+            return
+        self.app._assembly_set_segments(order, segs)
+
+    def _sync_source(self):
+        """After a re-layout: the source view shows its pull as it is now
+        (an undo, a track edit), or gives way to the cut if the pull left it."""
+        if self.src is None or self._src_order is None:
+            return
+        c = self._clip(self._src_order)
+        if c is None:
+            # Not in the cut.  Gone or IGNOREd: the view gives way.  Still
+            # there with no audio found: it is being looked for.
+            r = next((r for r in self.app.results
+                      if r.get("order") == self._src_order), None)
+            if r is None or r.get("_s4_ignored"):
+                self._src_order = None
+                if self.view == "source":
+                    self._show_view("cut")
+            return
+        self.src.set_segments(c.segments)
+        self.src.markers_changed()
+
+    def cut_out(self):
+        """C: take half a second out from the insertion point -- two edit
+        points with a cut between them, as the editor's C."""
+        c = self._clip_at(self.insert)
+        if c is None:
+            self.status.config(fg=SUB, text="Nothing to cut here: put the "
+                               "insertion point inside a pull.")
+            return
+        self._range = (c.order, self.insert, min(self.insert + CUT_OUT_S, c.end))
+        self.delete_range()
 
     def _begin_rename(self, key):
         """Name a mark in place: a field over its flag, Enter to keep,
@@ -3886,6 +4058,8 @@ class AssemblyWindow(object):
             c = self.clips[j]
             self.select(c.order)
             self.seek(c.start)
+            if self.view == "source":
+                self.show_source(c.order)
 
     # ── Playback ─────────────────────────────────────────────────────────
     def toggle_play(self):
@@ -4007,6 +4181,7 @@ class AssemblyWindow(object):
         self.return_key.set_on(_MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
+        self.view_key.set_on(self.view == "source")
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])
 
@@ -4020,6 +4195,11 @@ class AssemblyWindow(object):
         match_review._LAST_PLAY_RATE = self._rate
         if self.player is not None:
             self.player.set_rate(self._rate)
+        if self.src is not None:         # one speed for both views
+            self.src._play_rate = self._rate
+            self.src._sync_rate_btn()
+            if self.src._player is not None:
+                self.src._player.set_rate(self._rate)
         self._show_rate()
 
     def _show_rate(self):
@@ -4036,13 +4216,49 @@ class AssemblyWindow(object):
         k = e.keysym
         ctrl = bool(e.state & 0x0004)
         shift = bool(e.state & 0x0001)
-        if k == "space":
-            self.toggle_play()
+        # The window's keys, the same in both views; then the view's own.
+        if ctrl and k in ("equal", "plus"):
+            self.to_step4()                  # Pro Tools' Edit / Mix toggle
+        elif ctrl and k.lower() == "s":
+            self.save()
+        elif ctrl and k.lower() == "z":
+            # Step 4's own history: edits in both views and on the cards
+            # share it.
+            (self.app._s4_redo if shift else self.app._s4_undo)()
+        elif ctrl and k.lower() == "y":
+            self.app._s4_redo()
+        elif ctrl and k.lower() == "c":
+            self.copy_words()
+        elif k == "S" and not ctrl or k == "Return":
+            self.toggle_view()
+        elif k == "F" and not ctrl:
+            self.toggle_script_follow()
+        elif k == "N" and not ctrl:
+            self.toggle_return()
         elif k == "bracketleft":
             self.step_rate(-1)
         elif k == "bracketright":
             self.step_rate(1)
-        elif k in ("plus", "equal", "KP_Add") and not ctrl:
+        elif not ctrl and k.lower() == "p":
+            self.toggle_preroll()
+        elif not ctrl and k == "s":
+            self.toggle_follow()
+        elif k == "Right":
+            self._neighbour(1)
+        elif k == "Left":
+            self._neighbour(-1)
+        elif k in ("Up", "Down"):
+            self.cycle_reading(-1 if k == "Up" else 1)
+        elif self.view == "source" and self.src is not None:
+            self._on_key_source(self.src, k, ctrl)
+        else:
+            self._on_key_cut(k, ctrl)
+        return "break"
+
+    def _on_key_cut(self, k, ctrl):
+        if k == "space":
+            self.toggle_play()
+        elif k in ("plus", "equal", "KP_Add"):
             self.zoom(1.5)
         elif k in ("minus", "underscore", "KP_Subtract"):
             self.zoom(1 / 1.5)
@@ -4050,29 +4266,12 @@ class AssemblyWindow(object):
             self.return_to_zero()
         elif k == "End":
             self.seek(self.total_s)
-        elif k == "Right":
-            self._neighbour(1)
-        elif k == "Left":
-            self._neighbour(-1)
-        elif k in ("Up", "Down"):
-            self.cycle_reading(-1 if k == "Up" else 1)
         elif k in ("Delete", "BackSpace"):
             self._delete_key()
-        elif k == "Return":
-            self.open_selected()
         elif k in ("0", "KP_0", "KP_Insert"):
             self.stop(key=True)
-        elif not ctrl and k.lower() == "p":
-            self.toggle_preroll()
-        elif not ctrl and k.lower() == "n":
-            if shift:
-                self.toggle_return()
-            else:
-                self.drop_marker("note")
-        elif not ctrl and k == "S":
-            self.toggle_script_follow()
-        elif not ctrl and k.lower() == "s":
-            self.toggle_follow()
+        elif not ctrl and k == "n":
+            self.drop_marker("note")
         elif not ctrl and k.lower() == "r":
             self.zoom(1 / 1.5)               # Pro Tools: R out, T in
         elif not ctrl and k.lower() == "t":
@@ -4081,23 +4280,14 @@ class AssemblyWindow(object):
             self.drop_marker("music_inflection")
         elif not ctrl and k.lower() == "x":
             self.drop_marker("sfx")
-        elif ctrl and k in ("equal", "plus"):
-            self.to_step4()                  # Pro Tools' Edit / Mix toggle
-        elif ctrl and k.lower() == "s":
-            self.save()
         elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
             self.split()                     # Pro Tools: B, or Ctrl+E
+        elif k.lower() == "c" and not ctrl:
+            self.cut_out()
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
         elif k == "slash":
             self.nudge_gap()
-        elif ctrl and k.lower() == "z":
-            # Step 4's own history: edits here and on the cards share it.
-            (self.app._s4_redo if e.state & 0x0001 else self.app._s4_undo)()
-        elif ctrl and k.lower() == "y":
-            self.app._s4_redo()
-        elif ctrl and k.lower() == "c":
-            self.copy_words()
         elif k.lower() == "f" and not ctrl:
             self.fit()
         elif k == "Escape":
@@ -4106,7 +4296,51 @@ class AssemblyWindow(object):
             self.sel_marker = None
             self.redraw()
             self._update_status()
-        return "break"
+
+    def _on_key_source(self, src, k, ctrl):
+        """The same keys on the source view: the recording and the pull's
+        edit points, where the cut view has the track."""
+        if k == "space":
+            src._toggle_play()
+        elif k in ("plus", "equal", "KP_Add"):
+            src._zoom_by(1 / 1.5)
+        elif k in ("minus", "underscore", "KP_Subtract"):
+            src._zoom_by(1.5)
+        elif k == "Home":
+            src._playhead_s = 0.0
+            src._draw()
+        elif k == "End":
+            src._playhead_s = src._ctx_start + src._ctx_dur
+            src._draw()
+        elif k in ("Delete", "BackSpace"):
+            src.delete_mark()
+        elif k in ("0", "KP_0", "KP_Insert"):
+            src._stop()
+        elif not ctrl and k == "n":
+            src.drop_mark("note")
+        elif not ctrl and k.lower() == "r":
+            src._zoom_by(1.5)
+        elif not ctrl and k.lower() == "t":
+            src._zoom_by(1 / 1.5)
+        elif not ctrl and k.lower() == "m":
+            src.drop_mark("music_inflection")
+        elif not ctrl and k.lower() == "x":
+            src.drop_mark("sfx")
+        elif not ctrl and k.lower() == "i":
+            src._set_point_from_cursor("in")
+        elif not ctrl and k.lower() == "o":
+            src._set_point_from_cursor("out")
+        elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
+            src.split_at_playhead()
+        elif k.lower() == "c" and not ctrl:
+            src._add_cut()
+        elif k in ("comma", "period"):
+            src.nudge_edge(-1 if k == "comma" else 1)
+        elif k.lower() == "f" and not ctrl:
+            src._zoom_fit()
+        elif k == "Escape":
+            src._sel_mark = None
+            src._draw()
 
     # ── Lifetime ─────────────────────────────────────────────────────────
     def lift(self):
@@ -4145,6 +4379,12 @@ class AssemblyWindow(object):
             self.player.close()
         self._pool.shutdown(wait=False, cancel_futures=True)
         self._cancel_timers()
+        if self.src is not None:
+            try:
+                self.src.destroy()
+            except Exception:
+                pass
+            self.src = None
         try:
             self.win.destroy()
         except tk.TclError:

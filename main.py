@@ -8678,56 +8678,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     # from restored sessions / provisional-first / post-
                     # reassign flows all open cleanly.  A silent return here
                     # was the reason many cards appeared "dead to clicks".
-                    tried = []
-                    def _try(path, label):
-                        tried.append((label, path or "(unset)"))
-                        return path and os.path.isfile(path)
-
-                    sa = r.get("source_audio", "") or ""
-                    if not _try(sa, "source_audio"):
-                        sa = r.get("source_video", "") or ""
-                        if not _try(sa, "source_video"):
-                            sa = ""
-
-                    # For VO rows the winning take's apath is the canonical
-                    # source — try it before any pool guessing.
-                    if not sa and r.get("is_vo"):
-                        _td = r.get("takes_data") or []
-                        _bi = r.get("best_take_index", 0) or 0
-                        if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
-                            _apath = _td[_bi].get("apath", "") or ""
-                            if _try(_apath, "takes_data[{}].apath".format(_bi)):
-                                sa = _apath
-                                r["source_audio"] = _apath   # cache
-
-                    # Pool fallbacks — prefer audio, then video (existing
-                    # behavior extended: audio was never tried before).
-                    if not sa:
-                        tok = r.get("token", "")
-                        _pool = getattr(self, "_pool", None)
-                        if _pool is not None:
-                            if r.get("is_vo"):
-                                _pi = r.get("part_index", -1)
-                                try:
-                                    _bin = _pool.get_vo_assets().get(_pi, {}) or {}
-                                except Exception:
-                                    _bin = {}
-                                _audios = _bin.get("audios", []) or []
-                                _videos = _bin.get("videos", []) or []
-                            else:
-                                _assigned = _pool.get_interview_assets().get(tok, []) or []
-                                _audios = [p for p in _assigned if not is_video(p)]
-                                _videos = [p for p in _assigned if is_video(p)]
-
-                            _aud = next((p for p in _audios if os.path.isfile(p)), None)
-                            if _try(_aud, "pool audio"):
-                                sa = _aud
-                                r["source_audio"] = _aud   # cache
-                            else:
-                                _vid = next((p for p in _videos if os.path.isfile(p)), None)
-                                if _try(_vid, "pool video"):
-                                    sa = _vid
-                                    r["source_video"] = _vid   # cache
+                    sa, tried = self._s4_editor_source(r)
 
                     if not sa or not os.path.isfile(sa):
                         # Explain WHY the editor can't open — not silent.
@@ -8748,49 +8699,6 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     segs_r = r.get("segments") or [(0.0, 30.0)]
                     fps    = getattr(self, "_seq_fps", 24.0)
 
-                    # Gather neighbouring quote text for script context
-                    _ctx_before = _ctx_after = ""
-                    _this_order = r.get("order", -1)
-                    for _ri, _rr in enumerate(self.results):
-                        if _rr.get("order") == _this_order:
-                            if _ri > 0:
-                                _ctx_before = (self.results[_ri - 1]
-                                               .get("quote_text", "") or "")
-                            if _ri < len(self.results) - 1:
-                                _ctx_after  = (self.results[_ri + 1]
-                                               .get("quote_text", "") or "")
-                            break
-
-                    # Words: prefer per-result transcription (interview pulls store
-                    # their windowed words there); fall back to full-file cache
-                    # (VO takes are cached against the take file path).
-                    _words = (r.get("words")
-                              or engines.cache_load(sa)
-                              or [])
-
-                    # Format scripted timecode range for display in the editor
-                    _stc_in  = r.get("in_tc",  "")
-                    _stc_out = r.get("out_tc", "")
-                    _scripted_tc = (
-                        "{}  \u2192  {}".format(_stc_in, _stc_out)
-                        if _stc_in and _stc_out else ""
-                    )
-
-                    # Build {token: [audio_paths]} from the media pool so the
-                    # dialog's "🌐 all pulls" search can cross-check the
-                    # phrase against every OTHER token's transcript sidecar.
-                    # Used when the assigned token is itself wrong and the
-                    # quote lives in a completely different audio file.
-                    _pool_by_token = {}
-                    try:
-                        for _prow in getattr(self._pool, "_rows", []) or []:
-                            _tok = _prow["var"].get()
-                            _pth = _prow.get("path")
-                            if _tok and _pth and _tok != "— unassigned —":
-                                _pool_by_token.setdefault(_tok, []).append(_pth)
-                    except Exception:
-                        _pool_by_token = {}
-
                     # A background match for this row waits until the editor
                     # closes (_bg_flush_deferred) instead of changing the
                     # data out from under it.
@@ -8798,27 +8706,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     self._s4_editing_row = r
                     if _prev_row is not None and _prev_row is not r:
                         self._bg_flush_deferred(_prev_row)
-                    _clip = dict(title=r.get("token", ""),
-                                 quote_text=r.get("quote_text", ""),
-                                 matched_text=r.get("matched_text", ""),
-                                 context_before=_ctx_before,
-                                 context_after=_ctx_after,
-                                 scripted_tc=_scripted_tc,
-                                 words=_words,
+                    _this_order = r.get("order", -1)
+                    _clip = dict(self._s4_editor_clip(r, sa),
                                  on_accept=lambda *a, _sa=sa, **k:
                                      self._s4_live_accept(r, acc)(*a, apath=_sa, **k),
-                                 pool_by_token=_pool_by_token,
                                  on_next=self._s4_step_fn(_this_order, 1),
                                  on_prev=self._s4_step_fn(_this_order, -1),
-                                 auto_snap=not r.get("_s4_accepted"),
-                                 # The pull's spotting marks, the Assembly
-                                 # track's own: looked up by order, as a
-                                 # rebuild or an undo may replace the row.
-                                 get_markers=lambda o=_this_order: next(
-                                     (x.get("markers") for x in self.results
-                                      if x.get("order") == o), None),
-                                 set_markers=lambda m, o=_this_order:
-                                     self._assembly_set_markers({o: m}))
+                                 auto_snap=not r.get("_s4_accepted"))
                     # NEXT / PREVIOUS: the same window, showing another clip.
                     _open = self._s4_open_editor()
                     if _open is not None:
@@ -9117,6 +9011,129 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             if showing and getattr(self, "_rv", None):
                 self._open_assembly()
 
+    def _s4_editor_source(self, r):
+        """The recording the waveform editor shows for pull `r`: its
+        source audio, else its video, a VO pull's winning take, else the
+        pool's file for its token.  (sa, tried): the path, or None, and
+        what was looked at, for the message when there is none."""
+        tried = []
+        def _try(path, label):
+            tried.append((label, path or "(unset)"))
+            return path and os.path.isfile(path)
+
+        sa = r.get("source_audio", "") or ""
+        if not _try(sa, "source_audio"):
+            sa = r.get("source_video", "") or ""
+            if not _try(sa, "source_video"):
+                sa = ""
+
+        # For VO rows the winning take's apath is the canonical
+        # source — try it before any pool guessing.
+        if not sa and r.get("is_vo"):
+            _td = r.get("takes_data") or []
+            _bi = r.get("best_take_index", 0) or 0
+            if 0 <= _bi < len(_td) and isinstance(_td[_bi], dict):
+                _apath = _td[_bi].get("apath", "") or ""
+                if _try(_apath, "takes_data[{}].apath".format(_bi)):
+                    sa = _apath
+                    r["source_audio"] = _apath   # cache
+
+        # Pool fallbacks — prefer audio, then video (existing
+        # behavior extended: audio was never tried before).
+        if not sa:
+            tok = r.get("token", "")
+            _pool = getattr(self, "_pool", None)
+            if _pool is not None:
+                if r.get("is_vo"):
+                    _pi = r.get("part_index", -1)
+                    try:
+                        _bin = _pool.get_vo_assets().get(_pi, {}) or {}
+                    except Exception:
+                        _bin = {}
+                    _audios = _bin.get("audios", []) or []
+                    _videos = _bin.get("videos", []) or []
+                else:
+                    _assigned = _pool.get_interview_assets().get(tok, []) or []
+                    _audios = [p for p in _assigned if not is_video(p)]
+                    _videos = [p for p in _assigned if is_video(p)]
+
+                _aud = next((p for p in _audios if os.path.isfile(p)), None)
+                if _try(_aud, "pool audio"):
+                    sa = _aud
+                    r["source_audio"] = _aud   # cache
+                else:
+                    _vid = next((p for p in _videos if os.path.isfile(p)), None)
+                    if _try(_vid, "pool video"):
+                        sa = _vid
+                        r["source_video"] = _vid   # cache
+        return (sa if sa and os.path.isfile(sa) else None), tried
+
+    def _s4_editor_clip(self, r, sa):
+        """What the waveform editor shows for pull `r` from file `sa`,
+        besides its segments and what is done with them: the script around
+        it, the words, the pool for "all pulls" search, and the pull's
+        spotting marks.  Step 4's card and the Assembly's source view both
+        open the editor from this."""
+        # Gather neighbouring quote text for script context
+        _ctx_before = _ctx_after = ""
+        _this_order = r.get("order", -1)
+        for _ri, _rr in enumerate(self.results):
+            if _rr.get("order") == _this_order:
+                if _ri > 0:
+                    _ctx_before = (self.results[_ri - 1]
+                                   .get("quote_text", "") or "")
+                if _ri < len(self.results) - 1:
+                    _ctx_after  = (self.results[_ri + 1]
+                                   .get("quote_text", "") or "")
+                break
+
+        # Words: prefer per-result transcription (interview pulls store
+        # their windowed words there); fall back to full-file cache
+        # (VO takes are cached against the take file path).
+        _words = (r.get("words")
+                  or engines.cache_load(sa)
+                  or [])
+
+        # Format scripted timecode range for display in the editor
+        _stc_in  = r.get("in_tc",  "")
+        _stc_out = r.get("out_tc", "")
+        _scripted_tc = (
+            "{}  \u2192  {}".format(_stc_in, _stc_out)
+            if _stc_in and _stc_out else ""
+        )
+
+        # Build {token: [audio_paths]} from the media pool so the
+        # dialog's "🌐 all pulls" search can cross-check the
+        # phrase against every OTHER token's transcript sidecar.
+        # Used when the assigned token is itself wrong and the
+        # quote lives in a completely different audio file.
+        _pool_by_token = {}
+        try:
+            for _prow in getattr(self._pool, "_rows", []) or []:
+                _tok = _prow["var"].get()
+                _pth = _prow.get("path")
+                if _tok and _pth and _tok != "— unassigned —":
+                    _pool_by_token.setdefault(_tok, []).append(_pth)
+        except Exception:
+            _pool_by_token = {}
+
+        return dict(title=r.get("token", ""),
+                    quote_text=r.get("quote_text", ""),
+                    matched_text=r.get("matched_text", ""),
+                    context_before=_ctx_before,
+                    context_after=_ctx_after,
+                    scripted_tc=_scripted_tc,
+                    words=_words,
+                    pool_by_token=_pool_by_token,
+                    # The pull's spotting marks, the Assembly track's own:
+                    # looked up by order, as a rebuild or an undo may
+                    # replace the row.
+                    get_markers=lambda o=_this_order: next(
+                        (x.get("markers") for x in self.results
+                         if x.get("order") == o), None),
+                    set_markers=lambda m, o=_this_order:
+                        self._assembly_set_markers({o: m}))
+
     def _assembly_open_card(self, order):
         """Open a pull's waveform editor from the Assembly track.  Its
         accept saves Step 4 state, which redraws the cut."""
@@ -9158,7 +9175,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         return _go
 
     def _s4_open_editor(self):
-        """The waveform editor, if its window is open."""
+        """The waveform editor that is open: the Assembly window's source
+        view, else its own window."""
+        asm = getattr(self, "_assembly", None)
+        src = getattr(asm, "src", None)
+        if src is not None and src._alive():
+            return src
         dlg = getattr(self, "_s4_editor", None)
         try:
             return dlg if dlg is not None and dlg._win.winfo_exists() else None

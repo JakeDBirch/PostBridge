@@ -25,7 +25,7 @@ _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_s4_apply_state_rows", "_s4_push_undo", "_s4_undo", "_s4_redo",
                 "_assembly_set_default_gap", "_assembly_set_segments",
                 "_assembly_set_gap", "_assembly_set_markers", "_s4_open_editor",
-                "_s4_editor_markers_changed",
+                "_s4_editor_markers_changed", "_s4_editor_clip", "_s4_editor_source",
                 "_assembly_set_reading", "_assembly_edit_many",
                 "_assembly_ignore", "_assembly_unignore",
                 "_collect_export_inputs")
@@ -138,6 +138,9 @@ def view(monkeypatch):
 
     monkeypatch.setitem(assembly_view._MONITOR, "nudge_s", 0.1)
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
+    monkeypatch.setattr(assembly_view.match_review.MatchReviewDialog,
+                        "_start_extraction", lambda self: None)
+    app._s4_editor_source = lambda r: (WAV, [])   # the recording exists
     monkeypatch.setattr(os.path, "isfile",
                         lambda p, _f=os.path.isfile: p == WAV or _f(p))
     win = open_assembly(app)
@@ -586,8 +589,11 @@ def test_a_line_never_found_offers_no_bring_back(view, monkeypatch):
     win._on_text_release(_E(x, y))
     assert "No audio was found" in win.status.cget("text")
     assert win.sel_order == 3
-    win.open_selected()
-    assert app.opened == [3]
+    win.open_selected()                  # the recording's start, to look in
+    assert win.view == "source" and win._src_order == 3
+    assert win.src._edited_segments() == [(0.0, 30.0)]
+    assert _res(app, 3)["segments"] == []       # only looked at: nothing saved
+    win.toggle_view()
     menus = []
     monkeypatch.setattr(tk.Menu, "tk_popup", lambda self, x, y: menus.append(self))
     win._on_text_menu(_E(x, y))
@@ -654,7 +660,7 @@ def test_right_click_selects_the_word_and_offers_the_operations(view, monkeypatc
     assert _highlighted(win) == "ridge"
     for want in ("Play from here (Space)", "Delete (Del)", "Split (B)",
                  "Music inflection (M)", "SFX (X)", "Note (N)",
-                 "Copy (Ctrl+C)", "Open in editor (Enter)"):
+                 "Copy (Ctrl+C)", "Source view (Enter)"):
         assert want in seen
     assert not any("Restore" in s or "Music in " in s for s in seen)
     # Right-clicking inside a highlight keeps it.

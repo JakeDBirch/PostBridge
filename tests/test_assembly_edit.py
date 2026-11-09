@@ -31,7 +31,7 @@ _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_assembly_set_default_gap",
                 "_assembly_set_segments", "_assembly_set_gap",
                 "_assembly_set_markers", "_s4_open_editor",
-                "_s4_editor_markers_changed", "_assembly_set_reading",
+                "_s4_editor_markers_changed", "_s4_editor_clip", "_s4_editor_source", "_assembly_set_reading",
                 "_assembly_edit_many", "_collect_export_inputs")
 
 
@@ -126,6 +126,9 @@ def view(monkeypatch):
 
     monkeypatch.setitem(assembly_view._MONITOR, "nudge_s", 0.1)
     monkeypatch.setattr(assembly_view.playback, "available", lambda: False)
+    monkeypatch.setattr(assembly_view.match_review.MatchReviewDialog,
+                        "_start_extraction", lambda self: None)
+    app._s4_editor_source = lambda r: (WAV, [])   # the recording exists
     win = open_assembly(app)
     yield app, win
     win.close()
@@ -261,7 +264,7 @@ def test_sfx_spot_opens_its_name_field_and_enter_only_names_it(view):
     app.update()
     assert _res(app, 1)["markers"][0]["name"] == "rifle shot"
     assert win._rename is None
-    assert app.opened == []                 # Enter did not open the editor
+    assert win.view == "cut"                 # Enter did not change the view
 
     # Esc keeps the count for a name; a music cue doesn't open a field.
     win.set_insert(2.0)
@@ -275,17 +278,17 @@ def test_sfx_spot_opens_its_name_field_and_enter_only_names_it(view):
     assert [m["label"] for m in win.markers] == ["rifle shot", "SFX 2"]
     win.drop_marker("music_in")
     assert win._rename is None
-    assert app.opened == []
+    assert win.view == "cut"
 
 
-def test_enter_on_the_track_still_opens_the_editor(view):
+def test_enter_on_the_track_shows_the_source_view(view):
     app, win = view
     win.select(2)
     win.cv.focus_force()
     app.update()
     win.cv.event_generate("<KeyPress>", keysym="Return", when="now")
     app.update()
-    assert app.opened == [2]
+    assert win.view == "source" and win._src_order == 2
 
 
 def test_script_lights_the_word_being_said(view):
@@ -325,7 +328,7 @@ def test_inflection_and_notes(view):
     kinds = [(m["kind"], m["label"]) for m in win.markers]
     assert kinds == [("music_inflection", "Inflection 1"),
                      ("note", "check the date")]
-    assert app.opened == []
+    assert win.view == "cut"
     # Notes have their own lane on the ruler.
     win.redraw()
     note = win.markers[1]
@@ -347,10 +350,10 @@ def test_double_click_with_the_grabber_opens_the_editor(view):
             self.x, self.y = x, y
     x = win._x(1.0)
     win._on_track_double(_E(x, y1 - 4))
-    assert app.opened == [1]
+    assert win.view == "source" and win._src_order == 1
     # The selector's double-click takes the whole region instead.
     win._on_track_double(_E(x, y0 + 6))
-    assert app.opened == [1]
+    assert win._src_order == 1
     assert win.sel_region == (1, 0) and win._range[1:] == (0.0, 4.0)
 
 
@@ -947,7 +950,7 @@ def test_opening_and_swapping_during_playback_mean_the_ghost_cursors_pull(view):
     finally:
         win._playing = False
         win.stop = lambda key=False: None
-    assert app.opened == [1]
+    assert win._src_order == 1
     del win.stop
 
 

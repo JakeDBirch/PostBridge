@@ -225,6 +225,10 @@ class MatchReviewDialog:
         of source audio it was dropped on ("src").  None: no marks.
     fps : float
         Sequence frame rate — used for nudge step size.
+    on_edit : callable(segments) or None
+        Each finished edit, as it is made -- a view saves as it goes, where
+        the window waits for ACCEPT.  set_segments() brings in an edit made
+        elsewhere (an undo).
     host : tk widget or None
         None: the editor is its own full-screen window, with ACCEPT, CANCEL,
         PREVIOUS / NEXT and its own keys.  A frame: the editor is built into
@@ -239,7 +243,7 @@ class MatchReviewDialog:
                  on_accept=None, fps=24.0,
                  pool_by_token=None, on_next=None, on_prev=None,
                  auto_snap=True, get_markers=None, set_markers=None,
-                 host=None):
+                 host=None, on_edit=None):
         self._parent          = parent
         self._dialog          = host is None
         self._sel_mark        = None    # index of the chosen mark
@@ -261,7 +265,7 @@ class MatchReviewDialog:
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
                        on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                       get_markers, set_markers)
+                       get_markers, set_markers, on_edit)
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -400,9 +404,11 @@ class MatchReviewDialog:
     def _set_clip(self, source_audio, segments, title, quote_text, matched_text,
                   words, context_before, context_after, scripted_tc,
                   on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                  get_markers=None, set_markers=None):
+                  get_markers=None, set_markers=None, on_edit=None):
         """What belongs to one clip, as opposed to the window."""
         self._auto_snap       = auto_snap
+        self._on_edit         = on_edit
+        self._last_edge       = "in"   # what , and . nudge
         self._get_markers     = get_markers
         self._set_markers     = set_markers
         self._audio_path      = source_audio
@@ -466,7 +472,8 @@ class MatchReviewDialog:
                   scripted_tc="",
                   on_accept=None,
                   pool_by_token=None, on_next=None, on_prev=None,
-                  auto_snap=True, get_markers=None, set_markers=None):
+                  auto_snap=True, get_markers=None, set_markers=None,
+                  on_edit=None):
         """Bring another clip into this window, which stays open.  Takes what
         __init__ takes.  A file already loaded whole isn't loaded again."""
         self._stop()
@@ -482,7 +489,7 @@ class MatchReviewDialog:
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
                        on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                       get_markers, set_markers)
+                       get_markers, set_markers, on_edit)
         self._load_gen += 1
         self._playhead_s       = self._in_s
         self._drag             = None
@@ -743,8 +750,10 @@ class MatchReviewDialog:
         self._refresh_displays()
 
         # ── Controls row: zoom, SET IN/OUT  ──────────────────────────────
+        # (In a host the host's panels and keys do all of this.)
         nrow = tk.Frame(win, bg=BG)
-        nrow.pack(fill="x", padx=12, pady=(4, 2))
+        if self._dialog:
+            nrow.pack(fill="x", padx=12, pady=(4, 2))
 
         tk.Label(nrow, text="(1 frame = {:.2f}ms)".format(self._frame_s * 1000),
                  font=FB, bg=BG, fg=SUB).pack(side="left", padx=(0, 12))
@@ -951,7 +960,8 @@ class MatchReviewDialog:
 
         # ── Playback row ──────────────────────────────────────────────────
         prow = tk.Frame(win, bg=BG)
-        prow.pack(fill="x", padx=12, pady=(4, 2))
+        if self._dialog:
+            prow.pack(fill="x", padx=12, pady=(4, 2))
 
         def _pb(text, cmd, bg=SURF3, fg=TEXT):
             b = tk.Label(prow, text=text, font=FB, bg=bg, fg=fg,
@@ -963,7 +973,9 @@ class MatchReviewDialog:
             b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
             return b
 
-        self._play_edit_mode = tk.BooleanVar(value=True)
+        # A view plays the recording straight through: hearing the cut is
+        # the host's other view.
+        self._play_edit_mode = tk.BooleanVar(value=self._dialog)
 
         _pb("\u25b6 PLAY", self._play_or_edit)
         _pb("\u25a0 STOP", self._stop)
@@ -1475,6 +1487,8 @@ class MatchReviewDialog:
     # ── Drawing ───────────────────────────────────────────────────────────
 
     def _draw(self):
+        if self._drag is None:
+            self._edit_done()
         if self._samples is None:
             return
         # Every edit redraws, so this is the one place that catches them all:
@@ -1794,6 +1808,35 @@ class MatchReviewDialog:
         # Trigger lazy expansion if viewport has scrolled near an unloaded edge
         self._check_and_expand()
 
+    def _edit_done(self):
+        """A finished edit goes straight out through on_edit (a view).
+        Every edit ends in a redraw, so this is called from there -- but
+        never mid-drag -- and from the release.  Nothing goes out when
+        nothing changed."""
+        if self._on_edit is None:
+            return
+        segs = self._edited_segments()
+        if segs != self._opened_segs:
+            self._opened_segs = segs
+            self._on_edit(segs)
+
+    def set_segments(self, segments):
+        """The pull's segments as they are now, changed somewhere else
+        (an undo, the other view).  Not under a drag: that edit lands after."""
+        if self._drag is not None or not segments:
+            return
+        segs = [(float(a), float(b)) for a, b in segments]
+        if segs == self._edited_segments():
+            return
+        self._segments = [list(sg) for sg in segs]
+        self._in_s, self._out_s = segs[0][0], segs[-1][1]
+        self._opened_segs = self._edited_segments()
+        self._refresh_displays()
+        try:
+            self._draw()
+        except tk.TclError:
+            pass
+
     def _draw_words(self):
         """Draw transcribed words on the word-timeline canvas at their time positions."""
         cv = self._word_cv
@@ -2019,9 +2062,9 @@ class MatchReviewDialog:
         out_px = self._t_to_px(self._out_s)
         ph_px  = self._t_to_px(self._playhead_s)
         if abs(event.x - in_px) <= _MARKER_HIT:
-            self._drag = "in"
+            self._drag = self._last_edge = "in"
         elif abs(event.x - out_px) <= _MARKER_HIT:
-            self._drag = "out"
+            self._drag = self._last_edge = "out"
         else:
             # Check interior segment boundaries before falling through to
             # playhead / slip.  Uses _CUT_HIT (wider than _MARKER_HIT) so
@@ -2050,7 +2093,7 @@ class MatchReviewDialog:
                         interior_hit = ("seg_out", i)
                         best_dist    = d
             if interior_hit:
-                self._drag = interior_hit
+                self._drag = self._last_edge = interior_hit
             elif abs(event.x - ph_px) <= _MARKER_HIT:
                 # Playhead line: grab from anywhere along its full
                 # vertical extent, not just the triangle handle at
@@ -2424,6 +2467,7 @@ class MatchReviewDialog:
                 self._refresh_displays()
                 self._draw()
         self._drag = None
+        self._edit_done()
 
     def _on_hover(self, event):
         """Update the canvas cursor to reflect what a click-drag would do."""
@@ -3173,8 +3217,9 @@ class MatchReviewDialog:
 
     def _prune_empty_segments(self):
         """Drop any segments whose effective duration is below one frame
-        (~40 ms at 24 fps), and merge adjacent segments whose boundaries
-        touch (out == in).  Called after every mutation so the editor's
+        (~40 ms at 24 fps).  Segments that butt (out == in) stay apart:
+        that is a split, two regions of continuous audio, as on the
+        Assembly track and in the AAF.  Called after every mutation so the editor's
         segment list never falls into the "invisible sliver that can't
         be clicked" state Jordan hit — a zero-duration segment renders
         as no waveform region and doesn't fit a remove-segment button,
@@ -3197,14 +3242,7 @@ class MatchReviewDialog:
                 continue
             if _out - _in >= _EPS:
                 keep.append([_in, _out])
-        # Coalesce touching segments (out == next.in) so the "merge"
-        # button doesn't have to be clicked for redundant boundaries.
-        merged = []
-        for s in keep:
-            if merged and abs(merged[-1][1] - s[0]) < _EPS:
-                merged[-1][1] = s[1]
-            else:
-                merged.append(list(s))
+        merged = [list(s) for s in keep]
         # Guard: don't reduce to zero segments — leave at least one
         # even if everything was pruned (indicates a degenerate input).
         if not merged and self._segments:
@@ -3510,13 +3548,42 @@ class MatchReviewDialog:
         finally:
             m.grab_release()
 
-    def _add_cut(self):
-        """Split the segment under the playhead, creating a new cut point.
+    def split_at_playhead(self):
+        """B: break the segment under the playhead in two there, taking
+        nothing out -- two edit points on one moment."""
+        self._add_cut(gap=0.0)
+
+    def nudge_edge(self, direction):
+        """, and .: the edge last taken (IN, OUT or a cut's side) a frame
+        earlier or later."""
+        e = self._last_edge
+        if e in ("in", "out"):
+            self._nudge(e, direction)
+            return
+        kind, i = e
+        n, fs = len(self._segments), self._frame_s
+        if not 0 <= i < n:
+            return
+        if kind == "seg_in" and i > 0:
+            lo, hi = self._segments[i - 1][1] + fs, self._segments[i][1] - fs
+            self._segments[i][0] = min(max(self._segments[i][0] + direction * fs,
+                                           lo), hi)
+        elif kind == "seg_out" and i < n - 1:
+            lo, hi = self._segments[i][0] + fs, self._segments[i + 1][0] - fs
+            self._segments[i][1] = min(max(self._segments[i][1] + direction * fs,
+                                           lo), hi)
+        self._refresh_displays()
+        self._draw()
+
+    def _add_cut(self, gap=0.5):
+        """C: take `gap` seconds out from the playhead -- two edit points
+        with a cut between.  Split the segment under the playhead, creating
+        a new cut point.
 
         The cut starts exactly at the playhead position; a 0.5 s gap extends
         forward from there so the two new boundary markers are distinct.
         """
-        _GAP = 0.5   # seconds of gap inserted after the cut point
+        _GAP = gap   # seconds of gap inserted after the cut point
         t = self._playhead_s
         n = len(self._segments)
         for i, seg in enumerate(self._segments):
