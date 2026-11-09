@@ -195,3 +195,23 @@ def test_closing_takes_the_source_view_with_it(view):
     src = win.src
     win.close()
     assert not src._alive() and win.src is None
+
+
+def test_adopting_a_match_from_another_file_reassigns_the_pull(view):
+    """ADOPT in the source view's "all pulls" search: the pull takes the
+    other token and recording with the match as its one segment, through
+    the card's accept, as one undo step; the view then shows that file."""
+    app, win = view
+    win.show_source(1)
+    seen, orig = {}, app._rv[0]["accept_fn"]
+    app._rv[0]["accept_fn"] = lambda segs, **kw: (seen.update(kw), orig(segs))
+    depth = len(app._s4_undo_stack)
+    other = os.path.join(ROOT, "tests", "_no_such_other.wav")
+    app._s4_editor_source = lambda r: (other if r["order"] == 1 else WAV, [])
+    win.src._xtok_adopt("OTHER", other, 30.0, 33.0)
+    assert seen == {"new_token": "OTHER", "new_audio_path": other}
+    assert _segs(app, 1) == [(30.0, 33.0)]
+    assert len(app._s4_undo_stack) == depth + 1
+    win.refresh()
+    assert win.src._audio_path == other
+    assert win.src._edited_segments() == [(30.0, 33.0)]

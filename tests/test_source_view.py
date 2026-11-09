@@ -1,5 +1,5 @@
-"""The waveform editor built into another window as a view (host=), the way
-the Assembly window holds it as its source view.
+"""The waveform editor built into a window as a view (host=), the way the
+Assembly window holds it as its source view.
 
 Needs tkinter and a display; skips otherwise.
 """
@@ -60,13 +60,12 @@ def test_the_keys_are_the_hosts(hosted):
     assert top.bind() == ()
 
 
-def test_there_is_no_accept_or_step_row(hosted):
+def test_there_is_no_accept_row_or_transport(hosted):
     d, _top, frame, _root = hosted
     shown = _labels(frame)
-    for gone in ("ACCEPT EDIT POINTS", "ACCEPT AND NEXT", "CANCEL"):
+    for gone in ("ACCEPT EDIT POINTS", "ACCEPT AND NEXT", "CANCEL",
+                 "\u25b6 PLAY", "SKIP CUTS", "SET IN", "ADD CUT"):
         assert gone not in shown
-    assert d._next_btn is None
-    d._sync_step_btns()                      # nothing to dim, and no error
 
 
 def test_going_takes_the_view_and_leaves_the_window(hosted):

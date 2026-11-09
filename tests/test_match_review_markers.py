@@ -1,7 +1,9 @@
-"""Spotting marks in the waveform editor, in a real window.  The marks are the
-pull's own res["markers"] -- the list the Assembly track edits and the AAF
-exports -- read and written through get_markers / set_markers, as Step 4
-passes them.  The audio is put in place by hand, as in test_match_review_view.
+"""Spotting marks in the waveform editor (the Assembly's source view).  The
+marks are the pull's own res["markers"] -- the list the Assembly track edits
+and the AAF exports -- read and written through get_markers / set_markers, as
+the Assembly passes them.  The keys are the Assembly window's (see
+test_assembly_source_view); here the actions are called.  The audio is put in
+place by hand, as in test_match_review_view.
 
 Needs tkinter and a display; skips otherwise.
 """
@@ -20,6 +22,14 @@ tk = pytest.importorskip("tkinter")
 import match_review  # noqa: E402
 
 SECS = 120
+
+
+def _host(root):
+    """A frame in a window of its own, for the view to be built into."""
+    top = tk.Toplevel(root)
+    frame = tk.Frame(top)
+    frame.pack(fill="both", expand=True)
+    return frame
 
 
 class _Ev(object):
@@ -48,7 +58,7 @@ def ed(monkeypatch):
         else:
             res.pop("markers", None)
     d = match_review.MatchReviewDialog(
-        root, "no_such_file.wav", [[50.0, 60.0]], title="NARRATOR",
+        root, "no_such_file.wav", [[50.0, 60.0]], _host(root), title="NARRATOR",
         get_markers=lambda: res.get("markers"), set_markers=_set)
     settle = time.monotonic() + 0.2
     while time.monotonic() < settle:
@@ -60,7 +70,7 @@ def ed(monkeypatch):
     d._loaded_start_s, d._loaded_end_s = 0.0, float(SECS)
     d._draw()
     yield d, res, writes, root
-    d._on_cancel()
+    d.destroy()
     root.destroy()
 
 
@@ -85,7 +95,7 @@ def _drawn_labels(d):
 def test_m_drops_an_inflection_on_the_pull_at_the_playhead(ed):
     d, res, writes, root = ed
     d._playhead_s = 52.5
-    _key(root, d._cv, "m")
+    d.drop_mark("music_inflection")
     assert res["markers"] == [{"src": 52.5, "kind": "music_inflection",
                                "name": ""}]
     assert len(writes) == 1
@@ -96,31 +106,20 @@ def test_m_drops_an_inflection_on_the_pull_at_the_playhead(ed):
 def test_x_and_n_open_for_naming_and_enter_keeps_the_name(ed):
     d, res, writes, root = ed
     d._playhead_s = 55.0
-    _key(root, d._cv, "x")
+    d.drop_mark("sfx")
     assert d._mark_rename is not None
     entry = d._mark_rename[0]
     entry.insert(0, "rifle shot")
     _key(root, entry, "Return")
     assert d._mark_rename is None
     assert res["markers"][0]["name"] == "rifle shot"
-    assert d._win.winfo_exists()              # not the window's accept
+    assert d._alive()
     d._playhead_s = 56.0
-    _key(root, d._cv, "n")
+    d.drop_mark("note")
     _key(root, d._mark_rename[0], "Escape")
     assert [m["kind"] for m in res["markers"]] == ["sfx", "note"]
-    assert d._win.winfo_exists()              # not the window's close
+    assert d._alive()
     assert "rifle shot" in _drawn_labels(d)
-
-
-def test_typing_in_a_field_drops_nothing(ed):
-    d, res, _w, root = ed
-    def _all(w):
-        for c in w.winfo_children():
-            yield c
-            yield from _all(c)
-    entries = [w for w in _all(d._win) if isinstance(w, tk.Entry)]
-    _key(root, entries[-1], "m")
-    assert "markers" not in res
 
 
 def test_a_flag_drags_to_a_new_moment_as_one_undo_step(ed):
@@ -161,7 +160,7 @@ def test_delete_removes_the_chosen_mark_and_ctrl_click_any(ed):
     d._draw()
     d._on_press(_flag(d, 0))
     d._on_release(_flag(d, 0))
-    _key(root, d._cv, "Delete")
+    d.delete_mark()
     assert [m["kind"] for m in res["markers"]] == ["note"]
     d._on_press(_Ev(_flag(d, 0).x, _flag(d, 0).y, 0x0004, d._cv))
     assert "markers" not in res
@@ -223,8 +222,8 @@ def test_another_clip_shows_its_own_marks(ed):
     assert [m["name"] for m in d._marks()] == ["second"]
 
 
-def test_without_a_pull_to_mark_the_keys_do_nothing(ed, monkeypatch):
-    d, res, _w, root = ed
+def test_without_a_pull_to_mark_nothing_is_dropped(ed):
+    d, res, _w, _root = ed
     d._set_markers = None
-    _key(root, d._cv, "m")
+    d.drop_mark("music_inflection")
     assert "markers" not in res

@@ -59,9 +59,9 @@ AAF:
     the default gap, for pacing;
   * highlight part of a pull and press Delete to take it out (a whole
     pull, selected with the grabber: it is IGNOREd);
-  * double-click a pull with the grabber (or Enter) to open Step 4's
-    waveform editor on it, for hunting the right edit in audio outside the
-    pull; double-click with the selector takes the whole region.
+  * double-click a pull with the grabber (or Enter) to see it in the
+    source view, for hunting the right edit in audio outside the pull;
+    double-click with the selector takes the whole region.
 
 It is also where the cut gets spotted.  M drops a music inflection (a moment
 the music should answer), X an SFX spot and N a note, at the playhead -- while
@@ -945,6 +945,8 @@ class AssemblyWindow(object):
         key(p, "Delete selection", "Del", self._delete_key)
         key(p, "Split", "B", self.split)
         key(p, "Cut ½ s out", "C", self.cut_out)
+        key(p, "Set IN", "I", lambda: self.set_point("in"))
+        key(p, "Set OUT", "O", lambda: self.set_point("out"))
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
         key(p, "Nudge later by default gap", "/", self.nudge_gap)
@@ -3828,8 +3830,17 @@ class AssemblyWindow(object):
                                "show".format(order, r.get("token", "?")))
             return
         self.stop()
+        # A background match for this pull waits until the view leaves it
+        # (_bg_flush_deferred), instead of changing it under the edit.
+        prev = getattr(self.app, "_s4_editing_row", None)
+        self.app._s4_editing_row = r
+        flush = getattr(self.app, "_bg_flush_deferred", None)
+        if prev is not None and prev is not r and flush is not None:
+            flush(prev)
         if c is not None and c.segments:
-            segs = [list(sg) for sg in c.segments]
+            # The result's own segments: what the last edit wrote, ahead of
+            # the track's re-layout (which follows a save by a moment).
+            segs = [list(sg) for sg in (r.get("segments") or c.segments)]
             if at is None:
                 at = c.src_at(self.insert)
                 if at is None:           # in a gap: where its audio resumes
@@ -3843,7 +3854,7 @@ class AssemblyWindow(object):
             if at is None:
                 at = segs[0][0]
         kw = dict(self.app._s4_editor_clip(r, sa), auto_snap=False,
-                  on_edit=lambda s, o=order: self._src_edited(o, s))
+                  on_edit=lambda s, o=order, **k: self._src_edited(o, s, **k))
         if self.src is None:
             self.src = match_review.MatchReviewDialog(
                 self.app, sa, segs, fps=getattr(self.app, "_seq_fps", 24.0),
@@ -3856,15 +3867,32 @@ class AssemblyWindow(object):
         self._src_order = order
         self.src._playhead_s = at
         self.src._play_rate = self._rate
-        self.src._sync_rate_btn()
         if self.sel_order != order:
             self.select(order)
         self._show_view("source")
         self.src._draw()
 
+    def _release_row(self):
+        """The pull the source view had: a match that waited for it lands."""
+        row = getattr(self.app, "_s4_editing_row", None)
+        flush = getattr(self.app, "_bg_flush_deferred", None)
+        if row is not None and flush is not None:
+            flush(row)
+        elif row is not None:
+            self.app._s4_editing_row = None
+
+    def set_point(self, side):
+        """I / O: the pull's IN or OUT to the playhead, in the source view."""
+        if self.view == "source" and self.src is not None:
+            self.src._set_point_from_cursor(side)
+        else:
+            self.status.config(fg=SUB, text="Set IN / OUT work in the source "
+                               "view (Shift+S), on the recording itself.")
+
     def _leave_source(self):
         src = self.src
         src._stop()
+        self._release_row()
         t = self._timeline_time(self._src_order, src._playhead_s)
         self._show_view("cut")
         if t is not None:
@@ -3902,17 +3930,19 @@ class AssemblyWindow(object):
             self._update_status()
         self._show_monitor()
 
-    def _src_edited(self, order, segs):
+    def _src_edited(self, order, segs, **accept_kw):
         """An edit in the source view: the pull's new segments, saved as
         the track's edits are (one undo step; the join silences carried
-        over).  The track follows on Step 4's refresh."""
+        over).  With `accept_kw`, a cross-token ADOPT: the pull moves to
+        another token and recording.  The track follows on Step 4's
+        refresh, and so does the view."""
         if self._closed:
             return
         segs = [(float(a), float(b)) for a, b in segs]
         c = self._clip(order)
-        if c is not None and segs == c.segments:
+        if c is not None and segs == c.segments and not accept_kw:
             return
-        self.app._assembly_set_segments(order, segs)
+        self.app._assembly_set_segments(order, segs, **accept_kw)
 
     def _sync_source(self):
         """After a re-layout: the source view shows its pull as it is now
@@ -3927,8 +3957,14 @@ class AssemblyWindow(object):
                       if r.get("order") == self._src_order), None)
             if r is None or r.get("_s4_ignored"):
                 self._src_order = None
+                self._release_row()
                 if self.view == "source":
                     self._show_view("cut")
+            return
+        sa = self.app._s4_editor_source(c.res)[0] or c.play_path
+        if sa and sa != self.src._audio_path:
+            # Another recording now (an ADOPT): the view on that.
+            self.show_source(self._src_order)
             return
         self.src.set_segments(c.segments)
         self.src.markers_changed()
@@ -4049,11 +4085,19 @@ class AssemblyWindow(object):
         self.redraw()
 
     def _neighbour(self, direction):
-        """Start of the next / previous pull from the playhead."""
-        i = bisect.bisect_right(self._starts, self.playhead + 1e-3) - 1
-        j = i + 1 if direction > 0 else (
-            i if (0 <= i < len(self.clips) and
-                  self.playhead - self.clips[i].start > 0.25) else i - 1)
+        """Start of the next / previous pull from the playhead -- in the
+        source view, from the pull on show."""
+        if self.view == "source" and self._src_order is not None:
+            i = next((n for n, c in enumerate(self.clips)
+                      if c.order == self._src_order), None)
+            if i is None:
+                return
+            j = i + direction
+        else:
+            i = bisect.bisect_right(self._starts, self.playhead + 1e-3) - 1
+            j = i + 1 if direction > 0 else (
+                i if (0 <= i < len(self.clips) and
+                      self.playhead - self.clips[i].start > 0.25) else i - 1)
         if 0 <= j < len(self.clips):
             c = self.clips[j]
             self.select(c.order)
@@ -4197,7 +4241,6 @@ class AssemblyWindow(object):
             self.player.set_rate(self._rate)
         if self.src is not None:         # one speed for both views
             self.src._play_rate = self._rate
-            self.src._sync_rate_btn()
             if self.src._player is not None:
                 self.src._player.set_rate(self._rate)
         self._show_rate()
@@ -4284,6 +4327,8 @@ class AssemblyWindow(object):
             self.split()                     # Pro Tools: B, or Ctrl+E
         elif k.lower() == "c" and not ctrl:
             self.cut_out()
+        elif not ctrl and k.lower() in ("i", "o"):
+            self.set_point("in" if k.lower() == "i" else "out")
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
         elif k == "slash":
@@ -4326,10 +4371,8 @@ class AssemblyWindow(object):
             src.drop_mark("music_inflection")
         elif not ctrl and k.lower() == "x":
             src.drop_mark("sfx")
-        elif not ctrl and k.lower() == "i":
-            src._set_point_from_cursor("in")
-        elif not ctrl and k.lower() == "o":
-            src._set_point_from_cursor("out")
+        elif not ctrl and k.lower() in ("i", "o"):
+            self.set_point("in" if k.lower() == "i" else "out")
         elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
             src.split_at_playhead()
         elif k.lower() == "c" and not ctrl:
@@ -4380,6 +4423,7 @@ class AssemblyWindow(object):
         self._pool.shutdown(wait=False, cancel_futures=True)
         self._cancel_timers()
         if self.src is not None:
+            self._release_row()
             try:
                 self.src.destroy()
             except Exception:

@@ -1,5 +1,6 @@
-"""The waveform editor's window and zoom, in a real window.  The audio is put in
-place by hand: extraction hands back to Tk from a worker, which needs a mainloop.
+"""The waveform editor's zoom, snap and loading, built into a window as the
+Assembly's source view is.  The audio is put in place by hand: extraction hands
+back to Tk from a worker, which needs a mainloop.
 
 Needs tkinter and a display; skips otherwise.
 """
@@ -21,6 +22,14 @@ import match_review  # noqa: E402
 SECS = 120
 
 
+def _host(root):
+    """A frame in a window of its own, for the view to be built into."""
+    top = tk.Toplevel(root)
+    frame = tk.Frame(top)
+    frame.pack(fill="both", expand=True)
+    return frame
+
+
 @pytest.fixture
 def dlg(monkeypatch):
     monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
@@ -31,7 +40,7 @@ def dlg(monkeypatch):
         pytest.skip("Tk unavailable: {}".format(exc))
     root.withdraw()
     d = match_review.MatchReviewDialog(root, "no_such_file.wav", [[50.0, 60.0]],
-                                       title="BUTLER")
+                                       _host(root), title="BUTLER")
     settle = time.monotonic() + 0.2
     while time.monotonic() < settle:
         root.update()
@@ -40,18 +49,12 @@ def dlg(monkeypatch):
     d._ctx_start, d._ctx_dur = 0.0, float(SECS)
     d._spp, d._view_start = 400, d._sr * 10
     yield d
-    d._on_cancel()
+    d.destroy()
     root.destroy()
 
 
 def _middle_s(d):
     return (d._view_start + d._canvas_w / 2.0 * d._spp) / d._sr + d._ctx_start
-
-
-def test_it_opens_full_screen(dlg):
-    if sys.platform == "win32":
-        assert dlg._win.state() == "zoomed"
-    assert dlg._win.winfo_width() > 1000
 
 
 @pytest.mark.parametrize("factor", [1 / 1.5, 1.5])
@@ -106,17 +109,6 @@ def test_points_someone_has_set_stay_where_they_are(dlg):
     assert dlg._edited_segments() == [(50.0, 60.0)]
 
 
-def _labels(w):
-    for c in w.winfo_children():
-        if c.winfo_class() == "Label":
-            yield c
-        yield from _labels(c)
-
-
-def _button(d, text):
-    return next(b for b in _labels(d._win) if text in b.cget("text"))
-
-
 def _pump(root, secs=0.2):
     settle = time.monotonic() + secs
     while time.monotonic() < settle:
@@ -133,45 +125,12 @@ def walking(monkeypatch):
         pytest.skip("Tk unavailable: {}".format(exc))
     root.withdraw()
     log = []
-    d = match_review.MatchReviewDialog(root, "a.wav", [[50.0, 60.0]],
-                                       title="BUTLER", quote_text="first line",
-                                       on_accept=lambda s: log.append(("accept", s)),
-                                       on_next=lambda: log.append("next"),
-                                       on_prev=lambda: log.append("prev"))
+    d = match_review.MatchReviewDialog(root, "a.wav", [[50.0, 60.0]], _host(root),
+                                       title="BUTLER", quote_text="first line")
     _pump(root)
     yield root, d, log
-    d._on_cancel()
+    d.destroy()
     root.destroy()
-
-
-def test_the_buttons_are_on_screen_and_only_accept_and_next_accepts(walking):
-    root, d, log = walking
-    for text, want in (("PREVIOUS", "prev"), ("NEXT  ", "next")):
-        b = _button(d, text)
-        assert b.winfo_viewable()
-        assert (b.winfo_rooty() + b.winfo_height()
-                <= d._win.winfo_rooty() + d._win.winfo_height())
-        log.clear()
-        b.event_generate("<ButtonRelease-1>")
-        root.update()
-        assert log == [want]
-    log.clear()
-    _button(d, "ACCEPT AND NEXT").event_generate("<ButtonRelease-1>")
-    root.update()
-    assert log == [("accept", [(50.0, 60.0)]), "next"]
-    assert d._win.winfo_exists()
-
-
-def test_with_nothing_that_way_the_button_is_dim_and_does_nothing(walking):
-    root, d, log = walking
-    d._on_prev = None
-    d._sync_step_btns()
-    b = _button(d, "PREVIOUS")
-    assert b.cget("fg") == match_review.BORDER
-    b.event_generate("<ButtonRelease-1>")
-    root.update()
-    assert log == []
-    assert d._win.winfo_exists()
 
 
 def test_loading_a_clip_replaces_everything_about_the_last_one(walking):
@@ -183,7 +142,6 @@ def test_loading_a_clip_replaces_everything_about_the_last_one(walking):
                 scripted_tc="00:00:05 -> 00:00:06",
                 words=[{"word": "hello", "start": 5.0, "end": 5.4}])
     root.update()
-    assert d._win.title().endswith("MILLER")
     assert (d._in_s, d._out_s, d._playhead_s) == (5.0, 6.0, 5.0)
     assert d._samples is None and d._undo_stack == []
     assert d._search_var.get() == ""
@@ -191,7 +149,6 @@ def test_loading_a_clip_replaces_everything_about_the_last_one(walking):
     assert "first line" not in d._script_text.get("1.0", "end")
     assert d._scripted_val.cget("text") == "00:00:05 -> 00:00:06"
     assert d._word_frame.winfo_manager() == "pack"
-    assert d._on_next is None and d._on_prev is None
 
     d.load_clip("c.wav", [[7.0, 8.0]])          # no script text, no words
     root.update()
@@ -279,7 +236,7 @@ def playing(monkeypatch):
         pytest.skip("Tk unavailable: {}".format(exc))
     root.withdraw()
     d = match_review.MatchReviewDialog(
-        root, "a.wav", [[50.0, 50.0 + 0.3 * N_WORDS]], title="BUTLER",
+        root, "a.wav", [[50.0, 50.0 + 0.3 * N_WORDS]], _host(root), title="BUTLER",
         quote_text=SCRIPT, context_before="before\n" * 40,
         words=WORDS, auto_snap=False)
     _pump(root)
@@ -287,7 +244,7 @@ def playing(monkeypatch):
     d._ctx_start, d._ctx_dur = 0.0, 200.0
     p = d._player = _Player()
     yield root, d, p
-    d._on_cancel()
+    d.destroy()
     root.destroy()
 
 

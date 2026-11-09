@@ -63,7 +63,6 @@ from gui_components import VoBin, MediaPool, _SlimScrollbar, _FlatDropdown, _Fla
 import engines
 import monolog
 from sync_preview import SyncPreviewDialog
-from match_review import MatchReviewDialog
 from aaf_workflow import AafWorkflowMixin
 from pq_workflow import PqWorkflowMixin
 from episode import read_pq_session
@@ -8673,7 +8672,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 # ── Open waveform editor — primary card action ──────────────────────
                 # acc: this card's own accept, bound now -- looked up when
                 # the editor's Accept fires, `_accept` is the LAST card's.
-                def _open_review(event=None, r=res, acc=_accept):
+                def _open_review(event=None, r=res):
                     # Resolve source audio with a fallback ladder so cards
                     # from restored sessions / provisional-first / post-
                     # reassign flows all open cleanly.  A silent return here
@@ -8696,38 +8695,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             "No source available", _msg,
                             parent=_open._win if _open is not None else self)
                         return
-                    segs_r = r.get("segments") or [(0.0, 30.0)]
-                    fps    = getattr(self, "_seq_fps", 24.0)
-
-                    # A background match for this row waits until the editor
-                    # closes (_bg_flush_deferred) instead of changing the
-                    # data out from under it.
-                    _prev_row = getattr(self, "_s4_editing_row", None)
-                    self._s4_editing_row = r
-                    if _prev_row is not None and _prev_row is not r:
-                        self._bg_flush_deferred(_prev_row)
-                    _this_order = r.get("order", -1)
-                    _clip = dict(self._s4_editor_clip(r, sa),
-                                 on_accept=lambda *a, _sa=sa, **k:
-                                     self._s4_live_accept(r, acc)(*a, apath=_sa, **k),
-                                 on_next=self._s4_step_fn(_this_order, 1),
-                                 on_prev=self._s4_step_fn(_this_order, -1),
-                                 auto_snap=not r.get("_s4_accepted"))
-                    # NEXT / PREVIOUS: the same window, showing another clip.
-                    _open = self._s4_open_editor()
-                    if _open is not None:
-                        _open.load_clip(sa, segs_r, **_clip)
-                        return
-                    _dlg = MatchReviewDialog(self, sa, segs_r, fps=fps, **_clip)
-                    self._s4_editor = _dlg
-                    try:
-                        _w = _dlg._win
-                        _w.bind("<Destroy>",
-                                lambda ev, w=_w:
-                                    ev.widget is w and self._s4_editor_closed(),
-                                add="+")
-                    except Exception:
-                        self._s4_editing_row = None
+                    # The pull in the Assembly window's source view: its
+                    # whole recording, with its edit points on it.
+                    self._open_assembly()
+                    if self._assembly is not None:
+                        self._assembly.show_source(r.get("order"))
 
                 # ── Bind labels ────────────────────────────────────────────────────
                 ignore_lbl.bind("<Button-1>",
@@ -9134,75 +9106,25 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     set_markers=lambda m, o=_this_order:
                         self._assembly_set_markers({o: m}))
 
-    def _assembly_open_card(self, order):
-        """Open a pull's waveform editor from the Assembly track.  Its
-        accept saves Step 4 state, which redraws the cut."""
-        e = next((e for e in getattr(self, "_rv", [])
-                  if e["res"].get("order") == order), None)
-        if e is not None and e.get("open_review_fn"):
-            e["open_review_fn"]()
-
-    def _s4_step_card(self, order, direction):
-        """The card next to `order` in the sequence, after it or before it.
-        Ignored pulls are passed over: they aren't in the cut, and their
-        cards don't open."""
-        rows = [e for e in getattr(self, "_rv", [])
-                if not e["skip_var"].get()
-                and (e["res"].get("order", 0) - order) * direction > 0]
-        return min(rows, key=lambda e: abs(e["res"].get("order", 0) - order),
-                   default=None)
-
-    def _s4_live_accept(self, r, acc):
-        """The accept for pull `r` on the cards showing now.  The waveform
-        editor stays open while Step 4 rebuilds its cards (a refresh, an
-        undo), so the card it was opened from may be gone; its accept would
-        then update dead widgets.  `acc`, the opening card's, is the fallback
-        when Step 4 has no card for the pull."""
-        e = next((e for e in getattr(self, "_rv", []) if e["res"] is r), None) \
-            or next((e for e in getattr(self, "_rv", [])
-                     if e["res"].get("order") == r.get("order")), None)
-        return (e or {}).get("accept_fn") or acc
-
-    def _s4_step_fn(self, order, direction):
-        """What the waveform editor's NEXT / PREVIOUS does from the pull at
-        `order`, or None if there's nothing that way."""
-        if self._s4_step_card(order, direction) is None:
-            return None
-        def _go():
-            e = self._s4_step_card(order, direction)
-            if e is not None:
-                e["open_review_fn"]()
-        return _go
-
     def _s4_open_editor(self):
-        """The waveform editor that is open: the Assembly window's source
-        view, else its own window."""
+        """The waveform editor -- the Assembly window's source view -- if
+        it is built."""
         asm = getattr(self, "_assembly", None)
         src = getattr(asm, "src", None)
-        if src is not None and src._alive():
-            return src
-        dlg = getattr(self, "_s4_editor", None)
-        try:
-            return dlg if dlg is not None and dlg._win.winfo_exists() else None
-        except tk.TclError:
-            return None
+        return src if src is not None and src._alive() else None
 
-    def _s4_editor_closed(self):
-        self._s4_editor = None
-        row = getattr(self, "_s4_editing_row", None)
-        if row is not None:
-            self._bg_flush_deferred(row)
-
-    def _assembly_set_segments(self, order, segments, gaps=None):
-        """An edit on the Assembly track: the pull's new kept source
-        ranges, committed exactly as the waveform editor's accept does --
-        and with `gaps`, the silence at each of their joins (seg_gaps, see
-        engines.kept_segments), in the same undo step."""
+    def _assembly_set_segments(self, order, segments, gaps=None, **accept_kw):
+        """An edit in the Assembly window, on the track or in the source
+        view: the pull's new kept source ranges, committed exactly as the
+        card's accept does -- and with `gaps`, the silence at each of their
+        joins (seg_gaps, see engines.kept_segments), in the same undo step.
+        `accept_kw` is the accept's own: a cross-token ADOPT's new_token
+        and new_audio_path."""
         e = next((e for e in getattr(self, "_rv", [])
                   if e["res"].get("order") == order), None)
         if e is None or not e.get("accept_fn") or not segments:
             return
-        e["accept_fn"]([[float(a), float(b)] for a, b in segments])
+        e["accept_fn"]([[float(a), float(b)] for a, b in segments], **accept_kw)
         if gaps is not None:
             r = e["res"]
             gaps = [round(max(0.0, float(g)), 4) for g in gaps]
@@ -9852,7 +9774,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # ── Clip-review panel: shows what will actually be exported ──────────
         # Segments are read live from self.results so any Step 4 edits
-        # (via MatchReviewDialog) are reflected here before the build starts.
+        # (in the Assembly's source view) are reflected here before the build starts.
         _EXPORTABLE = ("ok", "direct", "manual", "low_confidence", "snapped")
         _clip_rows = []
         for _r in getattr(self, "results", []):

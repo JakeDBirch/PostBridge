@@ -1,9 +1,14 @@
 """
-Match Review Dialog — waveform + in/out editor for reconciled interview pulls and VO blocks.
+The source view -- the waveform editor for one reconciled pull, built into the
+Assembly window (assembly_view.AssemblyWindow.show_source; Shift+S there, or a
+Step 4 card).
 
-Opens from the Step 4 review panel so the user can visually verify and adjust
-the edit points found by the reconciler.  Shows a context window of the source
-audio waveform with the matched region highlighted and draggable IN/OUT markers.
+It draws the pull's whole recording with the matched region highlighted, its
+IN / OUT and cut points draggable, the script above and the transcript's
+words below, and the pull's spotting marks on it.  Every finished edit is
+handed straight back through on_edit, so the Assembly saves it as it would an
+edit on its track; the window, its keys and playback speed are the
+Assembly's (MatchReviewDialog's docstring has the contract).
 """
 
 import bisect
@@ -194,7 +199,10 @@ _WAVE_OUTLINE  = _WAVE_KEPT_LINE
 
 class MatchReviewDialog:
     """
-    Waveform + edit-point review dialog for a single reconciled clip.
+    The source view: one pull's edit points, cuts and spotting marks drawn
+    against its whole recording.  Built into the Assembly window
+    (assembly_view.AssemblyWindow), which owns the window, the keys and
+    playback speed, and saves each edit as it is made (on_edit).
 
     Parameters
     ----------
@@ -208,11 +216,6 @@ class MatchReviewDialog:
         Display name shown in the title bar (token name or VO id).
     quote_text : str
         The matched text — shown as context above the waveform.
-    on_accept : callable(segments)
-        Called with the (possibly adjusted) segments list on accept.
-    on_next, on_prev : callable()
-        Bring the next / previous clip into this window (see load_clip).
-        None means there isn't one, and dims the button.
     auto_snap : bool
         Snap IN/OUT to the speech edges on opening.  For points the matcher
         guessed; False for points someone has set, which stay where they are.
@@ -226,26 +229,20 @@ class MatchReviewDialog:
     fps : float
         Sequence frame rate — used for nudge step size.
     on_edit : callable(segments) or None
-        Each finished edit, as it is made -- a view saves as it goes, where
-        the window waits for ACCEPT.  set_segments() brings in an edit made
-        elsewhere (an undo).
-    host : tk widget or None
-        None: the editor is its own full-screen window, with ACCEPT, CANCEL,
-        PREVIOUS / NEXT and its own keys.  A frame: the editor is built into
-        it as a view of a bigger window, which owns the keys, the window and
-        when the view goes (destroy()).
+        Each finished edit, as it is made.  set_segments() brings in an edit
+        made elsewhere (an undo, the cut view).
+    host : tk widget
+        The frame the editor is built into.  The window, its keys and when
+        the view goes (destroy()) are the host's.
     """
 
-    def __init__(self, parent, source_audio, segments, title="",
+    def __init__(self, parent, source_audio, segments, host, title="",
                  quote_text="", matched_text="", words=None,
                  context_before="", context_after="",
-                 scripted_tc="",
-                 on_accept=None, fps=24.0,
-                 pool_by_token=None, on_next=None, on_prev=None,
+                 scripted_tc="", fps=24.0, pool_by_token=None,
                  auto_snap=True, get_markers=None, set_markers=None,
-                 host=None, on_edit=None):
+                 on_edit=None):
         self._parent          = parent
-        self._dialog          = host is None
         self._sel_mark        = None    # index of the chosen mark
         self._mark_drag       = None    # {"idx", "x0", "t", "moved"} while dragging one
         self._mark_rename     = None    # (Entry, index) while naming one
@@ -264,8 +261,8 @@ class MatchReviewDialog:
         self._full_loading    = set()   # files with a Phase 2 still running
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                       get_markers, set_markers, on_edit)
+                       pool_by_token, auto_snap, get_markers, set_markers,
+                       on_edit)
 
         # Load the full source file so the user can scroll to any position
         # (the matched region may be wrong and the true edit points may be far away).
@@ -308,8 +305,6 @@ class MatchReviewDialog:
         self._playhead_anim   = None   # after() id for cursor animation
         self._playback_start_wall = None   # wall-clock time playback began
         self._playback_start_file = None   # file time playback began
-        self._play_edit_mode  = None      # tk.BooleanVar — set in _build_ui
-        self._play_edit_segs  = None      # [(start_s, dur_s), ...] stitched anim
         self._remove_hit_areas = []       # [(cx, cy, seg_idx), ...] merge-cut targets
         self._remove_seg_areas = []       # [(cx, cy, seg_idx), ...] delete-segment targets
         self._pre_play_pos    = None      # playhead position saved before playback starts
@@ -320,7 +315,6 @@ class MatchReviewDialog:
         # kept for the life of the dialog; None means we fell back to the
         # render-a-file-and-hand-it-to-winsound path.
         self._player          = None
-        self._live_stitched   = False   # player is following the edit list
         self._play_rate_active = 1.0      # rate the CURRENTLY sounding audio was
                                           # rendered at; the playhead advances by
                                           # this per wall-second, and it must not
@@ -349,72 +343,26 @@ class MatchReviewDialog:
         # Temp dir for playback clips
         self._tmp_dir = tempfile.mkdtemp(prefix="pb_match_")
 
-        # ── Build window ──────────────────────────────────────────────────
-        if host is not None:
-            # A view in someone else's window: everything goes in a frame
-            # there, and the window, its keys and its closing are theirs.
-            self._win  = host.winfo_toplevel()
-            self._body = tk.Frame(host, bg=BG)
-            self._body.pack(fill="both", expand=True)
-            self._build_ui()
-            self._start_extraction()
-            return
-        self._win = tk.Toplevel(parent)
-        self._win.title(self._window_title(title))
-        self._win.configure(bg=BG)
-        self._win.resizable(True, True)
-        self._win.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        self._win.bind("<Escape>", lambda e: self._on_cancel())
-        self._win.bind("<Return>",  lambda e: self._on_accept_click())
-
-        self._win.update_idletasks()
-        pw = parent.winfo_width();  ph = parent.winfo_height()
-        px = parent.winfo_x();      py = parent.winfo_y()
-        _sw = parent.winfo_screenwidth()
-        _sh = parent.winfo_screenheight()
-        w = min(1600, _sw - 60)
-        h = min(1200, _sh - 40)
-        # Full screen, on the monitor the app is on: it fills whichever one
-        # holds the window when it is zoomed.
-        self._win.geometry("+{}+{}".format(px + 40, py + 40))
-        try:
-            self._win.state("zoomed")
-        except tk.TclError:
-            self._win.geometry("{}x{}+{}+{}".format(
-                w, h, max(0, px + (pw - w) // 2), max(0, py + (ph - h) // 2)))
-
-        self._body = tk.Frame(self._win, bg=BG)
+        # ── Build into the host ───────────────────────────────────────────
+        self._win  = host.winfo_toplevel()
+        self._body = tk.Frame(host, bg=BG)
         self._body.pack(fill="both", expand=True)
         self._build_ui()
-        # Focus the window so keyboard shortcuts work immediately, but
-        # DON'T grab_set() until the preview lands — the multi-second
-        # main-thread stalls during Phase-2 silence-boundary computation
-        # would leave the user unable to hit Escape.  grab_set fires
-        # inside _preview_done once samples are ready.
-        self._win.focus_force()
-        self._win.bind("<MouseWheel>", lambda e: "break")
         self._start_extraction()
 
     # ── The clip on show ──────────────────────────────────────────────────
 
-    @staticmethod
-    def _window_title(title):
-        return "MATCH REVIEW  —  " + title if title else "MATCH REVIEW"
-
     def _set_clip(self, source_audio, segments, title, quote_text, matched_text,
                   words, context_before, context_after, scripted_tc,
-                  on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                  get_markers=None, set_markers=None, on_edit=None):
-        """What belongs to one clip, as opposed to the window."""
+                  pool_by_token, auto_snap, get_markers=None,
+                  set_markers=None, on_edit=None):
+        """What belongs to one clip, as opposed to the view."""
         self._auto_snap       = auto_snap
         self._on_edit         = on_edit
         self._last_edge       = "in"   # what , and . nudge
         self._get_markers     = get_markers
         self._set_markers     = set_markers
         self._audio_path      = source_audio
-        self._on_accept       = on_accept
-        self._on_next         = on_next
-        self._on_prev         = on_prev
         self._matched_text    = matched_text or ""
         self._context_before  = context_before or ""
         self._context_after   = context_after  or ""
@@ -469,13 +417,11 @@ class MatchReviewDialog:
     def load_clip(self, source_audio, segments, title="",
                   quote_text="", matched_text="", words=None,
                   context_before="", context_after="",
-                  scripted_tc="",
-                  on_accept=None,
-                  pool_by_token=None, on_next=None, on_prev=None,
+                  scripted_tc="", pool_by_token=None,
                   auto_snap=True, get_markers=None, set_markers=None,
                   on_edit=None):
-        """Bring another clip into this window, which stays open.  Takes what
-        __init__ takes.  A file already loaded whole isn't loaded again."""
+        """Bring another clip into this view.  Takes what __init__ takes.
+        A file already loaded whole isn't loaded again."""
         self._stop()
         self._end_mark_rename(commit=True)
         self._sel_mark = self._mark_drag = None
@@ -488,8 +434,8 @@ class MatchReviewDialog:
             self._player = None
         self._set_clip(source_audio, segments, title, quote_text, matched_text,
                        words, context_before, context_after, scripted_tc,
-                       on_accept, pool_by_token, on_next, on_prev, auto_snap,
-                       get_markers, set_markers, on_edit)
+                       pool_by_token, auto_snap, get_markers, set_markers,
+                       on_edit)
         self._load_gen += 1
         self._playhead_s       = self._in_s
         self._drag             = None
@@ -502,13 +448,10 @@ class MatchReviewDialog:
         self._remove_seg_areas = []
         self._snap_lbl.config(text="")
         self._search_var.set("")
-        if self._dialog:
-            self._win.title(self._window_title(title))
         self._show_script()
         self._show_scripted_tc()
         self._show_word_row()
         self._refresh_displays()
-        self._sync_step_btns()
         self._cv.delete("all")
         self._word_cv.delete("all")
 
@@ -641,11 +584,6 @@ class MatchReviewDialog:
     def _build_ui(self):
         win = self._body
 
-        def bind(seq, fn):
-            # A view's keys are its host's to route (see `host`).
-            if self._dialog:
-                self._win.bind(seq, fn)
-
         # ── Script text — scrollable, capped height so controls always visible ──
         import tkinter.font as _tkfont
         _font_main = _tkfont.Font(family="Segoe UI", size=12)
@@ -749,138 +687,6 @@ class MatchReviewDialog:
 
         self._refresh_displays()
 
-        # ── Controls row: zoom, SET IN/OUT  ──────────────────────────────
-        # (In a host the host's panels and keys do all of this.)
-        nrow = tk.Frame(win, bg=BG)
-        if self._dialog:
-            nrow.pack(fill="x", padx=12, pady=(4, 2))
-
-        tk.Label(nrow, text="(1 frame = {:.2f}ms)".format(self._frame_s * 1000),
-                 font=FB, bg=BG, fg=SUB).pack(side="left", padx=(0, 12))
-
-        # ZOOM — only FIT stays as a button; wheel-scroll + keyboard
-        # shortcuts (+/-, r/t) still zoom, per the keybindings below.
-        tk.Label(nrow, text="ZOOM", font=FB, bg=BG, fg=SUB).pack(side="left", padx=(0, 4))
-        _zfit = tk.Label(nrow, text="FIT", font=FB, bg=SURF3, fg=TEXT,
-                          cursor="hand2", padx=8, pady=2, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-        _zfit.pack(side="left", padx=1)
-        _zfit.bind("<Enter>", lambda e, w=_zfit: w.config(bg=ACCENT))
-        _zfit.bind("<Leave>", lambda e, w=_zfit: w.config(bg=SURF3))
-        _zfit.bind("<ButtonRelease-1>", lambda e: self._zoom_fit())
-
-        tk.Frame(nrow, bg=BG, width=20).pack(side="left")
-        for slbl, side in [("SET IN", "in"), ("SET OUT", "out")]:
-            sb = tk.Label(nrow, text=slbl, font=FB, bg=SURF3, fg=TEXT,
-                          cursor="hand2", padx=8, pady=2, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-            sb.pack(side="left", padx=1)
-            sb.bind("<Enter>", lambda e, w=sb: w.config(bg=ACCENT))
-            sb.bind("<Leave>", lambda e, w=sb: w.config(bg=SURF3))
-            sb.bind("<ButtonRelease-1>",
-                    lambda e, s=side: self._set_point_from_cursor(s))
-
-        tk.Frame(nrow, bg=BG, width=20).pack(side="left")
-
-        # ADD CUT — splits segment at playhead position
-        ac_btn = tk.Label(nrow, text="ADD CUT", font=FB, bg=SURF3, fg=WARN,
-                          cursor="hand2", padx=8, pady=2, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-        ac_btn.pack(side="left", padx=1)
-        ac_btn.bind("<Enter>",          lambda e: ac_btn.config(bg=ACCENT, fg=BG))
-        ac_btn.bind("<Leave>",          lambda e: ac_btn.config(bg=SURF3, fg=WARN))
-        ac_btn.bind("<ButtonRelease-1>", lambda e: self._add_cut())
-
-        tk.Frame(nrow, bg=BG, width=12).pack(side="left")
-
-        # Undo / Redo buttons
-        for ulbl, ucmd in [("\u21a9 UNDO", self._undo_wf),
-                           ("\u21aa REDO", self._redo_wf)]:
-            ub = tk.Label(nrow, text=ulbl, font=FB, bg=SURF3, fg=TEXT,
-                          cursor="hand2", padx=8, pady=2, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-            ub.pack(side="left", padx=1)
-            ub.bind("<Enter>",           lambda e, w=ub: w.config(bg=ACCENT))
-            ub.bind("<Leave>",           lambda e, w=ub: w.config(bg=SURF3))
-            ub.bind("<ButtonRelease-1>", lambda e, f=ucmd: f())
-
-        # Spotting marks at the playhead -- the Assembly track's keys.
-        tk.Frame(nrow, bg=BG, width=20).pack(side="left")
-        tk.Label(nrow, text="MARK", font=FB, bg=BG, fg=SUB).pack(
-            side="left", padx=(0, 4))
-        for mlbl, kind, col in (("MUSIC (M)", "music_inflection", MARK_MUSIC),
-                                ("SFX (X)", "sfx", MARK_SFX),
-                                ("NOTE (N)", "note", MARK_NOTE)):
-            mb = tk.Label(nrow, text=mlbl, font=FB, bg=SURF3, fg=col,
-                          cursor="hand2", padx=8, pady=2, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-            mb.pack(side="left", padx=1)
-            mb.bind("<Enter>", lambda e, w=mb: w.config(bg=ACCENT, fg=BG))
-            mb.bind("<Leave>", lambda e, w=mb, c=col: w.config(bg=SURF3, fg=c))
-            mb.bind("<ButtonRelease-1>", lambda e, k=kind: self.drop_mark(k))
-
-        # M / X / N drop a mark at the playhead, while it plays too; Delete
-        # takes the chosen one away.  Not while typing in a field.
-        def _mark_key(fn):
-            def _h(e):
-                if isinstance(e.widget, tk.Entry):
-                    return None
-                fn()
-                return "break"
-            return _h
-        bind("m", _mark_key(lambda: self.drop_mark("music_inflection")))
-        bind("x", _mark_key(lambda: self.drop_mark("sfx")))
-        bind("n", _mark_key(lambda: self.drop_mark("note")))
-        bind("<Delete>", _mark_key(self.delete_mark))
-
-        # Keyboard nudge still works: ←/→ = IN, Shift-←/→ = OUT
-        bind("<Left>",        lambda e: self._nudge("in",  -1))
-        bind("<Right>",       lambda e: self._nudge("in",   1))
-        bind("<Shift-Left>",  lambda e: self._nudge("out", -1))
-        bind("<Shift-Right>", lambda e: self._nudge("out",  1))
-
-        # Spacebar = toggle play/stop
-        bind("<space>", lambda e: self._toggle_play())
-
-        # Shift+S = toggle SKIP CUTS (matches the checkbox in the
-        # transport row).  Both cases bound because Tk delivers
-        # <Shift-S> when caps/shift produces uppercase and <Shift-s>
-        # otherwise depending on keyboard layout.
-        def _toggle_skip_cuts(_e=None):
-            v = self._play_edit_mode
-            if v is not None:
-                v.set(not v.get())
-        bind("<Shift-S>", _toggle_skip_cuts)
-        bind("<Shift-s>", _toggle_skip_cuts)
-
-        # [ / ] — playback speed down / up
-        bind("<bracketleft>",  lambda e: self._cycle_rate(-1))
-        bind("<bracketright>", lambda e: self._cycle_rate(1))
-
-        # + / - zoom in / out — centred on the cursor
-        bind("<plus>",      lambda e: self._zoom_by(1.0/1.5))
-        bind("<minus>",      lambda e: self._zoom_by(1.5))
-        bind("<equal>",      lambda e: self._zoom_by(1.0/1.5))
-        bind("<underscore>", lambda e: self._zoom_by(1.5))
-
-        # I / O — set IN / OUT to playhead position
-        bind("i", lambda e: self._set_point_from_cursor("in"))
-        bind("o", lambda e: self._set_point_from_cursor("out"))
-
-        # C — insert a cut at the current playhead position (works during playback)
-        bind("c", lambda e: self._add_cut())
-
-        # R / T — zoom out / in (Pro Tools convention) — centred on the cursor
-        bind("r", lambda e: self._zoom_by(1.5))
-        bind("t", lambda e: self._zoom_by(1.0/1.5))
-
-        # Undo/redo keyboard shortcuts — return "break" to stop propagation
-        # to the Step 4 bind_all handlers on the parent window.
-        bind("<Control-z>", lambda e: (self._undo_wf(), "break")[1])
-        bind("<Control-Z>", lambda e: (self._redo_wf(), "break")[1])
-        bind("<Control-Shift-z>", lambda e: (self._redo_wf(), "break")[1])
-        bind("<Control-Shift-Z>", lambda e: (self._redo_wf(), "break")[1])
-
         # ── Transcript search row ─────────────────────────────────────────
         # Type a phrase, prev/next steps through matches on the word
         # timeline and centres the view + playhead on each hit.  Handy
@@ -958,114 +764,6 @@ class MatchReviewDialog:
         self._search_xtok_frame = tk.Frame(win, bg=BG)
         self._search_xtok_frame.pack(fill="x", padx=12, pady=(0, 0))
 
-        # ── Playback row ──────────────────────────────────────────────────
-        prow = tk.Frame(win, bg=BG)
-        if self._dialog:
-            prow.pack(fill="x", padx=12, pady=(4, 2))
-
-        def _pb(text, cmd, bg=SURF3, fg=TEXT):
-            b = tk.Label(prow, text=text, font=FB, bg=bg, fg=fg,
-                         cursor="hand2", padx=10, pady=4, bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-            b.pack(side="left", padx=(0, 6))
-            b.bind("<Enter>",          lambda e, w=b:       w.config(bg=ACCENT, fg=BG))
-            b.bind("<Leave>",          lambda e, w=b, ob=bg, of=fg: w.config(bg=ob, fg=of))
-            b.bind("<ButtonRelease-1>", lambda e, f=cmd: f())
-            return b
-
-        # A view plays the recording straight through: hearing the cut is
-        # the host's other view.
-        self._play_edit_mode = tk.BooleanVar(value=self._dialog)
-
-        _pb("\u25b6 PLAY", self._play_or_edit)
-        _pb("\u25a0 STOP", self._stop)
-
-        # Speed — a  −  [1.5×]  +  stepper, or [ and ] on the keyboard.
-        # Applies to the NEXT play rather than restarting what is already
-        # sounding, so stepping through speeds mid-audition does not keep
-        # throwing you back to the top of the clip.
-        self._rate_down = _pb("−", lambda: self._cycle_rate(-1))
-        self._rate_lbl  = tk.Label(prow, text="", font=FB, bg=SURF2, fg=TEXT,
-                                   width=5, padx=6, pady=4, bd=0,
-                                   highlightbackground=BORDER,
-                                   highlightthickness=1)
-        self._rate_lbl.pack(side="left", padx=(0, 6))
-        self._rate_up   = _pb("+", lambda: self._cycle_rate(1))
-        # _pb's hover restores the button's ORIGINAL fg on leave, which would
-        # wipe the end-stop dimming.  Re-apply it after the hover resets.
-        for _b in (self._rate_down, self._rate_up):
-            _b.bind("<Leave>", lambda e: self._sync_rate_btn(), add="+")
-        self._sync_rate_btn()
-
-        # SKIP CUTS checkbox — stitches segments, skipping excised gaps (ON by default)
-        # Packed to far right so it's visually separate from transport buttons
-        _pe_cb = tk.Checkbutton(prow, text="SKIP CUTS",
-                                variable=self._play_edit_mode,
-                                font=FB, bg=BG, fg=TEXT,
-                                selectcolor=BG, activebackground=BG,
-                                activeforeground=TEXT, cursor="hand2",
-                                bd=0, padx=4, pady=4,
-                                highlightthickness=0)
-        _pe_cb.pack(side="right", padx=(6, 0))
-
-        self._next_btn = self._prev_btn = None
-        if not self._dialog:
-            return
-        # ── Accept / Cancel ───────────────────────────────────────────────
-        bot = tk.Frame(win, bg=BG)
-        # side="bottom" so ACCEPT / CANCEL survive when the canvas
-        # frame (packed above with fill=both+expand=True) grows to
-        # fill the window.  Without this, resizing the editor shorter
-        # (or opening on a smaller display) pushes the accept row off
-        # the visible area — same failure mode as the Step 3 and
-        # Step 4 nav fixes (476483a + this session's).
-        bot.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
-
-        cancel = tk.Label(bot, text="CANCEL", font=FBT, bg=SURF3, fg=TEXT,
-                          cursor="hand2", padx=16, pady=6, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-        cancel.pack(side="left")
-        cancel.bind("<Enter>", lambda e: cancel.config(bg="#5a2020"))
-        cancel.bind("<Leave>", lambda e: cancel.config(bg=SURF3))
-        cancel.bind("<ButtonRelease-1>", lambda e: self._on_cancel())
-
-        accept = tk.Label(bot, text="ACCEPT EDIT POINTS", font=FBT,
-                          bg=SUCCESS, fg=TEXT, cursor="hand2",
-                          padx=16, pady=6, bd=0,
-                          highlightbackground=BORDER, highlightthickness=1)
-        accept.pack(side="right")
-        accept.bind("<Enter>", lambda e: accept.config(bg="#4a9a51"))
-        accept.bind("<Leave>", lambda e: accept.config(bg=SUCCESS))
-        accept.bind("<ButtonRelease-1>", lambda e: self._on_accept_click())
-
-        acc_next = tk.Label(bot, text="ACCEPT AND NEXT", font=FBT,
-                            bg=SUCCESS, fg=TEXT, cursor="hand2",
-                            padx=16, pady=6, bd=0,
-                            highlightbackground=BORDER, highlightthickness=1)
-        acc_next.pack(side="right", padx=(0, 8))
-        acc_next.bind("<Enter>", lambda e: acc_next.config(bg="#4a9a51"))
-        acc_next.bind("<Leave>", lambda e: acc_next.config(bg=SUCCESS))
-        acc_next.bind("<ButtonRelease-1>", lambda e: self._on_accept_next())
-        # "break": not the plain Return (accept and close) as well.
-        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
-            bind(seq, lambda e: (self._on_accept_next(), "break")[1])
-
-        def _step_btn(text, direction):
-            b = tk.Label(bot, text=text, font=FBT, bg=SURF3, fg=TEXT,
-                         padx=16, pady=6, bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-            b.pack(side="right", padx=(0, 8))
-            b.bind("<Enter>", lambda e: self._step_fn(direction)
-                   and b.config(bg=ACCENT, fg=BG))
-            b.bind("<Leave>", lambda e: (b.config(bg=SURF3),
-                                         self._sync_step_btns()))
-            b.bind("<ButtonRelease-1>", lambda e: self._on_step(direction))
-            return b
-        # Packed from the right, so NEXT sits nearest the accept buttons.
-        self._next_btn = _step_btn("NEXT  ▶", 1)
-        self._prev_btn = _step_btn("◀  PREVIOUS", -1)
-        self._sync_step_btns()
-
     def _alive(self):
         """The editor is still on screen (its window, or its frame in a
         host's)."""
@@ -1073,17 +771,6 @@ class MatchReviewDialog:
             return bool(self._body.winfo_exists())
         except (AttributeError, tk.TclError):
             return False
-
-    def _step_fn(self, direction):
-        return self._on_next if direction > 0 else self._on_prev
-
-    def _sync_step_btns(self):
-        """Dim the way that has run out, as the speed stepper does."""
-        if self._next_btn is None:
-            return
-        for btn, fn in ((self._prev_btn, self._on_prev),
-                        (self._next_btn, self._on_next)):
-            btn.config(fg=TEXT if fn else BORDER, cursor="hand2" if fn else "")
 
     # ── Extraction ────────────────────────────────────────────────────────
     #
@@ -1187,14 +874,6 @@ class MatchReviewDialog:
                     self._loaded_end_s   = preview_start + len(samples) / self._sr
                     self._compute_silence_boundaries()
                 self._auto_snap_boundaries()
-                # Preview + boundaries ready — now safe to grab modal
-                # focus.  If a later Phase-2 stall happens, the user
-                # can still Escape (or the parent app can dismiss).
-                try:
-                    if self._dialog:
-                        self._win.grab_set()
-                except tk.TclError:
-                    pass
                 self._refresh_displays()
                 try:
                     self._loading_lbl.destroy()
@@ -1491,10 +1170,6 @@ class MatchReviewDialog:
             self._edit_done()
         if self._samples is None:
             return
-        # Every edit redraws, so this is the one place that catches them all:
-        # drag a cut and the running stream picks up the new list on its next
-        # buffer.  No-op when nothing is playing.
-        self._live_push_segments()
         import numpy as _np
         cv = self._cv
         cv.delete("all")
@@ -1972,7 +1647,6 @@ class MatchReviewDialog:
                     prev_right = px + tw
 
     def _draw_playhead_only(self):
-        # (see _live_push_segments — hooked from _draw, not from here)
         """Redraw only the playhead — called every 40 ms during playback.
         Avoids the full delete("all") + redraw cycle for a static waveform."""
         cv = self._cv
@@ -2168,11 +1842,8 @@ class MatchReviewDialog:
                 was_playing = self._is_playing()
                 self._draw()
                 if was_playing:
-                    if self._play_edit_mode and self._play_edit_mode.get():
-                        self._play_or_edit()
-                    else:
-                        remain = max(0.5, self._ctx_dur - new_t)
-                        self._play(new_t, min(remain, 30.0))
+                    remain = max(0.5, self._ctx_dur - new_t)
+                    self._play(new_t, min(remain, 30.0))
                     # Return point is the clicked position, not the original start
                     self._pre_play_pos = new_t
 
@@ -2451,11 +2122,8 @@ class MatchReviewDialog:
             was_playing = self._is_playing()
             self._draw()
             if was_playing:
-                if self._play_edit_mode and self._play_edit_mode.get():
-                    self._play_or_edit()
-                else:
-                    remain = max(0.5, self._ctx_dur - new_t)
-                    self._play(new_t, min(remain, 30.0))
+                remain = max(0.5, self._ctx_dur - new_t)
+                self._play(new_t, min(remain, 30.0))
                 self._pre_play_pos = new_t
         # A drag on a CUT boundary can crush a segment down to zero
         # duration.  Auto-prune so the invisible-sliver-that-won't-
@@ -2920,80 +2588,18 @@ class MatchReviewDialog:
         ex.shutdown(wait=False)
 
     def _xtok_adopt(self, new_token, new_audio_path, in_s, out_s):
-        """User clicked ADOPT on a cross-token match.  Signals the
-        caller by invoking on_accept with the reassignment payload
-        (segments = single match window; new_token + new_audio_path
-        piggyback in the kwargs) and closes the dialog.  Callers that
-        don't care about reassignment (older signature) still get the
-        segments arg and simply ignore the rest."""
-        self._cleanup()
-        if not self._on_accept:
+        """ADOPT on a cross-token match: the pull is reassigned to that
+        token and file, with the match window as its one segment -- sent
+        through on_edit with the reassignment alongside the segments.  The
+        host then shows the view on the new recording."""
+        if self._on_edit is None:
             return
         segs = [(float(in_s), float(out_s))]
-        try:
-            self._on_accept(segs,
-                            new_token=new_token,
-                            new_audio_path=new_audio_path)
-        except TypeError:
-            # Caller uses the old single-arg signature — fall back
-            # gracefully; the token change is dropped in that case.
-            self._on_accept(segs)
-
-    def _sync_rate_btn(self):
-        """Repaint the speed stepper and remember the choice for the next card."""
-        global _LAST_PLAY_RATE
-        _LAST_PLAY_RATE = self._play_rate
-        lbl = getattr(self, "_rate_lbl", None)
-        if lbl is None:
-            return
-        try:
-            lbl.config(text="{:g}\u00d7".format(self._play_rate),
-                       fg=TEXT if self._play_rate == 1.0 else ACCENT)
-            # Dim the end stops so it is obvious the range has run out \u2014
-            # the buttons still take the click, they just have nowhere left
-            # to go.
-            i = _PLAY_RATES.index(self._play_rate)
-            for btn, spent in ((getattr(self, "_rate_down", None), i == 0),
-                               (getattr(self, "_rate_up", None),
-                                i == len(_PLAY_RATES) - 1)):
-                if btn is not None:
-                    btn.config(fg=BORDER if spent else TEXT)
-        except Exception:
-            pass
-
-    def _cycle_rate(self, step=1):
-        """Step through _PLAY_RATES.  Clamps at the ends rather than
-        wrapping — wrapping from 2x straight back to 0.75x is a nasty
-        surprise when you are tapping ] to go faster."""
-        try:
-            i = _PLAY_RATES.index(self._play_rate)
-        except ValueError:
-            i = _PLAY_RATES.index(1.0)
-        self._play_rate = _PLAY_RATES[
-            max(0, min(len(_PLAY_RATES) - 1, i + step))]
-        self._sync_rate_btn()
-        # Live: the next buffer is generated at the new speed, so this is
-        # heard immediately instead of on the next play.
-        if self._player is not None:
-            self._player.set_rate(self._play_rate)
-
-    def _play_in(self):
-        """Zoom to IN; stitched if PLAY EDIT on, else raw from IN."""
-        self._commit_in_entry()
-        self._zoom_to(self._in_s, window_s=10.0)
-        if self._play_edit_mode.get():
-            segs = self._build_stitched_segs()
-            if segs:
-                self._play_stitched(segs)
-        else:
-            self._play(self._in_s, 6.0)
-
-    def _play_out(self):
-        """Zoom to OUT and play up to 3s pre-roll, stopping exactly at the out point."""
-        self._commit_out_entry()
-        self._zoom_to(self._out_s, window_s=10.0)
-        pre = min(3.0, self._out_s)
-        self._play(self._out_s - pre, pre)
+        self._stop()
+        self._segments = [list(sg) for sg in segs]
+        self._in_s, self._out_s = segs[0]
+        self._opened_segs = segs             # not an edit on top of the adopt
+        self._on_edit(segs, new_token=new_token, new_audio_path=new_audio_path)
 
     def _on_resize(self, event):
         # Short-circuit no-op configures: Tk fires <Configure> repeatedly
@@ -3094,126 +2700,10 @@ class MatchReviewDialog:
             self._play_or_edit()
 
     def _play_or_edit(self):
-        """▶ PLAY — stitched from cursor if SKIP CUTS on, else raw from cursor.
-
-        With SKIP CUTS on, even a single segment is bounded by IN/OUT so
-        playback never drifts past the edit region.
-        """
-        if self._play_edit_mode.get():
-            cursor = self._playhead_s
-            n = len(self._segments)
-            segs_to_play = []
-            for i, seg in enumerate(self._segments):
-                s_in  = self._in_s  if i == 0       else seg[0]
-                s_out = self._out_s if i == n - 1   else seg[1]
-                if cursor >= s_out:
-                    continue
-                actual_start = max(cursor, s_in)
-                dur = s_out - actual_start
-                if dur > 0.01:
-                    segs_to_play.append((actual_start, dur))
-            if not segs_to_play:
-                segs_to_play = self._build_stitched_segs()
-            self._play_stitched(segs_to_play)
-        else:
-            remain = max(0.5, self._ctx_dur - self._playhead_s)
-            self._play(self._playhead_s, min(remain, 60.0))
-
-    def _build_stitched_segs(self):
-        """Return [(start_s, dur_s), ...] for each kept segment."""
-        n = len(self._segments)
-        result = []
-        for i, seg in enumerate(self._segments):
-            s_in  = self._in_s  if i == 0       else seg[0]
-            s_out = self._out_s if i == n - 1   else seg[1]
-            dur = s_out - s_in
-            if dur > 0.01:
-                result.append((s_in, dur))
-        return result
-
-    def _play_stitched(self, seg_list):
-        """Play the kept segments, skipping the excised gaps."""
-        if not seg_list:
-            return
-        import time as _time
-        _abs = [(a, a + d) for a, d in seg_list]
-        if self._live_play(_abs[0][0], _abs[-1][1], segments=_abs):
-            return
-        self._stop()
-        self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
-        self._playback_end_file = seg_list[-1][0] + seg_list[-1][1]
-        gen = self._load_gen
-
-        def _do():
-            import numpy as _np
-            import wave as _wave
-            chunks = []
-            for seg_start, seg_dur in seg_list:
-                wav = os.path.join(self._tmp_dir,
-                                   "_st{:.3f}.wav".format(seg_start))
-                extract_audio_segment(self._audio_path, seg_start, seg_dur,
-                                      wav, sample_rate=_PLAYBACK_SR)
-                with _wave.open(wav, "rb") as wf:
-                    data = wf.readframes(wf.getnframes())
-                chunks.append(_np.frombuffer(data, _np.int16)
-                               .astype(_np.float32) / 32768.0)
-            combined = (_np.concatenate(chunks) if chunks
-                        else _np.zeros(0, dtype=_np.float32))
-            peak = float(_np.max(_np.abs(combined))) if len(combined) else 0.0
-            if peak > 1e-6:
-                combined = combined / peak * 0.85
-            combined, _rate = self._stretch(combined, _PLAYBACK_SR)
-            # Prepend silent lead-in — see _play() for rationale.  For
-            # stitched playback the lead-in goes at the head of the
-            # combined stream only (NOT between segments — that would
-            # introduce gaps at every cut).
-            lead_samps = int(_PLAYBACK_SR * _LEAD_IN_MS / 1000)
-            if lead_samps:
-                combined = _np.concatenate(
-                    [_np.zeros(lead_samps, dtype=_np.float32), combined])
-            pcm = (combined * 32767).astype(_np.int16)
-            out_wav = os.path.join(self._tmp_dir, "_play_edit.wav")
-            with _wave.open(out_wav, "wb") as wf:
-                wf.setnchannels(1); wf.setsampwidth(2)
-                wf.setframerate(_PLAYBACK_SR)
-                wf.writeframes(pcm.tobytes())
-            return out_wav, _rate
-
-        def _done(fut):
-            try:
-                path, rate = fut.result()
-            except Exception:
-                _log.exception("play_stitched failed")
-                return
-            def _do_play():
-                if gen != self._load_gen:
-                    return
-                try:
-                    import winsound
-                    winsound.PlaySound(path,
-                                      winsound.SND_FILENAME | winsound.SND_ASYNC)
-                except Exception:
-                    _log.exception("winsound failed")
-                    return
-                self._playhead_s          = seg_list[0][0]
-                # See _play() — offset the wall-clock start into the
-                # future by _LEAD_IN_MS so the cursor doesn't move
-                # during the silent lead-in.
-                self._playback_start_wall = (
-                    _time.perf_counter() + _LEAD_IN_MS / 1000.0)
-                self._playback_start_file = seg_list[0][0]
-                self._play_edit_segs      = list(seg_list)
-                self._play_rate_active    = rate
-                self._animate_playhead()
-            try:
-                self._win.after(0, _do_play)
-            except Exception:
-                pass
-
-        ex = ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(_do)
-        fut.add_done_callback(_done)
-        ex.shutdown(wait=False)
+        """Play the recording from the playhead, as it is: hearing the cut
+        is the Assembly window's other view."""
+        remain = max(0.5, self._ctx_dur - self._playhead_s)
+        self._play(self._playhead_s, min(remain, 60.0))
 
     def _prune_empty_segments(self):
         """Drop any segments whose effective duration is below one frame
@@ -3605,19 +3095,6 @@ class MatchReviewDialog:
                 self._draw()
                 return
 
-    def _stitched_t_to_file_t(self, elapsed):
-        """Map elapsed playback wall-time → file-time position for stitched play."""
-        segs = self._play_edit_segs
-        if not segs:
-            return self._playback_start_file + elapsed
-        remaining = elapsed
-        for seg_start, seg_dur in segs:
-            if remaining <= seg_dur:
-                return seg_start + remaining
-            remaining -= seg_dur
-        last = segs[-1]
-        return last[0] + last[1]
-
     def _set_point_from_cursor(self, side):
         """Set IN or OUT to the current playhead position."""
         t = self._playhead_s
@@ -3677,42 +3154,23 @@ class MatchReviewDialog:
             return None
         return self._player
 
-    def _live_play(self, lo, hi, segments=None):
-        """Start live playback of [lo, hi], optionally following `segments`
-        (absolute [(in_s, out_s)]).  False means the caller should fall back."""
+    def _live_play(self, lo, hi):
+        """Start live playback of [lo, hi].  False means the caller should
+        fall back."""
         p = self._live_ready(lo, hi)
         if p is None:
             return False
         self._stop()
         self._pre_play_pos = self._playhead_s
-        p.set_segments(segments)
+        p.set_segments(None)
         p.set_rate(self._play_rate)
-        self._live_stitched = bool(segments)
         self._playback_end_file = hi
         if not p.play(lo, hi):
             return False
         self._playhead_s          = lo
         self._playback_start_wall = None     # position comes from the engine
-        self._play_edit_segs      = None
         self._animate_playhead()
         return True
-
-    def _live_push_segments(self):
-        """Hand the current edit list to a running player.
-
-        Called from _draw, which every edit already goes through — so moving
-        a cut updates what you are hearing without any extra plumbing at the
-        drag sites.
-        """
-        p = self._player
-        if p is None or not self._live_stitched or not p.is_playing():
-            return
-        try:
-            segs = [(a, a + d) for a, d in self._build_stitched_segs()]
-            if segs:
-                p.set_segments(segs)
-        except Exception:
-            pass
 
     def _stretch(self, arr, sr):
         """Time-stretch `arr` to the current playback rate, pitch preserved.
@@ -3754,7 +3212,7 @@ class MatchReviewDialog:
         import time as _time
         # Live engine first; the block below is the fallback for machines
         # with no PortAudio.
-        if self._live_play(start_s, start_s + duration_s, segments=None):
+        if self._live_play(start_s, start_s + duration_s):
             return
         self._stop()
         self._pre_play_pos = self._playhead_s   # save AFTER stop so it isn't cleared
@@ -3868,10 +3326,7 @@ class MatchReviewDialog:
         # cursor has to travel at the rate the SOUNDING audio was rendered
         # at -- not whatever the user has since dialled in for next time.
         elapsed *= float(getattr(self, "_play_rate_active", 1.0) or 1.0)
-        if self._play_edit_segs:
-            self._playhead_s = self._stitched_t_to_file_t(elapsed)
-        else:
-            self._playhead_s = self._playback_start_file + elapsed
+        self._playhead_s = self._playback_start_file + elapsed
         # Auto-stop when we reach the end of the scheduled playback region
         if (self._playback_end_file is not None and
                 self._playhead_s >= self._playback_end_file):
@@ -3890,12 +3345,10 @@ class MatchReviewDialog:
                 self._player.stop()
             except Exception:
                 pass
-            self._live_stitched = False
         if self._pre_play_pos is not None:
             self._playhead_s   = self._pre_play_pos
             self._pre_play_pos = None
         self._playback_start_wall = None
-        self._play_edit_segs      = None
         self._playback_end_file   = None
         if self._playhead_anim is not None:
             try:
@@ -3928,42 +3381,6 @@ class MatchReviewDialog:
                 seg[1] = seg[0] + self._frame_s
         return [(s[0], s[1]) for s in new_segs]
 
-    def _on_accept_click(self):
-        new_segs = self._edited_segments()
-        self._cleanup()
-        if self._on_accept:
-            self._on_accept(new_segs)
-
-    def _commit(self):
-        """Accept what's on show, with the window staying open."""
-        segs = self._edited_segments()
-        if self._on_accept:
-            self._on_accept(segs)
-        self._opened_segs = segs
-
-    def _on_step(self, direction):
-        """NEXT / PREVIOUS.  An edit made here is kept, as ACCEPT would keep
-        it; a clip only looked at stays as it was, not accepted."""
-        fn = self._step_fn(direction)
-        if not fn:
-            return
-        if self._edited_segments() != self._opened_segs:
-            self._commit()
-        fn()
-
-    def _on_accept_next(self):
-        """Accept this clip, edited or not, and on to the next; after the
-        last one there's nothing left to do here, so the window closes."""
-        fn = self._on_next
-        self._commit()
-        if fn:
-            fn()
-        else:
-            self._cleanup()
-
-    def _on_cancel(self):
-        self._cleanup()
-
     def _cleanup(self):
         self._stop()
         if self._player is not None:
@@ -3990,12 +3407,12 @@ class MatchReviewDialog:
         except Exception:
             pass
         try:
-            (self._win if self._dialog else self._body).destroy()
+            self._body.destroy()
         except Exception:
             pass
 
     def destroy(self):
-        """Take the editor away: its window, or as a view its frame."""
+        """Take the view away."""
         self._cleanup()
 
     # ── Helpers ───────────────────────────────────────────────────────────

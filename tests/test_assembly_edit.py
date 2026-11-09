@@ -107,11 +107,10 @@ def view(monkeypatch):
     app.REVIEW_STATUSES = ("review",)
     app._seq_fps = FPS
     app._pool, app.vo_bins = _Pool(), {}
-    app._assembly, app.saves, app.opened = None, 0, []
+    app._assembly, app.saves = None, 0
     app._s4_undo_stack, app._s4_redo_stack = [], []
     app._s4_save = lambda: (setattr(app, "saves", app.saves + 1),
                             app._assembly and app._assembly.schedule_refresh())
-    app._assembly_open_card = app.opened.append
     app._prefs, app.saved, app.lifted = {}, [], []
     app._save_prefs = lambda: None
     app._quick_save = app.saved.append
@@ -393,132 +392,6 @@ def test_panels_wrap_and_the_layout_is_kept(view):
     assert len(lay["panels"]) == n_panes - 1
 
 
-def test_editor_accept_edits_its_own_card(tmp_path):
-    """The waveform editor's Accept used to edit the LAST card in Step 4,
-    whichever card it was opened from."""
-    import wave
-    import main
-    wav = str(tmp_path / "GUEST.wav")
-    with wave.open(wav, "w") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-        w.writeframes(b"\x00\x00" * 16000 * 30)
-    try:
-        app = main.App()
-    except tk.TclError as exc:
-        pytest.skip("Tk unavailable: {}".format(exc))
-    try:
-        app.results = [
-            dict(order=o, token="GUEST", status="ok", part_index=0,
-                 segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
-                 rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
-                 source_audio=wav)
-            for o, a in ((1, 2.0), (2, 10.0), (3, 20.0))]
-        app.parts = [{"index": 0, "name": "Part 0"}]
-        app.tokens, app.workflow = ["GUEST"], "script_session"
-        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2, 3)]
-        app._script_path = str(tmp_path / "script.txt")
-        app.update()
-        app._step4()
-        for _ in range(60):
-            app.update()
-        import match_review
-        dialogs = []
-        orig = match_review.MatchReviewDialog.__init__
-
-        def _init(self, *a, **k):
-            orig(self, *a, **k)
-            dialogs.append(self)
-        match_review.MatchReviewDialog.__init__ = _init
-        try:
-            next(e for e in app._rv if e["res"]["order"] == 1)["open_review_fn"]()
-            for _ in range(20):
-                app.update()
-        finally:
-            match_review.MatchReviewDialog.__init__ = orig
-        d = dialogs[-1]
-        d._in_s += 0.5
-        d._on_accept_click()
-        app.update()
-        segs = {r["order"]: [list(s) for s in r["segments"]] for r in app.results}
-        assert segs[1] == [[2.5, 4.0]]
-        assert segs[3] == [[20.0, 22.0]]
-    finally:
-        app.destroy()
-
-
-@pytest.mark.parametrize("after_open", ["rebuild", "leave"])
-def test_editor_accept_after_step4_rebuilt_or_left(tmp_path, after_open):
-    """With the editor open, Step 4 rebuilt its cards (or was left), and
-    Accept raised TclError on the old card's label -- before the clip was
-    counted and saved, so the accept was lost."""
-    import wave
-    import main
-    wav = str(tmp_path / "GUEST.wav")
-    with wave.open(wav, "w") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-        w.writeframes(b"\x00\x00" * 16000 * 30)
-    try:
-        app = main.App()
-    except tk.TclError as exc:
-        pytest.skip("Tk unavailable: {}".format(exc))
-    try:
-        app.results = [
-            dict(order=o, token="GUEST", status="review", part_index=0,
-                 segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
-                 rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
-                 source_audio=wav)
-            for o, a in ((1, 2.0), (2, 10.0))]
-        app.parts = [{"index": 0, "name": "Part 0"}]
-        app.tokens, app.workflow = ["GUEST"], "script_session"
-        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2)]
-        app._script_path = str(tmp_path / "script.txt")
-        app.update()
-        app._step4()
-        for _ in range(60):
-            app.update()
-        import match_review
-        dialogs = []
-        orig = match_review.MatchReviewDialog.__init__
-
-        def _init(self, *a, **k):
-            orig(self, *a, **k)
-            dialogs.append(self)
-        match_review.MatchReviewDialog.__init__ = _init
-        try:
-            next(e for e in app._rv if e["res"]["order"] == 1)["open_review_fn"]()
-            for _ in range(20):
-                app.update()
-        finally:
-            match_review.MatchReviewDialog.__init__ = orig
-        d = dialogs[-1]
-
-        if after_open == "rebuild":
-            app._step4()
-        else:
-            app._clear()
-            app._rv = []
-        for _ in range(30):
-            app.update()
-        saves = []
-        app._s4_save = lambda *a, **k: saves.append(True)
-
-        d._in_s += 0.5
-        d._on_accept_click()           # raised TclError here
-        app.update()
-        r = next(r for r in app.results if r["order"] == 1)
-        assert [list(s) for s in r["segments"]] == [[2.5, 4.0]]
-        assert r["_s4_accepted"] and r["status"] == "manual"
-        assert saves
-        if after_open == "rebuild":
-            # The card on screen now shows it.
-            live = next(e for e in app._rv if e["res"]["order"] == 1)
-            assert live["accepted_flag"][0]
-            assert "ACCEPTED" in live["stat_lbl"].master.winfo_children()[-1].cget("text") \
-                or any("ACCEPTED" in str(w.cget("text")) for w in _labels(live["card"]))
-    finally:
-        app.destroy()
-
-
 def _labels(w):
     for c in w.winfo_children():
         if isinstance(c, tk.Label):
@@ -526,10 +399,9 @@ def _labels(w):
         yield from _labels(c)
 
 
-def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
-    """NEXT / PREVIOUS bring the neighbouring pull that's in the cut into the
-    same window.  A pull only looked at stays unaccepted, a pull edited is kept,
-    Ctrl+Enter accepts either way, and accepting the last one closes the window."""
+def _app_on_step4(tmp_path, n, status="ok"):
+    """A real App on Step 4 with n GUEST pulls of one recording, and the
+    pull a card opens in the Assembly's source view."""
     import wave
     import main
     wav = str(tmp_path / "GUEST.wav")
@@ -541,72 +413,127 @@ def test_the_editor_walks_the_sequence_in_one_window(tmp_path):
     except tk.TclError as exc:
         pytest.skip("Tk unavailable: {}".format(exc))
     try:
+        # Step 2's pool, which the Assembly lays the cut out from.
+        from types import SimpleNamespace
+        app._pool = SimpleNamespace(get_interview_assets=lambda: {"GUEST": [wav]},
+                                    get_vo_assets=lambda: {}, _rows=[])
         app.results = [
-            dict(order=o, token="GUEST", status="ok", part_index=0,
+            dict(order=o, token="GUEST", status=status, part_index=0,
                  segments=[[a, a + 2.0]], rec_in_s=a, rec_out_s=a + 2.0,
                  rec_in_tc="", rec_out_tc="", quote_text="line {}".format(o),
                  source_audio=wav)
-            for o, a in ((1, 2.0), (2, 10.0), (3, 20.0), (4, 30.0))]
+            for o, a in zip(range(1, n + 1), (2.0, 10.0, 20.0, 30.0))]
         app.parts = [{"index": 0, "name": "Part 0"}]
         app.tokens, app.workflow = ["GUEST"], "script_session"
-        app.pulls = [{"token": "GUEST", "order": o} for o in (1, 2, 3, 4)]
+        app.pulls = [{"token": "GUEST", "order": o} for o in range(1, n + 1)]
         app._script_path = str(tmp_path / "script.txt")
         app.update()
         app._step4()
         for _ in range(60):
             app.update()
+        return app
+    except Exception:
+        app.destroy()
+        raise
+
+
+def _open_source_from_card(app, order):
+    """Step 4's card opens the pull in the Assembly window's source view."""
+    next(e for e in app._rv if e["res"]["order"] == order)["open_review_fn"]()
+    for _ in range(20):
+        app.update()
+    asm = app._assembly
+    assert asm is not None and asm.view == "source" and asm._src_order == order
+    return asm
+
+
+def test_a_card_opens_its_pull_in_the_source_view_and_an_edit_lands_on_it(tmp_path):
+    """A card opens the Assembly window on its pull's recording; an edit
+    there goes to that pull, as it is made.  (The old editor's Accept once
+    edited the LAST card in Step 4, whichever card it was opened from.)"""
+    app = _app_on_step4(tmp_path, 3)
+    try:
+        asm = _open_source_from_card(app, 1)
+        d = asm.src
+        assert d._audio_path == app.results[0]["source_audio"]
+        assert (d._in_s, d._out_s) == (2.0, 4.0) and d._quote_text == "line 1"
+        d._in_s += 0.5
+        d._draw()
+        app.update()
+        segs = {r["order"]: [list(s) for s in r["segments"]] for r in app.results}
+        assert segs[1] == [[2.5, 4.0]]
+        assert segs[3] == [[20.0, 22.0]]
+        assert app.results[0]["_s4_accepted"]
+    finally:
+        app.destroy()
+
+
+def test_step4_rebuilding_its_cards_closes_the_assembly_cleanly(tmp_path):
+    """The Assembly is a view of Step 4's cards and goes with them (_clear).
+    An edit made in the source view before is kept; nothing stale is left
+    behind; the card opens the pull again as it now is."""
+    app = _app_on_step4(tmp_path, 2, status="review")
+    try:
+        asm = _open_source_from_card(app, 1)
+        d = asm.src
+        d._in_s += 0.5
+        d._draw()
+        app.update()
+        app._step4()
+        for _ in range(30):
+            app.update()
+        assert app._assembly is None and not d._alive()
+        assert app._s4_editing_row is None
+        assert app._s4_open_editor() is None
+        r = next(r for r in app.results if r["order"] == 1)
+        assert [list(s) for s in r["segments"]] == [[2.5, 4.0]]
+        assert r["_s4_accepted"] and r["status"] == "manual"
+        live = next(e for e in app._rv if e["res"]["order"] == 1)
+        assert live["accepted_flag"][0]
+        assert any("ACCEPTED" in str(w.cget("text")) for w in _labels(live["card"]))
+        asm = _open_source_from_card(app, 1)
+        assert (asm.src._in_s, asm.src._out_s) == (2.5, 4.0)
+    finally:
+        app.destroy()
+
+
+def test_the_arrows_walk_the_cut_in_the_source_view(tmp_path):
+    """→ / ← bring the neighbouring pull that's in the cut into the source
+    view.  A pull only looked at stays unaccepted; one edited is kept and
+    comes back as edited; an IGNOREd pull is passed over."""
+    app = _app_on_step4(tmp_path, 4)
+    try:
         card = {e["res"]["order"]: e for e in app._rv}
         card[3]["toggle_ignore_fn"]()
-        import match_review
-        dialogs = []
-        orig = match_review.MatchReviewDialog.__init__
+        asm = _open_source_from_card(app, 1)
+        d = asm.src
+        _key(app, d._cv, "Left")                # nothing before the first
+        assert asm._src_order == 1
+        _key(app, d._cv, "Right")               # only looked at
+        assert asm._src_order == 2 and d._quote_text == "line 2"
+        assert (d._in_s, d._out_s) == (10.0, 12.0)
+        assert app._s4_editing_row is card[2]["res"]
+        assert card[1]["res"].get("_s4_accepted") is None
+        assert card[1]["res"]["segments"] == [[2.0, 4.0]]
 
-        def _init(self, *a, **k):
-            orig(self, *a, **k)
-            dialogs.append(self)
-        match_review.MatchReviewDialog.__init__ = _init
-        try:
-            card[1]["open_review_fn"]()
-            app.update()
-            d = dialogs[-1]
-            assert d._on_prev is None           # nothing before the first
-            d._on_step(1)                       # only looked at
-            app.update()
-            assert d._win.winfo_exists() and dialogs == [d]
-            assert d._quote_text == "line 2"
-            assert (d._in_s, d._out_s) == (10.0, 12.0)
-            assert app._s4_editing_row is card[2]["res"]
-            assert card[1]["res"].get("_s4_accepted") is None
-            assert card[1]["res"]["segments"] == [[2.0, 4.0]]
+        d._in_s += 0.5                          # edited: kept as it is made
+        d._draw()
+        app.update()
+        assert card[2]["res"]["_s4_accepted"] is True
+        assert [list(s) for s in card[2]["res"]["segments"]] == [[10.5, 12.0]]
+        _key(app, d._cv, "Left")
+        assert d._quote_text == "line 1"
+        _key(app, d._cv, "Right")
+        assert (d._in_s, d._out_s) == (10.5, 12.0)   # back on the edit
+        _key(app, d._cv, "Right")
+        assert asm._src_order == 4 and d._quote_text == "line 4"   # past the ignored pull
+        _key(app, d._cv, "Right")
+        assert asm._src_order == 4              # nothing after the last
 
-            assert d._auto_snap                 # the matcher's guess
-            d._in_s += 0.5                      # edited
-            d._on_step(-1)
-            app.update()
-            assert d._quote_text == "line 1"
-            assert card[2]["res"]["_s4_accepted"] is True
-            assert [list(s) for s in card[2]["res"]["segments"]] == [[10.5, 12.0]]
-
-            d._on_step(1)
-            app.update()
-            assert not d._auto_snap             # back on the edit: left alone
-            assert (d._in_s, d._out_s) == (10.5, 12.0)
-            d._win.focus_force()
-            app.update()
-            d._win.event_generate("<Control-Return>")
-            app.update()
-            assert d._win.winfo_exists() and dialogs == [d]
-            assert d._quote_text == "line 4"    # past the ignored pull
-            assert d._on_next is None
-
-            d._on_accept_next()                 # accepted, nothing left
-            app.update()
-            assert card[4]["res"]["_s4_accepted"] is True
-            assert not d._win.winfo_exists()
-            assert app._s4_editing_row is None
-            assert app._s4_open_editor() is None
-        finally:
-            match_review.MatchReviewDialog.__init__ = orig
+        asm.close()
+        app.update()
+        assert app._s4_editing_row is None
+        assert app._s4_open_editor() is None
     finally:
         app.destroy()
 
@@ -1296,45 +1223,33 @@ def test_playback_is_not_held_in_by_a_highlight(view):
     assert "plays it" not in win.status.cget("text")
 
 
-def test_a_mark_made_in_the_waveform_editor_is_the_assembly_tracks(
-        view, monkeypatch):
-    """One list: what the editor drops shows on the track and reaches the
-    export, and what the track takes away goes from the editor."""
-    import match_review
+def test_a_mark_made_in_the_source_view_is_the_assembly_tracks(view):
+    """One list: what the source view drops shows on the track and reaches
+    the export, and what the track takes away goes from the source view."""
     app, win = view
-    monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
-                        lambda self: None)
-    dlg = match_review.MatchReviewDialog(
-        app, WAV, [[10.0, 14.0]], title="GUEST",
-        get_markers=lambda: next((x.get("markers") for x in app.results
-                                  if x["order"] == 1), None),
-        set_markers=lambda m: app._assembly_set_markers({1: m}))
-    app._s4_editor = dlg
-    try:
-        depth = len(app._s4_undo_stack)
-        dlg._playhead_s = 11.2                     # on "ridge"
-        dlg.drop_mark("music_inflection")
-        assert len(app._s4_undo_stack) == depth + 1
-        win.refresh()
-        tl0, _du, si0 = win._clip(1).pieces[0]
-        assert [m["kind"] for m in win.markers] == ["music_inflection"]
-        assert win.markers[0]["t"] == pytest.approx(tl0 + 11.2 - si0, abs=1e-3)
+    win.show_source(1)
+    dlg = win.src
+    depth = len(app._s4_undo_stack)
+    dlg._playhead_s = 11.2                     # on "ridge"
+    dlg.drop_mark("music_inflection")
+    assert len(app._s4_undo_stack) == depth + 1
+    win.refresh()
+    tl0, _du, si0 = win._clip(1).pieces[0]
+    assert [m["kind"] for m in win.markers] == ["music_inflection"]
+    assert win.markers[0]["t"] == pytest.approx(tl0 + 11.2 - si0, abs=1e-3)
 
-        edited, assets = app._collect_export_inputs()[:2]
-        placed, _s, _p = engines.layout_timeline(edited, 0.5, 48000, assets)
-        out = engines.place_markers(placed, 48000)
-        assert [(m["kind"], m["order"]) for m in out] == \
-            [("music_inflection", 1)]
+    edited, assets = app._collect_export_inputs()[:2]
+    placed, _s, _p = engines.layout_timeline(edited, 0.5, 48000, assets)
+    out = engines.place_markers(placed, 48000)
+    assert [(m["kind"], m["order"]) for m in out] == [("music_inflection", 1)]
 
-        win.select_marker((1, 0))
-        win.delete_marker()
-        assert dlg._marks() == [] and "markers" not in _res(app, 1)
-        app._s4_undo()                             # Step 4's undo, here too
-        assert [m["kind"] for m in dlg._marks()] == ["music_inflection"]
-    finally:
-        dlg._on_cancel()
-
-
+    win.toggle_view()
+    win.select_marker((1, 0))
+    win.delete_marker()
+    assert dlg._marks() == [] and "markers" not in _res(app, 1)
+    app._s4_undo()                             # Step 4's undo, there too
+    win.refresh()
+    assert [m["kind"] for m in dlg._marks()] == ["music_inflection"]
 # ── Shift: edits that move nothing after them ────────────────────────────
 SHIFT, SHIFT_CTRL = 0x0001, 0x0005          # Ctrl too: no snap, exact numbers
 

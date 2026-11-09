@@ -113,11 +113,10 @@ def view(monkeypatch):
     app.REVIEW_STATUSES = ("review",)
     app._seq_fps = 24.0
     app._pool, app.vo_bins = _Pool(), {}
-    app._assembly, app.saves, app.opened = None, 0, []
+    app._assembly, app.saves = None, 0
     app._s4_undo_stack, app._s4_redo_stack = [], []
     app._s4_save = lambda: (setattr(app, "saves", app.saves + 1),
                             app._assembly and app._assembly.schedule_refresh())
-    app._assembly_open_card = app.opened.append
     app._prefs, app.saved, app.lifted = {}, [], []
     app._save_prefs = lambda: None
     app._quick_save = app.saved.append
