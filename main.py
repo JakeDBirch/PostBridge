@@ -9225,13 +9225,21 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if e is not None and e["skip_var"].get():
             e["toggle_ignore_fn"]()
 
-    def _assembly_edit_many(self, edits, ignores=(), unignores=()):
+    def _assembly_edit_many(self, edits, ignores=(), unignores=(),
+                            gaps_after=None):
         """One edit across pulls, as one undo step: {order: (segments, gaps)}
         (gaps None: the card's accept carries the join silences over), plus
-        pulls to IGNORE and to bring back."""
+        pulls to IGNORE and to bring back, and {order: seconds} of silence
+        after pulls (gap_after_s, as _assembly_set_gap sets it)."""
         self._s4_push_undo()
         self._s4_undo_hold = True
         try:
+            for order, gap_s in (gaps_after or {}).items():
+                r = next((r for r in self.results if r.get("order") == order),
+                         None)
+                if r is not None:
+                    r["gap_after"]   = True
+                    r["gap_after_s"] = round(max(0.0, float(gap_s)), 4)
             for order, (segments, gaps) in edits.items():
                 self._assembly_set_segments(order, segments, gaps)
             for order in ignores:
@@ -9240,6 +9248,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 self._assembly_unignore(order)
         finally:
             self._s4_undo_hold = False
+        if gaps_after:
+            self._s4_save()
 
     def _assembly_set_markers(self, changes):
         """Spotting markers edited on the Assembly track or in the waveform

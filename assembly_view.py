@@ -33,6 +33,11 @@ AAF:
     trim -- shuffle-style, so everything after it moves up or back.  An edge
     snaps to where speech starts and stops, and to the playhead, as in the
     waveform editor (the ticks on the track); Ctrl places it freely;
+  * hold Shift and nothing after the edit moves.  Shift-drag right on a
+    seam, or in the silence between two regions, to roll it: the out before
+    and the in after move together.  Shift-drag either side of a seam to
+    trim that side alone, the silence there taking up the difference (it
+    goes as far as the silence does);
   * drag a region, or the gap in front of it, to change that gap -- the
     gap after the pull before it, or inside a pull, the silence at that
     join;
@@ -109,6 +114,7 @@ LEAD_S      = 0.5     # silence ahead of 0:00 so playback can start at the top
 LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
+ROLL_PX     = 3       # Shift on a seam this near its line rolls it
 CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
 WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
 SCRIPT_HOLD_S = 4.0   # the script stops following this long after you scroll it
@@ -2965,7 +2971,16 @@ class AssemblyWindow(object):
         if self.cv.cget("cursor") != cur:
             self.cv.config(cursor=cur)
         self.cv.delete("hover")
-        if kind in ("in", "out"):
+        seam = self._roll_at(e, kind, c, k)
+        if seam is not None:
+            # Shift on a seam: both sides light, as both will move.
+            y0, y1 = self._track_box()
+            (cl, kl), (cr, kr) = seam
+            for hx in (self._x(cl.pieces[kl][0] + cl.pieces[kl][1]),
+                       self._x(cr.pieces[kr][0])):
+                self.cv.create_line(hx, y0, hx, y1, fill=WARN, width=2,
+                                    tags=("hover",))
+        elif kind in ("in", "out"):
             tl, du, _si = c.pieces[k]
             hx = self._x(tl if kind == "in" else tl + du)
             y0, y1 = self._track_box()
@@ -2992,6 +3007,13 @@ class AssemblyWindow(object):
             self._drag = {"mode": "scrub"}
             self.seek(t)
             return
+        seam = self._roll_at(e, kind, c, k)
+        if seam is not None:
+            self._range = None
+            self.sel_region = None
+            self._drag = self._roll_drag(seam, e.x)
+            self.select(c.order)
+            return
         if kind in ("in", "out"):
             self._range = None
             # The insertion point pulls the edge to it -- unless it is parked on
@@ -3004,6 +3026,13 @@ class AssemblyWindow(object):
                           "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
                           "moved": False,
                           "ph": None if near else c.src_at(self.insert)}
+            if e.state & 0x0001:
+                # Shift: the silence on the far side of this edge takes up
+                # the trim, so nothing after it moves.
+                across = self._region_across(c, k, kind)
+                if across is not None:
+                    rc, rk = (across if kind == "out" else (c, k))
+                    self._drag["hold"] = self._space(rc.order, rk)
             self.select(c.order)
             return
         if kind == "select":
@@ -3089,12 +3118,118 @@ class AssemblyWindow(object):
             d["value"] = max(0.0, sp["value"] + dt)
             self._layout(self._space_override(sp, d["value"]))
             self._sync_region_range()
+        elif mode == "roll":
+            d["value"] = self._rolled(d, dt)
+            self._layout({o: {"segments": s} for o, s in d["value"].items()})
         else:
             d["value"] = self._trimmed(d, dt)
-            self._layout({d["order"]: {"segments": d["value"]}})
+            self._layout(self._trim_overrides(d))
         self.redraw()
         self._show_snapped(d)
         self._status_drag(d)
+
+    # ── Shift: edits that move nothing after them ────────────────────────
+    def _next_clip(self, c):
+        i = next((n for n, x in enumerate(self.clips) if x.order == c.order), None)
+        return self.clips[i + 1] if i is not None and i + 1 < len(self.clips) \
+            else None
+
+    def _region_across(self, c, k, side):
+        """The region across region k's in or out edge, as (clip, index) --
+        inside the pull or in the pull next to it -- or None."""
+        if side == "out":
+            if k + 1 < len(c.pieces):
+                return c, k + 1
+            n = self._next_clip(c)
+            return (n, 0) if n is not None and n.pieces else None
+        if k > 0:
+            return c, k - 1
+        p = self._prev_clip(c)
+        return (p, len(p.pieces) - 1) if p is not None and p.pieces else None
+
+    def _roll_at(self, e, kind, c, k):
+        """The seam a Shift-press at e would roll, as ((left clip, index),
+        (right clip, index)), or None: right on a seam's line, or anywhere
+        in the silence between two regions."""
+        if not e.state & 0x0001 or c is None:
+            return None
+        if kind == "gap":
+            if k is None or not 0 <= k < len(c.pieces):
+                return None
+            left = self._region_across(c, k, "in")
+            return (left, (c, k)) if left is not None else None
+        if kind not in ("in", "out"):
+            return None
+        across = self._region_across(c, k, kind)
+        if across is None:
+            return None
+        left, right = ((c, k), across) if kind == "out" else (across, (c, k))
+        (cl, kl), (cr, kr) = left, right
+        x_out = self._x(cl.pieces[kl][0] + cl.pieces[kl][1])
+        x_in = self._x(cr.pieces[kr][0])
+        if abs(e.x - x_out) <= ROLL_PX and abs(e.x - x_in) <= ROLL_PX:
+            return left, right
+        return None
+
+    def _roll_drag(self, seam, x):
+        (cl, kl), (cr, kr) = seam
+        seam_t = cr.pieces[kr][0]
+        return {"mode": "roll", "x0": x, "moved": False,
+                "left": (cl.order, kl), "right": (cr.order, kr),
+                "segsL": list(cl.segments), "gapsL": list(cl.seg_gaps),
+                "segsR": list(cr.segments), "gapsR": list(cr.seg_gaps),
+                "end": self._file_end.get(cl.play_path, float("inf")),
+                "seam": seam_t,
+                "near": abs(self.insert - seam_t) * self.pps
+                <= match_review.SNAP_PLAYHEAD_PX}
+
+    def _rolled(self, d, dt):
+        """Both sides of a seam moved by dt: the out before it and the in
+        after it, each held inside its own region and its file.  Snaps to
+        speech on either side, or the seam to the insertion point.
+        Returns {order: segments} for the one or two pulls it touches."""
+        (ol, kl), (orr, kr) = d["left"], d["right"]
+        aL, bL = d["segsL"][kl]
+        aR, bR = d["segsR"][kr]
+        d["snapped"] = False
+        if not d.get("free"):
+            cands = []
+            for o, edge in ((orr, aR), (ol, bL)):
+                s = match_review.snap_to_boundary(
+                    edge + dt, self._sil.get(o) or (),
+                    match_review.SNAP_PX / self.pps)
+                if s != edge + dt:
+                    cands.append(s - edge)
+            if not d["near"] and abs(d["seam"] + dt - self.insert) * self.pps \
+                    <= match_review.SNAP_PLAYHEAD_PX:
+                cands.append(self.insert - d["seam"])
+            if cands:
+                dt = min(cands, key=lambda c: abs(c - dt))
+                d["snapped"] = True
+        lo = max(aL + MIN_SEG_S - bL, -aR)
+        hi = min(bR - MIN_SEG_S - aR, d["end"] - bL)
+        dt = min(max(dt, lo), hi)
+        d["dt"] = dt
+        left = [tuple(s) for s in d["segsL"]]
+        right = left if ol == orr else [tuple(s) for s in d["segsR"]]
+        left[kl] = (aL, bL + dt)
+        right[kr] = (aR + dt, bR)
+        return {ol: left, orr: right}
+
+    def _held_silence(self, d):
+        """The silence across a Shift-trimmed edge, after the trim."""
+        hold, k = d["hold"], d["k"]
+        a0, b0 = d["segs0"][k]
+        a, b = d["value"][k]
+        return max(0.0, hold["value"] + (a - a0 if d["mode"] == "in" else b0 - b))
+
+    def _trim_overrides(self, d):
+        over = {d["order"]: {"segments": d["value"]}}
+        if d.get("hold") is not None:
+            for o, f in self._space_override(d["hold"],
+                                             self._held_silence(d)).items():
+                over.setdefault(o, {}).update(f)
+        return over
 
     # A "space" is the silence in front of one region, which is what
     # moving that region changes: {"order", "k", "owner", "value"}, and for
@@ -3156,6 +3291,13 @@ class AssemblyWindow(object):
             hi = segs[k + 1][0] if k + 1 < len(segs) else \
                 self._file_end.get(c.play_path if c else None, float("inf"))
             segs[k][1] = min(max(self._snap_edge(d, b + dt), a + MIN_SEG_S), hi)
+        hold = d.get("hold")
+        if hold is not None:
+            # Shift: it opens out only as far as the silence there goes.
+            if d["mode"] == "in":
+                segs[k][0] = max(segs[k][0], a - hold["value"])
+            else:
+                segs[k][1] = min(segs[k][1], b + hold["value"])
         return [tuple(s) for s in segs]
 
     def _snap_edge(self, d, src):
@@ -3187,6 +3329,14 @@ class AssemblyWindow(object):
     def _show_snapped(self, d):
         """The edge lights while it is held by a snap, as the editor's does."""
         if not d.get("snapped"):
+            return
+        if d["mode"] == "roll":
+            o, k = d["right"]
+            c = self._clip(o)
+            if c is not None and k < len(c.pieces):
+                x = self._x(c.pieces[k][0])
+                y0, y1 = self._track_box()
+                self.cv.create_line(x, y0, x, y1, fill=_C_SNAPPED, width=2)
             return
         c = self._clip(d["order"])
         if c is None or d["k"] >= len(c.pieces):
@@ -3226,12 +3376,43 @@ class AssemblyWindow(object):
             self._range = None           # a moved region stays selected
         if d["mode"] == "gap":
             self._commit_space(d["space"], d["value"])
+        elif d["mode"] == "roll":
+            self._commit_roll(d)
+        elif d.get("hold") is not None:
+            self._commit_held_trim(d)
         else:
             segs, gaps = _tidy(d["value"], d["gaps0"])
             if segs and (segs, gaps) != _tidy(d["segs0"], d["gaps0"]):
                 self.app._assembly_set_segments(d["order"], segs, gaps)
         self.refresh()
         self._park_at_edit(d)
+
+    def _commit_roll(self, d):
+        if not d.get("dt"):
+            return
+        (ol, _kl), (orr, _kr) = d["left"], d["right"]
+        if ol == orr:
+            self.app._assembly_set_segments(ol, d["value"][ol], d["gapsL"])
+        else:
+            self.app._assembly_edit_many({ol: (d["value"][ol], d["gapsL"]),
+                                          orr: (d["value"][orr], d["gapsR"])})
+
+    def _commit_held_trim(self, d):
+        """A Shift-trim: the pull's segments, and the silence across the
+        edge -- a join inside the pull, or the gap after the pull before
+        or this one -- as one undo step."""
+        if d["value"] == [tuple(s) for s in d["segs0"]]:
+            return
+        hold, sil = d["hold"], self._held_silence(d)
+        if hold["k"] == 0:
+            self.app._assembly_edit_many(
+                {d["order"]: _tidy(d["value"], d["gaps0"])},
+                gaps_after={hold["owner"]: sil})
+            return
+        gaps = list(hold["gaps"])
+        gaps[hold["k"] - 1] = sil
+        segs, gaps = _tidy(d["value"], gaps)
+        self.app._assembly_set_segments(d["order"], segs, gaps)
 
     def _park_at_edit(self, d):
         """After an edit the insertion point sits on the new seam, so
@@ -3242,6 +3423,12 @@ class AssemblyWindow(object):
             if c is not None and sp["k"] < len(c.pieces):
                 self.set_insert(c.pieces[sp["k"]][0])
             return
+        if d["mode"] == "roll":
+            o, k = d["right"]
+            c = self._clip(o)
+            if c is not None and k < len(c.pieces):
+                self.set_insert(c.pieces[k][0])
+            return
         c = self._clip(d["order"])
         if c is None or not c.pieces:
             return
@@ -3249,6 +3436,19 @@ class AssemblyWindow(object):
         self.set_insert(tl if d["mode"] == "in" else tl + du)
 
     def _status_drag(self, d):
+        if d["mode"] == "roll":
+            (ol, kl), (orr, kr) = d["left"], d["right"]
+            cl, cr = self._clip(ol), self._clip(orr)
+            self.status.config(fg=TEXT, text="Roll   {} out {}   ·   {} in {}"
+                               "   ({:+.3f}s)   ·   nothing after it moves{}".format(
+                                   cl.label if cl else "",
+                                   secs_tc(d["value"][ol][kl][1]),
+                                   cr.label if cr else "",
+                                   secs_tc(d["value"][orr][kr][0]),
+                                   d.get("dt", 0.0),
+                                   "   ·   snapped  (Ctrl places it freely)"
+                                   if d.get("snapped") else ""))
+            return
         if d["mode"] == "gap":
             sp = d["space"]
             self.status.config(fg=TEXT, text="{}:  {:.3f}s   ({:+.3f}s)".format(
@@ -3257,9 +3457,11 @@ class AssemblyWindow(object):
         seg0, seg = d["segs0"][d["k"]], d["value"][d["k"]]
         i = 0 if d["mode"] == "in" else 1
         c = self._clip(d["order"])
-        self.status.config(fg=TEXT, text="{}   {} {}   ({:+.3f}s){}".format(
+        self.status.config(fg=TEXT, text="{}   {} {}   ({:+.3f}s){}{}".format(
             c.label if c else "", "in " if i == 0 else "out",
             secs_tc(seg[i]), seg[i] - seg0[i],
+            "   ·   silence {:.3f}s, nothing after it moves".format(
+                self._held_silence(d)) if d.get("hold") is not None else "",
             "   ·   snapped  (Ctrl places it freely)" if d.get("snapped") else ""))
 
     def _status_range(self):

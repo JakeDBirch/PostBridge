@@ -1330,3 +1330,134 @@ def test_a_mark_made_in_the_waveform_editor_is_the_assembly_tracks(
         assert [m["kind"] for m in dlg._marks()] == ["music_inflection"]
     finally:
         dlg._on_cancel()
+
+
+# ── Shift: edits that move nothing after them ────────────────────────────
+SHIFT, SHIFT_CTRL = 0x0001, 0x0005          # Ctrl too: no snap, exact numbers
+
+
+def _mid_y(win):
+    y0, y1 = win._track_box()
+    return (y0 + y1) / 2.0
+
+
+def _drag_to(win, x0, new_x, state, edge_x=None):
+    """Press at x0 and drag to new_x, measured from edge_x (the line
+    pressed beside) when given -- new_x - edge_x is the move."""
+    y = _mid_y(win)
+    win._on_track_press(_Ev(x0, y, state))
+    d = win._drag
+    d["x0"] = x0 if edge_x is None else edge_x
+    win._on_track_drag(_Ev(new_x, y, state))
+    win._on_track_release(_Ev(new_x, y, state))
+    return d
+
+
+def _segs(app, order):
+    return [tuple(round(v, 4) for v in s) for s in _res(app, order)["segments"]]
+
+
+@pytest.fixture
+def wide(view):
+    app, win = view
+    win.pps = 100.0
+    win.view0 = -0.5
+    win.redraw()
+    return app, win
+
+
+def test_shift_trimming_an_out_leaves_silence_and_moves_nothing_after(wide):
+    app, win = wide
+    start2, depth = win._clip(2).start, len(app._s4_undo_stack)
+    out_x = win._x(win._clip(1).end)
+    d = _drag_to(win, out_x - 2, out_x - 100, SHIFT_CTRL, out_x)      # 1 s earlier
+    assert d["mode"] == "out" and d["hold"] is not None
+    assert _segs(app, 1) == [(10.0, 13.0)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(1.5)
+    assert win._clip(2).start == pytest.approx(start2, abs=1e-3)
+    assert len(app._s4_undo_stack) == depth + 1                # one step
+    app._s4_undo()
+    assert _segs(app, 1) == [(10.0, 14.0)]
+    assert "gap_after_s" not in _res(app, 1)
+
+
+def test_shift_trimming_an_in_keeps_the_rest_of_the_region_in_place(wide):
+    app, win = wide
+    end2 = win._clip(2).end
+    in_x = win._x(win._clip(2).start)
+    _drag_to(win, in_x + 2, in_x + 50, SHIFT_CTRL, in_x)             # 0.5 s later
+    assert _segs(app, 2) == [(20.5, 22.0)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(1.0)
+    assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
+
+
+def test_a_shift_trim_opens_out_only_as_far_as_the_silence(wide):
+    app, win = wide
+    start2 = win._clip(2).start
+    out_x = win._x(win._clip(1).end)
+    _drag_to(win, out_x - 2, out_x + 200, SHIFT_CTRL, out_x)          # 2 s; 0.5 s free
+    assert _segs(app, 1) == [(10.0, 14.5)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(0.0)
+    assert win._clip(2).start == pytest.approx(start2, abs=1e-3)
+
+
+def test_without_shift_a_trim_still_shuffles(wide):
+    app, win = wide
+    start2 = win._clip(2).start
+    out_x = win._x(win._clip(1).end)
+    _drag_to(win, out_x - 2, out_x - 100, 0x0004, out_x)
+    assert _segs(app, 1) == [(10.0, 13.0)]
+    assert win._clip(2).start == pytest.approx(start2 - 1.0, abs=1e-3)
+
+
+def test_shift_on_a_split_rolls_it(wide):
+    app, win = wide
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    win.refresh()
+    start2 = win._clip(2).start
+    tl, du, _si = win._clip(1).pieces[0]
+    seam = win._x(tl + du)
+    d = _drag_to(win, seam, seam + 50, SHIFT_CTRL)
+    assert d["mode"] == "roll"
+    assert _segs(app, 1) == [(10.0, 12.5), (12.5, 14.0)]
+    assert win._clip(2).start == pytest.approx(start2, abs=1e-3)
+    assert win.insert == pytest.approx(tl + du + 0.5, abs=1e-3)   # on the seam
+
+
+def test_shift_beside_a_split_trims_one_side_into_silence(wide):
+    app, win = wide
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    win.refresh()
+    tl, du, _si = win._clip(1).pieces[1]
+    end1 = win._clip(1).end
+    d = _drag_to(win, win._x(tl) + 5, win._x(tl) + 50, SHIFT_CTRL,
+                 win._x(tl))
+    assert d["mode"] == "in"
+    assert _segs(app, 1) == [(10.0, 12.0), (12.5, 14.0)]
+    assert _res(app, 1)["seg_gaps"] == [pytest.approx(0.5)]
+    assert win._clip(1).end == pytest.approx(end1, abs=1e-3)
+
+
+def test_shift_in_the_gap_between_pulls_rolls_both_as_one_undo_step(wide):
+    app, win = wide
+    c1, c2 = win._clip(1), win._clip(2)
+    start2, end2, depth = c2.start, c2.end, len(app._s4_undo_stack)
+    x = win._x((c1.end + c2.start) / 2.0)
+    d = _drag_to(win, x, x + 30, SHIFT_CTRL)
+    assert d["mode"] == "roll"
+    assert _segs(app, 1) == [(10.0, 14.3)]
+    assert _segs(app, 2) == [(20.3, 22.0)]
+    assert win._clip(2).start == pytest.approx(start2 + 0.3, abs=1e-3)
+    assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
+    assert len(app._s4_undo_stack) == depth + 1
+    app._s4_undo()
+    assert _segs(app, 1) == [(10.0, 14.0)] and _segs(app, 2) == [(20.0, 22.0)]
+
+
+def test_a_roll_stops_short_of_emptying_a_region(wide):
+    app, win = wide
+    c1, c2 = win._clip(1), win._clip(2)
+    x = win._x((c1.end + c2.start) / 2.0)
+    _drag_to(win, x, x + 1000, SHIFT_CTRL)                     # 10 s: too far
+    a, b = _segs(app, 2)[0]
+    assert b == 22.0 and 0 < b - a < 0.1

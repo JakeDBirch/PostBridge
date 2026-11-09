@@ -2,6 +2,15 @@
 
 ---
 
+## November 9, 2026
+
+### Assembly: Shift edits move nothing after them
+- **Shift-drag right on a seam to roll it.** The out point before the seam and the in point after it move together, so one region grows by what the other loses, and everything later on the track stays where it is. This works on a split or cut inside a pull, and between two pulls. The seam snaps to where speech starts and stops, and to the insertion point. Ctrl places it freely.
+- **Shift-drag in the silence between two regions rolls them too.** Both edges move together and the silence between them stays the same length.
+- **Shift-drag either side of a seam to trim that side alone, leaving silence.** Trimming a region shorter leaves silence where the audio was, instead of pulling everything after it up. Opening a region out uses up the silence beside it, and stops when that silence is gone. The status line shows how much silence is left.
+- **Without Shift, nothing has changed.** A trim still shuffles everything after it.
+- Each of these is one undo step, even when it changes two pulls.
+
 ## November 5, 2026
 
 ### Waveform editor: spotting marks
