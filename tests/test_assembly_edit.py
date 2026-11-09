@@ -468,10 +468,11 @@ def test_a_card_opens_its_pull_in_the_source_view_and_an_edit_lands_on_it(tmp_pa
         app.destroy()
 
 
-def test_step4_rebuilding_its_cards_closes_the_assembly_cleanly(tmp_path):
-    """The Assembly is a view of Step 4's cards and goes with them (_clear).
-    An edit made in the source view before is kept; nothing stale is left
-    behind; the card opens the pull again as it now is."""
+def test_step4_rebuilding_its_cards_keeps_the_assembly_open(tmp_path):
+    """Step 4 rebuilt its cards (a reconcile landing, a VO take re-read)
+    with the source view open: the Assembly stays, on the same pull, and
+    an edit made after lands on the card on screen now -- counted and
+    saved.  Leaving Step 4 for another screen still closes it."""
     app = _app_on_step4(tmp_path, 2, status="review")
     try:
         asm = _open_source_from_card(app, 1)
@@ -482,17 +483,27 @@ def test_step4_rebuilding_its_cards_closes_the_assembly_cleanly(tmp_path):
         app._step4()
         for _ in range(30):
             app.update()
-        assert app._assembly is None and not d._alive()
-        assert app._s4_editing_row is None
-        assert app._s4_open_editor() is None
+        assert app._assembly is asm and d._alive()
+        assert asm.view == "source" and asm._src_order == 1
+        assert app._s4_open_editor() is d
+        saves = []
+        app._s4_save = lambda *a, **k: saves.append(True)
+        d._in_s += 0.5
+        d._draw()
+        app.update()
         r = next(r for r in app.results if r["order"] == 1)
-        assert [list(s) for s in r["segments"]] == [[2.5, 4.0]]
+        assert [list(s) for s in r["segments"]] == [[3.0, 4.0]]
         assert r["_s4_accepted"] and r["status"] == "manual"
+        assert saves
         live = next(e for e in app._rv if e["res"]["order"] == 1)
         assert live["accepted_flag"][0]
         assert any("ACCEPTED" in str(w.cget("text")) for w in _labels(live["card"]))
-        asm = _open_source_from_card(app, 1)
-        assert (asm.src._in_s, asm.src._out_s) == (2.5, 4.0)
+
+        app._clear()                           # another screen
+        app.update()
+        assert app._assembly is None and not d._alive()
+        assert app._s4_editing_row is None
+        assert app._s4_open_editor() is None
     finally:
         app.destroy()
 

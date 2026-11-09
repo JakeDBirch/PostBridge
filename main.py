@@ -459,7 +459,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=36)
 
-    def _clear(self):
+    def _clear(self, keep_assembly=False):
+        """Take the screen down for the next one.  `keep_assembly`: Step 4
+        rebuilding its own cards, which the Assembly window stays open
+        across (it is told to refresh once they are built)."""
         # Flush any pending Step 4 state write before the screen goes
         # away.  _s4_save coalesces rapid edits behind a short timer;
         # every navigation lands here, so this is the universal
@@ -469,9 +472,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._ep_save_flush()
         except Exception:
             pass
-        # The Assembly view is a view of Step 4's cards, which go with
-        # the screen.
-        if self._assembly is not None:
+        # The Assembly window is a view of Step 4's cards, which go with
+        # the screen -- unless Step 4 is only rebuilding them.
+        if self._assembly is not None and not keep_assembly:
             self._assembly.close()
         self.unbind_all("<MouseWheel>")
         # <x>/<X> are Step 4's "toggle IGNORE on the active card"
@@ -7682,7 +7685,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     r["markers"] = _mk[r["order"]]
         self._marker_carryover = None
 
-        self._clear()
+        self._clear(keep_assembly=True)
         self._section("STEP 4 — REVIEW")
         # A session closed part way through its second pass picks it up here.
         self.after(1000, self._refine_resume)
@@ -8760,6 +8763,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # Build finished — live edits from here on should update the
             # UNCONFIRMED label and re-filter normally again.
             self._s4_building = False
+            # The Assembly window shows these cards now.
+            if self._assembly is not None:
+                self._assembly.schedule_refresh()
 
             # Store tally callbacks on self so _s4_apply_state can reach them
             self._s4_increment_confirmed = _increment_confirmed

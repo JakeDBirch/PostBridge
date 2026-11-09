@@ -13,7 +13,7 @@
 - **A split stays two regions in the source view.** The old editor merged butted segments on every change, so its C had to leave a hole. Now a split is two regions of continuous audio in both views and in the AAF, as it always was on the track.
 - **ADOPT from the "all pulls" search** still reassigns the pull to the other token and recording, as one undo step; the source view then shows the new recording.
 - **A line never found** opens on the first 30 seconds of the recording to look in, as before. Nothing is saved until an edit point is moved.
-- Step 4 rebuilding its cards (a reconcile landing, a VO take re-read) closes the Assembly window, as it always did. An edit made in the source view before that is kept.
+- **The Assembly window stays open when Step 4 rebuilds its cards** (a reconcile landing, a VO take re-read). It used to close with them. It refreshes onto the new cards, on the same pull and view; an edit made before the rebuild is kept and one made after lands on the card now on screen. Leaving Step 4 for another screen still closes it.
 
 ### Assembly: Shift edits move nothing after them
 - **Shift-drag right on a seam to roll it.** The out point before the seam and the in point after it move together, so one region grows by what the other loses, and everything later on the track stays where it is. This works on a split or cut inside a pull, and between two pulls. The seam snaps to where speech starts and stops, and to the insertion point. Ctrl places it freely.
