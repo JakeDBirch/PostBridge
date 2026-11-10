@@ -39,6 +39,47 @@ from gui_components import _FlatDropdown, _FlatProgressBar
 from sync_preview import SyncPreviewDialog
 import engines
 
+
+def parse_offset_text(text):
+    """Seconds from a typed offset: '3280.5', '54:40.5' or '0:54:40.5',
+    optionally negative.  None when it isn't a time."""
+    s = (text or "").strip().rstrip("s").strip()
+    neg = s.startswith("-")
+    s = s.lstrip("+-").strip()
+    parts = s.split(":")
+    if not s or len(parts) > 3:
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(v < 0 for v in vals) or any(v >= 60 for v in vals[1:]):
+        return None
+    t = 0.0
+    for v in vals:
+        t = t * 60.0 + v
+    return -t if neg else t
+
+
+def fmt_duration(secs):
+    """'27:41.5' / '1:22:09.0' -- a length or offset, to a tenth."""
+    if secs is None:
+        return "?"
+    sign = "-" if secs < 0 else ""
+    t = round(abs(secs), 1)
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "{}{}:{:02d}:{:04.1f}".format(sign, int(h), int(m), s)
+    return "{}{}:{:04.1f}".format(sign, int(m), s)
+
+
+def natural_key(name):
+    """Sort key putting 'Part 2' before 'Part 10'."""
+    return [int(t) if t.isdigit() else t
+            for t in re.split(r"(\d+)", name.lower())]
+
+
 # Sequence preset table: (display_name, width, height, fps)
 # width/height/fps = None means "detect from media" or "custom — leave fields as-is"
 _AAF_SEQ_PRESETS = [
@@ -995,7 +1036,8 @@ class AafWorkflowMixin:
         "sync":   ("_aaf_sync_btns", "_aaf_align_btns",
                    "_aaf_sync_dot_labels", "_aaf_qa_btns",
                    "_aaf_try_next_btns", "_aaf_confirm_btns",
-                   "_aaf_lock_btns"),
+                   "_aaf_lock_btns", "_aaf_aud_dur_labels",
+                   "_aaf_offset_entry_vars"),
     }
 
     def _aaf_reset_pages(self):
@@ -1341,6 +1383,14 @@ class AafWorkflowMixin:
                       self._aaf_reset_all, small=True).pack(side="right", padx=(0, 4))
             self._btn(hdr, "UNLOCK ALL",
                       self._aaf_unlock_all, small=True).pack(side="right", padx=(0, 4))
+            _chain = self._btn(hdr, "CHAIN PARTS",
+                               self._aaf_chain_parts, small=True)
+            _chain.pack(side="right", padx=(0, 4))
+            self._tooltip(_chain,
+                "Audio split into parts from one video (Part 1, 2, 3...):\n"
+                "sync each part in turn, starting the next one where the\n"
+                "last one ends.  Rows sharing a video are chained in\n"
+                "file-name order; locked rows are kept as they are.")
 
             # SOURCE CLIP (left, fixed width)
             _snf = tk.Frame(hdr, bg=SURF, width=_nw_s)
@@ -1791,19 +1841,44 @@ class AafWorkflowMixin:
             aud_frame.pack_propagate(False)
             aud_frame.pack(side="left", fill="y")
             aud_dd_state = "disabled" if locked else "readonly"
+            # The file's length, right of its name: a split recording's
+            # parts start where the ones before them end, so the lengths
+            # are the offsets.
+            dur_lbl = tk.Label(aud_frame, text=self._aaf_dur_text(cur_full),
+                               font=FB, bg=bg, fg=SUB, padx=4)
+            dur_lbl.pack(side="right")
+            self._aaf_aud_dur_labels[base] = dur_lbl
+            if cur_full:
+                self._aaf_probe_durations([cur_full])
             aud_dd = _FlatDropdown(aud_frame, textvariable=aud_disp,
                                    values=aud_options,
                                    state=aud_dd_state, font=FB)
-            aud_dd.pack(fill="x", expand=True)
+            aud_dd.pack(side="left", fill="x", expand=True)
 
             # ── OFFSET (left, fixed width) ─────────────────────────────────
+            # Typed in seconds or as h:mm:ss; Enter or leaving the box sets
+            # it.  A typed offset is where SYNC starts looking.
             off_frame = tk.Frame(row1, bg=bg, width=_ow_s)
             off_frame.pack_propagate(False)
             off_frame.pack(side="left", fill="y")
-            tk.Label(off_frame,
-                     textvariable=self._aaf_source_offset_vars[base],
-                     font=FB, bg=bg, fg=ACCENT,
-                     anchor="e").pack(side="left", fill="x", expand=True)
+            ov = self._aaf_source_offset_vars[base]
+            if locked:
+                tk.Label(off_frame, textvariable=ov,
+                         font=FB, bg=bg, fg=ACCENT,
+                         anchor="e").pack(side="left", fill="x", expand=True)
+            else:
+                ev = tk.StringVar(value=ov.get())
+                self._aaf_offset_entry_vars[base] = ev
+                ent = tk.Entry(off_frame, textvariable=ev, font=FB,
+                               bg=SURF2, fg=ACCENT, insertbackground=TEXT,
+                               relief="flat", justify="right", width=9)
+                ent.pack(side="left", fill="x", expand=True)
+                ent.bind("<Return>",
+                         lambda e, b=base, v=ev: self._aaf_commit_offset(b, v))
+                ent.bind("<FocusOut>",
+                         lambda e, b=base, v=ev: self._aaf_commit_offset(b, v))
+                self._tooltip(ent, "Seconds into the video this audio starts\n"
+                                   "(or h:mm:ss).  SYNC searches around it.")
             tk.Label(off_frame, text="s", font=FB, bg=bg,
                      fg=SUB).pack(side="left", padx=(2, 4))
 
@@ -2360,6 +2435,179 @@ class AafWorkflowMixin:
             return False
         self._aaf_ffmpeg_ok = True
         return True
+
+    # ── Audio lengths, typed offsets, chained parts ─────────────────────
+    # A long recording split into Part 1/2/3 audio files (for an older
+    # transcription pass) still has one video.  Each part starts where the
+    # ones before it end, so the parts' lengths are the offsets, and SYNC
+    # searches around whatever offset the row holds (parsers.offset_hint).
+
+    def _aaf_dur_text(self, path):
+        """The length shown beside a reference audio's name: '' when there
+        is no file, '…' while it is being measured."""
+        if not path:
+            return ""
+        cache = getattr(self, "_aaf_audio_durations", {})
+        if path not in cache:
+            return "…"
+        return fmt_duration(cache[path])
+
+    def _aaf_probe_durations(self, paths):
+        """Measure the lengths of *paths* off the main thread and show them
+        on every row that uses them."""
+        if not hasattr(self, "_aaf_audio_durations"):
+            self._aaf_audio_durations = {}
+            self._aaf_dur_probing = set()
+        todo = [p for p in paths if p and p not in self._aaf_audio_durations
+                and p not in self._aaf_dur_probing]
+        if not todo:
+            return
+        self._aaf_dur_probing.update(todo)
+
+        def _run():
+            got = {}
+            for p in todo:
+                try:
+                    got[p] = engines.get_media_duration(p)
+                except Exception:
+                    got[p] = None
+
+            def _show():
+                self._aaf_audio_durations.update(got)
+                self._aaf_dur_probing.difference_update(got)
+                for b, lbl in list(getattr(self, "_aaf_aud_dur_labels", {}).items()):
+                    p = self._aaf_source_syncaudio_vars.get(b, tk.StringVar()).get()
+                    if p in got:
+                        try:
+                            lbl.config(text=self._aaf_dur_text(p))
+                        except tk.TclError:
+                            pass
+            self._ui(_show)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _aaf_commit_offset(self, base, entry_var):
+        """Set *base*'s offset from what was typed in its OFFSET box.  The
+        row is then synced-by-hand (used by the build) but not verified:
+        SYNC refines it, ALIGN or ACCEPT confirms it."""
+        ov = self._aaf_source_offset_vars.get(base)
+        if ov is None or self._aaf_sync_locked_vars.get(
+                base, tk.BooleanVar()).get():
+            return
+        t = parse_offset_text(entry_var.get())
+        if t is None:
+            entry_var.set(ov.get())          # not a time: put it back
+            return
+        new = "{:.3f}".format(t)
+        entry_var.set(new)
+        if new == ov.get():
+            return
+        self._aaf_push_undo(base)
+        self._aaf_set_typed_offset(base, t)
+        self._rebuild_aaf_source_rows()
+
+    def _aaf_set_typed_offset(self, base, t):
+        """Give *base* the offset *t* as an unverified starting point."""
+        self._aaf_source_offset_vars[base].set("{:.3f}".format(t))
+        sv = self._aaf_source_sync_vars.get(base)
+        if sv:
+            sv.set(True)
+        lv = self._aaf_source_sync_label_vars.get(base)
+        if lv:
+            lv.set("≈ {} (typed)".format(fmt_duration(t)))
+        self._aaf_set_sync_state(base, "")
+        self._aaf_set_drift(base, None)
+        if hasattr(self, "_aaf_source_sync_candidates"):
+            self._aaf_source_sync_candidates.pop(base, None)
+
+    def _aaf_chain_groups(self):
+        """{video label: [source, ...]} for every video that two or more
+        sync rows share, each list in its audio files' name order (natural:
+        Part 2 before Part 10)."""
+        groups = {}
+        for b in self._aaf_page_bases("sync"):
+            v = self._aaf_source_file_vars[b].get()
+            a = self._aaf_source_syncaudio_vars[b].get()
+            if v == "— no video —" or not a:
+                continue
+            groups.setdefault(v, []).append(b)
+        return {v: sorted(bs, key=lambda b: natural_key(
+                    basename(self._aaf_source_syncaudio_vars[b].get())))
+                for v, bs in groups.items() if len(bs) >= 2}
+
+    def _aaf_chain_parts(self):
+        """Sync split parts one after another: Part 1 as usual, then each
+        next part searched for where the previous one ends (its synced
+        offset plus its length).  Each part starts from the previous part's
+        measured offset, so a gap or overlap at a cut doesn't add up down
+        the chain.  Locked rows keep their offset and the chain carries on
+        from it."""
+        groups = self._aaf_chain_groups()
+        if not groups:
+            messagebox.showinfo("Chain Parts",
+                "No video is shared by two or more rows.\n\n"
+                "Give each part's row the same video file and its own "
+                "reference audio, then CHAIN PARTS syncs them in order.")
+            return
+        if not self._aaf_ffmpeg_ready():
+            return
+        chains = list(groups.values())
+        paths = [self._aaf_source_syncaudio_vars[b].get()
+                 for bs in chains for b in bs]
+
+        def _measure():
+            durs = {}
+            for p in paths:
+                try:
+                    durs[p] = engines.get_media_duration(p)
+                except Exception:
+                    durs[p] = None
+            def _go():
+                if not hasattr(self, "_aaf_audio_durations"):
+                    self._aaf_audio_durations = {}
+                    self._aaf_dur_probing = set()
+                self._aaf_audio_durations.update(durs)
+                for bs in chains:
+                    self._aaf_chain_step(bs, 0, durs)
+            self._ui(_go)
+        threading.Thread(target=_measure, daemon=True).start()
+
+    def _aaf_chain_step(self, chain, i, durs):
+        """Sync chain[i] (seeded from chain[i-1]), then carry on with the
+        rest once it lands."""
+        if i >= len(chain):
+            return
+        base = chain[i]
+        if base in getattr(self, "_aaf_syncing", {}):
+            self.after(300, lambda: self._aaf_chain_step(chain, i, durs))
+            return
+        locked = self._aaf_sync_locked_vars.get(base, tk.BooleanVar()).get()
+        if not locked:
+            if i > 0:
+                prev = chain[i - 1]
+                try:
+                    p_off = float(self._aaf_source_offset_vars[prev].get())
+                except ValueError:
+                    p_off = 0.0
+                p_len = durs.get(self._aaf_source_syncaudio_vars[prev].get())
+                if not p_len:
+                    messagebox.showwarning("Chain Parts",
+                        "Could not read the length of {}, so the parts after "
+                        "it were left alone.".format(basename(
+                            self._aaf_source_syncaudio_vars[prev].get())))
+                    return
+                self._aaf_push_undo(base)
+                self._aaf_set_typed_offset(base, p_off + p_len)
+                self._rebuild_aaf_source_rows()
+            # Part 1 is synced from zero unless it already has a result.
+            if i > 0 or not self._aaf_sync_state_vars[base].get():
+                self._aaf_do_sync(base)
+        self.after(300, lambda: self._aaf_chain_wait(chain, i, durs))
+
+    def _aaf_chain_wait(self, chain, i, durs):
+        if chain[i] in getattr(self, "_aaf_syncing", {}):
+            self.after(300, lambda: self._aaf_chain_wait(chain, i, durs))
+            return
+        self._aaf_chain_step(chain, i + 1, durs)
 
     def _aaf_sync_all(self):
         """Run sync detection for every source marked 'needs sync' that has video + audio."""
@@ -3001,6 +3249,11 @@ class AafWorkflowMixin:
             return                   # already running (SYNC ALL pressed twice)
         if not self._aaf_ffmpeg_ready():
             return
+        # An offset typed but not yet entered (clicking SYNC doesn't take
+        # the focus from the box) is the one meant.
+        _pending = getattr(self, "_aaf_offset_entry_vars", {}).get(base)
+        if _pending is not None:
+            self._aaf_commit_offset(base, _pending)
         self._aaf_push_undo(base)
 
         # The reference audio is whatever the user has selected in the dropdown.
