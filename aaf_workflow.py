@@ -74,6 +74,143 @@ def fmt_duration(secs):
     return "{}{}:{:04.1f}".format(sign, int(m), s)
 
 
+def _open_file(path):
+    """Open *path* in the system's default app."""
+    import sys as _sys
+    if _sys.platform.startswith("win"):
+        os.startfile(path)
+    else:
+        import subprocess as _sp
+        _sp.Popen(["open" if _sys.platform == "darwin" else "xdg-open", path])
+
+
+def _covered_fraction(s, e, intervals):
+    """How much of [s, e] the union of *intervals* covers, 0..1."""
+    if e <= s:
+        return 0.0
+    cov, cur = 0.0, s
+    for a, b in sorted(intervals):
+        if b <= cur or a >= e:
+            continue
+        a = max(a, cur)
+        b = min(b, e)
+        if b > a:
+            cov += b - a
+            cur = b
+    return cov / (e - s)
+
+
+def missing_video_report(missing, video_intervals, oor_warnings, info):
+    """The editor's reference for an AAF -> XML build: every clip that has
+    no picture of its own, at its record timecode, so a hole in the cut
+    can be looked up instead of hunted for.
+
+    missing:          [{clip_name, base, track, start_secs, end_secs,
+                        hidden}] -- clips the build gave no video.
+    video_intervals:  [(start_secs, end_secs)] of clips that did get video;
+                      says whether another camera covers the hole.
+    oor_warnings:     per-source lines from build_xml_from_pt about clips
+                      clamped back inside their video.
+    info:             {seq_name, xml_path, fps, drop_frame, start_tc_secs,
+                       total_clips}.
+    """
+    import datetime as _dt
+    fps   = info.get("fps") or 29.97
+    drop  = bool(info.get("drop_frame"))
+    t0    = float(info.get("start_tc_secs") or 0.0)
+
+    def tc(secs):
+        return engines.secs_to_tc(t0 + secs, fps, drop)[0]
+
+    def dur(secs):
+        return fmt_duration(max(0.0, secs))
+
+    shown  = sorted((m for m in missing if not m.get("hidden")),
+                    key=lambda m: (m["start_secs"], m["track"]))
+    hidden = [m for m in missing if m.get("hidden")]
+    total  = info.get("total_clips") or 0
+
+    L = []
+    L.append("CLIPS WITHOUT VIDEO")
+    L.append("=" * 78)
+    L.append("Sequence:  {}".format(info.get("seq_name", "")))
+    L.append("XML:       {}".format(os.path.basename(info.get("xml_path", ""))))
+    L.append("Built:     {}".format(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    L.append("Timecode:  {} fps{}, sequence starts {}".format(
+        "{:g}".format(fps), " drop-frame" if drop else "", tc(0.0)))
+    L.append("")
+    if not shown:
+        L.append("Every clip in the AAF has video.")
+    else:
+        L.append("{} of {} clips have no video of their own.  In the XML they "
+                 "are sound only:".format(len(shown), total))
+        L.append("the picture tracks are empty under them unless another "
+                 "camera covers that")
+        L.append("moment (PICTURE column).")
+        L.append("")
+        L.append("  PICTURE  none = nothing on screen   partly = some of it "
+                 "covered   other = another")
+        L.append("           camera covers it all")
+        L.append("")
+        hdr = "  {:<11}  {:<11}  {:>8}  {:<7}  {:<8}  {}".format(
+            "REC IN", "REC OUT", "DUR", "PICTURE", "TRACK", "CLIP  (source)")
+        L.append(hdr)
+        L.append("  " + "-" * (len(hdr) - 2))
+        n_black = 0
+        for m in shown:
+            f = _covered_fraction(m["start_secs"], m["end_secs"], video_intervals)
+            pic = "other" if f >= 0.99 else ("partly" if f > 0.01 else "none")
+            n_black += pic != "other"
+            name = m["clip_name"]
+            if m.get("base") and m["base"] not in name:
+                name += "  ({})".format(m["base"])
+            L.append("  {:<11}  {:<11}  {:>8}  {:<7}  {:<8}  {}".format(
+                tc(m["start_secs"]), tc(m["end_secs"]),
+                dur(m["end_secs"] - m["start_secs"]), pic,
+                (m.get("track") or "")[:8], name))
+        L.append("")
+        L.append("{} of these {} the screen empty for some or all of "
+                 "{} length.".format(n_black,
+                                     "leaves" if n_black == 1 else "leave",
+                                     "its" if n_black == 1 else "their"))
+        L.append("")
+        L.append("By source:")
+        by_src = {}
+        for m in shown:
+            by_src.setdefault(m.get("base") or m["clip_name"], []).append(m)
+        for src in sorted(by_src, key=natural_key):
+            ms = by_src[src]
+            L.append("  {:<44}  {:>3} clip{}  {}".format(
+                src[:44], len(ms), "s" if len(ms) != 1 else " ",
+                dur(sum(x["end_secs"] - x["start_secs"] for x in ms))))
+    if oor_warnings:
+        L.append("")
+        L.append("PICTURE THAT MAY NOT MATCH")
+        L.append("-" * 78)
+        L.append("These sources have clips whose sync placed them outside "
+                 "their video file.")
+        L.append("They were clamped back in, so there is picture, but it may "
+                 "not be the right")
+        L.append("moment:")
+        for w in oor_warnings:
+            L.append("  * " + w)
+    if hidden:
+        L.append("")
+        L.append("LEFT OUT ON PURPOSE")
+        L.append("-" * 78)
+        L.append("Sources hidden in setup (music, effects, etc.) -- not "
+                 "expected to have video:")
+        counts = {}
+        for m in hidden:
+            counts[m.get("base") or m["clip_name"]] = counts.get(
+                m.get("base") or m["clip_name"], 0) + 1
+        for src in sorted(counts, key=natural_key):
+            L.append("  {:<44}  {:>3} clip{}".format(
+                src[:44], counts[src], "s" if counts[src] != 1 else ""))
+    L.append("")
+    return "\n".join(L)
+
+
 def natural_key(name):
     """Sort key putting 'Part 2' before 'Part 10'."""
     return [int(t) if t.isdigit() else t
@@ -5688,6 +5825,8 @@ class AafWorkflowMixin:
         clips_with_media    = []
         track_names_ordered = []   # preserves insertion order for XML track sequence
         _occ_count = {}   # base → occurrence index (for multi-slot positional assignment)
+        _no_video  = []   # clips left without picture -- the editor's report
+        _hidden_srcs = set(getattr(self, "_aaf_hidden_sources", set()))
 
         for clip in all_clips:
             base = get_clip_base_name(clip["clip_name"])
@@ -5726,6 +5865,14 @@ class AafWorkflowMixin:
                 vp = None
                 unmatched += 1
                 clip_results.append((clip["clip_name"], "— no video assigned —", WARN))
+                _no_video.append({
+                    "clip_name":  clip["clip_name"],
+                    "base":       base,
+                    "track":      clip.get("track_name", ""),
+                    "start_secs": float(clip.get("start_secs", 0.0)),
+                    "end_secs":   float(clip.get("end_secs", 0.0)),
+                    "hidden":     base in _hidden_srcs,
+                })
 
             # Build the per-angle track name list.  Single-video sources
             # get one track (the historical behaviour); stacked sources
@@ -5998,11 +6145,35 @@ class AafWorkflowMixin:
                 engines.clear_rx_cache()
                 _no_channels = engines.channels_unknown(xmeml)
 
+                # The editor's reference: every clip with no picture, at
+                # its record timecode, next to the XML.
+                _report = None
+                try:
+                    _bases = [get_clip_base_name(c["clip_name"]) for c in all_clips]
+                    _n_counted = sum(1 for _b in _bases
+                                     if _b is not None and _b not in _hidden_srcs)
+                    _txt = missing_video_report(
+                        _no_video,
+                        [(c["start_secs"], c["end_secs"])
+                         for c in clips_with_media if c.get("video_path")],
+                        _oor_warnings,
+                        {"seq_name": seq_name, "xml_path": out, "fps": fps,
+                         "drop_frame": drop_fr, "start_tc_secs": start_tc,
+                         "total_clips": _n_counted})
+                    _report = os.path.splitext(out)[0] + "_missing_video.txt"
+                    with open(_report, "w", encoding="utf-8") as _fh:
+                        _fh.write(_txt)
+                    print("Missing-video report: {}".format(_report))
+                except Exception as _e:
+                    print("Missing-video report not written: {}".format(_e))
+                    _report = None
+
                 def _finish():
                     self.out_path.set(out)
                     self._aaf_done(matched, unmatched,
                                    len(clips_with_media), clip_results,
-                                   gaps_closed=_gaps_closed)
+                                   gaps_closed=_gaps_closed,
+                                   report_path=_report)
                     if _no_channels:
                         messagebox.showwarning(
                             "Audio channels unknown",
@@ -6038,7 +6209,7 @@ class AafWorkflowMixin:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _aaf_done(self, matched, unmatched, total, clip_results=None,
-                  gaps_closed=0):
+                  gaps_closed=0, report_path=None):
         self._clear()
         tk.Frame(self.body, bg=BG, height=20).pack()
         tk.Label(self.body, text="\u2713",
@@ -6075,6 +6246,12 @@ class AafWorkflowMixin:
         self._btn(nav, "← BACK TO SETUP", self._aaf_step2).pack(
             side="left", padx=(0, 10))
         self._btn(nav, "START NEW EPISODE", self._reset).pack(side="left")
+        if report_path and os.path.isfile(report_path):
+            self._btn(nav, "OPEN EDITOR REPORT",
+                      lambda p=report_path: _open_file(p)).pack(
+                side="left", padx=(10, 0))
+            tk.Label(self.body, text="Clips without video: " + report_path,
+                     font=FB, bg=BG, fg=SUB).pack(pady=(6, 0))
 
         # ── Per-clip colored log (same scheme as Script→AAF reconcile view) ──
         if clip_results:
