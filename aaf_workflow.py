@@ -3061,6 +3061,17 @@ class AafWorkflowMixin:
             return
 
         start_offset = 0.0
+        # The OFFSET box seeds the search.  Sync on its own only looks about
+        # ±2 minutes either side of zero, so audio that is a later piece of
+        # one long recording (Part 2 of a file split for transcription)
+        # starts out of its reach; typing roughly where it starts -- Part 1's
+        # length -- lets SYNC find the exact frame there.  It is the offset
+        # for the slot-1 video, so only that video is searched around it.
+        try:
+            _hint = float(self._aaf_source_offset_vars[base].get())
+        except (KeyError, ValueError, tk.TclError):
+            _hint = None
+        _hint_vp = _all_vps[0]
         # Tk vars must be read on the main thread; cache the flag here so
         # the worker thread doesn't touch Tk state.
         _has_slate_flag = bool(self._aaf_source_has_slate_vars.get(
@@ -3113,7 +3124,8 @@ class AafWorkflowMixin:
                         start_offset=start_offset,
                         return_candidates=True,
                         has_slate=_has_slate_flag,
-                        drift_out=_dr)
+                        drift_out=_dr,
+                        offset_hint=_hint if _vp == _hint_vp else None)
                     return off, conf, _vp, alts, (_dr or None)
                 if _n_vps == 1:
                     return _one(_all_vps[0])

@@ -935,8 +935,16 @@ def _event_diff_offset(video_path, audio_path, probe_duration=300.0,
 def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
                         sample_rate=8000, start_offset=0.0,
                         n_probes=3, return_candidates=False,
-                        has_slate=False, drift_out=None):
+                        has_slate=False, drift_out=None, offset_hint=None):
     """Multi-window sync detection wrapper.
+
+    ``offset_hint``: a rough offset the caller already knows (seconds,
+    same sign as the result), e.g. the user typed "Part 1's length" for an
+    audio file that is the second piece of one long recording.  The
+    detector itself only searches about ±2 minutes, so an audio piece that
+    starts 40 minutes into the video is out of its reach.  Past
+    ``_HINT_MIN_S`` the search is centred on the hint instead of on zero;
+    see _detect_near_hint.
 
     ``drift_out``: pass a dict to receive the camera-clock drift the probes
     measured, when they could: ``{"ppm", "t_ref", "n_probes", "span_s"}``.
@@ -969,6 +977,18 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     surfaced by Stage 1 — used by the sync-preview dialog to let the
     user audition alternatives when the auto pick is wrong.
     """
+
+    if offset_hint is not None and offset_hint > _HINT_MIN_S:
+        res = _detect_near_hint(
+            video_path, audio_path, float(offset_hint),
+            dict(probe_duration=probe_duration, sample_rate=sample_rate,
+                 start_offset=start_offset, n_probes=n_probes,
+                 has_slate=has_slate),
+            drift_out)
+        if res is not None:
+            return res if return_candidates else res[:2]
+        # Could not cut the window (unreadable video, no duration):
+        # fall through to the ordinary search.
 
     def _augment(T, conf, alts):
         """Cross-check the envelope detector's pick against the onset
@@ -1234,6 +1254,61 @@ def detect_sync_offset(video_path, audio_path, probe_duration=300.0,
     if drift_out is not None and _drift is not None and abs(res[0] - final_T) <= 0.1:
         drift_out.update(_drift)
     return res
+
+
+# Hints at or below this are already inside the detector's own reach.
+_HINT_MIN_S = 60.0
+# How far before the hint the window opens.  The detector then looks for a
+# residual of about +_HINT_PAD_S, well inside its ±30 s fine pass, so a
+# hint that is up to _HINT_PAD_S too late still lands.
+_HINT_PAD_S = 15.0
+# How far past the hint's end the window runs, for a hint that is too early.
+_HINT_TAIL_S = 150.0
+
+
+def _detect_near_hint(video_path, audio_path, hint, kw, drift_out):
+    """Run detect_sync_offset against the stretch of the video that the
+    hint says the audio covers, and shift the answer back to video time.
+
+    The stretch is cut once to a temporary mono WAV, from (hint - pad) for
+    the audio's length plus margins, and the ordinary detector runs on it
+    unchanged: probes, cross-check and re-rank all work exactly as they do
+    for an unsplit source whose camera started about pad seconds early.
+    Returns (T, conf, candidates) in the full video's time, or None when
+    the window could not be cut (the caller then searches as usual).
+    """
+    try:
+        from engines import get_media_duration as _gmd
+        dur = float(_gmd(audio_path) or 0.0)
+    except Exception:
+        dur = 0.0
+    if dur <= 0.0:
+        return None
+    vs = max(0.0, hint - _HINT_PAD_S)
+    span = (hint - vs) + dur + _HINT_TAIL_S
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="pb_hint_")
+    os.close(fd)
+    try:
+        cmd = (_ffmpeg_cmd() + ["-y", "-v", "quiet"]
+               + audio_read_args(video_path, vs, span)
+               + ["-vn", "-ac", "1", "-ar", "16000",
+                  "-c:a", "pcm_s16le", tmp])
+        # Audio-only decode of up to a few hours: minutes at worst.
+        r = run_hidden(cmd, capture_output=True, timeout=1800)
+        if r.returncode != 0 or os.path.getsize(tmp) < 16000:
+            return None
+        T, conf, alts = detect_sync_offset(
+            tmp, audio_path, return_candidates=True, drift_out=drift_out,
+            **kw)
+        return (round(T + vs, 6), conf,
+                [(round(t + vs, 4), c) for (t, c) in (alts or [])])
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _detect_sync_offset_at(video_path, audio_path, probe_duration=300.0,
