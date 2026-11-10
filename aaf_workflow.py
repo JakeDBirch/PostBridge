@@ -152,6 +152,9 @@ def missing_video_report(missing, video_intervals, oor_warnings, info):
                  "covered   other = another")
         L.append("           camera covers it all")
         L.append("")
+        L.append("  Every none/partly spot also has a NO VIDEO marker on the "
+                 "sequence.")
+        L.append("")
         hdr = "  {:<11}  {:<11}  {:>8}  {:<7}  {:<8}  {}".format(
             "REC IN", "REC OUT", "DUR", "PICTURE", "TRACK", "CLIP  (source)")
         L.append(hdr)
@@ -209,6 +212,48 @@ def missing_video_report(missing, video_intervals, oor_warnings, info):
                 src[:44], counts[src], "s" if counts[src] != 1 else ""))
     L.append("")
     return "\n".join(L)
+
+
+def missing_video_markers(missing, video_intervals, merge_gap_secs=1.0):
+    """Sequence markers over the holes in the picture: clips with no video
+    that no other camera fully covers (the report's PICTURE none/partly).
+    Holes from one source less than *merge_gap_secs* apart share a marker,
+    so a run of short lines reads as one spot on the timeline."""
+    holes = []
+    for m in missing:
+        if m.get("hidden"):
+            continue
+        if _covered_fraction(m["start_secs"], m["end_secs"],
+                             video_intervals) >= 0.99:
+            continue
+        holes.append(m)
+    holes.sort(key=lambda m: (m.get("base") or "", m["start_secs"]))
+    spans = []
+    for m in holes:
+        src = m.get("base") or m["clip_name"]
+        last = spans[-1] if spans else None
+        if (last and last["src"] == src
+                and m["start_secs"] - last["end"] < merge_gap_secs):
+            last["end"] = max(last["end"], m["end_secs"])
+            last["clips"].append(m["clip_name"])
+        else:
+            spans.append({"src": src, "start": m["start_secs"],
+                          "end": m["end_secs"], "clips": [m["clip_name"]]})
+    spans.sort(key=lambda s: s["start"])
+    out = []
+    for s in spans:
+        n = len(s["clips"])
+        out.append({
+            "name": "NO VIDEO: {}".format(s["src"]),
+            "comment": "{} clip{} with no video ({}).  See the "
+                       "_missing_video.txt report.".format(
+                           n, "s" if n != 1 else "",
+                           ", ".join(s["clips"][:6])
+                           + (", ..." if n > 6 else "")),
+            "start_secs": s["start"],
+            "end_secs": s["end"],
+        })
+    return out
 
 
 def natural_key(name):
@@ -6100,6 +6145,14 @@ class AafWorkflowMixin:
                     "drop-frame" if drop_fr else "non-drop"))
                 _oor_warnings = []
                 _build_stats  = {}
+                # A marker over every hole in the picture, so the editor
+                # finds them on the timeline (the report lists them all).
+                _vid_iv = [(c["start_secs"], c["end_secs"])
+                           for c in clips_with_media if c.get("video_path")]
+                _markers = missing_video_markers(_no_video, _vid_iv)
+                if _markers:
+                    print("{} NO VIDEO marker(s) on the sequence.".format(
+                        len(_markers)))
                 xmeml = engines.build_xml_from_pt(
                     clips_with_media,
                     track_names_ordered,
@@ -6112,7 +6165,8 @@ class AafWorkflowMixin:
                     close_gaps_max_secs=close_gaps_secs,
                     close_gaps_across_sources=close_gaps_src,
                     stats_out=_build_stats,
-                    seq_start_secs=start_tc, seq_drop_frame=drop_fr)
+                    seq_start_secs=start_tc, seq_drop_frame=drop_fr,
+                    markers=_markers)
                 _gaps_closed = _build_stats.get("gaps_closed", 0)
                 if close_gaps_secs:
                     print("Video gaps closed (\u2264{:.1f}s{}): {}".format(
@@ -6153,10 +6207,7 @@ class AafWorkflowMixin:
                     _n_counted = sum(1 for _b in _bases
                                      if _b is not None and _b not in _hidden_srcs)
                     _txt = missing_video_report(
-                        _no_video,
-                        [(c["start_secs"], c["end_secs"])
-                         for c in clips_with_media if c.get("video_path")],
-                        _oor_warnings,
+                        _no_video, _vid_iv, _oor_warnings,
                         {"seq_name": seq_name, "xml_path": out, "fps": fps,
                          "drop_frame": drop_fr, "start_tc_secs": start_tc,
                          "total_clips": _n_counted})

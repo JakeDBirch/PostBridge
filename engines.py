@@ -5016,7 +5016,11 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
                       warnings_out=None, close_gaps_max_secs=0.0,
                       close_gaps_across_sources=False, stats_out=None,
                       seq_start_secs=0.0, seq_drop_frame=False,
-                      mix_lag_secs=0.0):
+                      mix_lag_secs=0.0, markers=None):
+    # markers: [{name, comment, start_secs, end_secs}] -- sequence markers,
+    # in session seconds like the clips (end_secs None: a point marker).
+    # Placed with the same rounding as the clips, so a marker spans
+    # exactly the frames its clip covers.
     # make_rate() writes the NTSC rational for 23.976 / 29.97 / 59.94; do
     # the frame arithmetic at that exact rate too (see exact_fps).
     fps        = exact_fps(seq_fps)
@@ -5392,6 +5396,16 @@ def build_xml_from_pt(clips_with_media, track_names, seq_name,
     SubElement(seq, "name").text     = seq_name
     SubElement(seq, "duration").text = str(total)
     make_rate(seq, fps); make_tc(seq, fps, seq_start_secs, seq_drop_frame)
+
+    for m in markers or []:
+        mk = SubElement(seq, "marker")
+        SubElement(mk, "name").text    = m.get("name", "")
+        SubElement(mk, "comment").text = m.get("comment", "")
+        m_in = max(0, f2fr(m["start_secs"], fps))
+        SubElement(mk, "in").text      = str(m_in)
+        m_end = m.get("end_secs")
+        SubElement(mk, "out").text     = (
+            str(max(m_in + 1, f2fr(m_end, fps))) if m_end is not None else "-1")
 
     media = SubElement(seq, "media")
     vel   = SubElement(media, "video")

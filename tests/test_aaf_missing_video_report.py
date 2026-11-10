@@ -59,6 +59,34 @@ def test_report_lists_clips_by_record_timecode():
     assert not any("Music_Cue_4" in l for l in rows)
 
 
+def test_markers_cover_only_the_holes():
+    from aaf_workflow import missing_video_markers
+    ms = missing_video_markers(
+        [_m("D3.wav-01", "Denise_Part_3", 62.0, 64.0),
+         _m("D3.wav-02", "Denise_Part_3", 64.5, 66.0),   # 0.5 s on: same spot
+         _m("D3.wav-03", "Denise_Part_3", 90.0, 91.0),   # its own spot
+         _m("D3.wav-04", "Denise_Part_3", 125.0, 131.5), # other camera covers
+         _m("Cue.wav-01", "Music", 10.0, 40.0, hidden=True)],
+        [(120.0, 140.0)])
+    assert [(m["start_secs"], m["end_secs"]) for m in ms] == [
+        (62.0, 66.0), (90.0, 91.0)]
+    assert ms[0]["name"] == "NO VIDEO: Denise_Part_3"
+    assert "2 clips" in ms[0]["comment"] and "D3.wav-02" in ms[0]["comment"]
+
+
+def test_xml_carries_the_markers():
+    import engines
+    x = engines.build_xml_from_pt(
+        [], [], "Ep 5", seq_fps=29.97, seq_start_secs=T0,
+        markers=[{"name": "NO VIDEO: D3", "comment": "c",
+                  "start_secs": 62.0, "end_secs": 66.0}])
+    mk = x.find("sequence/marker")
+    assert mk.find("name").text == "NO VIDEO: D3"
+    # Same frame rounding as the clips: round(secs * fps).
+    assert (mk.find("in").text, mk.find("out").text) == (
+        str(round(62.0 * 29.97)), str(round(66.0 * 29.97)))
+
+
 def test_report_when_nothing_is_missing():
     txt = missing_video_report([], [(0, 10)], [], INFO)
     assert "Every clip in the AAF has video." in txt
@@ -114,7 +142,9 @@ def test_build_writes_the_report_next_to_the_xml(tmp_path, monkeypatch):
     out = str(tmp_path / "Ep5_aaf.xml")
     monkeypatch.setattr(aaf_workflow.filedialog, "asksaveasfilename",
                         lambda **k: out)
-    monkeypatch.setattr(engines, "build_xml_from_pt", lambda *a, **k: "<xmeml/>")
+    built = {}
+    monkeypatch.setattr(engines, "build_xml_from_pt",
+                        lambda *a, **k: built.update(k) or "<xmeml/>")
     monkeypatch.setattr(engines, "write_xml",
                         lambda x, p: open(p, "w").write(x))
     monkeypatch.setattr(engines, "channels_unknown", lambda x: [])
@@ -152,6 +182,10 @@ def test_build_writes_the_report_next_to_the_xml(tmp_path, monkeypatch):
         row = next(l for l in txt.splitlines() if "Denise_Part_3.wav-01" in l)
         assert row.split()[:4] == ["01:00:39:29", "01:00:49:28", "0:10.0", "none"]
         assert "LEFT OUT ON PURPOSE" in txt and "CamB" in txt
+        # One marker, over Denise's hole; none for the hidden CamB.
+        assert [(m["name"], m["start_secs"], m["end_secs"])
+                for m in built["markers"]] == [
+            ("NO VIDEO: Denise_Part_3", 40.0, 50.0)]
         assert not errors, "\n".join(errors)
         assert not [d for d in dialogs if d[0] == "showerror"], dialogs
     finally:
