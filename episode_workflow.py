@@ -419,6 +419,7 @@ class EpisodeWorkflowMixin:
             tk.Label(body, text="No sources yet. Use a recording below as a source.",
                      font=FB, bg=SURF, fg=SUB).pack(anchor="w")
         free_video = self._ep_free_media("video")
+        free_audio = self._ep_free_media("audio")
         for name in sorted(ep["sources"]):
             src = ep["sources"][name]
             row = tk.Frame(body, bg=SURF2, highlightbackground=BORDER, highlightthickness=1)
@@ -443,12 +444,32 @@ class EpisodeWorkflowMixin:
                          ).pack(side="left")
             self._btn(top, "REMOVE SOURCE", lambda n=name: self._ep_remove_source(n),
                       small=True).pack(side="right")
+            others = [o for o in sorted(ep["sources"]) if o != name]
+            if others:
+                cv = tk.StringVar(value="— combine with —")
+                _FlatDropdown(top, cv, ["— combine with —"] + others, font=FB, width=22
+                              ).pack(side="right", padx=(0, 8))
+                cv.trace_add("write", lambda *_a, n=name, v=cv: (
+                    self._ep_combine(n, v.get()) if v.get() in ep["sources"] else None))
             # Recordings
             for a in src.get("audio", []):
                 self._ep_media_line(row, a, "REC", lambda p=a, n=name: self._ep_detach(n, "audio", p))
             # Cameras
             for v in src.get("video", []):
                 self._ep_media_line(row, v, "CAM", lambda p=v, n=name: self._ep_detach(n, "video", p))
+            if free_audio:
+                addr = tk.Frame(row, bg=SURF2)
+                addr.pack(fill="x", padx=10, pady=(2, 0))
+                tk.Label(addr, text="+ recording", font=FB, bg=SURF2, fg=SUB).pack(side="left")
+                rv = tk.StringVar(value="— choose —")
+                _FlatDropdown(addr, rv, ["— choose —"] + [os.path.basename(a) for a in free_audio],
+                              font=FB, width=34).pack(side="left", padx=(8, 0))
+                def _attach_rec(*_a, n=name, v=rv, fa=free_audio):
+                    for p in fa:
+                        if os.path.basename(p) == v.get():
+                            self._ep_attach(n, "audio", p)
+                            return
+                rv.trace_add("write", _attach_rec)
             if free_video:
                 add = tk.Frame(row, bg=SURF2)
                 add.pack(fill="x", padx=10, pady=(2, 6))
@@ -606,6 +627,12 @@ class EpisodeWorkflowMixin:
             name = "{} ({})".format(base, i); i += 1
         ep["sources"][name] = {"token": None, "audio": [relpath], "video": [],
                                "session": None, "user_made": True}
+        self._ep_view()
+
+    def _ep_combine(self, name, other):
+        """Two sources are one session (each mic was given its own): *other*
+        folds into *name*."""
+        EP.merge_sources(self._ep, name, other)
         self._ep_view()
 
     def _ep_remove_source(self, name):

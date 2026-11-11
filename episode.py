@@ -470,6 +470,41 @@ def _name_match(src_name, video_stem):
     return shared / float(len(s)), shared
 
 
+def _name_words(text):
+    """Every word of a name, short ones included ("DJ", "Jim")."""
+    return {str(int(w)) if w.isdigit() else w
+            for w in re.findall(r"[a-z0-9]+", text.lower())}
+
+
+def _same_session_names(a, b):
+    """Could two recordings of the same length be two mics of one session?
+    They share two identifying words ("Dave Kaufmann" / "Dave Kaufmann
+    (Jordan)"), or one name is the other with something added ("DJ" /
+    "DJ (Jordan)", "Jim Gorges" / "Jim Gorges (Jordan)").  Counting only
+    4+ letter words left "DJ" with none and "Jim Gorges" with one, so the
+    interviewer's side of those sessions became a source of its own."""
+    if len(_sig_words(a) & _sig_words(b)) >= 2:
+        return True
+    wa, wb = _name_words(a), _name_words(b)
+    return bool(wa and wb) and (wa <= wb or wb <= wa)
+
+
+def merge_sources(ep, into, other):
+    """Fold source *other* into *into*: its recordings and cameras join,
+    and a token, session or VO part *into* lacks comes across.  The result
+    is the user's, so a rescan keeps it."""
+    srcs = ep["sources"]
+    if into == other or into not in srcs or other not in srcs:
+        return
+    a, b = srcs[into], srcs.pop(other)
+    for kind in ("audio", "video"):
+        a[kind] = sorted(set(a.get(kind, [])) | set(b.get(kind, [])))
+    for k in ("token", "session", "vo_part"):
+        if not a.get(k) and b.get(k):
+            a[k] = b[k]
+    a["user_made"] = True
+
+
 def _stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -667,7 +702,8 @@ def propose_sources(files, sessions=None):
         placed = False
         for s in sources:
             d0 = files[s["audio"][0]]["duration_s"] or 0.0
-            if abs(d - d0) <= 1.0 and len(_sig_words(_stem(r)) & _sig_words(_stem(s["audio"][0]))) >= 2:
+            if abs(d - d0) <= 1.0 and any(_same_session_names(_stem(r), _stem(a))
+                                          for a in s["audio"]):
                 s["audio"].append(r)
                 placed = True
                 break

@@ -165,3 +165,54 @@ def test_step2_never_guesses_another_session_or_part():
     assert match_source_to_video("Ep 7 pt 1", ["a/Ep 7 CAM 1 01.mp4"]) == "a/Ep 7 CAM 1 01.mp4"
     assert match_source_to_video("Butler Interview_JORDAN", ["a/Butler Interview.MP4"]) \
         == "a/Butler Interview.MP4"
+
+
+def _rec(secs):
+    return {"kind": "audio", "size": 1, "duration_s": secs, "status": "source",
+            "reason": "", "dup_of": None}
+
+
+def test_interviewer_side_pairs_with_short_names():
+    """Jordan's folder: each interview recorded as "<Guest>.mp3" plus
+    "<Guest> (Jordan).mp3".  Only Dave Kaufmann paired -- "DJ" and
+    "Jim Gorges" had too few long words to count as the same name."""
+    files = {}
+    for guest, secs in [("DJ", 3409.0), ("Dave Kaufmann", 3074.0), ("Jim Gorges", 3674.0)]:
+        files["{}.mp3".format(guest)] = _rec(secs)
+        files["{} (Jordan).mp3".format(guest)] = _rec(secs + 0.2)
+    srcs = EP.propose_sources(files)
+    assert sorted(srcs) == ["DJ", "Dave Kaufmann", "Jim Gorges"]
+    assert srcs["DJ"]["audio"] == ["DJ (Jordan).mp3", "DJ.mp3"]
+    assert srcs["Jim Gorges"]["audio"] == ["Jim Gorges (Jordan).mp3", "Jim Gorges.mp3"]
+
+
+def test_same_length_different_people_stay_apart():
+    files = {"DJ.mp3": _rec(3409.0), "Jim Gorges.mp3": _rec(3409.3),
+             "Dave.mp3": _rec(3409.1)}
+    assert sorted(EP.propose_sources(files)) == ["DJ", "Dave", "Jim Gorges"]
+
+
+def test_rescan_folds_the_interviewer_side_in():
+    """An episode scanned by the old rule keeps the guest's source (and its
+    transcript) and the interviewer's side joins it."""
+    files = {"DJ.mp3": _rec(3409.0), "DJ (Jordan).mp3": _rec(3409.2)}
+    ep = {"sources": {
+        "DJ": {"token": "DJ", "audio": ["DJ.mp3"], "video": [], "session": "s1"},
+        "DJ (Jordan)": {"token": "DJ", "audio": ["DJ (Jordan).mp3"], "video": [],
+                        "session": "s2"}}}
+    EP.apply_scan(ep, {"files": files, "sources": EP.propose_sources(files),
+                       "mix": None, "sessions": {}})
+    assert list(ep["sources"]) == ["DJ"]
+    assert ep["sources"]["DJ"]["audio"] == ["DJ (Jordan).mp3", "DJ.mp3"]
+    assert ep["sources"]["DJ"]["session"] == "s1"
+
+
+def test_merge_sources():
+    ep = {"sources": {
+        "A": {"token": None, "audio": ["a.wav"], "video": [], "session": None},
+        "B": {"token": "B", "audio": ["b.wav"], "video": ["b.mp4"], "session": "s"}}}
+    EP.merge_sources(ep, "A", "B")
+    assert list(ep["sources"]) == ["A"]
+    a = ep["sources"]["A"]
+    assert a["audio"] == ["a.wav", "b.wav"] and a["video"] == ["b.mp4"]
+    assert a["token"] == "B" and a["session"] == "s" and a["user_made"]
