@@ -6,7 +6,10 @@
 
 ### Google Docs: SEND TO SCRIPT at the cursor
 **SEND TO SCRIPT** now offers **AT THE CURSOR**: the pull lands where your cursor is in the Doc.
-- **It needs the PostBridge panel open in the Doc.** Google only lets a script that lives inside the Doc see the cursor, so PostBridge comes with one. **SET UP THE PANEL…** in the Send to Script window copies it and lists the steps (Extensions → Apps Script, paste, save, reload). That is done once per Doc.
+- **It needs the PostBridge panel open in the Doc.** Google only lets a script that lives inside the Doc see the cursor, so PostBridge comes with one. **SET UP THE PANEL…** in the Send to Script window has **INSTALL IN THE DOC**, which puts it there for you, once per Doc. Everyone who can edit the Doc then has the panel.
+- **The install asks Google for one more permission,** to add scripts to your Docs; a browser tab opens for it the first time. Nothing else PostBridge does uses it. Each Google account also has to switch on "Google Apps Script API" once; if yours is off, PostBridge opens that page and says so. **COPY SCRIPT** is there for pasting it in by hand (Extensions → Apps Script) if the install is refused.
+- **After the install:** reload the Doc, then **PostBridge → Open panel** and allow it, the first time. From then on the panel opens by itself whenever you open the Doc (**PostBridge → Stop opening the panel by itself** turns that off).
+- **UPDATE IN THE DOC** replaces the button once a Doc has the panel, and brings its script up to date with a newer PostBridge.
 - **With the panel open,** click where the pull should go and send it. It arrives within a few seconds, on the line the cursor is on if that line is empty, otherwise just below it. The cursor moves to the end of the pull, so a run of pulls stacks in order.
 - **Without the panel** the pull waits at the end of the Doc. Opening the panel, or **PostBridge → Put waiting pulls at the cursor** in the Doc, moves it. **Leave waiting pulls where they are** keeps them at the end.
 - A Doc with no sections now asks **AT THE CURSOR** or **END OF THE DOC**, where it used to go straight to the end.

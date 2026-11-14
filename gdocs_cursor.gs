@@ -7,22 +7,36 @@
  * and can see the cursor, moves it there.  With the panel open that happens
  * by itself within a few seconds; the menu does it on demand.
  *
- * Installed once per Doc: Extensions > Apps Script, paste, save, reload.
+ * Installed once per Doc, by PostBridge (INSTALL IN THE DOC) or by hand:
+ * Extensions > Apps Script, paste, save, reload.  Once a person has opened
+ * the panel, it opens by itself for them whenever they open the Doc.
  *
  * @OnlyCurrentDoc
  */
 
 var PB_PENDING = 'postbridge_pending_pull';   // gdocs.PENDING_RANGE
+var PB_AUTO = 'pb_auto_panel';                // per person: open the panel with the Doc
 
 function onOpen() {
   DocumentApp.getUi().createMenu('PostBridge')
       .addItem('Open panel (pulls land at the cursor)', 'pbShowPanel')
       .addItem('Put waiting pulls at the cursor', 'pbPlaceFromMenu')
       .addItem('Leave waiting pulls where they are', 'pbReleaseFromMenu')
+      .addItem('Stop opening the panel by itself', 'pbNoAuto')
       .addToUi();
+  // For someone who has opened the panel before.  Google decides whether a
+  // script may do this as a Doc opens; if not, the menu is still there.
+  try {
+    if (PropertiesService.getUserProperties().getProperty(PB_AUTO) === '1') { pbShowPanel(); }
+  } catch (e) {}
+}
+
+function pbNoAuto() {
+  try { PropertiesService.getUserProperties().deleteProperty(PB_AUTO); } catch (e) {}
 }
 
 function pbShowPanel() {
+  try { PropertiesService.getUserProperties().setProperty(PB_AUTO, '1'); } catch (e) {}
   DocumentApp.getUi().showSidebar(
       HtmlService.createHtmlOutput(PB_PANEL_HTML).setTitle('PostBridge'));
 }

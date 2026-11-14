@@ -45,6 +45,12 @@ import webbrowser
 from utils import app_state_dir
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+# Asked for only when the panel is installed in a Doc (INSTALL IN THE DOC):
+# it lets PostBridge create and update Apps Script projects.  Everything
+# else runs on drive.file alone.
+SCRIPT_SCOPE = "https://www.googleapis.com/auth/script.projects"
+SCRIPT_API = "https://script.googleapis.com/v1/projects"
+SCRIPT_SETTINGS_URL = "https://script.google.com/home/usersettings"
 CLIENT_FILE = "google_client.json"
 PICKER_FILE = "google_picker_key.txt"
 TOKEN_FILE  = "google_token.json"
@@ -152,19 +158,37 @@ def install_setup(client_src=None, key_src=None):
 
 # ── Sign-in ───────────────────────────────────────────────────────────────
 
-def get_credentials(interactive=True):
+def _granted_scopes():
+    """The permissions the saved sign-in holds (the usual one, if unknown)."""
+    try:
+        with open(token_path(), encoding="utf-8") as f:
+            got = json.load(f).get("scopes") or []
+    except (OSError, ValueError):
+        got = []
+    if isinstance(got, str):
+        got = got.split()
+    return list(got) or list(SCOPES)
+
+
+def get_credentials(interactive=True, extra=()):
     """Valid credentials, refreshing or signing in (browser) as needed.
     None when not configured, or when a sign-in would be needed and
-    *interactive* is False."""
+    *interactive* is False.  *extra* names permissions beyond the usual
+    one; a sign-in that lacks them is done again, asking for them too, and
+    the wider sign-in then serves everything."""
     if not is_configured():
         return None
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     creds = None
     tp = token_path()
-    if os.path.isfile(tp):
+    held = _granted_scopes()
+    want = list(SCOPES) + [x for x in extra if x not in SCOPES]
+    if os.path.isfile(tp) and all(x in held for x in want):
         try:
-            creds = Credentials.from_authorized_user_file(tp, SCOPES)
+            # With the permissions it was given: a refresh that names one
+            # Google never granted is refused.
+            creds = Credentials.from_authorized_user_file(tp, held)
         except Exception:
             creds = None
     if creds and creds.valid:
@@ -179,18 +203,32 @@ def get_credentials(interactive=True):
     if not interactive:
         return None
     from google_auth_oauthlib.flow import InstalledAppFlow
-    flow = InstalledAppFlow.from_client_secrets_file(client_config_path(), SCOPES)
+    ask = want + [x for x in held if x not in want]
+    # Google lets a person untick a permission; that is reported below, in
+    # words, in place of oauthlib's "Scope has changed" error.
+    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+    flow = InstalledAppFlow.from_client_secrets_file(client_config_path(), ask)
     creds = flow.run_local_server(port=0, prompt="consent",
                                   success_message="PostBridge is signed in. You can close this tab.")
+    got = set(getattr(creds, "granted_scopes", None) or creds.scopes or [])
     _save_token(creds)
+    missing = [x for x in extra if x not in got]
+    if missing:
+        raise RuntimeError("Google signed in without the permission PostBridge asked for "
+                           "({}). Try again and leave it ticked.".format(
+                               ", ".join(m.rsplit("/", 1)[-1] for m in missing)))
     return creds
 
 
 def _save_token(creds):
     try:
         os.makedirs(app_state_dir(), exist_ok=True)
+        data = json.loads(creds.to_json())
+        granted = getattr(creds, "granted_scopes", None)
+        if granted:
+            data["scopes"] = list(granted)       # what Google gave, not what was asked
         with open(token_path(), "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+            f.write(json.dumps(data))
     except OSError:
         pass
 
@@ -812,6 +850,52 @@ def park_pull(creds, doc_id, text, tab=None, docs=None):
         except Exception as e:
             if attempt == 2 or "revision" not in str(e).lower():
                 raise
+
+
+class ScriptApiOff(RuntimeError):
+    """The signed-in person has the Apps Script API switched off (it is off
+    until switched on, once, at SCRIPT_SETTINGS_URL)."""
+
+
+def _script_call(session, method, url, body):
+    r = session.request(method, url, json=body, timeout=60)
+    if r.status_code < 400:
+        return r.json()
+    try:
+        msg = r.json()["error"]["message"]
+    except Exception:
+        msg = (r.text or "")[:300]
+    if r.status_code == 404:
+        raise LookupError(msg)
+    if "usersettings" in msg:
+        raise ScriptApiOff(msg)
+    raise RuntimeError("Google would not install the panel ({}): {}".format(r.status_code, msg))
+
+
+def install_cursor_script(creds, doc_id, script_id=None, session=None):
+    """Put the cursor panel's script inside the Doc, as the paste into
+    Extensions > Apps Script would.  *script_id* is the project a past
+    install made: it is brought up to date; one that is gone is made anew.
+    Returns the project's id.  Needs SCRIPT_SCOPE."""
+    if session is None:
+        from google.auth.transport.requests import AuthorizedSession
+        session = AuthorizedSession(creds)
+    # No oauthScopes: Apps Script works them out from the code, as it does
+    # for a pasted script, and @OnlyCurrentDoc keeps them to this one Doc.
+    manifest = {"timeZone": "Etc/UTC", "exceptionLogging": "STACKDRIVER", "runtimeVersion": "V8"}
+    files = {"files": [
+        {"name": "Code", "type": "SERVER_JS", "source": cursor_script()},
+        {"name": "appsscript", "type": "JSON", "source": json.dumps(manifest)}]}
+    if script_id:
+        try:
+            _script_call(session, "PUT", "{}/{}/content".format(SCRIPT_API, script_id), files)
+            return script_id
+        except LookupError:
+            pass
+    made = _script_call(session, "POST", SCRIPT_API, {"title": "PostBridge", "parentId": doc_id})
+    script_id = made["scriptId"]
+    _script_call(session, "PUT", "{}/{}/content".format(SCRIPT_API, script_id), files)
+    return script_id
 
 
 def cursor_script():

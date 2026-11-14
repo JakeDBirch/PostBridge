@@ -596,6 +596,17 @@ def test_send_to_script_at_the_cursor_and_its_setup(app, monkeypatch, project):
     assert _click(app, app._pq_setup_win, "COPY SCRIPT")
     assert "function pbPlacePending" in app.clipboard_get()
     assert gdocs.PENDING_RANGE in app.clipboard_get()
+
+    # INSTALL IN THE DOC asks for the wider permission, installs, and the
+    # episode remembers the script so the next install is an update.
+    asked = []
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True, extra=():
+                        asked.append(list(extra)) or object())
+    monkeypatch.setattr(gdocs, "install_cursor_script", lambda creds, doc_id, script_id=None, session=None:
+                        "script-9" if (doc_id, script_id) == ("doc123", None) else "wrong")
+    assert _click(app, app._pq_setup_win, "INSTALL IN THE DOC")
+    assert _wait(app, lambda: app._ep["links"]["gdoc"].get("cursor_script") == "script-9", secs=10)
+    assert [gdocs.SCRIPT_SCOPE] in asked
     assert _click(app, app._pq_setup_win, "CLOSE")
 
     assert _click(app, app._pq_part_win, "AT THE CURSOR")

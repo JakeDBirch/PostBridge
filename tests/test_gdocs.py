@@ -425,6 +425,75 @@ def test_in_doc_script_waits_for_a_cursor_and_leaves_a_pull_the_cursor_is_in():
     assert r["lines"] == lines and r["ranges"] == 0 and r["result"] == {"released": 1}
 
 
+class _Resp:
+    def __init__(self, status, data):
+        self.status_code, self._data, self.text = status, data, str(data)
+
+    def json(self):
+        return self._data
+
+
+class _Session:
+    """Fake Apps Script API: answers from a list, records the calls."""
+    def __init__(self, answers):
+        self.answers, self.calls = list(answers), []
+
+    def request(self, method, url, json=None, timeout=None):
+        self.calls.append((method, url.replace(gdocs.SCRIPT_API, ""), json))
+        return self.answers.pop(0)
+
+
+def test_install_makes_the_script_inside_the_doc():
+    s = _Session([_Resp(200, {"scriptId": "S1"}), _Resp(200, {})])
+    assert gdocs.install_cursor_script(None, "doc1", session=s) == "S1"
+    assert s.calls[0] == ("POST", "", {"title": "PostBridge", "parentId": "doc1"})
+    method, url, body = s.calls[1]
+    assert (method, url) == ("PUT", "/S1/content")
+    files = {f["name"]: f for f in body["files"]}
+    assert "function pbPlacePending" in files["Code"]["source"]
+    assert files["Code"]["type"] == "SERVER_JS" and files["appsscript"]["type"] == "JSON"
+    assert "oauthScopes" not in files["appsscript"]["source"]
+
+
+def test_install_updates_a_past_install_and_remakes_one_that_is_gone():
+    s = _Session([_Resp(200, {})])
+    assert gdocs.install_cursor_script(None, "doc1", "S1", session=s) == "S1"
+    assert [c[:2] for c in s.calls] == [("PUT", "/S1/content")]
+    gone = {"error": {"message": "Requested entity was not found."}}
+    s = _Session([_Resp(404, gone), _Resp(200, {"scriptId": "S2"}), _Resp(200, {})])
+    assert gdocs.install_cursor_script(None, "doc1", "S1", session=s) == "S2"
+
+
+def test_install_says_when_the_apps_script_api_is_off():
+    off = {"error": {"message": "User has not enabled the Apps Script API. Enable it by "
+                                "visiting https://script.google.com/home/usersettings then retry."}}
+    with pytest.raises(gdocs.ScriptApiOff):
+        gdocs.install_cursor_script(None, "doc1", session=_Session([_Resp(403, off)]))
+    no = {"error": {"message": "The caller does not have permission"}}
+    with pytest.raises(RuntimeError, match="does not have permission"):
+        gdocs.install_cursor_script(None, "doc1", session=_Session([_Resp(403, no)]))
+
+
+def test_a_sign_in_without_the_script_permission_is_done_again(tmp_path, monkeypatch):
+    """The usual sign-in holds drive.file only.  It keeps serving everything
+    else untouched, and only the install asks Google again."""
+    import json
+    tok = tmp_path / "google_token.json"
+    tok.write_text(json.dumps({"token": "t", "refresh_token": "r", "client_id": "c",
+                               "client_secret": "s", "expiry": "2099-01-01T00:00:00Z",
+                               "scopes": gdocs.SCOPES}))
+    monkeypatch.setattr(gdocs, "token_path", lambda: str(tok))
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    assert gdocs._granted_scopes() == gdocs.SCOPES
+    assert gdocs.get_credentials(interactive=False, extra=[gdocs.SCRIPT_SCOPE]) is None
+    tok.write_text(json.dumps({"token": "t", "refresh_token": "r", "client_id": "c",
+                               "client_secret": "s", "expiry": "2099-01-01T00:00:00Z",
+                               "scopes": gdocs.SCOPES + [gdocs.SCRIPT_SCOPE]}))
+    creds = gdocs.get_credentials(interactive=False, extra=[gdocs.SCRIPT_SCOPE])
+    assert creds is not None and gdocs.SCRIPT_SCOPE in creds.scopes
+    assert gdocs.get_credentials(interactive=False) is not None      # and for everything else
+
+
 CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",
                         "client_secret": "s", "redirect_uris": ["http://localhost"]}}
 KEY = "AIza" + "B" * 35

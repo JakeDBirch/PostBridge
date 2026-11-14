@@ -5484,7 +5484,7 @@ class PqWorkflowMixin:
             if t["mark"]:
                 _send(gdocs.SEND_MARK)
             else:
-                self._pq_choose_part(t["parts"], in_tc, out_tc, _send, gd)
+                self._pq_choose_part(t["parts"], in_tc, out_tc, _send, gd, ep)
 
         def _read():
             self._pq_flash_status("Reading the Doc\u2026")
@@ -5493,7 +5493,7 @@ class PqWorkflowMixin:
                 _aim)
         self._ep_gdoc_with_tab(ep, _read)
 
-    def _pq_choose_part(self, parts, in_tc, out_tc, send, gd=None):
+    def _pq_choose_part(self, parts, in_tc, out_tc, send, gd=None, ep=None):
         """Ask where in the script a pull goes: at the cursor, or at the end
         of a section (of the Doc, if it has none).  The one used last stands
         out, since pulls tend to come in runs for one place."""
@@ -5534,15 +5534,16 @@ class PqWorkflowMixin:
                  font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(8, 0))
         foot = tk.Frame(win, bg=BG)
         foot.pack(fill="x", padx=20, pady=(10, 14))
-        self._btn(foot, "SET UP THE PANEL\u2026", lambda: self._pq_cursor_setup(gd), small=True
+        self._btn(foot, "SET UP THE PANEL\u2026", lambda: self._pq_cursor_setup(gd, ep), small=True
                   ).pack(side="left")
         self._btn(foot, "CANCEL", win.destroy, small=True).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
         self._center_dialog(win, min_w=460, min_h=200)
 
-    def _pq_cursor_setup(self, gd=None):
-        """How to put the PostBridge panel in a Doc, once per Doc: the script
-        that sees the cursor has to live inside the Doc itself."""
+    def _pq_cursor_setup(self, gd=None, ep=None):
+        """Put the PostBridge panel in a Doc, once per Doc: the script that
+        sees the cursor has to live inside the Doc itself.  INSTALL IN THE
+        DOC does it; the paste by hand stays for when Google refuses."""
         import gdocs
         import webbrowser
         win = tk.Toplevel(self)
@@ -5553,22 +5554,28 @@ class PqWorkflowMixin:
         tk.Label(win, text="Pulls at the cursor: set up once per Doc", font=FH,
                  bg=BG, fg=TEXT).pack(anchor="w", padx=20, pady=(14, 6))
         steps = [
-            "1.  COPY SCRIPT (below).",
-            "2.  In the Doc: Extensions \u2192 Apps Script. Select everything in the editor, "
-            "paste over it, save (Ctrl+S), and close that tab.",
-            "3.  Reload the Doc. After a few seconds a PostBridge menu appears next to Help: "
+            "1.  INSTALL IN THE DOC (below). The first time, Google asks you to let "
+            "PostBridge add scripts to your Docs.",
+            "2.  Reload the Doc. After a few seconds a PostBridge menu appears next to Help: "
             "PostBridge \u2192 Open panel.",
-            "4.  The first time, Google asks you to allow it. If it says the app isn't "
-            "verified: Advanced \u2192 Go to the project. It is your own copy and only "
-            "reaches this Doc.",
-            "5.  Leave the panel open and click where the next pull should go. "
-            "Then SEND TO SCRIPT \u2192 AT THE CURSOR.",
+            "3.  The first time, Google asks you to allow the panel. If it says the app isn't "
+            "verified: Advanced \u2192 Go to PostBridge. It only reaches this Doc.",
+            "4.  Click where the next pull should go, then SEND TO SCRIPT \u2192 AT THE CURSOR. "
+            "From then on the panel opens by itself whenever you open the Doc.",
+            "By hand, if the install is refused: COPY SCRIPT, then in the Doc Extensions "
+            "\u2192 Apps Script, paste over what is there, save, and carry on from step 2.",
         ]
         for st in steps:
-            tk.Label(win, text=st, font=FB, bg=BG, fg=TEXT, justify="left", anchor="w",
-                     wraplength=520).pack(anchor="w", padx=20, pady=2)
-        said = tk.Label(win, text="", font=FB, bg=BG, fg=SUCCESS)
+            tk.Label(win, text=st, font=FB, bg=BG, fg=TEXT if st[0].isdigit() else SUB,
+                     justify="left", anchor="w", wraplength=540
+                     ).pack(anchor="w", padx=20, pady=2)
+        said = tk.Label(win, text="", font=FB, bg=BG, fg=SUCCESS, justify="left",
+                        anchor="w", wraplength=540)
         said.pack(anchor="w", padx=20, pady=(6, 0))
+
+        def _say(text):
+            if win.winfo_exists():
+                said.config(text=text)
 
         def _copy():
             try:
@@ -5578,18 +5585,48 @@ class PqWorkflowMixin:
                 return
             self.clipboard_clear()
             self.clipboard_append(text)
-            said.config(text="\u2713 Script copied")
+            _say("\u2713 Script copied")
+
+        def _install():
+            if not self._gdocs_ready():
+                return
+            _say("Installing\u2026 (a browser tab opens if Google needs your OK)")
+
+            def _work():
+                creds = gdocs.get_credentials(extra=[gdocs.SCRIPT_SCOPE])
+                try:
+                    return gdocs.install_cursor_script(creds, gd["id"], gd.get("cursor_script"))
+                except gdocs.ScriptApiOff:
+                    webbrowser.open(gdocs.SCRIPT_SETTINGS_URL)
+                    raise RuntimeError(
+                        "Your Google account has the Apps Script API switched off. "
+                        "On the page that just opened, switch \"Google Apps Script API\" on, "
+                        "then press INSTALL IN THE DOC again.")
+
+            def _done(script_id):
+                gd["cursor_script"] = script_id
+                if ep is not None:
+                    try:
+                        import episode as EP
+                        ep.setdefault("links", {}).setdefault("gdoc", gd)["cursor_script"] = script_id
+                        EP.save(ep)
+                    except Exception:
+                        pass
+                _say("\u2713 Installed. Reload the Doc, then PostBridge \u2192 Open panel.")
+            self._ep_gdoc_bg(_work, _done)
 
         foot = tk.Frame(win, bg=BG)
         foot.pack(fill="x", padx=20, pady=(10, 14))
-        self._btn(foot, "COPY SCRIPT", _copy, small=True, color=ACCENT).pack(side="left")
         if (gd or {}).get("id"):
+            self._btn(foot, "UPDATE IN THE DOC" if gd.get("cursor_script") else "INSTALL IN THE DOC",
+                      _install, small=True, color=ACCENT).pack(side="left")
             self._btn(foot, "OPEN THE DOC", lambda: webbrowser.open(
                 "https://docs.google.com/document/d/{}/edit".format(gd["id"])), small=True
                       ).pack(side="left", padx=(8, 0))
+        self._btn(foot, "COPY SCRIPT", _copy, small=True).pack(side="left", padx=(8, 0))
         self._btn(foot, "CLOSE", win.destroy, small=True).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
-        self._center_dialog(win, min_w=580, min_h=300)
+        self._center_dialog(win, min_w=600, min_h=320)
 
     def _pq_build_pull_block(self):
         """(block, in_tc, out_tc) for the transcript selection, or None."""

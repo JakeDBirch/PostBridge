@@ -76,6 +76,7 @@ const ctx = {
   DocumentApp: {ElementType: T, getActiveDocument: () => doc, getUi: () => null},
   LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
   HtmlService: {},
+  PropertiesService: {getUserProperties: () => ({getProperty: () => null, setProperty: () => {}, deleteProperty: () => {}})},
 };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
