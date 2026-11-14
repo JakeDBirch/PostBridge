@@ -15,8 +15,9 @@ What this gives the episode:
   cannot make *suggestions*; these are ordinary edits, attributed to the
   account that signed in.)
 * **Send to script** -- a pull block added from Pull Quotes: where an
-  ``@@`` mark is typed in the Doc, else at the end of the section chosen
-  (the end of the Doc, if it has no sections).
+  ``@@`` mark is typed in the Doc, at the cursor (through the script that
+  runs inside the Doc, gdocs_cursor.gs: the API here cannot see a cursor),
+  at the end of the section chosen, or at the end of the Doc.
 * **Fix format** -- Fix Format's structure repairs made in the Doc, line by
   line.  Wording and timecodes stay; Docs' version history can undo it.
 
@@ -50,6 +51,10 @@ TOKEN_FILE  = "google_token.json"
 
 NOTE_PREFIX = "// ⚠ PostBridge: "
 SEND_MARK = "@@"     # typed in the Doc where SEND TO SCRIPT should put the pull
+SEND_CURSOR = "<cursor>"                    # SEND TO SCRIPT's "at the cursor"
+PENDING_RANGE = "postbridge_pending_pull"   # named range on a pull waiting for
+                                            # the in-Doc script (gdocs_cursor.gs)
+CURSOR_SCRIPT = "gdocs_cursor.gs"
 NOTE_RANGE  = "pbnote"       # named-range prefix on every note we write
 NOTE_BG     = {"red": 1.0, "green": 0.86, "blue": 0.62}
 
@@ -642,6 +647,25 @@ def plan_insert_at_mark(doc, text):
             {"insertText": {"location": {"index": index}, "text": body}}]
 
 
+def plan_park(doc, text):
+    """Request leaving *text* at the end of the Doc under the named range
+    PENDING_RANGE.  The Docs API cannot see the cursor; the script inside
+    the Doc (gdocs_cursor.gs) can, and moves whatever waits under that name
+    to it.  Until it does, the pull is simply at the end of the Doc."""
+    content = doc.get("body", {}).get("content", [])
+    at = (content[-1].get("endIndex", 2) if content else 2) - 1
+    body = text.strip("\n")
+    return [{"insertText": {"location": {"index": at}, "text": "\n" + body}},
+            {"createNamedRange": {"name": PENDING_RANGE, "range": {
+                "startIndex": at + 1, "endIndex": at + 1 + _u16(body)}}}]
+
+
+def pending_count(doc):
+    """How many pulls wait in *doc* for the in-Doc script."""
+    grp = (doc.get("namedRanges") or {}).get(PENDING_RANGE) or {}
+    return len(grp.get("namedRanges", []))
+
+
 # ── Writing ───────────────────────────────────────────────────────────────
 
 def _in_tab(reqs, tab_id):
@@ -772,6 +796,33 @@ def insert_at_mark(creds, doc_id, text, tab=None, docs=None):
         except Exception as e:
             if attempt == 2 or "revision" not in str(e).lower():
                 raise
+
+
+def park_pull(creds, doc_id, text, tab=None, docs=None):
+    """Leave a pull for the in-Doc script to move to the cursor.  Returns
+    how many were already waiting: more than none means the panel is not
+    open in the Doc, since an open panel takes each one within seconds."""
+    if docs is None:
+        _drive, docs = services(creds)
+    for attempt in range(3):
+        doc = _get_tab(docs, doc_id, tab)
+        try:
+            _batch(docs, doc_id, plan_park(doc, text), doc.get("revisionId"), doc.get("tabId"))
+            return pending_count(doc)
+        except Exception as e:
+            if attempt == 2 or "revision" not in str(e).lower():
+                raise
+
+
+def cursor_script():
+    """The text of the script that goes inside the Doc."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (getattr(sys, "_MEIPASS", None), here):
+        p = os.path.join(d, CURSOR_SCRIPT) if d else None
+        if p and os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+    raise RuntimeError("{} is missing from this copy of PostBridge.".format(CURSOR_SCRIPT))
 
 
 # ── Change detection ──────────────────────────────────────────────────────

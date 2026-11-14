@@ -359,6 +359,72 @@ def test_insert_at_mark_redoes_the_plan_and_fails_without_a_mark():
         gdocs.insert_at_mark(None, "doc1", PULL, docs=_Docs(_doc(PARTS)))
 
 
+def test_a_pull_for_the_cursor_waits_at_the_end_under_a_named_range():
+    lines = ["[PART Open]", "Words.", ""]
+    doc = _doc(lines)
+    reqs = gdocs.plan_park(doc, PULL)
+    assert _applied(lines, [reqs[0]]) == "\n".join(lines) + "\n" + PULL.strip("\n") + "\n"
+    rng = reqs[1]["createNamedRange"]
+    assert rng["name"] == gdocs.PENDING_RANGE
+    whole = "\n".join(lines) + "\n" + PULL.strip("\n") + "\n"
+    assert whole[rng["range"]["startIndex"] - 1:rng["range"]["endIndex"] - 1] == PULL.strip("\n")
+
+    docs = _Docs(doc)
+    assert gdocs.park_pull(None, "doc1", PULL, docs=docs) == 0
+    assert docs.batches[0]["writeControl"] == {"requiredRevisionId": "r1"}
+    waiting = _doc(lines, named={gdocs.PENDING_RANGE: (1, 5)})
+    assert gdocs.park_pull(None, "doc1", PULL, docs=_Docs(waiting)) == 1
+    # A waiting pull is not one of PostBridge's notes: clearing notes leaves it.
+    assert gdocs.existing_notes(waiting) == []
+
+
+def _in_doc(scenario):
+    """What the script that runs inside the Doc does with *scenario*."""
+    import json, shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    out = subprocess.run([node, os.path.join(ROOT, "tests", "gdocs_cursor_mock.js"),
+                          os.path.join(ROOT, gdocs.CURSOR_SCRIPT), json.dumps(scenario)],
+                         capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+DOC = ["[PART Open]", "First.", "", "Last.", ""]
+
+
+def test_in_doc_script_moves_the_pull_to_an_empty_line_at_the_cursor():
+    r = _in_doc({"lines": DOC + ["[A 00:00:01-00:00:02]", "Words."], "pending": [[5, 6]], "cursor": 2})
+    assert r["lines"] == ["[PART Open]", "First.", "[A 00:00:01-00:00:02]", "Words.", "Last.", ""]
+    assert r["result"]["placed"] == ["[A 00:00:01-00:00:02]"] and r["ranges"] == 0
+    assert r["cursor"] == 3                      # on the pull's last line, for the next one
+
+
+def test_in_doc_script_puts_the_pull_below_a_line_with_words():
+    r = _in_doc({"lines": DOC + ["[A 1]", "Words."], "pending": [[5, 6]], "cursor": 1})
+    assert r["lines"] == ["[PART Open]", "First.", "", "[A 1]", "Words.", "", "Last.", ""]
+
+
+def test_in_doc_script_keeps_the_order_pulls_were_sent_in():
+    r = _in_doc({"lines": DOC + ["[A 1]", "One.", "", "[B 2]", "Two."],
+                 "pending": [[5, 6], [8, 9]], "cursor": 2})
+    assert r["lines"] == ["[PART Open]", "First.", "[A 1]", "One.", "", "[B 2]", "Two.",
+                          "Last.", "", ""]
+    assert r["result"]["placed"] == ["[A 1]", "[B 2]"]
+
+
+def test_in_doc_script_waits_for_a_cursor_and_leaves_a_pull_the_cursor_is_in():
+    lines = DOC + ["[A 1]", "Words."]
+    r = _in_doc({"lines": lines, "pending": [[5, 6]], "cursor": None})
+    assert r["lines"] == lines and r["ranges"] == 1
+    assert r["result"]["waiting"] == 1 and "Click in the Doc" in r["result"]["note"]
+    r = _in_doc({"lines": lines, "pending": [[5, 6]], "cursor": 6})
+    assert r["lines"] == lines and r["ranges"] == 0 and r["result"]["placed"] == ["[A 1]"]
+    r = _in_doc({"lines": lines, "pending": [[5, 6]], "cursor": 2, "release": True})
+    assert r["lines"] == lines and r["ranges"] == 0 and r["result"] == {"released": 1}
+
+
 CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",
                         "client_secret": "s", "redirect_uris": ["http://localhost"]}}
 KEY = "AIza" + "B" * 35

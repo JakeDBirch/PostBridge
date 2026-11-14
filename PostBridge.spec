@@ -106,7 +106,7 @@ _icon_win = os.path.join(_icon_dir, "PostBridge.ico")
 _icon_mac = os.path.join(_icon_dir, "PostBridge.icns")
 
 # ── Include HTML helper files ─────────────────────────────────────────────────
-for _fn in ("blood_trails_formatter.html",):
+for _fn in ("blood_trails_formatter.html", "gdocs_cursor.gs"):
     _fp = os.path.join(src_dir, _fn)
     if os.path.isfile(_fp):
         added_files.append((_fp, "."))

@@ -5461,23 +5461,30 @@ class PqWorkflowMixin:
             def _work():
                 if part is gdocs.SEND_MARK:
                     gdocs.insert_at_mark(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
+                elif part is gdocs.SEND_CURSOR:
+                    return gdocs.park_pull(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
                 elif part is None:
                     gdocs.append_block(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
                 else:
                     gdocs.append_to_part(gdocs.get_credentials(), gd["id"], block, part, tab=gd.get("tab"))
-            self._ep_gdoc_bg(_work, lambda _r: self._pq_flash_status(
-                "\u2713 Sent to {}  [{}\u2013{}]".format(
-                    "the @@ mark" if part is gdocs.SEND_MARK else part or "script",
-                    in_tc, out_tc)))
+            def _done(waiting):
+                where = {gdocs.SEND_MARK: "the @@ mark", gdocs.SEND_CURSOR: "the cursor",
+                         None: "the end of the script"}.get(part, part)
+                msg = "\u2713 Sent to {}  [{}\u2013{}]".format(where, in_tc, out_tc)
+                if part is gdocs.SEND_CURSOR and waiting:
+                    # An open panel takes each pull in seconds, so one still
+                    # waiting means nothing in the Doc is moving them.
+                    msg += "  \u00b7  {} still waiting at the end of the Doc: open " \
+                           "PostBridge \u2192 Open panel there".format(waiting + 1)
+                self._pq_flash_status(msg)
+            self._ep_gdoc_bg(_work, _done)
 
         def _aim(t):
             # An @@ typed in the Doc says exactly where; no question needed.
             if t["mark"]:
                 _send(gdocs.SEND_MARK)
-            elif t["parts"]:
-                self._pq_choose_part(t["parts"], in_tc, out_tc, _send)
             else:
-                _send(None)
+                self._pq_choose_part(t["parts"], in_tc, out_tc, _send, gd)
 
         def _read():
             self._pq_flash_status("Reading the Doc\u2026")
@@ -5486,19 +5493,19 @@ class PqWorkflowMixin:
                 _aim)
         self._ep_gdoc_with_tab(ep, _read)
 
-    def _pq_choose_part(self, parts, in_tc, out_tc, send):
-        """Ask which section of the script a pull goes in.  The one used last
-        stands out, since pulls tend to come in runs for one section."""
+    def _pq_choose_part(self, parts, in_tc, out_tc, send, gd=None):
+        """Ask where in the script a pull goes: at the cursor, or at the end
+        of a section (of the Doc, if it has none).  The one used last stands
+        out, since pulls tend to come in runs for one place."""
         win = tk.Toplevel(self)
         win.title("Send to script")
         win.configure(bg=BG)
         win.transient(self)
         self._pq_part_win = win
-        tk.Label(win, text="Which section does this pull go in?", font=FH,
+        import gdocs
+        tk.Label(win, text="Where does this pull go?", font=FH,
                  bg=BG, fg=TEXT).pack(anchor="w", padx=20, pady=(14, 2))
-        tk.Label(win, text="It goes at the end of the section  \u00b7  [{}\u2013{}]".format(in_tc, out_tc),
-                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 2))
-        tk.Label(win, text="For an exact spot, type @@ there in the Doc and send again.",
+        tk.Label(win, text="[{}\u2013{}]".format(in_tc, out_tc),
                  font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 10))
         last = getattr(self, "_pq_last_part", None)
 
@@ -5507,13 +5514,82 @@ class PqWorkflowMixin:
             win.destroy()
             send(part)
 
+        self._btn(win, "AT THE CURSOR", lambda: _pick(gdocs.SEND_CURSOR), small=True,
+                  color=ACCENT if last == gdocs.SEND_CURSOR else None
+                  ).pack(fill="x", padx=20, pady=2)
+        tk.Label(win, text="Needs the PostBridge panel open in the Doc. Without it the pull "
+                           "waits at the end of the Doc.",
+                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 8))
+        tk.Label(win, text="Or at the end of a section:" if parts else "Or:",
+                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 2))
         for part in parts:
             self._btn(win, part, lambda p=part: _pick(p), small=True,
                       color=ACCENT if part == last else None
                       ).pack(fill="x", padx=20, pady=2)
-        self._btn(win, "CANCEL", win.destroy, small=True).pack(anchor="e", padx=20, pady=(10, 14))
+        if not parts:
+            self._btn(win, "END OF THE DOC", lambda: _pick(None), small=True
+                      ).pack(fill="x", padx=20, pady=2)
+        tk.Label(win, text="For an exact spot without the panel, type @@ there in the Doc "
+                           "and send again.",
+                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(8, 0))
+        foot = tk.Frame(win, bg=BG)
+        foot.pack(fill="x", padx=20, pady=(10, 14))
+        self._btn(foot, "SET UP THE PANEL\u2026", lambda: self._pq_cursor_setup(gd), small=True
+                  ).pack(side="left")
+        self._btn(foot, "CANCEL", win.destroy, small=True).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
         self._center_dialog(win, min_w=460, min_h=200)
+
+    def _pq_cursor_setup(self, gd=None):
+        """How to put the PostBridge panel in a Doc, once per Doc: the script
+        that sees the cursor has to live inside the Doc itself."""
+        import gdocs
+        import webbrowser
+        win = tk.Toplevel(self)
+        win.title("Set up the PostBridge panel")
+        win.configure(bg=BG)
+        win.transient(self)
+        self._pq_setup_win = win
+        tk.Label(win, text="Pulls at the cursor: set up once per Doc", font=FH,
+                 bg=BG, fg=TEXT).pack(anchor="w", padx=20, pady=(14, 6))
+        steps = [
+            "1.  COPY SCRIPT (below).",
+            "2.  In the Doc: Extensions \u2192 Apps Script. Select everything in the editor, "
+            "paste over it, save (Ctrl+S), and close that tab.",
+            "3.  Reload the Doc. After a few seconds a PostBridge menu appears next to Help: "
+            "PostBridge \u2192 Open panel.",
+            "4.  The first time, Google asks you to allow it. If it says the app isn't "
+            "verified: Advanced \u2192 Go to the project. It is your own copy and only "
+            "reaches this Doc.",
+            "5.  Leave the panel open and click where the next pull should go. "
+            "Then SEND TO SCRIPT \u2192 AT THE CURSOR.",
+        ]
+        for st in steps:
+            tk.Label(win, text=st, font=FB, bg=BG, fg=TEXT, justify="left", anchor="w",
+                     wraplength=520).pack(anchor="w", padx=20, pady=2)
+        said = tk.Label(win, text="", font=FB, bg=BG, fg=SUCCESS)
+        said.pack(anchor="w", padx=20, pady=(6, 0))
+
+        def _copy():
+            try:
+                text = gdocs.cursor_script()
+            except Exception as e:
+                messagebox.showerror("Set up the PostBridge panel", str(e))
+                return
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            said.config(text="\u2713 Script copied")
+
+        foot = tk.Frame(win, bg=BG)
+        foot.pack(fill="x", padx=20, pady=(10, 14))
+        self._btn(foot, "COPY SCRIPT", _copy, small=True, color=ACCENT).pack(side="left")
+        if (gd or {}).get("id"):
+            self._btn(foot, "OPEN THE DOC", lambda: webbrowser.open(
+                "https://docs.google.com/document/d/{}/edit".format(gd["id"])), small=True
+                      ).pack(side="left", padx=(8, 0))
+        self._btn(foot, "CLOSE", win.destroy, small=True).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        self._center_dialog(win, min_w=580, min_h=300)
 
     def _pq_build_pull_block(self):
         """(block, in_tc, out_tc) for the transcript selection, or None."""

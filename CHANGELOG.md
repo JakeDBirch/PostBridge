@@ -4,6 +4,13 @@
 
 ## November 13, 2026
 
+### Google Docs: SEND TO SCRIPT at the cursor
+**SEND TO SCRIPT** now offers **AT THE CURSOR**: the pull lands where your cursor is in the Doc.
+- **It needs the PostBridge panel open in the Doc.** Google only lets a script that lives inside the Doc see the cursor, so PostBridge comes with one. **SET UP THE PANEL…** in the Send to Script window copies it and lists the steps (Extensions → Apps Script, paste, save, reload). That is done once per Doc.
+- **With the panel open,** click where the pull should go and send it. It arrives within a few seconds, on the line the cursor is on if that line is empty, otherwise just below it. The cursor moves to the end of the pull, so a run of pulls stacks in order.
+- **Without the panel** the pull waits at the end of the Doc. Opening the panel, or **PostBridge → Put waiting pulls at the cursor** in the Doc, moves it. **Leave waiting pulls where they are** keeps them at the end.
+- A Doc with no sections now asks **AT THE CURSOR** or **END OF THE DOC**, where it used to go straight to the end.
+
 ### Google Docs: SEND TO SCRIPT puts the pull at an `@@` mark
 Type `@@` in the Doc where the next pull should go, then **SEND TO SCRIPT**. The pull lands exactly there and the `@@` is removed; nothing is asked. With no `@@` in the Doc it works as before: it lists the sections and adds the pull at the end of the one you choose. (Google does not let PostBridge see where your cursor is, so the mark stands in for it.) If the Doc has more than one `@@`, the first is used and the rest stay for later pulls.
 

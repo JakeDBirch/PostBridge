@@ -515,6 +515,8 @@ def _send_setup(app, monkeypatch, parts, mark=False):
                         {"mark": mark, "parts": parts})
     monkeypatch.setattr(gdocs, "insert_at_mark", lambda creds, doc_id, text, tab=None, docs=None:
                         sent.append((doc_id, text, "@@")))
+    monkeypatch.setattr(gdocs, "park_pull", lambda creds, doc_id, text, tab=None, docs=None:
+                        sent.append((doc_id, text, "cursor")) or 0)
     monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, tab=None, docs=None:
                         sent.append((doc_id, text, part)))
     monkeypatch.setattr(gdocs, "append_block", lambda creds, doc_id, text, after_marker=None, tab=None, docs=None:
@@ -564,13 +566,41 @@ def test_send_to_script_goes_to_the_mark_without_asking(app, monkeypatch, projec
     assert not app._errors, "\n".join(app._errors)
 
 
-def test_send_to_script_with_no_sections_goes_to_the_end(app, monkeypatch, project):
+def test_send_to_script_with_no_sections_offers_the_cursor_or_the_end(app, monkeypatch, project):
     _open_fresh(app, monkeypatch, project)
     sent = _send_setup(app, monkeypatch, [])
     app._pq_part_win = None
     app._pq_send_to_script()
+    assert _wait(app, lambda: app._pq_part_win is not None, secs=10)
+    _pump(app, 3)
+    assert _click(app, app._pq_part_win, "END OF THE DOC")
     assert _wait(app, lambda: bool(sent), secs=10)
-    assert sent[0][2] is None and app._pq_part_win is None
+    assert sent[0][2] is None
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_send_to_script_at_the_cursor_and_its_setup(app, monkeypatch, project):
+    import gdocs
+    _open_fresh(app, monkeypatch, project)
+    sent = _send_setup(app, monkeypatch, ["Open", "Part 1: The Lake"])
+    app._pq_part_win = None
+    app._pq_send_to_script()
+    assert _wait(app, lambda: app._pq_part_win is not None, secs=10)
+    _pump(app, 3)
+
+    # The set-up window hands over the script that goes in the Doc.
+    app._pq_setup_win = None
+    assert _click(app, app._pq_part_win, "SET UP THE PANEL\u2026")
+    _pump(app, 3)
+    assert app._pq_setup_win is not None
+    assert _click(app, app._pq_setup_win, "COPY SCRIPT")
+    assert "function pbPlacePending" in app.clipboard_get()
+    assert gdocs.PENDING_RANGE in app.clipboard_get()
+    assert _click(app, app._pq_setup_win, "CLOSE")
+
+    assert _click(app, app._pq_part_win, "AT THE CURSOR")
+    assert _wait(app, lambda: bool(sent), secs=10)
+    assert sent[0][2] == "cursor" and app._pq_last_part == gdocs.SEND_CURSOR
     assert not app._errors, "\n".join(app._errors)
 
 
