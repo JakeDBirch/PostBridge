@@ -14,8 +14,9 @@ What this gives the episode:
   its own notes and removes the ones whose problem is gone.  (The Docs API
   cannot make *suggestions*; these are ordinary edits, attributed to the
   account that signed in.)
-* **Send to script** -- a pull block added from Pull Quotes, at the end of
-  the section chosen (the end of the Doc, if it has no sections).
+* **Send to script** -- a pull block added from Pull Quotes: where an
+  ``@@`` mark is typed in the Doc, else at the end of the section chosen
+  (the end of the Doc, if it has no sections).
 * **Fix format** -- Fix Format's structure repairs made in the Doc, line by
   line.  Wording and timecodes stay; Docs' version history can undo it.
 
@@ -48,6 +49,7 @@ PICKER_FILE = "google_picker_key.txt"
 TOKEN_FILE  = "google_token.json"
 
 NOTE_PREFIX = "// ⚠ PostBridge: "
+SEND_MARK = "@@"     # typed in the Doc where SEND TO SCRIPT should put the pull
 NOTE_RANGE  = "pbnote"       # named-range prefix on every note we write
 NOTE_BG     = {"red": 1.0, "green": 0.86, "blue": 0.62}
 
@@ -580,6 +582,66 @@ def plan_append_to_part(doc, text, part):
     return None
 
 
+def _u16(text):
+    """Length of *text* as the Docs API counts it (UTF-16 units)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def find_mark(doc):
+    """Where the first ``@@`` in *doc* sits: (index, text before it on its
+    line, text after it), or None.  The Docs API cannot see anyone's cursor,
+    so the writer types the mark where the next pull should go.  A mark in
+    one of PostBridge's own notes is not one."""
+    for el in doc.get("body", {}).get("content", []):
+        p = el.get("paragraph")
+        if not p:
+            continue
+        at = el.get("startIndex", 0)
+        runs = []
+        for r in p.get("elements", []):
+            at = r.get("startIndex", at)
+            if "textRun" in r:
+                content = r["textRun"].get("content", "")
+                runs.append((content, at))
+                at += _u16(content)
+            else:
+                at = r.get("endIndex", at + 1)
+        txt = "".join(c for c, _i in runs)
+        off = txt.find(SEND_MARK)
+        if off < 0 or txt.startswith(NOTE_PREFIX):
+            continue
+        seen = 0
+        for content, start in runs:
+            if off < seen + len(content):
+                index = start + _u16(content[:off - seen])
+                break
+            seen += len(content)
+        return index, txt[:off], txt[off + len(SEND_MARK):].rstrip("\n")
+    return None
+
+
+def has_mark(doc):
+    return find_mark(doc) is not None
+
+
+def plan_insert_at_mark(doc, text):
+    """Request putting *text* where the ``@@`` mark is, the mark removed, or
+    None if the Doc has no mark.  The pull stands on lines of its own:
+    words before or after the mark on its line stay, above and below it."""
+    found = find_mark(doc)
+    if found is None:
+        return None
+    index, before, after = found
+    body = text.strip("\n")
+    if before.strip():
+        body = "\n" + body
+    if after.strip():
+        body = body + "\n"
+    return [{"deleteContentRange": {"range": {"startIndex": index,
+                                              "endIndex": index + _u16(SEND_MARK)}}},
+            {"insertText": {"location": {"index": index}, "text": body}}]
+
+
 # ── Writing ───────────────────────────────────────────────────────────────
 
 def _in_tab(reqs, tab_id):
@@ -677,6 +739,33 @@ def append_to_part(creds, doc_id, text, part, tab=None, docs=None):
         reqs = plan_append_to_part(doc, text, part)
         if reqs is None:
             raise RuntimeError('The Doc no longer has a section called "{}".'.format(part))
+        try:
+            _batch(docs, doc_id, reqs, doc.get("revisionId"), doc.get("tabId"))
+            return
+        except Exception as e:
+            if attempt == 2 or "revision" not in str(e).lower():
+                raise
+
+
+def send_targets(creds, doc_id, tab=None, docs=None):
+    """What SEND TO SCRIPT can aim at: {"mark": is there an @@, "parts":
+    the section names}."""
+    if docs is None:
+        _drive, docs = services(creds)
+    doc = _get_tab(docs, doc_id, tab)
+    return {"mark": has_mark(doc), "parts": doc_parts(doc)}
+
+
+def insert_at_mark(creds, doc_id, text, tab=None, docs=None):
+    """Put a pull where the @@ mark is.  Pinned to the revision it was
+    planned against and redone if the Doc changed, like append_to_part."""
+    if docs is None:
+        _drive, docs = services(creds)
+    for attempt in range(3):
+        doc = _get_tab(docs, doc_id, tab)
+        reqs = plan_insert_at_mark(doc, text)
+        if reqs is None:
+            raise RuntimeError("The Doc no longer has an {} mark.".format(SEND_MARK))
         try:
             _batch(docs, doc_id, reqs, doc.get("revisionId"), doc.get("tabId"))
             return

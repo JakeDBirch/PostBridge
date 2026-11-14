@@ -5437,8 +5437,9 @@ class PqWorkflowMixin:
             self.after(secs, lambda: lbl.config(text=prev_text, fg=prev_fg))
 
     def _pq_send_to_script(self):
-        """Send the selected pull to the episode's Google Doc, at the end of
-        the section chosen, or at the end if the Doc has no sections."""
+        """Send the selected pull to the episode's Google Doc: where an @@
+        mark is typed, else at the end of the section chosen, or at the end
+        if the Doc has no sections."""
         built = self._pq_build_pull_block()
         if built is None:
             messagebox.showinfo("Send to script", "Select the words of the pull first.")
@@ -5458,19 +5459,31 @@ class PqWorkflowMixin:
 
         def _send(part):
             def _work():
-                if part is None:
+                if part is gdocs.SEND_MARK:
+                    gdocs.insert_at_mark(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
+                elif part is None:
                     gdocs.append_block(gdocs.get_credentials(), gd["id"], block, tab=gd.get("tab"))
                 else:
                     gdocs.append_to_part(gdocs.get_credentials(), gd["id"], block, part, tab=gd.get("tab"))
             self._ep_gdoc_bg(_work, lambda _r: self._pq_flash_status(
-                "\u2713 Sent to {}  [{}\u2013{}]".format(part or "script", in_tc, out_tc)))
+                "\u2713 Sent to {}  [{}\u2013{}]".format(
+                    "the @@ mark" if part is gdocs.SEND_MARK else part or "script",
+                    in_tc, out_tc)))
+
+        def _aim(t):
+            # An @@ typed in the Doc says exactly where; no question needed.
+            if t["mark"]:
+                _send(gdocs.SEND_MARK)
+            elif t["parts"]:
+                self._pq_choose_part(t["parts"], in_tc, out_tc, _send)
+            else:
+                _send(None)
 
         def _read():
             self._pq_flash_status("Reading the Doc\u2026")
             self._ep_gdoc_bg(
-                lambda: gdocs.list_parts(gdocs.get_credentials(), gd["id"], tab=gd.get("tab")),
-                lambda parts: self._pq_choose_part(parts, in_tc, out_tc, _send)
-                if parts else _send(None))
+                lambda: gdocs.send_targets(gdocs.get_credentials(), gd["id"], tab=gd.get("tab")),
+                _aim)
         self._ep_gdoc_with_tab(ep, _read)
 
     def _pq_choose_part(self, parts, in_tc, out_tc, send):
@@ -5484,6 +5497,8 @@ class PqWorkflowMixin:
         tk.Label(win, text="Which section does this pull go in?", font=FH,
                  bg=BG, fg=TEXT).pack(anchor="w", padx=20, pady=(14, 2))
         tk.Label(win, text="It goes at the end of the section  \u00b7  [{}\u2013{}]".format(in_tc, out_tc),
+                 font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 2))
+        tk.Label(win, text="For an exact spot, type @@ there in the Doc and send again.",
                  font=FB, bg=BG, fg=SUB).pack(anchor="w", padx=20, pady=(0, 10))
         last = getattr(self, "_pq_last_part", None)
 

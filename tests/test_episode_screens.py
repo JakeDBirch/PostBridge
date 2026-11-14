@@ -503,7 +503,7 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     assert not app._errors, "\n".join(app._errors)
 
 
-def _send_setup(app, monkeypatch, parts):
+def _send_setup(app, monkeypatch, parts, mark=False):
     """A pull selected, a Doc linked with *parts*; records what gets sent."""
     import gdocs
     sent = []
@@ -511,7 +511,10 @@ def _send_setup(app, monkeypatch, parts):
     monkeypatch.setattr(gdocs, "is_ready", lambda: True)
     monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
     monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
-    monkeypatch.setattr(gdocs, "list_parts", lambda creds, doc_id, tab=None, docs=None: parts)
+    monkeypatch.setattr(gdocs, "send_targets", lambda creds, doc_id, tab=None, docs=None:
+                        {"mark": mark, "parts": parts})
+    monkeypatch.setattr(gdocs, "insert_at_mark", lambda creds, doc_id, text, tab=None, docs=None:
+                        sent.append((doc_id, text, "@@")))
     monkeypatch.setattr(gdocs, "append_to_part", lambda creds, doc_id, text, part, tab=None, docs=None:
                         sent.append((doc_id, text, part)))
     monkeypatch.setattr(gdocs, "append_block", lambda creds, doc_id, text, after_marker=None, tab=None, docs=None:
@@ -548,6 +551,16 @@ def test_send_to_script_asks_which_section(app, monkeypatch, project):
     assert sent == [("doc123", "[BUTLER 00:00:05-00:00:20]\nWe went out.\n", "Part 1: The Lake")]
     assert app._pq_last_part == "Part 1: The Lake"
     assert not app._pq_part_win.winfo_exists()
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_send_to_script_goes_to_the_mark_without_asking(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    sent = _send_setup(app, monkeypatch, ["Open", "Part 1: The Lake"], mark=True)
+    app._pq_part_win = None
+    app._pq_send_to_script()
+    assert _wait(app, lambda: bool(sent), secs=10)
+    assert sent[0][2] == "@@" and app._pq_part_win is None
     assert not app._errors, "\n".join(app._errors)
 
 

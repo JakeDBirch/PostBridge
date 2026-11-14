@@ -304,6 +304,61 @@ def test_append_to_part_redoes_the_plan_if_the_doc_changed():
     assert gdocs.list_parts(None, "doc1", docs=docs) == ["Open", "Part 1: The Lake"]
 
 
+def test_pull_goes_where_the_mark_is():
+    """Jordan: the pull should come in where the cursor is.  The API cannot
+    see a cursor, so an @@ typed in the Doc is the spot."""
+    lines = ["[PART Open]", "First words.", "@@", "Last words.", ""]
+    doc = _doc(lines)
+    assert gdocs.has_mark(doc) and not gdocs.has_mark(_doc(PARTS))
+    assert gdocs.plan_insert_at_mark(_doc(PARTS), PULL) is None
+    fixed = _applied(lines, gdocs.plan_insert_at_mark(doc, PULL))
+    assert fixed == "\n".join(["[PART Open]", "First words."] + PULL.strip("\n").split("\n")
+                              + ["Last words.", ""]) + "\n"
+
+
+def test_a_mark_inside_a_line_splits_it_around_the_pull():
+    lines = ["Before \U0001F3A3 @@ after.", "@@"]
+    fixed = _applied_u16(lines, gdocs.plan_insert_at_mark(_doc16(lines), PULL))
+    assert fixed == "Before \U0001F3A3 \n" + PULL.strip("\n") + "\n after.\n@@\n"
+
+
+def test_a_mark_in_a_postbridge_note_is_not_one():
+    assert not gdocs.has_mark(_doc([gdocs.NOTE_PREFIX + "type @@ here"]))
+
+
+def _doc16(lines):
+    """_doc with indices in UTF-16 units, as the Docs API counts them."""
+    content, idx = [], 1
+    for ln in lines:
+        txt = ln + "\n"
+        n = len(txt.encode("utf-16-le")) // 2
+        content.append({"startIndex": idx, "endIndex": idx + n, "paragraph": {"elements": [
+            {"startIndex": idx, "endIndex": idx + n, "textRun": {"content": txt}}]}})
+        idx += n
+    return {"revisionId": "r1", "body": {"content": content}}
+
+
+def _applied_u16(lines, reqs):
+    raw = ("\n".join(lines) + "\n").encode("utf-16-le")
+    for r in reqs:
+        if "deleteContentRange" in r:
+            rg = r["deleteContentRange"]["range"]
+            raw = raw[:(rg["startIndex"] - 1) * 2] + raw[(rg["endIndex"] - 1) * 2:]
+        else:
+            i = (r["insertText"]["location"]["index"] - 1) * 2
+            raw = raw[:i] + r["insertText"]["text"].encode("utf-16-le") + raw[i:]
+    return raw.decode("utf-16-le")
+
+
+def test_insert_at_mark_redoes_the_plan_and_fails_without_a_mark():
+    docs = _Docs(_doc(["[PART Open]", "@@"]))
+    gdocs.insert_at_mark(None, "doc1", PULL, docs=docs)
+    assert docs.batches[0]["writeControl"] == {"requiredRevisionId": "r1"}
+    assert gdocs.send_targets(None, "doc1", docs=docs) == {"mark": True, "parts": ["Open"]}
+    with pytest.raises(RuntimeError, match="no longer has"):
+        gdocs.insert_at_mark(None, "doc1", PULL, docs=_Docs(_doc(PARTS)))
+
+
 CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",
                         "client_secret": "s", "redirect_uris": ["http://localhost"]}}
 KEY = "AIza" + "B" * 35

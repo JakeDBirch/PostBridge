@@ -2,6 +2,17 @@
 
 ---
 
+## November 13, 2026
+
+### Google Docs: SEND TO SCRIPT puts the pull at an `@@` mark
+Type `@@` in the Doc where the next pull should go, then **SEND TO SCRIPT**. The pull lands exactly there and the `@@` is removed; nothing is asked. With no `@@` in the Doc it works as before: it lists the sections and adds the pull at the end of the one you choose. (Google does not let PostBridge see where your cursor is, so the mark stands in for it.) If the Doc has more than one `@@`, the first is used and the rest stay for later pulls.
+
+### Episode sources: the interviewer's side pairs with short names
+- **Recordings like `DJ.mp3` and `DJ (Jordan).mp3` now land in one source.** Two recordings of the same length were paired only when their names shared two longer words, so "DJ" and "Jim Gorges" were missed while "Dave Kaufmann" paired. Scan the folder again to fix an episode already set up; the source keeps its token and transcript.
+- **Sources can be fixed by hand.** Each source has **combine with** (fold another source into it) and **+ recording** (attach a recording not in a source yet).
+
+---
+
 ## November 9, 2026
 
 ### The waveform editor and the Assembly are one window
