@@ -18,27 +18,77 @@ var PB_PENDING = 'postbridge_pending_pull';   // gdocs.PENDING_RANGE
 var PB_AUTO = 'pb_auto_panel';                // per person: open the panel with the Doc
 
 function onOpen() {
-  DocumentApp.getUi().createMenu('PostBridge')
+  // The panel opens by itself for someone who has opened it before.  Google
+  // limits what a script may do as a Doc opens, so when that fails the menu
+  // says why, in its last line.
+  var why = '';
+  try {
+    if (pbWantsPanel_()) {
+      pbOpenPanel_();
+    } else if (pbDocProp_(PB_AUTO + '_any') === '1') {
+      why = 'could not tell who opened the Doc';
+    }
+  } catch (e) {
+    why = String(e && e.message ? e.message : e);
+  }
+  var menu = DocumentApp.getUi().createMenu('PostBridge')
       .addItem('Open panel (pulls land at the cursor)', 'pbShowPanel')
       .addItem('Put waiting pulls at the cursor', 'pbPlaceFromMenu')
       .addItem('Leave waiting pulls where they are', 'pbReleaseFromMenu')
-      .addItem('Stop opening the panel by itself', 'pbNoAuto')
-      .addToUi();
-  // For someone who has opened the panel before.  Google decides whether a
-  // script may do this as a Doc opens; if not, the menu is still there.
+      .addItem('Stop opening the panel by itself', 'pbNoAuto');
+  if (why) {
+    menu.addSeparator().addItem('Panel did not open by itself: ' + why.slice(0, 90), 'pbShowPanel');
+  }
+  menu.addToUi();
+}
+
+function pbDocProp_(key) {
+  try { return PropertiesService.getDocumentProperties().getProperty(key); } catch (e) { return null; }
+}
+
+/** A key for the person at the Doc that works as the Doc opens, or ''. */
+function pbWho_() {
+  try { return Session.getTemporaryActiveUserKey() || ''; } catch (e) { return ''; }
+}
+
+/** Has this person opened the panel here before?  Two ways of knowing. */
+function pbWantsPanel_() {
   try {
-    if (PropertiesService.getUserProperties().getProperty(PB_AUTO) === '1') { pbShowPanel(); }
+    if (PropertiesService.getUserProperties().getProperty(PB_AUTO) === '1') { return true; }
+  } catch (e) {}
+  var who = pbWho_();
+  return !!who && pbDocProp_(PB_AUTO + '_' + who) === '1';
+}
+
+function pbRemember_(on) {
+  var who = pbWho_();
+  try {
+    var up = PropertiesService.getUserProperties();
+    if (on) { up.setProperty(PB_AUTO, '1'); } else { up.deleteProperty(PB_AUTO); }
+  } catch (e) {}
+  try {
+    var dp = PropertiesService.getDocumentProperties();
+    if (on) {
+      dp.setProperty(PB_AUTO + '_any', '1');
+      if (who) { dp.setProperty(PB_AUTO + '_' + who, '1'); }
+    } else if (who) {
+      dp.deleteProperty(PB_AUTO + '_' + who);
+    }
   } catch (e) {}
 }
 
 function pbNoAuto() {
-  try { PropertiesService.getUserProperties().deleteProperty(PB_AUTO); } catch (e) {}
+  pbRemember_(false);
+}
+
+function pbOpenPanel_() {
+  DocumentApp.getUi().showSidebar(
+      HtmlService.createHtmlOutput(PB_PANEL_HTML).setTitle('PostBridge'));
 }
 
 function pbShowPanel() {
-  try { PropertiesService.getUserProperties().setProperty(PB_AUTO, '1'); } catch (e) {}
-  DocumentApp.getUi().showSidebar(
-      HtmlService.createHtmlOutput(PB_PANEL_HTML).setTitle('PostBridge'));
+  pbRemember_(true);
+  pbOpenPanel_();
 }
 
 function pbPlaceFromMenu() {

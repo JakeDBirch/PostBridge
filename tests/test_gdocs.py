@@ -494,6 +494,26 @@ def test_a_sign_in_without_the_script_permission_is_done_again(tmp_path, monkeyp
     assert gdocs.get_credentials(interactive=False) is not None      # and for everything else
 
 
+def test_in_doc_panel_opens_by_itself_for_someone_who_opened_it_before():
+    base = {"lines": [""]}
+    assert _in_doc(dict(base, open={}))["shown"] == 0                    # never opened: left alone
+    r = _in_doc(dict(base, open={"first": True, "who": "k1"}))
+    assert r["shown"] == 2 and r["doc"]["pb_auto_panel_k1"] == "1"       # opened, then with the Doc
+    # Known only through the Doc (no per-person store as the Doc opens).
+    assert _in_doc(dict(base, open={"who": "k1", "doc": {"pb_auto_panel_k1": "1"}}))["shown"] == 1
+    assert _in_doc(dict(base, open={"who": "k2", "doc": {"pb_auto_panel_k1": "1"}}))["shown"] == 0
+
+
+def test_in_doc_menu_says_why_the_panel_did_not_open():
+    base = {"lines": [""]}
+    r = _in_doc(dict(base, open={"user": {"pb_auto_panel": "1"}, "blocked": "No permission to show UI"}))
+    assert r["shown"] == 0
+    assert r["menu"][-1] == "Panel did not open by itself: No permission to show UI"
+    r = _in_doc(dict(base, open={"doc": {"pb_auto_panel_any": "1"}}))
+    assert r["menu"][-1] == "Panel did not open by itself: could not tell who opened the Doc"
+    assert len(_in_doc(dict(base, open={}))["menu"]) == 4
+
+
 CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",
                         "client_secret": "s", "redirect_uris": ["http://localhost"]}}
 KEY = "AIza" + "B" * 35

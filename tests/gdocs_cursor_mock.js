@@ -72,14 +72,42 @@ const doc = {
   newPosition: (el, off) => ({el, off}),
   setCursor: pos => { cursor = pos.el; },
 };
+// scenario.open: {user: {...}, doc: {...}, who: 'key', blocked: 'message'} runs
+// onOpen() and prints {menu: [item titles], shown: n, user, doc}.
+const op = sc.open || {};
+const store = o => ({
+  getProperty: k => (k in o ? o[k] : null),
+  setProperty: (k, v) => { o[k] = v; },
+  deleteProperty: k => { delete o[k]; },
+});
+const userProps = op.user || {}, docProps = op.doc || {};
+const menu = [];
+let shown = 0;
+const menuObj = {
+  addItem: t => { menu.push(t); return menuObj; },
+  addSeparator: () => menuObj,
+  addToUi: () => {},
+};
+const ui = {
+  createMenu: () => menuObj,
+  showSidebar: () => { if (op.blocked) { throw new Error(op.blocked); } shown++; },
+};
+const html = {setTitle: () => html};
 const ctx = {
-  DocumentApp: {ElementType: T, getActiveDocument: () => doc, getUi: () => null},
+  DocumentApp: {ElementType: T, getActiveDocument: () => doc, getUi: () => ui},
   LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
-  HtmlService: {},
-  PropertiesService: {getUserProperties: () => ({getProperty: () => null, setProperty: () => {}, deleteProperty: () => {}})},
+  HtmlService: {createHtmlOutput: () => html},
+  PropertiesService: {getUserProperties: () => store(userProps),
+                      getDocumentProperties: () => store(docProps)},
+  Session: {getTemporaryActiveUserKey: () => op.who || ''},
 };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+if (sc.open) {
+  vm.runInContext(op.first ? 'pbShowPanel(); onOpen()' : 'onOpen()', ctx);
+  process.stdout.write(JSON.stringify({menu, shown, user: userProps, doc: docProps}));
+  process.exit(0);
+}
 const result = vm.runInContext(sc.release ? '({released: pbRelease()})' : 'pbPlacePending()', ctx);
 process.stdout.write(JSON.stringify({
   lines: body.kids.map(k => k.text), result,
