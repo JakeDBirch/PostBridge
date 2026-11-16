@@ -9,33 +9,25 @@
  *
  * Installed once per Doc, by PostBridge (INSTALL IN THE DOC) or by hand:
  * Extensions > Apps Script, paste, save, reload.  Once a person has opened
- * the panel, it opens by itself for them whenever they open the Doc.
+ * the panel, it opens by itself whenever the Doc is opened (an open
+ * trigger, which Google asks them to allow).
  *
  * @OnlyCurrentDoc
  */
 
 var PB_PENDING = 'postbridge_pending_pull';   // gdocs.PENDING_RANGE
-var PB_AUTO = 'pb_auto_panel';                // per person: open the panel with the Doc
+var PB_AUTO = 'pb_auto_panel';                // 'off' per person; '_error' on the Doc
 
 function onOpen() {
-  // The panel opens by itself for someone who has opened it before.  Google
-  // limits what a script may do as a Doc opens, so when that fails the menu
-  // says why, in its last line.
-  var why = '';
-  try {
-    if (pbWantsPanel_()) {
-      pbOpenPanel_();
-    } else if (pbDocProp_(PB_AUTO + '_any') === '1') {
-      why = 'could not tell who opened the Doc';
-    }
-  } catch (e) {
-    why = String(e && e.message ? e.message : e);
-  }
   var menu = DocumentApp.getUi().createMenu('PostBridge')
       .addItem('Open panel (pulls land at the cursor)', 'pbShowPanel')
       .addItem('Put waiting pulls at the cursor', 'pbPlaceFromMenu')
       .addItem('Leave waiting pulls where they are', 'pbReleaseFromMenu')
+      .addSeparator()
+      .addItem('Open the panel by itself with this Doc', 'pbAutoOn')
       .addItem('Stop opening the panel by itself', 'pbNoAuto');
+  // What went wrong the last time the panel tried to open by itself.
+  var why = pbDocProp_(PB_AUTO + '_error');
   if (why) {
     menu.addSeparator().addItem('Panel did not open by itself: ' + why.slice(0, 90), 'pbShowPanel');
   }
@@ -46,39 +38,50 @@ function pbDocProp_(key) {
   try { return PropertiesService.getDocumentProperties().getProperty(key); } catch (e) { return null; }
 }
 
-/** A key for the person at the Doc that works as the Doc opens, or ''. */
-function pbWho_() {
-  try { return Session.getTemporaryActiveUserKey() || ''; } catch (e) { return ''; }
-}
-
-/** Has this person opened the panel here before?  Two ways of knowing. */
-function pbWantsPanel_() {
-  try {
-    if (PropertiesService.getUserProperties().getProperty(PB_AUTO) === '1') { return true; }
-  } catch (e) {}
-  var who = pbWho_();
-  return !!who && pbDocProp_(PB_AUTO + '_' + who) === '1';
-}
-
-function pbRemember_(on) {
-  var who = pbWho_();
-  try {
-    var up = PropertiesService.getUserProperties();
-    if (on) { up.setProperty(PB_AUTO, '1'); } else { up.deleteProperty(PB_AUTO); }
-  } catch (e) {}
+function pbSetDocProp_(key, value) {
   try {
     var dp = PropertiesService.getDocumentProperties();
-    if (on) {
-      dp.setProperty(PB_AUTO + '_any', '1');
-      if (who) { dp.setProperty(PB_AUTO + '_' + who, '1'); }
-    } else if (who) {
-      dp.deleteProperty(PB_AUTO + '_' + who);
-    }
+    if (value) { dp.setProperty(key, value); } else { dp.deleteProperty(key); }
   } catch (e) {}
+}
+
+/**
+ * Runs as the Doc opens, through the trigger pbAutoOn makes.  onOpen above
+ * is not allowed to show a panel ("Specified permissions are not sufficient
+ * to call Ui.showSidebar"); a trigger someone has authorised is.
+ */
+function pbOpened() {
+  try {
+    pbOpenPanel_();
+    pbSetDocProp_(PB_AUTO + '_error', '');
+  } catch (e) {
+    pbSetDocProp_(PB_AUTO + '_error', String(e && e.message ? e.message : e));
+  }
+}
+
+function pbMyTriggers_() {
+  var out = [];
+  var all = ScriptApp.getUserTriggers(DocumentApp.getActiveDocument());
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getHandlerFunction() === 'pbOpened') { out.push(all[i]); }
+  }
+  return out;
+}
+
+/** The panel opens with the Doc from now on.  Asks Google's OK once. */
+function pbAutoOn() {
+  try { PropertiesService.getUserProperties().deleteProperty(PB_AUTO); } catch (e) {}
+  if (!pbMyTriggers_().length) {
+    ScriptApp.newTrigger('pbOpened').forDocument(DocumentApp.getActiveDocument()).onOpen().create();
+  }
+  pbSetDocProp_(PB_AUTO + '_error', '');
 }
 
 function pbNoAuto() {
-  pbRemember_(false);
+  try { PropertiesService.getUserProperties().setProperty(PB_AUTO, 'off'); } catch (e) {}
+  var mine = pbMyTriggers_();
+  for (var i = 0; i < mine.length; i++) { ScriptApp.deleteTrigger(mine[i]); }
+  pbSetDocProp_(PB_AUTO + '_error', '');
 }
 
 function pbOpenPanel_() {
@@ -87,8 +90,14 @@ function pbOpenPanel_() {
 }
 
 function pbShowPanel() {
-  pbRemember_(true);
   pbOpenPanel_();
+  // Opening it once is enough to have it open with the Doc, unless that
+  // was turned off.  A failure here must not cost the panel just opened.
+  try {
+    if (PropertiesService.getUserProperties().getProperty(PB_AUTO) !== 'off') { pbAutoOn(); }
+  } catch (e) {
+    pbSetDocProp_(PB_AUTO + '_error', String(e && e.message ? e.message : e));
+  }
 }
 
 function pbPlaceFromMenu() {

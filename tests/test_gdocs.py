@@ -494,24 +494,32 @@ def test_a_sign_in_without_the_script_permission_is_done_again(tmp_path, monkeyp
     assert gdocs.get_credentials(interactive=False) is not None      # and for everything else
 
 
-def test_in_doc_panel_opens_by_itself_for_someone_who_opened_it_before():
+def test_in_doc_panel_opens_with_the_doc_once_it_has_been_opened():
+    """In a real Doc, onOpen may not show a panel ("Specified permissions are
+    not sufficient to call Ui.showSidebar"), so opening it once makes an open
+    trigger, which may."""
     base = {"lines": [""]}
-    assert _in_doc(dict(base, open={}))["shown"] == 0                    # never opened: left alone
-    r = _in_doc(dict(base, open={"first": True, "who": "k1"}))
-    assert r["shown"] == 2 and r["doc"]["pb_auto_panel_k1"] == "1"       # opened, then with the Doc
-    # Known only through the Doc (no per-person store as the Doc opens).
-    assert _in_doc(dict(base, open={"who": "k1", "doc": {"pb_auto_panel_k1": "1"}}))["shown"] == 1
-    assert _in_doc(dict(base, open={"who": "k2", "doc": {"pb_auto_panel_k1": "1"}}))["shown"] == 0
+    r = _in_doc(dict(base, open={"run": ["open"]}))
+    assert r["shown"] == 0 and r["triggers"] == 0 and len(r["menu"]) == 5
+    r = _in_doc(dict(base, open={"run": ["pbShowPanel", "open", "pbShowPanel", "open"]}))
+    assert r["triggers"] == 1                 # one trigger, however often it is opened
+    assert r["shown"] == 4                    # twice by hand, twice with the Doc
+    # Turned off, it stays off even when the panel is opened by hand.
+    r = _in_doc(dict(base, open={"run": ["pbShowPanel", "pbNoAuto", "pbShowPanel", "open"]}))
+    assert r["triggers"] == 0 and r["shown"] == 2 and r["user"] == {"pb_auto_panel": "off"}
+    r = _in_doc(dict(base, open={"run": ["pbShowPanel", "pbNoAuto", "pbAutoOn", "open"]}))
+    assert r["triggers"] == 1 and r["shown"] == 2 and r["user"] == {}
 
 
 def test_in_doc_menu_says_why_the_panel_did_not_open():
     base = {"lines": [""]}
-    r = _in_doc(dict(base, open={"user": {"pb_auto_panel": "1"}, "blocked": "No permission to show UI"}))
-    assert r["shown"] == 0
-    assert r["menu"][-1] == "Panel did not open by itself: No permission to show UI"
-    r = _in_doc(dict(base, open={"doc": {"pb_auto_panel_any": "1"}}))
-    assert r["menu"][-1] == "Panel did not open by itself: could not tell who opened the Doc"
-    assert len(_in_doc(dict(base, open={}))["menu"]) == 4
+    r = _in_doc(dict(base, open={"run": ["pbShowPanel", "block", "open", "open"]}))
+    assert r["shown"] == 1
+    assert r["menu"][-1] == "Panel did not open by itself: Not allowed"
+    # Making the trigger refused: the panel still opens, and the menu says so.
+    r = _in_doc(dict(base, open={"run": ["pbShowPanel", "open"], "noTriggers": "Triggers are off"}))
+    assert r["shown"] == 1 and r["triggers"] == 0
+    assert r["menu"][-1] == "Panel did not open by itself: Triggers are off"
 
 
 CLIENT = {"installed": {"client_id": "123-abc.apps.googleusercontent.com",

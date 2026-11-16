@@ -72,8 +72,8 @@ const doc = {
   newPosition: (el, off) => ({el, off}),
   setCursor: pos => { cursor = pos.el; },
 };
-// scenario.open: {user: {...}, doc: {...}, who: 'key', blocked: 'message'} runs
-// onOpen() and prints {menu: [item titles], shown: n, user, doc}.
+// scenario.open: {run: ['pbShowPanel', 'open', ...], user: {...}, doc: {...}}
+// prints {menu: [item titles], shown: n, triggers: n, user, doc}.
 const op = sc.open || {};
 const store = o => ({
   getProperty: k => (k in o ? o[k] : null),
@@ -93,19 +93,45 @@ const ui = {
   showSidebar: () => { if (op.blocked) { throw new Error(op.blocked); } shown++; },
 };
 const html = {setTitle: () => html};
+let triggers = [];
 const ctx = {
   DocumentApp: {ElementType: T, getActiveDocument: () => doc, getUi: () => ui},
   LockService: {getDocumentLock: () => ({tryLock: () => true, releaseLock: () => {}})},
   HtmlService: {createHtmlOutput: () => html},
   PropertiesService: {getUserProperties: () => store(userProps),
                       getDocumentProperties: () => store(docProps)},
-  Session: {getTemporaryActiveUserKey: () => op.who || ''},
+  ScriptApp: {
+    getUserTriggers: () => triggers.slice(),
+    newTrigger: fn => {
+      const b = {forDocument: () => b, onOpen: () => b, create: () => {
+        if (op.noTriggers) { throw new Error(op.noTriggers); }
+        const t = {getHandlerFunction: () => fn};
+        triggers.push(t);
+        return t;
+      }};
+      return b;
+    },
+    deleteTrigger: t => { triggers = triggers.filter(x => x !== t); },
+  },
 };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 if (sc.open) {
-  vm.runInContext(op.first ? 'pbShowPanel(); onOpen()' : 'onOpen()', ctx);
-  process.stdout.write(JSON.stringify({menu, shown, user: userProps, doc: docProps}));
+  // op.run: the functions to call, in order; a trigger made on the way
+  // fires its handler at each 'open'.
+  for (const step of op.run || ['open']) {
+    if (step === 'open') {
+      menu.length = 0;
+      vm.runInContext('onOpen()', ctx);
+      triggers.forEach(t => vm.runInContext(t.getHandlerFunction() + '()', ctx));
+    } else if (step === 'block') {
+      op.blocked = 'Not allowed';
+    } else {
+      vm.runInContext(step + '()', ctx);
+    }
+  }
+  process.stdout.write(JSON.stringify({menu, shown, triggers: triggers.length,
+                                       user: userProps, doc: docProps}));
   process.exit(0);
 }
 const result = vm.runInContext(sc.release ? '({released: pbRelease()})' : 'pbPlacePending()', ctx);
