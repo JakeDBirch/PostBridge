@@ -456,3 +456,38 @@ def test_clicking_a_tick_puts_the_insertion_point_on_it(view, monkeypatch):
     # Ticks stay clickable with snapping off.
     monkeypatch.setitem(assembly_view._MONITOR, "snap", False)
     assert win._hit(x, top)[0] == "tick"
+
+
+# ── Showing the surrounding audio doesn't stop playback ──────────────────
+
+class _Playing(_Player):
+    def __init__(self, at):
+        _Player.__init__(self)
+        self.at, self.seeks = at, []
+
+    def position(self):
+        return self.at
+
+    def seek(self, t):
+        self.seeks.append(t)
+        self.at = t
+
+    def is_playing(self):
+        return True
+
+
+def test_enter_while_playing_carries_on_from_the_same_moment(view):
+    app, win = view
+    _cut_one(app, win)
+    win.player = p = _Playing(1.5)                # 12.5 s of the recording
+    win._playing = True
+    try:
+        win.toggle_excised()
+        assert win._playing                       # not stopped
+        assert p.seeks == [pytest.approx(5.5)]
+        assert win._clip(1).src_at(p.at) == pytest.approx(12.5)
+        win.toggle_excised()
+        assert win._playing and p.at == pytest.approx(1.5)
+    finally:
+        win._playing = False
+        win.player = None

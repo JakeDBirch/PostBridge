@@ -4336,13 +4336,23 @@ class AssemblyWindow(object):
         the same edits, the playhead on the same moment of the cut."""
         if self.view == "source":
             self._leave_source()
-        self.stop()
-        ph, ins = self._to_cut_t(self.playhead), self._to_cut_t(self.insert)
-        x = self._x(self.playhead)
+        # Playback carries on through it: the same moment of the cut, at
+        # its place on the new layout.  Only a moment of surrounding audio
+        # being heard has none once it is hidden: the cut picks up there.
+        playing = self._playing and self.player is not None
+        now = self.player.position() if playing else self.playhead
+        ph, ins = self._to_cut_t(now), self._to_cut_t(self.insert)
+        origin = self._to_cut_t(self._play_origin)
+        x = self._x(now)
         self.excised = not self.excised
+        self._layout()
+        new = self._to_open_t(ph)
+        if playing:
+            self.player.seek(new)        # before the rest of the refresh
         self.refresh()
-        self.playhead = self._to_open_t(ph)
+        self.playhead = new
         self.insert = self._to_open_t(ins)
+        self._play_origin = self._to_open_t(origin)
         self.view0 = self.playhead - x / self.pps
         self.redraw()
         self._show_monitor()

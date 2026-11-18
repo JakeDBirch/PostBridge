@@ -4,6 +4,9 @@
 
 ## November 18, 2026
 
+### Assembly: Show surrounding audio doesn't stop playback
+- **Enter shows or hides the surrounding audio while the cut plays,** and playback carries on from the same moment of the cut at its new place on the track. It used to stop. A moment of surrounding audio being heard (Skip edits off) has no place once it's hidden, so the cut picks up where it resumes.
+
 ### Assembly: click a speech tick to go there
 - **Click one of the ticks along the top or bottom of the waveform** (where speech starts and stops) and the insertion point lands exactly on it. The pointer turns to a hand over one. A click a few pixels off still takes it, and the middle of the waveform clicks as before. The ticks show when zoomed in far enough, with snapping on or off.
 
