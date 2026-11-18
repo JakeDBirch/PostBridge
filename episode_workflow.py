@@ -1408,6 +1408,11 @@ class EpisodeWorkflowMixin:
         script = (saved or {}).get("script") or ""
         if saved and (os.path.isfile(script)
                       or self._is_foreign_platform_path(script)):
+            # The saved Step 2 opens as it was left, except where a source
+            # has since been given a token in the review: that is the newer
+            # word on whose file it is.
+            if os.path.isfile(script):
+                self._ep_s2s_carry_tokens(saved, self._ep_source_tokens(script))
             self._open_session_data(saved)
             return
         # A linked Google Doc is fetched (and checked) first, so the script
@@ -1428,6 +1433,25 @@ class EpisodeWorkflowMixin:
             EP.save(ep)
         # Pre-fill Step 2: every source's recordings and cameras, assigned to
         # the source's token when the script knows it.
+        assignments, shared = {}, []
+        for val, _chosen, files in self._ep_source_tokens(script):
+            for p in files:
+                if p in assignments:
+                    # A file more than one source holds: a second row for
+                    # it in Step 2, under this source's token.
+                    shared.append({"path": p, "token": val, "twin": True})
+                else:
+                    assignments[p] = val
+        self._pending_setup = {"assignments": assignments, "shared": shared}
+        self.workflow = "script_session"
+        self._load_script(script)
+
+    def _ep_source_tokens(self, script):
+        """What Step 2 assigns each source's files to, for *script*:
+        [(value, chosen, [files])] in source order.  value is a token, "VO:
+        part" or unassigned; chosen is False when nobody picked it -- the
+        source has no token the script knows, and the value is a default."""
+        ep = self._ep
         known, part_names, vo_parts = set(), set(), set()
         try:
             from parsers import parse_script, is_plain_script
@@ -1446,11 +1470,12 @@ class EpisodeWorkflowMixin:
                 part_names = vo_parts = {monolog.NARRATION["name"]}
         except Exception:
             pass
-        assignments, shared = {}, []
+        rows = []
         for _name in sorted(ep["sources"]):
             src = ep["sources"][_name]
             tok = src.get("token")
             vo = src.get("vo_part")
+            chosen = True
             if tok and tok in known:
                 val = tok
             elif vo and vo in part_names:
@@ -1459,20 +1484,66 @@ class EpisodeWorkflowMixin:
             elif not tok and not src.get("session") and len(vo_parts) == 1:
                 # No interview token, no transcript session: a narrator
                 # recording.  With one narrated part there is no choice.
-                val = "VO: " + next(iter(vo_parts))
+                val, chosen = "VO: " + next(iter(vo_parts)), False
             else:
-                val = "— unassigned —"
-            for r in src.get("audio", []) + src.get("video", []):
-                p = EP.absp(ep, r)
-                if p in assignments:
-                    # A file more than one source holds: a second row for
-                    # it in Step 2, under this source's token.
-                    shared.append({"path": p, "token": val, "twin": True})
-                else:
-                    assignments[p] = val
-        self._pending_setup = {"assignments": assignments, "shared": shared}
-        self.workflow = "script_session"
-        self._load_script(script)
+                val, chosen = "— unassigned —", False
+            rows.append((val, chosen, [EP.absp(ep, r) for r in
+                                       src.get("audio", []) + src.get("video", [])]))
+        return rows
+
+    @staticmethod
+    def _ep_s2s_carry_tokens(saved, rows):
+        """Bring the sources' chosen tokens into a saved Step 2 setup, in
+        place.  A file goes to its source's token; one that several sources
+        hold goes to each of theirs (a second row per extra token), keeping
+        any start typed for a token it already had.  Files of a source with
+        no chosen token, and files in no source, stay as saved.  Returns
+        the files whose assignment changed."""
+        none = "— unassigned —"
+        norm = lambda p: os.path.normcase(os.path.normpath(p))
+        asg = saved.setdefault("assignments", {})
+        key_of = {norm(p): p for p in asg}
+        was = {}                     # file -> its saved tokens, own row first
+        for p, t in asg.items():
+            was.setdefault(norm(p), []).append(t)
+        for it in saved.get("shared") or []:
+            if it.get("twin") and it.get("path"):
+                was.setdefault(norm(it["path"]), []).append(it.get("token"))
+        want, holders, path_of = {}, {}, {}
+        for val, chosen, files in rows:
+            for p in files:
+                if not p:
+                    continue
+                k = norm(p)
+                holders[k] = holders.get(k, 0) + 1
+                path_of.setdefault(k, p)
+                if chosen:
+                    want.setdefault(k, []).append(val)
+        changed = []
+        for k, toks in want.items():
+            toks = list(dict.fromkeys(toks))
+            old = [t for t in was.get(k, []) if t and t != none]
+            # A source holding it that chose nothing keeps what was saved.
+            target = toks + ([t for t in old if t not in toks]
+                             if holders[k] > len(want[k]) else [])
+            if set(target) == set(old):
+                continue
+            path = key_of.get(k, path_of[k])
+            starts = {it.get("token"): it["start"] for it in saved.get("shared") or []
+                      if it.get("path") and norm(it["path"]) == k
+                      and it.get("start") is not None}
+            asg[path] = target[0]
+            shared = [it for it in saved.get("shared") or []
+                      if not (it.get("path") and norm(it["path"]) == k)]
+            if len(target) > 1:
+                for i, t in enumerate(target):
+                    item = {"path": path, "token": t, "twin": i > 0}
+                    if t in starts:
+                        item["start"] = starts[t]
+                    shared.append(item)
+            saved["shared"] = shared
+            changed.append(path)
+        return changed
 
     def _ep_paired_videos(self):
         """The cameras of every source that also has a recording, normcased:

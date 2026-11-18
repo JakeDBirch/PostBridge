@@ -380,3 +380,75 @@ def test_the_review_offers_the_script_tokens_and_folds_sources(app, monkeypatch,
     _pump(app, 10)
     assert app._ep_open["Butler Interview"] is False
     assert not app._errors, "\n".join(app._errors)
+
+
+# ── Review tokens reach a Script -> Session that was already saved ────────
+
+def _carry(saved, rows):
+    import episode_workflow
+    changed = episode_workflow.EpisodeWorkflowMixin._ep_s2s_carry_tokens(saved, rows)
+    return sorted(os.path.basename(p) for p in changed)
+
+
+def test_a_token_chosen_in_the_review_reaches_a_saved_step_2():
+    un = "\u2014 unassigned \u2014"
+    saved = {"assignments": {"X:/a/guest.wav": un, "X:/a/host.wav": "OLD",
+                             "X:/a/vo.wav": "VO: Open", "X:/a/loose.wav": "LOOSE"}}
+    rows = [("GUEST", True, ["X:/a/guest.wav", "X:/a/host.wav"]),
+            (un, False, ["X:/a/vo.wav"])]            # no token chosen: left alone
+    assert _carry(saved, rows) == ["guest.wav", "host.wav"]
+    assert saved["assignments"] == {"X:/a/guest.wav": "GUEST", "X:/a/host.wav": "GUEST",
+                                    "X:/a/vo.wav": "VO: Open", "X:/a/loose.wav": "LOOSE"}
+    assert _carry(saved, rows) == []                 # nothing left to change
+
+
+def test_a_shared_recording_reaches_a_saved_step_2_under_both_tokens():
+    host = "X:/a/jordan.wav"
+    saved = {"assignments": {host: "GUEST1", "X:/a/g1.wav": "GUEST1", "X:/a/g2.wav": "GUEST2"}}
+    rows = [("GUEST1", True, ["X:/a/g1.wav", host]), ("GUEST2", True, ["X:/a/g2.wav", host])]
+    assert _carry(saved, rows) == ["jordan.wav"]
+    assert saved["assignments"][host] == "GUEST1"
+    assert saved["shared"] == [{"path": host, "token": "GUEST1", "twin": False},
+                               {"path": host, "token": "GUEST2", "twin": True}]
+    # Already under both, with a start typed for one: untouched.
+    saved["shared"][1]["start"] = 2415.0
+    assert _carry(saved, rows) == [] and saved["shared"][1]["start"] == 2415.0
+    # One part renamed in the review: the other keeps its typed start.
+    rows[0] = ("FIRST", True, ["X:/a/g1.wav", host])
+    assert _carry(saved, rows) == ["g1.wav", "jordan.wav"]
+    assert saved["shared"] == [{"path": host, "token": "FIRST", "twin": False},
+                               {"path": host, "token": "GUEST2", "twin": True, "start": 2415.0}]
+
+
+def test_the_review_token_shows_in_step_2_after_a_save(app, monkeypatch, project):
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    script = os.path.join(project, "05_SCRIPT", "Ep 7 carry.txt")
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("[PART Open]\n[VO PART_0_NARRATOR]\nA quiet morning.\n"
+                "[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n"
+                "[CARY 00:00:05-00:00:20]\nIt was cold.\n")
+    ep["links"]["script"] = EP.rel(ep, script)
+    app._ep_save()
+
+    def _rows():
+        return {os.path.basename(r["path"]): r["var"].get() for r in app._pool._rows}
+    app._ep_launch_s2s()
+    assert _wait(app, lambda: getattr(app, "_pool", None) is not None
+                 and len(app._pool._rows) >= 9, secs=30), app._errors
+    _pump(app, 10)
+    assert _rows()["Ep 7 pt 2.wav"] == "VO: Open"
+    EP.set_stage(ep, EP.STAGE_S2S, app._build_setup_data())     # Step 2, saved
+
+    ep["sources"]["Ep 7 pt 2"]["token"] = "CARY"                # then the review
+    app._pool = None
+    app._ep_launch_s2s()
+    assert _wait(app, lambda: getattr(app, "_pool", None) is not None
+                 and len(app._pool._rows) >= 9, secs=30), app._errors
+    _pump(app, 10)
+    rows = _rows()
+    assert rows["Ep 7 pt 2.wav"] == "CARY"
+    assert rows["Ep 7 pt 1.wav"] == "VO: Open"                  # as it was saved
+    assert rows["Butler Interview_CARY.wav"] == "BUTLER"
+    assert not app._errors, "\n".join(app._errors)
