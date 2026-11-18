@@ -247,6 +247,7 @@ class MatchReviewDialog:
         # only the pull's kept audio, skipping what its cuts take out.
         self.on_playhead      = None
         self.skip_cuts        = False
+        self.snap             = True    # the host's snapping switch
         self._sel_mark        = None    # index of the chosen mark
         self._mark_drag       = None    # {"idx", "x0", "t", "moved"} while dragging one
         self._mark_rename     = None    # (Entry, index) while naming one
@@ -1876,6 +1877,8 @@ class MatchReviewDialog:
 
     def _snap_to_silence(self, t):
         """Return t snapped to nearest silence boundary if within ~8 pixels."""
+        if not self.snap:
+            return t
         return snap_to_boundary(t, self._silence_boundaries,
                                 SNAP_PX * self._spp / self._sr)
 
@@ -1885,6 +1888,8 @@ class MatchReviewDialog:
         Playhead snap uses a slightly larger radius (12 px) so it feels
         magnetic.
         """
+        if not self.snap:
+            return t
         return snap_to_boundary(
             t, self._silence_boundaries, SNAP_PX * self._spp / self._sr,
             # Skip the playhead if we're dragging the playhead itself.

@@ -182,7 +182,7 @@ SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too clos
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
             "return_on": True, "script": True, "nudge_s": 0.1,
-            "skip_cuts": True, "normalize": True}
+            "skip_cuts": True, "normalize": True, "snap": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -1108,6 +1108,7 @@ class AssemblyWindow(object):
         key(p, "Split", "B", self.split)
         key(p, "Cut ½ s out", "C", self.cut_out)
         key(p, "Heal cut", "H", self.heal)
+        self.snap_key = key(p, "Snap", "G", self.toggle_snap, toggle=True)
         key(p, "Set IN", "I", lambda: self.set_point("in"))
         key(p, "Set OUT", "O", lambda: self.set_point("out"))
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
@@ -1188,8 +1189,8 @@ class AssemblyWindow(object):
             "it back.  Gap: drag to "
             "retime.  Flag: drag, double-click to name, Ctrl+click or "
             "right-click to delete.  "
-            "Edges and highlights snap to speech starts and stops; hold Ctrl "
-            "to place one freely.  Ctrl+wheel: zoom.  In the text: drag to "
+            "Edges and highlights snap to speech starts and stops (G turns "
+            "it off); hold Ctrl to place one freely.  Ctrl+wheel: zoom.  In the text: drag to "
             "highlight, double-click "
             "a word, triple-click its pull, right-click for everything.")),
             fill=True)
@@ -2983,7 +2984,7 @@ class AssemblyWindow(object):
         """Where an edge will snap: short ticks top and bottom of the lane, as
         the waveform editor draws them."""
         sil = self._sil.get(c.order)
-        if not sil or self.pps < SNAP_TICKS_PPS:
+        if not sil or self.pps < SNAP_TICKS_PPS or not _MONITOR["snap"]:
             return
         h = self._ls
         for tl, du, si in c.pieces:
@@ -3496,7 +3497,7 @@ class AssemblyWindow(object):
         aL, bL = d["segsL"][kl]
         aR, bR = d["segsR"][kr]
         d["snapped"] = False
-        if not d.get("free"):
+        if not d.get("free") and _MONITOR["snap"]:
             cands = []
             for o, edge in ((orr, aR), (ol, bL)):
                 s = match_review.snap_to_boundary(
@@ -3608,7 +3609,7 @@ class AssemblyWindow(object):
         """Where a dragged edge lands, at source time src: on a speech start
         or stop, or the playhead, if it is near one -- the waveform editor's
         snap, at the same distances on screen."""
-        if d.get("free"):
+        if d.get("free") or not _MONITOR["snap"]:
             d["snapped"] = False
             return src
         best = match_review.snap_to_boundary(
@@ -3622,7 +3623,7 @@ class AssemblyWindow(object):
         """A highlight's edge at timeline time t, snapped the same way."""
         c = self._clip_at(t)
         k = c.piece_at(t) if c is not None else None
-        if free or k is None:
+        if free or k is None or not _MONITOR["snap"]:
             return t
         tl, du, si = c.pieces[k]
         best = match_review.snap_to_boundary(
@@ -4168,6 +4169,7 @@ class AssemblyWindow(object):
         elif self._src_order != order or self.src._audio_path != sa:
             self.src.load_clip(sa, segs, **kw)
         self.src.skip_cuts = _MONITOR["skip_cuts"]
+        self.src.snap = _MONITOR["snap"]
         self._src_order = order
         self.src._playhead_s = at
         self.src._play_rate = self._rate
@@ -4218,6 +4220,19 @@ class AssemblyWindow(object):
                     t = tl + (s - si)
                     break
         self._light_script_word(False if t is None else t)
+
+    def toggle_snap(self):
+        """G: edges and highlights snap to speech starts and stops and to
+        the insertion point -- or go exactly where they are dragged, as
+        holding Ctrl does.  In Find in recording too."""
+        _MONITOR["snap"] = not _MONITOR["snap"]
+        if self.src is not None:
+            self.src.snap = _MONITOR["snap"]
+        self._show_monitor()
+        self.redraw()
+        self.status.config(fg=SUB, text="Snapping {}".format(
+            "on: edges snap to speech and the insertion point"
+            if _MONITOR["snap"] else "off: edges go where you drag them"))
 
     def _apply_gains(self):
         self.audio.set_gains(self._gain if _MONITOR["normalize"] else {})
@@ -4713,6 +4728,7 @@ class AssemblyWindow(object):
         self.script_key.set_on(_MONITOR["script"])
         self.skip_key.set_on(_MONITOR["skip_cuts"])
         self.norm_key.set_on(_MONITOR["normalize"])
+        self.snap_key.set_on(_MONITOR["snap"])
         self.view_key.set_on(self.excised)
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])
@@ -4764,6 +4780,8 @@ class AssemblyWindow(object):
             self.accept_next()
         elif k == "S" and not ctrl:
             self.toggle_skip_cuts()
+        elif not ctrl and k.lower() == "g":
+            self.toggle_snap()
         elif k in ("Return", "KP_Enter"):
             self.toggle_view()
         elif ctrl and k.lower() == "f":

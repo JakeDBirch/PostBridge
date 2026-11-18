@@ -341,3 +341,33 @@ def test_a_join_back_in_the_recording_is_not_healed(view):
     win.heal()
     assert [tuple(s) for s in _res(app, 1)["segments"]] == [(12.0, 14.0), (10.0, 11.0)]
     assert "nothing to heal" in win.status.cget("text")
+
+
+# ── Snapping on and off (G) ──────────────────────────────────────────────
+
+def test_g_turns_snapping_off_and_on(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "snap", True)
+    win._sil[1] = [11.02]                         # a speech edge near 11.0
+    c = win._clip(1)
+    d = {"mode": "out", "order": 1, "k": 0, "segs0": list(c.segments),
+         "gaps0": list(c.seg_gaps)}
+    assert win._snap_edge(dict(d), 11.0) == pytest.approx(11.02)
+    _key(app, win.cv, "g")
+    assert not assembly_view._MONITOR["snap"] and not win.snap_key.on
+    assert win._snap_edge(dict(d), 11.0) == 11.0
+    assert win._snap_timeline(1.0) == 1.0
+    _key(app, win.cv, "g")
+    assert assembly_view._MONITOR["snap"] and win.snap_key.on
+
+
+def test_snapping_off_reaches_find_in_recording(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "snap", True)
+    win.show_source(1)
+    win.src._silence_boundaries = [11.02]
+    win.src._spp = win.src._sr // 100              # 10 ms a pixel: 80 ms reach
+    assert win.src._snap_to_silence(11.0) == pytest.approx(11.02)
+    win.toggle_snap()
+    assert win.src.snap is False and win.src._snap_to_silence(11.0) == 11.0
+    win.toggle_snap()
