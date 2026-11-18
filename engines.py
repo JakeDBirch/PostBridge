@@ -188,7 +188,7 @@ def extract_window(media_path, start_s, end_s, out_path):
     Returns (True, None) on success, (False, error_message) on failure.
     """
     length = [] if end_s is None else ["-t", str(max(1.0, end_s - start_s))]
-    timeout = 3600 if end_s is None else 60
+    timeout = 3600 if end_s is None or end_s - start_s > 300 else 60
     ff = _ffmpeg_cmd()
     cmd = ff + [
         "-y",
@@ -1665,7 +1665,8 @@ def transcribe_clip_verbatim(wav_path, progress_cb=None, cancel_event=None,
 
 def transcribe_session_per_track(audio_paths, speaker_labels=None,
                                    progress_cb=None, cancel_event=None,
-                                   model_size=None, segment_cb=None):
+                                   model_size=None, segment_cb=None,
+                                   spans=None):
     """Transcribe each audio file separately and merge by timestamp.
 
     Each track is transcribed in isolation with `transcribe_clip_verbatim`,
@@ -1705,7 +1706,12 @@ def transcribe_session_per_track(audio_paths, speaker_labels=None,
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tmp = tf.name
         try:
-            ok, err = extract_window(src, 0, None, tmp)
+            # A recording shared with another session is heard from its
+            # start in this one, for this one's length (see span_of), so
+            # its words come back on this session's clock.
+            _s0, _len = span_of(spans, src)
+            ok, err = extract_window(src, _s0,
+                                     (_s0 + _len) if _len else None, tmp)
             if not ok:
                 raise RuntimeError(
                     "audio extract failed for {}: {}".format(
@@ -1881,7 +1887,118 @@ def _mix_dynaudnorm(path):
 
 _MIX_ALG_VER = 2   # bump when mix_for_transcript's algorithm changes
 
-def _stable_mix_cache_path(paths):
+
+# ── A recording shared between tokens ────────────────────────────────────────
+# One side of a session can come as a single file while the other side was
+# split into consecutive recordings (Riverside does this when a participant's
+# recording fails part way).  Each part is its own token, and the unbroken
+# file belongs to all of them: in each token it has a START -- how far into
+# the file that token's own time zero sits -- so
+#       time in the file = time in the token + start.
+# "spans" below is {span_key(path): (start_s, length_s or None)} for one
+# token's files; a file not in it starts at 0 and runs its whole length.
+
+def span_key(path):
+    return os.path.normcase(os.path.abspath(path)) if path else ""
+
+
+def span_of(spans, path):
+    """(start, length) of *path* within its token: (0.0, None) unless told."""
+    s = (spans or {}).get(span_key(path))
+    if not s:
+        return 0.0, None
+    try:
+        start = max(0.0, float(s[0] or 0.0))
+    except (TypeError, ValueError, IndexError):
+        start = 0.0
+    try:
+        length = float(s[1]) if len(s) > 1 and s[1] else None
+    except (TypeError, ValueError):
+        length = None
+    return start, (length if length and length > 0 else None)
+
+
+def spans_from(saved):
+    """A saved {path: [start, length]} as spans keyed for lookup."""
+    out = {}
+    for p, v in (saved or {}).items():
+        try:
+            out[span_key(p)] = (float(v[0] or 0.0), float(v[1]) if v[1] else None)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _live_spans(spans, paths):
+    """The spans that change what *paths* sound like: sorted
+    [(key, start, length)], empty when every file plays whole from 0."""
+    out = []
+    for p in paths or []:
+        start, length = span_of(spans, p)
+        if start > 0 or length:
+            out.append((span_key(p).lower(), round(start, 3),
+                        round(length, 3) if length else 0))
+    return sorted(out)
+
+
+def _natural_key(text):
+    return [int(t) if t.isdigit() else t
+            for t in re.findall(r"\d+|\D+", (text or "").lower())]
+
+
+def shared_starts(file_len, parts):
+    """Where each token's time zero sits inside a recording they share.
+
+    file_len : the shared recording's length in seconds.
+    parts    : [(key, own_len, name)] -- one per token holding the file;
+               own_len is the length of that token's own recording (None
+               when it has none), name what to order the parts by (the own
+               recording's file name: Riverside numbers them as they come).
+
+    The first part starts with the file.  The last ends with it: everyone's
+    recording stops when the session does, so whatever went missing between
+    two parts shows up as a later start.  A part between them follows the
+    one before it.  A token with no recording of its own starts at 0.
+
+    Returns {key: start_s}.
+    """
+    out = {k: 0.0 for k, _l, _n in parts}
+    timed = sorted(((k, float(l), n) for k, l, n in parts if l and l > 0),
+                   key=lambda t: (_natural_key(os.path.basename(t[2] or "")), str(t[0])))
+    if len(timed) < 2 or not file_len or file_len <= 0:
+        return out
+    end = 0.0
+    for i, (k, own, _n) in enumerate(timed):
+        start = end
+        if i == len(timed) - 1:
+            start = max(end, float(file_len) - own)
+        out[k] = round(max(0.0, start), 3)
+        end = out[k] + own
+    return out
+
+
+def format_start(secs):
+    """A start as H:MM:SS.mmm."""
+    ms = int(round(max(0.0, float(secs or 0.0)) * 1000))
+    return "{}:{:02d}:{:02d}.{:03d}".format(
+        ms // 3600000, (ms // 60000) % 60, (ms // 1000) % 60, ms % 1000)
+
+
+def parse_start(text):
+    """Seconds from H:MM:SS.mmm, MM:SS, or plain seconds; None if neither."""
+    t = (text or "").strip().replace(",", ".")
+    if not t:
+        return 0.0
+    try:
+        secs = 0.0
+        for part in t.split(":"):
+            secs = secs * 60 + float(part)
+    except ValueError:
+        return None
+    return secs if secs >= 0 else None
+
+
+def _stable_mix_cache_path(paths, spans=None):
     """Content-addressed path in the transcript cache for the mixed
     result of `paths`.  Key: md5(sorted (abspath, mtime, size) + alg_ver).
     Returns None when no cache directory is set (falls back to temp).
@@ -1905,6 +2022,11 @@ def _stable_mix_cache_path(paths):
             parts.append((ap.lower(), mt, sz))
         parts.sort()
         payload = {"paths": parts, "alg": _MIX_ALG_VER}
+        # A file that joins part way in makes a different mix; files that
+        # all play whole keep the name they always had.
+        live = _live_spans(spans, paths)
+        if live:
+            payload["spans"] = live
         digest = hashlib.md5(
             json.dumps(payload, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
@@ -1913,10 +2035,13 @@ def _stable_mix_cache_path(paths):
         return None
 
 
-def mix_for_transcript(paths):
+def mix_for_transcript(paths, spans=None):
     """
     Mix a list of audio file paths into a single 16 kHz mono WAV
     suitable for Whisper transcription.
+
+    *spans* places a file that does not start with the others: see
+    span_of.  Such a file joins the mix from its start, for its length.
 
     Each track receives:
       1. An adaptive noise gate keyed to its own measured noise floor.
@@ -1939,7 +2064,7 @@ def mix_for_transcript(paths):
     import numpy as np
 
     # ── Fast path: mix already cached and inputs unchanged ────────────────
-    cached_path = _stable_mix_cache_path(paths)
+    cached_path = _stable_mix_cache_path(paths, spans)
     if cached_path and os.path.isfile(cached_path):
         try:
             if os.path.getsize(cached_path) > 44:   # >= a WAV header
@@ -1950,6 +2075,13 @@ def mix_for_transcript(paths):
     track_data = []
     for path in paths:
         pcm      = _mix_decode(path)
+        _start, _length = span_of(spans, path)
+        if _start > 0 or _length:
+            _a = int(round(_start * _MIX_SR))
+            _b = _a + int(round(_length * _MIX_SR)) if _length else None
+            pcm = pcm[_a:_b]
+            if len(pcm) == 0:               # starts past its own end
+                pcm = np.zeros(_MIX_FRAME_SAMP, dtype=np.float32)
         # Noise-floor estimate.  The fixed 10th-percentile assumption
         # breaks for a continuously-talking speaker (typical interview
         # guest at 80-95% duty cycle): the 10th percentile lands INSIDE
@@ -4670,8 +4802,9 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                         first = fid not in defined
                         if first: defined.add(fid)
                         clip_pos[("v", slot+1)] += 1
+                        _sh = f2fr(res_start(res, vp), fps)
                         ci = _make_clipitem(cid, fid, vp, sf, ef,
-                                            seg_in_fr, seg_out_fr, fps,
+                                            seg_in_fr + _sh, seg_out_fr + _sh, fps,
                                             True, first, seq_w, seq_h, seq_sr,
                                             name_prefix=iv_prefix)
                         v_tracks[slot].append(ci)
@@ -4685,8 +4818,9 @@ def build_xml(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                         first = fid not in defined
                         if first: defined.add(fid)
                         clip_pos[("a", slot+1)] += 1
+                        _sh = f2fr(res_start(res, ap), fps)
                         ci = _make_clipitem(cid, fid, ap, sf, ef,
-                                            seg_in_fr, seg_out_fr, fps,
+                                            seg_in_fr + _sh, seg_out_fr + _sh, fps,
                                             False, first, seq_w, seq_h, seq_sr,
                                             name_prefix=iv_prefix)
                         a_tracks[slot].append(ci)
@@ -5614,7 +5748,17 @@ def _matched_files(res):
             if p and not _is_cached_mix_path(p)]
 
 
-def tokens_short_of_their_match(results, int_assets):
+def res_start(res, path):
+    """How far into *path* this pull's own time zero sits (see span_of).
+    res["_starts"] is {span_key(path): seconds}, put there by the app's
+    export-input collection for a recording shared between tokens."""
+    try:
+        return max(0.0, float((res.get("_starts") or {}).get(span_key(path)) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tokens_short_of_their_match(results, int_assets, spans=None):
     """Tokens whose pulls were matched in a mix of their recordings that Step 2
     no longer gives them all of: {token: the audio files it has now}.  The mix
     is named from exactly what went into it, so a side that has since gone
@@ -5631,7 +5775,7 @@ def tokens_short_of_their_match(results, int_assets):
         seen.add(tok)
         now = [p for p in (int_assets or {}).get(tok, [])
                if p and not is_video(p) and not _is_temp_mix_path(p)]
-        want = _stable_mix_cache_path(now) if now else None
+        want = _stable_mix_cache_path(now, (spans or {}).get(tok)) if now else None
         if not want or os.path.basename(want) != os.path.basename(src):
             out[tok] = now
     return out
@@ -5823,6 +5967,8 @@ def layout_timeline(results, gap_secs, sr, int_assets,
             entry["segments"] = segments
             entry["seg_gaps"] = seg_gaps[1:]
             entry["paths"]    = apaths
+            # A shared recording is cut that much further into its file.
+            entry["starts"]   = [s2sa(res_start(res, p)) for p in apaths]
             for (seg_in_s, seg_out_s), before in zip(segments, seg_gaps):
                 cursor += s2sa(before)
                 dur_sa = s2sa(seg_out_s - seg_in_s)
@@ -6050,6 +6196,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         # "speaker-0" / "speaker-1" filenames or where a token has 3+
         # parallel sources.
         host_paths, guest_paths = split_host_guest(entry["paths"])
+        _shift = dict(zip(entry["paths"], entry.get("starts") or []))
 
         for st_sa, dur_sa, src_in in entry["pieces"]:
             # Each non-host file → its own track.  Primary file uses the
@@ -6057,11 +6204,13 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
             # TOKEN_2, which collided with a real token named ADAM_2.
             for gi, gp in enumerate(guest_paths):
                 track_name = track if gi == 0 else "{} ({})".format(track, gi + 1)
-                slots.append((gp, st_sa, dur_sa, src_in, track_name))
+                slots.append((gp, st_sa, dur_sa, src_in + _shift.get(gp, 0),
+                              track_name))
                 slot_orders.append(res["order"])
             # All host-named files → shared JORDAN track
             for hp in host_paths:
-                slots.append((hp, st_sa, dur_sa, src_in, HOST_NAME.upper()))
+                slots.append((hp, st_sa, dur_sa, src_in + _shift.get(hp, 0),
+                              HOST_NAME.upper()))
                 slot_orders.append(res["order"])
 
     # ── Overlap guard ─────────────────────────────────────────────────────────

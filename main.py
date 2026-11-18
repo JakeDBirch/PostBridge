@@ -1835,6 +1835,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     if os.path.isfile(path):
                         self._pool._add(path)
                         self._pool._rows[-1]["var"].set(token)
+                self._pool.apply_shared(redo.get("shared"))
             finally:
                 self._pool._bulk_loading = False
             self._pool._refresh_count()
@@ -1860,8 +1861,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if (self._pool and self._pool._rows
                 and not getattr(self, "_redo_setup", None)):
             self._redo_setup = {
-                "assignments": [(r["path"], r["var"].get())
-                                for r in self._pool._rows],
+                "assignments": self._pool.assignment_pairs(),
+                "shared":      self._pool.get_shared(),
             }
 
         # If results were saved and loaded, skip straight to Step 4
@@ -3770,8 +3771,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "version":   1,
             "workflow":  getattr(self, "workflow", "script_xml"),
             "script":    getattr(self, "_script_path", ""),
-            "assignments": {r["path"]: r["var"].get()
-                            for r in self._pool._rows} if self._pool else {},
+            "assignments": dict(self._pool.assignment_pairs()) if self._pool else {},
+            # Files more than one token holds: their second rows and starts.
+            "shared":    self._pool.get_shared() if self._pool else [],
             "pad":       self.pad_var.get(),
             "gap":       self.gap_var.get(),
         }
@@ -4098,6 +4100,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             saved_tok = assignments.get(r["path"])
             if saved_tok:
                 r["var"].set(saved_tok)
+        self._pool.apply_shared(data.get("shared"))
         self._pool._refresh_count()
         if missing:
             messagebox.showwarning("Missing files",
@@ -4151,6 +4154,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         pool._bulk_loading = True
 
         def _finish():
+            pool.apply_shared(data.get("shared"))
             pool._bulk_loading = False
             pool._refresh_count()
             if missing:
@@ -4332,6 +4336,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 cls._remap_path(p, video_index, audio_index): tok
                 for p, tok in old_assignments.items()
             }
+        for it in data.get("shared") or []:
+            if it.get("path"):
+                it["path"] = cls._remap_path(it["path"], video_index, audio_index)
 
         for r in data.get("results", []):
             for key in ("source_audio", "source_video"):
@@ -5075,6 +5082,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             r["_prov_segs"] = [tuple(sg) for sg in (r.get("segments") or [])]
             tok = pull.get("token", "")
             files = [p for p in int_assets.get(tok, []) if not is_video(p)]
+            # The token's own recording, not one it shares from part way in:
+            # the script's timecodes are on the token's own clock.
+            _sp = (getattr(self, "_tok_spans", None) or {}).get(tok)
+            files.sort(key=lambda p: engines.span_of(_sp, p)[0] > 0)
             if files:
                 r["source_audio"] = files[0]
             results.append(r)
@@ -5105,11 +5116,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # Save setup so "Redo" can restore it (pool is destroyed by _clear below)
         self._redo_setup = {
-            "assignments": [(r["path"], r["var"].get()) for r in self._pool._rows],
+            "assignments": self._pool.assignment_pairs(),
+            "shared":      self._pool.get_shared(),
         }
 
         int_assets = self._pool.get_interview_assets()
         vo_assets  = self._pool.get_vo_assets()
+        # Where a recording shared between tokens starts in each (read here,
+        # on the main thread: the pool's rows are Tk variables).
+        self._tok_spans = self._pool.get_spans()
 
         # AAF → Pro Tools only needs audio.  Drop video files for any token /
         # VO part that already has a matching audio file.  Fall back to video
@@ -6239,6 +6254,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         transcript_sources   = {}
         _unmixed             = {}    # token -> its files: mixed when its turn comes
+        # token -> where its shared recordings start (engines.span_of)
+        _tok_spans           = getattr(self, "_tok_spans", None) or {}
+
+        def _placed(tok, paths):
+            """Does any of *tok*'s files join part way in, or stop early?
+            Then only a mix puts them on the token's own clock."""
+            return bool(engines._live_spans(_tok_spans.get(tok), paths))
 
         def _mix_now(tok, paths):
             try:
@@ -6251,12 +6273,13 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 # branch always runs the mix.
                 _mix_cache_p = None
                 try:
-                    _mix_cache_p = engines._stable_mix_cache_path(paths)
+                    _mix_cache_p = engines._stable_mix_cache_path(
+                        paths, _tok_spans.get(tok))
                 except Exception:
                     _mix_cache_p = None
                 _was_cached = bool(
                     _mix_cache_p and os.path.isfile(_mix_cache_p))
-                tmp = engines.mix_for_transcript(paths)
+                tmp = engines.mix_for_transcript(paths, _tok_spans.get(tok))
                 transcript_sources[tok] = tmp
                 self._temp_mix_files.append(tmp)
                 if _was_cached:
@@ -6316,17 +6339,24 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     SUB)
             if not paths:
                 transcript_sources[tok] = None
-            elif len(paths) == 1:
+            elif len(paths) == 1 and not _placed(tok, paths):
                 transcript_sources[tok] = paths[0]
                 self._log_line(
                     "  [{}] source: {}".format(
                         tok, os.path.basename(paths[0])), SUB)
             else:
+                for _sp in paths:
+                    _s0, _ = engines.span_of(_tok_spans.get(tok), _sp)
+                    if _s0 > 0:
+                        self._log_line(
+                            "  [{}] {} joins from {} (shared with another "
+                            "token)".format(tok, os.path.basename(_sp),
+                                            engines.format_start(_s0)), SUB)
                 # A new mix can take minutes, so it waits for its token's turn
                 # like Whisper does, and the top of the script isn't held up.
                 _p = None
                 try:
-                    _p = engines._stable_mix_cache_path(paths)
+                    _p = engines._stable_mix_cache_path(paths, _tok_spans.get(tok))
                 except Exception:
                     pass
                 if _p and os.path.isfile(_p):
@@ -6784,7 +6814,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 _pooled_from = None
                 if not _pb_words:
                     _pool_srcs = token_audio_paths.get(token) or []
-                    if len(_pool_srcs) > 1:
+                    # A shared recording's sidecar is on that file's clock,
+                    # not this token's: never stands in for the mix.
+                    if len(_pool_srcs) > 1 and not _placed(token, _pool_srcs):
                         _pb_words, _pb_blobs = engines.pooled_transcript_load(
                             _pool_srcs)
                         if _pb_words:
@@ -9971,6 +10003,20 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             _rest = [p for p in int_assets.get(_otok, [])
                      if _norm(p) != _norm(src)] if _otok else []
             r["_export_paths"] = [src] + _rest
+            r["_export_token"] = _otok
+
+        # ── A recording shared between tokens ─────────────────────────────
+        # It is cut that much further into its file: each pull carries the
+        # starts of the token whose files it exports from.
+        _spans = self._pool.get_spans() if hasattr(self._pool, "get_spans") else {}
+        self._tok_spans = _spans
+        for r in edited:
+            if r.get("is_vo"):
+                continue
+            _sp = _spans.get(r.pop("_export_token", None) or r.get("token", ""))
+            r.pop("_starts", None)              # never one from an earlier pool
+            if _sp:
+                r["_starts"] = {k: v[0] for k, v in _sp.items() if v[0] > 0}
 
         try:
             vo_bin_data = {pi: vb for pi, vb in self.vo_bins.items()}
@@ -10084,7 +10130,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
     def _export_sides_ok(self, edited, int_assets):
         """A token matched in a mix of its recordings that has since lost one
         from Step 2 would export without that side: say so first."""
-        short = engines.tokens_short_of_their_match(edited, int_assets)
+        short = engines.tokens_short_of_their_match(
+            edited, int_assets, getattr(self, "_tok_spans", None))
         if not short:
             return True
         lines = "\n".join("{}:  {}".format(tok, ", ".join(

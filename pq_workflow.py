@@ -186,8 +186,14 @@ class PqWorkflowMixin:
         recording, so part of one would silently lose the rest."""
         words = session.get("transcript") or []
         if words and not session.get("_streaming"):
+            # Not beside a recording another session shares: these words
+            # are on this session's clock, and a sidecar speaks for its
+            # whole file.
+            placed = engines.spans_from(session.get("spans"))
             for media_path in session.get("media", []):
                 try:
+                    if engines.span_key(media_path) in placed:
+                        continue
                     if os.path.isfile(media_path):
                         engines.pb_transcript_save(
                             media_path, words, model=engines.session_model(session))
@@ -209,6 +215,10 @@ class PqWorkflowMixin:
             "media":       list(session.get("media", [])),
             "transcript":  list(session.get("transcript") or []),
         }
+        # Where a recording shared with another session starts in this one:
+        # {path: [start, length]} (engines.span_of).
+        if session.get("spans"):
+            payload["spans"] = {p: list(v) for p, v in session["spans"].items()}
         # The Whisper size that made the words, for whoever opens this next.
         model = engines.session_model(session)
         if model:
@@ -974,12 +984,17 @@ class PqWorkflowMixin:
         covered = set()
         for s in proj.get("sessions", []):
             covered.update(os.path.normcase(os.path.abspath(m)) for m in s.get("media", []))
+        shared = _EP.shared_files(ep)
         out = []
         for name in sorted(ep.get("sources", {})):
             src = ep["sources"][name]
             media = [_EP.absp(ep, r) for r in src.get("audio", [])]
             media = [m for m in media if m and os.path.isfile(m)]
-            if not media or any(os.path.normcase(m) in covered for m in media):
+            # A recording two sources share is in the other one's session
+            # too: only this source's own recordings say it has one.
+            own = [_EP.absp(ep, r) for r in src.get("audio", [])
+                   if r not in shared] or media
+            if not media or any(os.path.normcase(m) in covered for m in own if m):
                 continue
             tok = src.get("token") or self._pq_suggest_token(media) or \
                 re.sub(r"[^A-Z0-9_]+", "_", name.upper()).strip("_")
@@ -1001,6 +1016,15 @@ class PqWorkflowMixin:
         if not match:
             return None
         session = self._pq_create_session(token, match[0][2])
+        if session is not None:
+            # Where a recording shared with another source starts in this one.
+            import episode as _EP
+            ep = self._ep_bound(self._pq_project.get("episode_file"))
+            spans = {_EP.absp(ep, r): list(v)
+                     for r, v in _EP.source_spans(ep, name).items()} if ep else {}
+            if spans:
+                session["spans"] = spans
+                self._pq_save_session_file(session)
         if session is not None and open_view:
             self._pq_open_session_view(session, transcribe_now=True)
         return session
@@ -4449,6 +4473,9 @@ class PqWorkflowMixin:
                 audios = [p for p in media if not is_video(p)]
                 if not audios:
                     audios = list(media)
+                # A recording this session shares with another joins from
+                # its start here (engines.span_of).
+                _spans = engines.spans_from(session.get("spans"))
 
                 tmp_paths = []
                 try:
@@ -4682,7 +4709,8 @@ class PqWorkflowMixin:
                                     progress_cb=_on_seg_end,
                                     cancel_event=cancel_event,
                                     model_size="tiny",
-                                    segment_cb=_stream_seg_cb_tiny)
+                                    segment_cb=_stream_seg_cb_tiny,
+                                    spans=_spans)
                             tiny_words_box[0] = tw
                             if tw:
                                 # Final render with the complete tiny
@@ -4785,7 +4813,8 @@ class PqWorkflowMixin:
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
                                 cancel_event=cancel_event,
-                                segment_cb=_stream_seg_cb_main)
+                                segment_cb=_stream_seg_cb_main,
+                                spans=_spans)
                             tiny_thread.join()
                         elif do_progressive:
                             _set_phase("draft (tiny)")
@@ -4796,7 +4825,8 @@ class PqWorkflowMixin:
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
                                 cancel_event=cancel_event,
-                                segment_cb=_stream_seg_cb_main)
+                                segment_cb=_stream_seg_cb_main,
+                                spans=_spans)
                         else:
                             # Non-progressive multi-track: stream
                             # configured directly.
@@ -4806,12 +4836,13 @@ class PqWorkflowMixin:
                                 audios, speaker_labels=speaker_labels,
                                 progress_cb=_on_seg_end,
                                 cancel_event=cancel_event,
-                                segment_cb=_stream_seg_cb_main)
+                                segment_cb=_stream_seg_cb_main,
+                                spans=_spans)
                         # Build a mix purely for the playback cache so
                         # the user can hear both speakers when auditioning
                         # transcript regions.
                         _set_phase("building playback mix")
-                        mix_path = engines.mix_for_transcript(audios)
+                        mix_path = engines.mix_for_transcript(audios, _spans)
                         tmp_paths.append(mix_path)
 
                     # ── Merge with prior user edits ──────────────────

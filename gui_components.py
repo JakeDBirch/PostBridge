@@ -707,20 +707,23 @@ class MediaPool(tk.Frame):
             self.after(0, lambda ps=paths: [self._add(p) for p in ps])
         threading.Thread(target=_walk, daemon=True).start()
 
-    def _add(self, path):
+    def _add(self, path, twin=False):
+        """A row for *path*.  twin=True is a second row for a file already
+        in the pool: the same recording under another token (one side of a
+        session that came as one file while the other side came in parts)."""
         if not path: return
         fn_check = os.path.basename(path)
         if fn_check.startswith("._") or fn_check == ".DS_Store":
             return
-        if any(r["path"] == path for r in self._rows): return
+        if any(r["path"] == path for r in self._rows) != bool(twin): return
 
         fn  = basename(path)
-        tok = suggest_token(fn, self._tokens) or ""
-        if not tok:
+        tok = "" if twin else (suggest_token(fn, self._tokens) or "")
+        if not tok and not twin:
             vo = suggest_vo_part(fn, self._parts)
             if vo:
                 tok = vo
-        if not tok and self._default_vo and not is_video(path):
+        if not tok and not twin and self._default_vo and not is_video(path):
             tok = self._default_vo
 
         options = ["— unassigned —"] + sorted(self._tokens) + [
@@ -747,6 +750,12 @@ class MediaPool(tk.Frame):
                     pass
 
         def _on_token_change(*a, _p=path, _v=var):
+            if twin:
+                # A second token for the same file: nothing follows it.
+                _apply_token_style(_v.get())
+                self._schedule_starts()
+                return
+            self._schedule_starts()
             if not getattr(self, "_in_mirror", False):
                 self._auto_assigned.discard(_p)
                 if _v.get() == "— unassigned —":
@@ -796,8 +805,8 @@ class MediaPool(tk.Frame):
         fn_frame.pack_propagate(False)
         tint_refs.append(fn_frame)
 
-        fn_lbl = tk.Label(fn_frame, text=fn, font=FB, bg=initial_bg, fg=TEXT,
-                          padx=6, anchor="w")
+        fn_lbl = tk.Label(fn_frame, text=("↳ " + fn) if twin else fn,
+                          font=FB, bg=initial_bg, fg=TEXT, padx=6, anchor="w")
         fn_lbl.pack(fill="both", expand=True)
         tint_refs.append(fn_lbl)
 
@@ -869,6 +878,29 @@ class MediaPool(tk.Frame):
         # ever instantiated for the Script→Session flow (the AAF→XML
         # workflow has its own pool in aaf_workflow.py), so there's no
         # workflow to hide from.
+        # "from H:MM:SS" -- shown only on the rows of a file more than one
+        # token holds: how far into the file this token's time zero sits.
+        # Worked out from the recordings' lengths; typing one overrides it,
+        # clearing it goes back to the worked-out value.
+        start_var   = tk.StringVar(value="")
+        start_frame = tk.Frame(row, bg=initial_bg)
+        tint_refs.append(start_frame)
+        start_cap = tk.Label(start_frame, text="from", font=FB, bg=initial_bg,
+                             fg=SUB, padx=2)
+        start_cap.pack(side="left")
+        tint_refs.append(start_cap)
+        start_ent = tk.Entry(start_frame, textvariable=start_var, font=FB,
+                             bg=SURF, fg=TEXT, insertbackground=TEXT,
+                             relief="flat", width=12)
+        start_ent.pack(side="left", padx=(2, 4))
+
+        # "+ TOKEN" -- give this file a second row, for another token.
+        share = tk.Label(row, text="+ TOKEN", font=("Courier New", 8, "bold"),
+                         bg=initial_bg, fg=SUB, cursor="hand2", padx=4)
+        tint_refs.append(share)
+        if not twin:
+            share.pack(side="left")
+
         wipe = tk.Label(row, text="🗑", font=FB, bg=initial_bg, fg=SUB,
                         cursor="hand2", padx=4)
         wipe.pack(side="left")
@@ -883,11 +915,22 @@ class MediaPool(tk.Frame):
                "fn_frame": fn_frame,
                "fn_lbl": fn_lbl, "dd_frame": dd_frame, "sash": sash,
                "link_id": None, "link_mirrored": False,
-               "link_lbl": link_lbl, "rm_lbl": rm}
+               "link_lbl": link_lbl, "rm_lbl": rm,
+               "twin": bool(twin), "start_var": start_var,
+               "start_frame": start_frame, "start_user": False,
+               "start_before": wipe if twin else share}
         self._rows.append(rec)
         rm.bind("<Button-1>", lambda e, r=rec: self._remove(r))
         wipe.bind("<Button-1>",
                    lambda e, r=rec: self._wipe_cache(r))
+        share.bind("<Button-1>", lambda e, r=rec: self._add_share(r))
+
+        def _start_typed(*_a, r=rec):
+            if not getattr(self, "_starts_writing", False):
+                r["start_user"] = True
+        start_var.trace_add("write", _start_typed)
+        for _ev in ("<FocusOut>", "<Return>"):
+            start_ent.bind(_ev, lambda e, r=rec: self._commit_start(r))
 
         self._dz_lbl.config(text="")
         # During bulk restore, _apply_setup_data calls _refresh_count once
@@ -903,12 +946,201 @@ class MediaPool(tk.Frame):
             self._prune_scheduled = True
             self.after(80, self._deferred_prune)
 
+        if twin:
+            return
         # Background: detect duration and assign to a link group
         def _fetch_dur(_p=path):
             dk = _get_dur_key(_p)
             if dk is not None:
                 self.after(0, lambda: self._set_link_group(_p, dk))
         threading.Thread(target=_fetch_dur, daemon=True).start()
+
+    # ── A file under more than one token ──────────────────────────────────
+
+    def _add_share(self, rec):
+        """Second row for *rec*'s file, to assign it to another token."""
+        self._add(rec["path"], twin=True)
+        self._refresh_starts()
+
+    def _schedule_starts(self):
+        """Refresh the starts once the current burst of changes settles.
+        Nothing to do -- and nothing scheduled -- while no file is shared."""
+        if not any(r.get("twin") for r in self._rows):
+            return
+        if getattr(self, "_starts_after", None) is not None:
+            return
+        def _go():
+            self._starts_after = None
+            try:
+                if self.winfo_exists():
+                    self._refresh_starts()
+            except tk.TclError:
+                pass
+        try:
+            self._starts_after = self.after(60, _go)
+        except tk.TclError:
+            self._starts_after = None
+
+    def _dur(self, path):
+        cache = self.__dict__.setdefault("_dur_cache", {})
+        if path not in cache:
+            import engines
+            try:
+                cache[path] = float(engines.get_media_duration(path) or 0.0)
+            except Exception:
+                cache[path] = 0.0
+        return cache[path]
+
+    def _shared_paths(self):
+        seen, shared = set(), set()
+        for r in self._rows:
+            (shared if r["path"] in seen else seen).add(r["path"])
+        return shared
+
+    def _own_recording(self, token, shared):
+        """(length, path) of the recording that is *token*'s alone -- what
+        a shared file is placed against.  Audio before picture; the longest."""
+        if not token or token == "— unassigned —":
+            return None, ""
+        own = [r["path"] for r in self._rows
+               if r["var"].get() == token and r["path"] not in shared]
+        own = [p for p in own if not is_video(p)] or own
+        best = max(own, key=self._dur, default=None)
+        if best is None or self._dur(best) <= 0:
+            return None, ""
+        return self._dur(best), best
+
+    def _auto_starts(self):
+        """{id(row): (start, length)} for every row of a shared file, from
+        the lengths alone (engines.shared_starts)."""
+        import engines
+        shared = self._shared_paths()
+        out = {}
+        for p in shared:
+            rows = [r for r in self._rows if r["path"] == p]
+            parts, lens = [], {}
+            for r in rows:
+                own_len, own_path = self._own_recording(r["var"].get(), shared)
+                lens[id(r)] = own_len
+                parts.append((id(r), own_len, own_path))
+            starts = engines.shared_starts(self._dur(p), parts)
+            for r in rows:
+                out[id(r)] = (starts.get(id(r), 0.0), lens[id(r)])
+        return out
+
+    def _row_span(self, rec, auto):
+        """(start, length) of a shared row: the typed start, else worked out."""
+        import engines
+        start, length = auto.get(id(rec), (0.0, None))
+        if rec.get("start_user"):
+            typed = engines.parse_start(rec["start_var"].get())
+            if typed is not None:
+                start = typed
+        return start, length
+
+    def _refresh_starts(self):
+        """Show a start on every row of a shared file, hide it elsewhere,
+        and fill in the ones nobody typed."""
+        import engines
+        auto = self._auto_starts()
+        self._starts_writing = True
+        try:
+            for r in self._rows:
+                fr = r.get("start_frame")
+                if fr is None:
+                    continue
+                try:
+                    if id(r) not in auto:
+                        r["start_user"] = False
+                        fr.pack_forget()
+                        continue
+                    if not r.get("start_user"):
+                        r["start_var"].set(engines.format_start(auto[id(r)][0]))
+                    fr.pack(side="left", before=r["start_before"])
+                except tk.TclError:
+                    continue
+        finally:
+            self._starts_writing = False
+
+    def _commit_start(self, rec):
+        """The start box lost focus: tidy what was typed; empty or unreadable
+        goes back to the worked-out start."""
+        import engines
+        if not rec.get("start_user"):
+            return
+        secs = engines.parse_start(rec["start_var"].get()) \
+            if rec["start_var"].get().strip() else None
+        rec["start_user"] = secs is not None
+        if secs is not None:
+            self._starts_writing = True
+            try:
+                rec["start_var"].set(engines.format_start(secs))
+            finally:
+                self._starts_writing = False
+        self._refresh_starts()
+
+    def get_spans(self):
+        """{token: {engines.span_key(path): (start, length)}} for the files
+        more than one token holds.  Empty when no file is shared."""
+        import engines
+        auto = self._auto_starts()
+        out = {}
+        for r in self._rows:
+            tok = r["var"].get()
+            if id(r) not in auto or tok == "— unassigned —":
+                continue
+            out.setdefault(tok, {})[engines.span_key(r["path"])] = \
+                self._row_span(r, auto)
+        return out
+
+    def assignment_pairs(self):
+        """[(path, token)] for every file's own row -- what a save keeps as
+        the file's assignment.  Second rows are in get_shared()."""
+        return [(r["path"], r["var"].get()) for r in self._rows
+                if not r.get("twin")]
+
+    def get_shared(self):
+        """What a save keeps of shared files: one item per row of each,
+        [{"path", "token", "twin", "start"}]; "start" only when typed."""
+        import engines
+        shared = self._shared_paths()
+        out = []
+        for r in self._rows:
+            if r["path"] not in shared:
+                continue
+            item = {"path": r["path"], "token": r["var"].get(),
+                    "twin": bool(r.get("twin"))}
+            if r.get("start_user"):
+                typed = engines.parse_start(r["start_var"].get())
+                if typed is not None:
+                    item["start"] = typed
+            out.append(item)
+        return out
+
+    def apply_shared(self, items):
+        """Put back what get_shared() kept.  The files' own rows must be in."""
+        import engines
+        for it in items or []:
+            path = it.get("path")
+            own = next((r for r in self._rows
+                        if r["path"] == path and not r.get("twin")), None)
+            if own is None:
+                continue
+            rec = own
+            if it.get("twin"):
+                self._add(path, twin=True)
+                rec = self._rows[-1]
+                if it.get("token"):
+                    rec["var"].set(it["token"])
+            if it.get("start") is not None:
+                self._starts_writing = True
+                try:
+                    rec["start_var"].set(engines.format_start(it["start"]))
+                finally:
+                    self._starts_writing = False
+                rec["start_user"] = True
+        if items:
+            self._refresh_starts()
 
     def _sort_rows(self):
         """Re-pack pool rows in the chosen display order; auto-size columns
@@ -1103,7 +1335,7 @@ class MediaPool(tk.Frame):
         self._in_mirror = True
         try:
             for r in self._rows:
-                if r["path"] == changed_path:
+                if r["path"] == changed_path or r.get("twin"):
                     continue
                 current = r["var"].get()
                 if current != "— unassigned —":
@@ -1278,10 +1510,17 @@ class MediaPool(tk.Frame):
                     pass
 
     def _remove(self, rec):
-        self._rows = [r for r in self._rows if r is not rec]
-        rec["row"].destroy()
+        # A file's second rows go with its own row.
+        gone = [rec] + ([r for r in self._rows
+                         if r["path"] == rec["path"] and r.get("twin")]
+                        if not rec.get("twin") else [])
+        self._rows = [r for r in self._rows if all(r is not g for g in gone)]
+        for g in gone:
+            g["row"].destroy()
         self._refresh_count()
         self._update_link_visuals()
+        if rec.get("start_frame") is not None:
+            self._refresh_starts()
 
     def _wipe_cache(self, rec):
         """Delete the cached pull-reconciliation results for the token
@@ -1351,7 +1590,8 @@ class MediaPool(tk.Frame):
                 if _p: paths_for_tok.append(_p)
         if len(paths_for_tok) >= 2:
             try:
-                transcript_key_path = engines._stable_mix_cache_path(paths_for_tok)
+                transcript_key_path = engines._stable_mix_cache_path(
+                    paths_for_tok, self.get_spans().get(tok))
             except Exception:
                 transcript_key_path = None
         elif len(paths_for_tok) == 1:
@@ -1502,7 +1742,8 @@ class MediaPool(tk.Frame):
         for r in self._rows:
             tok = r["var"].get()
             if tok == "— unassigned —": continue
-            out.setdefault(tok, []).append(r["path"])
+            if r["path"] not in out.setdefault(tok, []):
+                out[tok].append(r["path"])
         return out
 
     def get_audio_paths(self, token):

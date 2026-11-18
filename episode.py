@@ -505,6 +505,104 @@ def merge_sources(ep, into, other):
     a["user_made"] = True
 
 
+# ── A recording two sources share ─────────────────────────────────────────
+# One side of a session can come as a single file while the other side came
+# in consecutive parts (Riverside does this when a participant's recording
+# fails part way).  Each part is a source of its own, with its own token;
+# the unbroken file -- and its camera -- belongs to all of them.  In each it
+# has a start: how far into the file that source's own recording begins
+# (engines.shared_starts works it out from the lengths).
+
+def share_file(ep, name, kind, relpath):
+    """Put *relpath* in source *name* as well as wherever it already is."""
+    src = ep["sources"].get(name)
+    if src is None or relpath in src.get(kind, []):
+        return
+    src.setdefault(kind, []).append(relpath)
+    src[kind].sort()
+    for other in ep["sources"].values():
+        if relpath in other.get(kind, []):
+            other["user_made"] = True       # a rescan keeps every side of it
+
+
+def shared_files(ep):
+    """{rel path: [names of the sources holding it]} for every recording or
+    camera more than one source holds."""
+    held = {}
+    for name in sorted(ep.get("sources", {})):
+        src = ep["sources"][name]
+        for r in src.get("audio", []) + src.get("video", []):
+            held.setdefault(r, []).append(name)
+    return {r: names for r, names in held.items() if len(names) > 1}
+
+
+def _own_recording(ep, name, shared):
+    """(length, rel path) of the longest recording that is *name*'s alone."""
+    src = ep["sources"].get(name, {})
+    own = [r for r in src.get("audio", []) if r not in shared] or \
+          [r for r in src.get("video", []) if r not in shared]
+    dur = lambda r: (ep["media"].get(r) or {}).get("duration_s") or 0.0
+    best = max(own, key=dur, default=None)
+    if best is None or dur(best) <= 0:
+        return None, ""
+    return dur(best), best
+
+
+def source_spans(ep, name):
+    """{rel path: (start, length)} for the files source *name* shares with
+    another: where its own recording begins in each, and for how long."""
+    import engines
+    shared = shared_files(ep)
+    out = {}
+    for r, names in shared.items():
+        if name not in names:
+            continue
+        parts, lens = [], {}
+        for n in names:
+            own_len, own_path = _own_recording(ep, n, shared)
+            lens[n] = own_len
+            parts.append((n, own_len, own_path))
+        file_len = (ep["media"].get(r) or {}).get("duration_s") or 0.0
+        out[r] = (engines.shared_starts(file_len, parts).get(name, 0.0), lens[name])
+    return out
+
+
+def assign_script_tokens(ep, tokens):
+    """Give each source that has no token the script token its name or its
+    recordings' names carry.  Returns the names of the sources given one.
+
+    Only a clear answer is taken: a token another source already has is not
+    offered, and one that two sources both look like goes to neither (the
+    review's dropdown is for those).  A source is tried once per set of
+    script tokens (src["token_tried"]), so a token the user cleared stays
+    cleared until the script's tokens change.
+    """
+    from utils import suggest_token
+    tokens = [t for t in (tokens or []) if t]
+    tried = sorted(tokens)
+    sources = ep.get("sources", {})
+    free = [t for t in tokens
+            if t not in {s.get("token") for s in sources.values()}]
+    claims = {}
+    for name in sorted(sources):
+        src = sources[name]
+        if src.get("token") or src.get("vo_part") or src.get("token_tried") == tried:
+            continue
+        src["token_tried"] = tried
+        votes = [suggest_token(name + ".x", free)] + [
+            suggest_token(os.path.basename(a), free) for a in src.get("audio", [])]
+        votes = [v for v in votes if v]
+        if votes:
+            best = max(sorted(set(votes)), key=votes.count)
+            claims.setdefault(best, []).append(name)
+    given = []
+    for tok, names in claims.items():
+        if len(names) == 1:
+            sources[names[0]]["token"] = tok
+            given.append(names[0])
+    return sorted(given)
+
+
 def _stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 

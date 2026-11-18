@@ -1192,9 +1192,13 @@ class AssemblyWindow(object):
                 kind = "host" if res.get("token", "").lower() == host_lc else "int"
                 # The same reference Step 4 plays: the transcription mix
                 # for a multi-file token, else the token's own file.
+                # A recording shared with another token is on its own
+                # file's clock, so the fallback is one that is not.
+                _own = next((p for p, s in zip(e["paths"], e.get("starts") or ())
+                             if not s), e["paths"][0])
                 path = next((p for p in (res.get("source_audio"),
                                          res.get("source_video"),
-                                         e["paths"][0])
+                                         _own)
                              if p and os.path.isfile(p)), None)
             c = _Clip(e, res, LAYOUT_SR, kind,
                       res.get("status", "") in review, path)

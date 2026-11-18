@@ -410,6 +410,9 @@ class EpisodeWorkflowMixin:
                 else:
                     self._btn(r, "LINK GOOGLE DOC\u2026", self._ep_gdoc_link, small=True
                               ).pack(side="left", padx=(12, 0))
+                if not links.get("script"):
+                    self._btn(r, "CHOOSE SCRIPT\u2026", self._ep_choose_script, small=True
+                              ).pack(side="left", padx=(6, 0))
 
     def _ep_render_sources(self, parent):
         ep = self._ep
@@ -420,25 +423,98 @@ class EpisodeWorkflowMixin:
                      font=FB, bg=SURF, fg=SUB).pack(anchor="w")
         free_video = self._ep_free_media("video")
         free_audio = self._ep_free_media("audio")
+        shared = EP.shared_files(ep)
+        # With a script linked, a source's token is one of the script's:
+        # the clear ones are filled in, the rest are a dropdown.
+        tokens, part_names = self._ep_script_names()
+        auto = self.__dict__.setdefault("_ep_auto_tokens", set())
+        if tokens:
+            auto.update(EP.assign_script_tokens(ep, tokens))
+        # Which sources are open.  One with many files starts closed.
+        opened = self.__dict__.setdefault("_ep_open", {})
+        if len(ep["sources"]) > 1:
+            bar = tk.Frame(body, bg=SURF)
+            bar.pack(fill="x")
+            def _all(state):
+                for n in ep["sources"]:
+                    opened[n] = state
+                self._ep_view()
+            self._btn(bar, "COLLAPSE ALL", lambda: _all(False), small=True).pack(side="right")
+            self._btn(bar, "EXPAND ALL", lambda: _all(True), small=True
+                      ).pack(side="right", padx=(0, 6))
+            if tokens:
+                tk.Label(bar, text="tokens from {}".format(os.path.basename(
+                             ep.get("links", {}).get("script") or "")),
+                         font=FB, bg=SURF, fg=SUB).pack(side="left")
         for name in sorted(ep["sources"]):
             src = ep["sources"][name]
+            n_rec, n_cam = len(src.get("audio", [])), len(src.get("video", []))
+            is_open = opened.setdefault(name, n_rec + n_cam <= 4)
             row = tk.Frame(body, bg=SURF2, highlightbackground=BORDER, highlightthickness=1)
             row.pack(fill="x", pady=3)
             top = tk.Frame(row, bg=SURF2)
-            top.pack(fill="x", padx=10, pady=(6, 2))
-            tk.Label(top, text=name, font=FBT, bg=SURF2, fg=TEXT).pack(side="left")
+            top.pack(fill="x", padx=10, pady=(6, 6))
+            arrow = tk.Label(top, text="\u25bc" if is_open else "\u25b6", font=FB,
+                             bg=SURF2, fg=ACCENT, cursor="hand2")
+            arrow.pack(side="left", padx=(0, 6))
+            title = tk.Label(top, text=name, font=FBT, bg=SURF2, fg=TEXT, cursor="hand2")
+            title.pack(side="left")
+            count = tk.Label(top, text="   {} recording{} \u00b7 {} camera{}".format(
+                                 n_rec, "" if n_rec == 1 else "s",
+                                 n_cam, "" if n_cam == 1 else "s"),
+                             font=FB, bg=SURF2, fg=SUB, cursor="hand2")
+            count.pack(side="left")
+            det = tk.Frame(row, bg=SURF2)
+            if is_open:
+                det.pack(fill="x")
+            def _toggle(_e=None, n=name, d=det, a=arrow):
+                opened[n] = not opened.get(n)
+                if opened[n]:
+                    d.pack(fill="x")
+                else:
+                    d.pack_forget()
+                a.config(text="\u25bc" if opened[n] else "\u25b6")
+            for w in (arrow, title, count):
+                w.bind("<Button-1>", _toggle)
             tk.Label(top, text="   token", font=FB, bg=SURF2, fg=SUB).pack(side="left")
-            tv = tk.StringVar(value=src.get("token") or "")
-            te = tk.Entry(top, textvariable=tv, font=FB, bg=SURF, fg=TEXT,
-                          insertbackground=TEXT, relief="flat", width=14)
-            te.pack(side="left", padx=(6, 0))
-            def _tok(*_a, n=name, v=tv):
-                t = "".join(ch for ch in v.get().upper() if ch.isalnum() or ch == "_")
-                ep["sources"][n]["token"] = t or None
-            tv.trace_add("write", _tok)
-            if src.get("vo_part"):
-                tk.Label(top, text="   narrator \u00b7 VO: {}".format(src["vo_part"]),
-                         font=FB, bg=SURF2, fg=SUB).pack(side="left")
+            if tokens:
+                none = "\u2014 no token \u2014"
+                cur = ("VO: " + src["vo_part"]) if src.get("vo_part") and not src.get("token") \
+                    else (src.get("token") or none)
+                opts = [none] + list(tokens)
+                if src.get("token") and src["token"] not in tokens:
+                    opts.append(src["token"])          # typed before the script was linked
+                opts += ["VO: " + p for p in part_names]
+                if cur not in opts:
+                    opts.append(cur)
+                tv = tk.StringVar(value=cur)
+                _FlatDropdown(top, tv, opts, font=FB, width=20).pack(side="left", padx=(6, 0))
+                hint = tk.Label(top, text="  from the script" if name in auto else "",
+                                font=FB, bg=SURF2, fg=SUB)
+                hint.pack(side="left")
+                def _pick(*_a, n=name, v=tv, h=hint, none=none):
+                    s = ep["sources"][n]
+                    val = v.get()
+                    if val.startswith("VO: "):
+                        s["token"], s["vo_part"] = None, val[4:]
+                    else:
+                        s["token"] = None if val == none else val
+                        s.pop("vo_part", None)
+                    auto.discard(n)
+                    h.config(text="")
+                tv.trace_add("write", _pick)
+            else:
+                tv = tk.StringVar(value=src.get("token") or "")
+                te = tk.Entry(top, textvariable=tv, font=FB, bg=SURF, fg=TEXT,
+                              insertbackground=TEXT, relief="flat", width=14)
+                te.pack(side="left", padx=(6, 0))
+                def _tok(*_a, n=name, v=tv):
+                    t = "".join(ch for ch in v.get().upper() if ch.isalnum() or ch == "_")
+                    ep["sources"][n]["token"] = t or None
+                tv.trace_add("write", _tok)
+                if src.get("vo_part"):
+                    tk.Label(top, text="   narrator \u00b7 VO: {}".format(src["vo_part"]),
+                             font=FB, bg=SURF2, fg=SUB).pack(side="left")
             if src.get("session"):
                 tk.Label(top, text="   transcribed", font=FB, bg=SURF2, fg=SUCCESS
                          ).pack(side="left")
@@ -451,14 +527,37 @@ class EpisodeWorkflowMixin:
                               ).pack(side="right", padx=(0, 8))
                 cv.trace_add("write", lambda *_a, n=name, v=cv: (
                     self._ep_combine(n, v.get()) if v.get() in ep["sources"] else None))
+            spans = EP.source_spans(ep, name)
             # Recordings
             for a in src.get("audio", []):
-                self._ep_media_line(row, a, "REC", lambda p=a, n=name: self._ep_detach(n, "audio", p))
+                self._ep_media_line(det, a, "REC", lambda p=a, n=name: self._ep_detach(n, "audio", p),
+                                    span=spans.get(a), also=[o for o in shared.get(a, []) if o != name])
             # Cameras
             for v in src.get("video", []):
-                self._ep_media_line(row, v, "CAM", lambda p=v, n=name: self._ep_detach(n, "video", p))
+                self._ep_media_line(det, v, "CAM", lambda p=v, n=name: self._ep_detach(n, "video", p),
+                                    span=spans.get(v), also=[o for o in shared.get(v, []) if o != name])
+            # One side of the session in a single file while this source is
+            # one part of the other side: that file is shared, not moved.
+            theirs = [(k, r) for o in others for k in ("audio", "video")
+                      for r in ep["sources"][o].get(k, []) if r not in src.get(k, [])]
+            if theirs:
+                shr = tk.Frame(det, bg=SURF2)
+                shr.pack(fill="x", padx=10, pady=(2, 0))
+                tk.Label(shr, text="+ share from another source", font=FB, bg=SURF2, fg=SUB
+                         ).pack(side="left")
+                hv = tk.StringVar(value="\u2014 choose \u2014")
+                labels = {}
+                for k, r in theirs:
+                    labels.setdefault("{}  {}".format("REC" if k == "audio" else "CAM",
+                                                      os.path.basename(r)), (k, r))
+                _FlatDropdown(shr, hv, ["\u2014 choose \u2014"] + sorted(labels),
+                              font=FB, width=44).pack(side="left", padx=(8, 0))
+                def _share(*_a, n=name, v=hv, lab=labels):
+                    if v.get() in lab:
+                        self._ep_share(n, *lab[v.get()])
+                hv.trace_add("write", _share)
             if free_audio:
-                addr = tk.Frame(row, bg=SURF2)
+                addr = tk.Frame(det, bg=SURF2)
                 addr.pack(fill="x", padx=10, pady=(2, 0))
                 tk.Label(addr, text="+ recording", font=FB, bg=SURF2, fg=SUB).pack(side="left")
                 rv = tk.StringVar(value="— choose —")
@@ -471,7 +570,7 @@ class EpisodeWorkflowMixin:
                             return
                 rv.trace_add("write", _attach_rec)
             if free_video:
-                add = tk.Frame(row, bg=SURF2)
+                add = tk.Frame(det, bg=SURF2)
                 add.pack(fill="x", padx=10, pady=(2, 6))
                 tk.Label(add, text="+ camera", font=FB, bg=SURF2, fg=SUB).pack(side="left")
                 av = tk.StringVar(value="— choose —")
@@ -485,9 +584,53 @@ class EpisodeWorkflowMixin:
                             return
                 av.trace_add("write", _attach)
             else:
-                tk.Frame(row, bg=SURF2, height=4).pack()
+                tk.Frame(det, bg=SURF2, height=4).pack()
 
-    def _ep_media_line(self, parent, relpath, tag, detach_cmd):
+    def _ep_script_names(self):
+        """(tokens, part names) of the linked script, in script order;
+        ([], []) with no script to read.  Read again only when it changes."""
+        ep = self._ep
+        path = EP.absp(ep, ep.get("links", {}).get("script"))
+        try:
+            key = (path, os.path.getmtime(path)) if path else None
+        except OSError:
+            key = None
+        if key is None:
+            return [], []
+        cache = getattr(self, "_ep_script_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        tokens, part_names = [], []
+        try:
+            from parsers import parse_script, is_plain_script
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            toks, parts, pulls, vo_blocks, _t, _w = parse_script(text)
+            tokens = list(dict.fromkeys(toks or []))
+            part_names = list(dict.fromkeys(p["name"] for p in parts))
+            if not pulls and not vo_blocks and is_plain_script(text):
+                import monolog
+                part_names = [monolog.NARRATION["name"]]
+        except Exception:
+            pass
+        self._ep_script_cache = (key, (tokens, part_names))
+        return tokens, part_names
+
+    def _ep_choose_script(self):
+        """Link the episode's script from the review, so the sources can
+        take its tokens before Script -> Session is ever opened."""
+        ep = self._ep
+        path = filedialog.askopenfilename(
+            title="Open Script", initialdir=ep["root"],
+            filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        if not path:
+            return
+        ep.setdefault("links", {})["script"] = EP.rel(ep, path)
+        self._ep_view()
+
+    def _ep_media_line(self, parent, relpath, tag, detach_cmd, span=None, also=()):
+        """*span* and *also*: for a file shared with other sources, where
+        this source's own recording begins in it, and who else holds it."""
         ep = self._ep
         rec = ep["media"].get(relpath, {})
         r = tk.Frame(parent, bg=SURF2)
@@ -497,6 +640,11 @@ class EpisodeWorkflowMixin:
         d = rec.get("duration_s")
         txt = "{}   {}".format(os.path.basename(relpath), self._ep_fmt_dur(d))
         tk.Label(r, text=txt, font=FB, bg=SURF2, fg=TEXT, anchor="w").pack(side="left", padx=(8, 0))
+        if also:
+            import engines
+            tk.Label(r, text="shared with {} \u00b7 from {}".format(
+                         ", ".join(also), engines.format_start((span or (0.0,))[0])),
+                     font=FB, bg=SURF2, fg=ACCENT).pack(side="left", padx=(10, 0))
         tk.Label(r, text=os.path.dirname(relpath), font=(_SANS, 10), bg=SURF2, fg=SUB
                  ).pack(side="left", padx=(10, 0))
         x = tk.Label(r, text=" ✕ ", font=FB, bg=SURF2, fg=SUB, cursor="hand2")
@@ -649,6 +797,12 @@ class EpisodeWorkflowMixin:
         src.setdefault(kind, []).append(relpath)
         src[kind].sort()
         src["user_made"] = True
+        self._ep_view()
+
+    def _ep_share(self, name, kind, relpath):
+        """*relpath* joins source *name* and stays where it is."""
+        EP.share_file(self._ep, name, kind, relpath)
+        self._ep["sources"][name]["user_made"] = True
         self._ep_view()
 
     def _ep_detach(self, name, kind, relpath):
@@ -1093,6 +1247,13 @@ class EpisodeWorkflowMixin:
         pool = getattr(self, "_pool", None)
         rows = [(r["path"], r["var"].get()) for r in getattr(pool, "_rows", [])]
         from utils import is_video
+        # A file with more than one row is shared between tokens: it joins
+        # each token's source and leaves none of them.
+        _n = {}
+        for path, tok in rows:
+            if tok and not tok.startswith("\u2014"):
+                _n[path] = _n.get(path, 0) + 1
+        multi = {EP.rel(ep, p) for p, n in _n.items() if n > 1}
         # Recordings first: a camera assigned to a VO part follows the
         # recording that narrates it, so every part must be placed before
         # any camera looks for it.
@@ -1128,7 +1289,8 @@ class EpisodeWorkflowMixin:
                 self._ep_ensure_media(ep, r, kind)
                 if r not in src.setdefault(kind, []):
                     for other_name, other in ep["sources"].items():
-                        if other_name != name and r in other.get(kind, []):
+                        if other_name != name and r in other.get(kind, []) \
+                                and r not in multi:
                             other[kind].remove(r)
                     src[kind].append(r)
                     src[kind].sort()
@@ -1154,7 +1316,8 @@ class EpisodeWorkflowMixin:
             self._ep_ensure_media(ep, r, kind)
             if r not in src.setdefault(kind, []):
                 for other_name, other in ep["sources"].items():
-                    if other_name != name and r in other.get(kind, []):
+                    if other_name != name and r in other.get(kind, []) \
+                            and r not in multi:
                         other[kind].remove(r)
                 src[kind].append(r)
                 src[kind].sort()
@@ -1184,10 +1347,11 @@ class EpisodeWorkflowMixin:
                 if set(vids) != set(src.get("video", [])):
                     # The user picked these cameras in Step 2: they
                     # leave any other source, and a rescan keeps them.
+                    _both = EP.shared_files(ep)     # a shared camera stays shared
                     for other_name, other in ep["sources"].items():
                         if other_name != name:
                             other["video"] = [v for v in other.get("video", [])
-                                              if v not in vids]
+                                              if v not in vids or v in _both]
                     src["user_made"] = True
                 src["video"] = vids
             sd = data.get("sync", {}).get(base, {})
@@ -1282,8 +1446,9 @@ class EpisodeWorkflowMixin:
                 part_names = vo_parts = {monolog.NARRATION["name"]}
         except Exception:
             pass
-        assignments = {}
-        for src in ep["sources"].values():
+        assignments, shared = {}, []
+        for _name in sorted(ep["sources"]):
+            src = ep["sources"][_name]
             tok = src.get("token")
             vo = src.get("vo_part")
             if tok and tok in known:
@@ -1298,8 +1463,14 @@ class EpisodeWorkflowMixin:
             else:
                 val = "— unassigned —"
             for r in src.get("audio", []) + src.get("video", []):
-                assignments[EP.absp(ep, r)] = val
-        self._pending_setup = {"assignments": assignments}
+                p = EP.absp(ep, r)
+                if p in assignments:
+                    # A file more than one source holds: a second row for
+                    # it in Step 2, under this source's token.
+                    shared.append({"path": p, "token": val, "twin": True})
+                else:
+                    assignments[p] = val
+        self._pending_setup = {"assignments": assignments, "shared": shared}
         self.workflow = "script_session"
         self._load_script(script)
 
