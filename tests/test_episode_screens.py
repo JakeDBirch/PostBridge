@@ -473,7 +473,41 @@ def test_a_view_only_doc_offers_no_writes_and_says_whose_it_is(app, monkeypatch,
             out += _texts(c)
         return out
     assert any("Jordan Sillars" in t and "View only" in t for t in _texts(win))
+
+    # The project copy can be fixed instead -- and stays fixed on every
+    # fetch, while the Doc itself is never written.
+    from tkinter import messagebox as ew_messagebox
+    import script_normalize
+    monkeypatch.setattr(ew_messagebox, "askyesno", lambda *a, **k: True)
+    monkeypatch.setattr(gdocs, "fix_format", lambda *a, **k: pytest.fail("wrote the Doc"))
+    fixed = script_normalize.normalize(broken, title="Ep 7 script")[0]
+    copy = os.path.join(project, "Ep 7 script.txt")
+    assert open(copy, encoding="utf-8").read() == broken
+    assert _click(app, win, "FIX FORMAT IN PROJECT COPY")
+    assert _wait(app, lambda: app._ep_findings_win is not win
+                 and app._ep_findings_win.winfo_exists(), secs=10)
+    _pump(app, 3)
+    win = app._ep_findings_win
+    assert app._ep["links"]["gdoc"]["fix_local"] is True
+    assert open(copy, encoding="utf-8").read() == fixed != broken
+    assert not _click(app, win, "FIX FORMAT IN PROJECT COPY")
+    assert any("Fixed in the project copy" in t for t in _texts(win))
     _click(app, win, "CLOSE")
+    app._ep_gdoc_fetch()                    # a later fetch: still fixed
+    assert _wait(app, lambda: app._ep_findings_win is not win
+                 and app._ep_findings_win.winfo_exists(), secs=10)
+    _pump(app, 3)
+    win = app._ep_findings_win
+    assert open(copy, encoding="utf-8").read() == fixed
+
+    # Turned off, the Doc comes down exactly as it is again.
+    assert _click(app, win, "STOP FIXING THE COPY")
+    assert _wait(app, lambda: app._ep_findings_win is not win
+                 and app._ep_findings_win.winfo_exists(), secs=10)
+    _pump(app, 3)
+    assert "fix_local" not in app._ep["links"]["gdoc"]
+    assert open(copy, encoding="utf-8").read() == broken
+    _click(app, app._ep_findings_win, "CLOSE")
     app._ep_findings_win = None
     assert not app._errors, "\n".join(app._errors)
 

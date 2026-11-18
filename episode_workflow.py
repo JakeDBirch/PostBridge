@@ -843,6 +843,12 @@ class EpisodeWorkflowMixin:
 
         def _done(res):
             text, meta = res
+            # FIX FORMAT IN PROJECT COPY: for a Doc this account can't write,
+            # Fix Format runs on what is saved here instead, on every fetch.
+            # The Doc stays as it is.
+            local_fixes = []
+            if gd.get("fix_local"):
+                text, local_fixes = script_normalize.normalize(text, title=meta.get("name"))
             path = self._ep_gdoc_script_path(meta.get("name"))
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
@@ -854,11 +860,12 @@ class EpisodeWorkflowMixin:
             import script_check
             findings = script_check.run_checks(text, script_path=path)
             diff = gdocs.diff_pulls(prev_text, text) if prev_text else None
-            self._ep_show_findings(findings, text, meta, diff, then)
+            self._ep_show_findings(findings, text, meta, diff, then, local_fixes)
         self._ep_gdoc_bg(_work, _done)
 
-    def _ep_show_findings(self, findings, text, meta, diff, then=None):
-        """Script Check results for a fetched Doc, with the Doc actions."""
+    def _ep_show_findings(self, findings, text, meta, diff, then=None, local_fixes=()):
+        """Script Check results for a fetched Doc, with the Doc actions.
+        *local_fixes*: what Fix Format changed in the project copy."""
         import script_check
         n_err, n_warn, n_info = script_check.summarize(findings)
         win = tk.Toplevel(self)
@@ -875,6 +882,11 @@ class EpisodeWorkflowMixin:
             head += "   \u00b7   since the last fetch: {} pull{} added, {} removed, {} changed".format(
                 a, "" if a == 1 else "s", r, c)
         tk.Label(win, text=head, font=FB, bg=BG, fg=SUB, padx=20).pack(anchor="w", pady=(0, 8))
+        if local_fixes:
+            tk.Label(win, font=FB, bg=BG, fg=SUB, padx=20, justify="left",
+                     wraplength=900, anchor="w", text="Fixed in the project copy "
+                     "(the Doc is unchanged):  " + ";  ".join(local_fixes)
+                     ).pack(anchor="w", fill="x", pady=(0, 8))
         box = tk.Frame(win, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
         box.pack(fill="both", expand=True, padx=20)
         lst = tk.Text(box, font=FB, bg=SURF, fg=TEXT, relief="flat", bd=0, wrap="word",
@@ -947,27 +959,59 @@ class EpisodeWorkflowMixin:
             self._btn(nav, "CONTINUE  \u2192", _continue, color=ACCENT).pack(side="right")
         else:
             self._btn(nav, "CLOSE", _continue).pack(side="right")
+        name = meta.get("name", "the Doc")
+        fix_local = bool(gd.get("fix_local"))
+        local_changes = script_normalize.normalize(text, title=meta.get("name"))[1]
+
+        def _set_fix_local(on):
+            if on and not messagebox.askyesno("Fix format in the project copy", "\n".join(
+                    ["“{}” is view only, so it stays as it is.  The script "
+                     "saved in the project folder gets these fixes, now and every "
+                     "time it is fetched:".format(name), ""]
+                    + ["• " + c for c in local_changes]
+                    + ["", "Wording and timecodes stay as they are."]), parent=win):
+                return
+            link = self._ep.setdefault("links", {}).setdefault("gdoc", {})
+            if on:
+                link["fix_local"] = True
+            else:
+                link.pop("fix_local", None)
+            EP.save(self._ep)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._ep_gdoc_fetch(then)      # fetch again, fixed (or not) this time
+
         if not gdocs.can_edit(meta):
             # Shared view-only: it fetches and checks, but nothing can be
             # written back -- say so instead of offering buttons Google
-            # would refuse.
+            # would refuse.  The project copy can still be fixed.
             owner = gdocs.owner_name(meta) or "its owner"
             tk.Label(nav, font=FB, bg=BG, fg=WARN, justify="left", anchor="w",
                      wraplength=520, text=(
                          "View only: “{}” belongs to {}, and this Google "
-                         "account can't edit it, so notes and Fix Format can't go "
-                         "into the Doc.  Ask {} to share it with you as an Editor, "
-                         "then fetch again.").format(meta.get("name", "the Doc"),
-                                                     owner, owner)
+                         "account can't edit it, so nothing can be written into the "
+                         "Doc.  Ask {} to share it with you as an Editor{}.").format(
+                             name, owner, owner,
+                             "" if fix_local or not local_changes
+                             else ", or fix the format in the project copy")
                      ).pack(side="left", fill="x", expand=True)
+            if not fix_local and local_changes:
+                self._btn(nav, "FIX FORMAT IN PROJECT COPY", lambda: _set_fix_local(True),
+                          small=True, color=ACCENT).pack(side="left", padx=(8, 0))
         else:
             self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
             if findings:
                 self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
                           ).pack(side="left", padx=(8, 0))
-            if script_normalize.normalize(text, title=meta.get("name"))[1]:
+            if local_changes:
                 self._btn(nav, "FIX FORMAT IN DOC", _fix, small=True, color=ACCENT
                           ).pack(side="left", padx=(8, 0))
+        if fix_local:
+            # Turned off, the next fetch saves the Doc exactly as it is.
+            self._btn(nav, "STOP FIXING THE COPY", lambda: _set_fix_local(False),
+                      small=True).pack(side="left", padx=(8, 0))
         self._center_dialog(win, min_w=760, min_h=420)
 
     # ── Write-backs from the stages ───────────────────────────────────────
