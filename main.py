@@ -1481,7 +1481,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._prefs["last_script"] = self._script_path
         self._save_prefs()
 
-        self.seq_name.set("{} (AUTO)".format(doc_title))
+        self.seq_name.set("{} (AUTO)".format(self._export_base_name()))
 
         # Step 1's label and nav exist only while Step 1 is on screen.  A
         # launch from an episode loads with no Step 1 showing, maybe after one
@@ -9988,10 +9988,48 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             title="Save {}".format(ext.upper().strip(".")),
             defaultextension=ext,
             filetypes=ftypes,
-            initialfile="roughcut{}".format(ext))
+            initialfile=self._export_file_stem() + ext,
+            **self._export_initial_dir())
         if p:
             self.out_path.set(p)
             self._seq_from_out_path()
+
+    # ── What the export is called ─────────────────────────────────────────
+    # The episode's name when the script is the episode's, the script's own
+    # title (or file name) otherwise -- never a generic "roughcut".
+
+    def _export_episode(self):
+        """The open episode, when the script on screen is its script."""
+        ep = getattr(self, "_ep", None)
+        try:
+            if ep and self._ep_stage_showing() == "script_session":
+                return ep
+        except Exception:
+            pass
+        return None
+
+    def _export_base_name(self):
+        ep = self._export_episode()
+        title = ((ep or {}).get("title") or "").strip()
+        if title:
+            return title
+        script = getattr(self, "_script_path", None) or ""
+        return (getattr(self, "doc_title", "") or "").strip() \
+            or os.path.splitext(os.path.basename(script))[0] or "roughcut"
+
+    def _export_file_stem(self):
+        """The file name the save dialog offers: the sequence name as it
+        stands (so a retyped one carries over), made safe for a file."""
+        name = self.seq_name.get().strip() \
+            or "{} (AUTO)".format(self._export_base_name())
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .")
+        return name or "roughcut"
+
+    def _export_initial_dir(self):
+        """The save dialog opens in the episode's folder, when there is one."""
+        ep = self._export_episode()
+        root = (ep or {}).get("root")
+        return {"initialdir": root} if root and os.path.isdir(root) else {}
 
     def _seq_from_out_path(self, _e=None):
         """The sequence takes the save file's name; it can still be retyped."""
@@ -10151,7 +10189,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 "(no file / transcript / segments).")
             return
 
-        seq_name = self.seq_name.get() or "roughcut"
+        seq_name = self.seq_name.get() or self._export_base_name()
         tok      = "VO" if res.get("is_vo") else (res.get("token") or "pull")
         # A fresh name per export.  Re-importing a re-exported AAF from the
         # same path into Pro Tools gave the audio of the FIRST export there

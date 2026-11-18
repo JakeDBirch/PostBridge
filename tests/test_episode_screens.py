@@ -781,3 +781,25 @@ def test_send_to_script_needs_a_selection_and_a_doc(app, monkeypatch, project):
     app._pq_send_to_script()
     assert any("Select the words" in e for e in app._errors)
     app._errors.clear()
+
+
+def test_the_export_is_named_after_the_episode(app, monkeypatch, project):
+    """Not "roughcut": the sequence and the file the save dialog offers take
+    the episode's name, and the dialog opens in the episode's folder."""
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    ep["title"] = "GF_07: Dodge City"
+    script = os.path.join(project, "05_SCRIPT", "draft.txt")
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("[PART Open]\n[BUTLER 00:00:05-00:00:20]\nWe went out at four.\n")
+    ep["links"]["script"] = EP.rel(ep, script)
+    app._ep_save()
+    app._ep_launch_s2s()
+    assert _wait(app, lambda: getattr(app, "_pool", None) is not None, secs=30)
+    assert app.seq_name.get() == "GF_07: Dodge City (AUTO)"
+    assert app._export_file_stem() == "GF_07_ Dodge City (AUTO)"
+    assert app._export_initial_dir() == {"initialdir": ep["root"]}
+    app.seq_name.set("my own name")
+    assert app._export_file_stem() == "my own name"
+    assert not app._errors, "\n".join(app._errors)
