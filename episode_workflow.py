@@ -947,13 +947,27 @@ class EpisodeWorkflowMixin:
             self._btn(nav, "CONTINUE  \u2192", _continue, color=ACCENT).pack(side="right")
         else:
             self._btn(nav, "CLOSE", _continue).pack(side="right")
-        self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
-        if findings:
-            self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
-                      ).pack(side="left", padx=(8, 0))
-        if script_normalize.normalize(text, title=meta.get("name"))[1]:
-            self._btn(nav, "FIX FORMAT IN DOC", _fix, small=True, color=ACCENT
-                      ).pack(side="left", padx=(8, 0))
+        if not gdocs.can_edit(meta):
+            # Shared view-only: it fetches and checks, but nothing can be
+            # written back -- say so instead of offering buttons Google
+            # would refuse.
+            owner = gdocs.owner_name(meta) or "its owner"
+            tk.Label(nav, font=FB, bg=BG, fg=WARN, justify="left", anchor="w",
+                     wraplength=520, text=(
+                         "View only: “{}” belongs to {}, and this Google "
+                         "account can't edit it, so notes and Fix Format can't go "
+                         "into the Doc.  Ask {} to share it with you as an Editor, "
+                         "then fetch again.").format(meta.get("name", "the Doc"),
+                                                     owner, owner)
+                     ).pack(side="left", fill="x", expand=True)
+        else:
+            self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
+            if findings:
+                self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
+                          ).pack(side="left", padx=(8, 0))
+            if script_normalize.normalize(text, title=meta.get("name"))[1]:
+                self._btn(nav, "FIX FORMAT IN DOC", _fix, small=True, color=ACCENT
+                          ).pack(side="left", padx=(8, 0))
         self._center_dialog(win, min_w=760, min_h=420)
 
     # ── Write-backs from the stages ───────────────────────────────────────

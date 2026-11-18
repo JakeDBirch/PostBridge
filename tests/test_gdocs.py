@@ -714,3 +714,43 @@ def test_diff_pulls_counts_changes():
     old = "[PART A]\n[BUTLER 00:00:05-00:00:20]\nWe went out.\n[BUTLER 00:01:00-00:01:10]\nLater.\n"
     new = "[PART A]\n[BUTLER 00:00:05-00:00:20]\nWe went out early.\n[JENA 00:02:00-00:02:10]\nNew.\n"
     assert gdocs.diff_pulls(old, new) == (1, 1, 1)
+
+
+def test_a_view_only_doc_says_so_instead_of_a_raw_403():
+    """FIX FORMAT on a Doc shared view-only came back as Google's raw
+    'HttpError 403 ... The caller does not have permission'."""
+    from googleapiclient.errors import HttpError
+
+    class _Resp(dict):
+        status = 403
+        reason = "Forbidden"
+
+    def _refuse(content):
+        def _fail():
+            raise HttpError(_Resp(), content)
+        return _fail
+
+    # An old note to clear, so a write is actually sent.
+    docs = _Docs(_doc(SCRIPT, named={"pbnote:old": (1, 6)}))
+    docs.batchUpdate = lambda documentId, body: _Exec(_refuse(
+        b'{"error": {"code": 403, "message": "The caller does not have '
+        b'permission", "status": "PERMISSION_DENIED"}}'))
+    with pytest.raises(gdocs.DocReadOnly, match="view only"):
+        gdocs.fix_format(None, "doc1", docs=docs)
+    with pytest.raises(gdocs.DocReadOnly):
+        gdocs.write_notes(None, "doc1", [("[PART Open]", "WARN: x")], docs=docs)
+    # A 403 that is not about this account (a quota, say) stays as it was.
+    docs.batchUpdate = lambda documentId, body: _Exec(_refuse(
+        b'{"error": {"code": 403, "message": "Quota exceeded", '
+        b'"status": "RESOURCE_EXHAUSTED"}}'))
+    with pytest.raises(HttpError):
+        gdocs.clear_notes(None, "doc1", docs=docs)
+
+
+def test_can_edit_reads_the_docs_capabilities():
+    assert gdocs.can_edit({"capabilities": {"canEdit": True}})
+    assert not gdocs.can_edit({"capabilities": {"canEdit": False}})
+    assert gdocs.can_edit({"name": "unknown"})           # not asked: assume yes
+    assert gdocs.owner_name({"owners": [{"displayName": "Jordan Sillars"}]}) == \
+        "Jordan Sillars"
+    assert gdocs.owner_name({}) == ""

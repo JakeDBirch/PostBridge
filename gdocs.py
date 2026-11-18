@@ -371,9 +371,44 @@ def fetch_text(creds, doc_id, tab=None, drive=None, docs=None):
     doc = _get_tab(docs, doc_id, tab)
     text = "\n".join(t for t, _s, _e in script_lines(doc)) + "\n"
     # supportsAllDrives: without it a Doc on a shared drive is "not found".
-    meta = drive.files().get(fileId=doc_id, fields="name,modifiedTime,version",
-                             supportsAllDrives=True).execute()
+    # capabilities and owners say up front whether the Doc can be written.
+    meta = drive.files().get(
+        fileId=doc_id, supportsAllDrives=True,
+        fields="name,modifiedTime,version,capabilities(canEdit),owners(displayName)"
+    ).execute()
     return normalize_text(text), meta
+
+
+def can_edit(meta):
+    """Whether the signed-in account may edit the Doc *meta* describes.
+    A Doc shared view-only can be fetched and checked, but not written --
+    no notes, no Fix Format, no Send to Script.  True when unknown."""
+    return (meta.get("capabilities") or {}).get("canEdit", True) is not False
+
+
+def owner_name(meta):
+    owners = meta.get("owners") or []
+    return (owners[0].get("displayName") or "") if owners else ""
+
+
+class DocReadOnly(PermissionError):
+    """Google refused a write: the account can see the Doc, not edit it."""
+
+
+READ_ONLY_MSG = ("Google won't let the signed-in account change this Doc: it is "
+                 "shared with you to view only.  Ask the Doc's owner to share it "
+                 "with you as an Editor, then try again.")
+
+
+def _permission_denied(e):
+    """An HttpError that is Google saying no to this account (403
+    PERMISSION_DENIED) -- not a quota or a disabled API, also 403s."""
+    status = getattr(getattr(e, "resp", None), "status", None)
+    body = getattr(e, "content", b"") or b""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    return str(status) == "403" and (
+        "PERMISSION_DENIED" in body or "does not have permission" in str(e))
 
 
 def paragraphs(doc):
@@ -723,7 +758,12 @@ def _batch(docs, doc_id, reqs, revision_id=None, tab_id=None):
     body = {"requests": _in_tab(reqs, tab_id)}
     if revision_id:
         body["writeControl"] = {"requiredRevisionId": revision_id}
-    docs.documents().batchUpdate(documentId=doc_id, body=body).execute()
+    try:
+        docs.documents().batchUpdate(documentId=doc_id, body=body).execute()
+    except Exception as e:
+        if _permission_denied(e):
+            raise DocReadOnly(READ_ONLY_MSG) from e
+        raise
 
 
 def write_notes(creds, doc_id, notes, tab=None, docs=None):

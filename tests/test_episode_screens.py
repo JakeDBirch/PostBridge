@@ -440,6 +440,44 @@ def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch
     assert not app._errors, "\n".join(app._errors)
 
 
+def test_a_view_only_doc_offers_no_writes_and_says_whose_it_is(app, monkeypatch, project):
+    """A Doc shared view-only fetched and checked fine, then FIX FORMAT IN
+    DOC failed with a raw 403.  Nothing that writes is offered for it."""
+    import gdocs
+    _open_fresh(app, monkeypatch, project)
+    broken = ("Ep 7\nPart 1\n[VO PART_1_NARRATOR]\nA quiet morning.\n---\n"
+              "[BUTLER 00:00:05-00:00:20]\n“We went out.”\n")
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id, tab=None: (
+        broken, {"name": "Ep 7 script", "version": "3", "modifiedTime": "t",
+                 "capabilities": {"canEdit": False},
+                 "owners": [{"displayName": "Jordan Sillars"}]}))
+    app._ep["links"]["gdoc"] = {"id": "doc123", "name": "Ep 7 script"}
+    app._ep_gdoc_fetch()
+    assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
+    _pump(app, 3)
+    win = app._ep_findings_win
+    for label in ("FIX FORMAT IN DOC", "WRITE NOTES INTO DOC", "CLEAR NOTES IN DOC"):
+        assert not _click(app, win, label), label
+
+    def _texts(w):
+        out = []
+        for c in w.winfo_children():
+            try:
+                out.append(c.cget("text"))
+            except Exception:
+                pass
+            out += _texts(c)
+        return out
+    assert any("Jordan Sillars" in t and "View only" in t for t in _texts(win))
+    _click(app, win, "CLOSE")
+    app._ep_findings_win = None
+    assert not app._errors, "\n".join(app._errors)
+
+
 def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     import gdocs
     _open_fresh(app, monkeypatch, project)
