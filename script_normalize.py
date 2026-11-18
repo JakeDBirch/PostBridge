@@ -189,23 +189,9 @@ def normalize(text, title=None):
     """(new_text, changes) -- `changes` says what was done in plain words, and
     is empty when the script's structure is already sound.
 
-    `title` is used when the script has none, usually the file's name.  A
-    part title the narrator reads ("Part 1: Evan") gets a line of narration
-    of its own (add_part_titles).
+    `title` is used when the script has none, usually the file's name.
     """
-    new, changes = _normalize_structure(text, title)
-    base = new if changes else text.lstrip("\ufeff").replace(
-        "\r\n", "\n").replace("\r", "\n")
-    titled, n = add_part_titles(base)
-    if not n:
-        return new, changes
-    return titled, list(changes) + [
-        "Added the narrator's reading of {} part title{} as narration, so it "
-        "is matched and placed".format(n, "" if n == 1 else "s")]
-
-
-def _normalize_structure(text, title=None):
-    text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
     if re.search(r"(?m)^@(PULL|VO|PART)\b", text):
         return text, []                 # the old syntax needs the AI prompt
     if is_plain_script(text) and not has_loose_pulls(text):
@@ -374,113 +360,3 @@ def _normalize_structure(text, title=None):
         return text, []
     return new, changes
 
-
-
-# ── Part titles the narrator reads ───────────────────────────────────────
-#
-# "[PART Part 1: Evan]" names a section, and the narrator reads that name
-# out ("Part one. Evan.") -- but a header is not narration, so nothing asked
-# for that reading to be found in the narrator's recording, and the title
-# never reached the cut.  A part named "Part …" gets its title as the first
-# line of narration in the part: the first paragraph of its first [VO]
-# block when the part opens with narration, else a [VO] block of its own
-# ahead of the pull it opens with.
-
-_READ_TITLE_RE = re.compile(r"^part\s+\S+", re.IGNORECASE)
-_PART_NUM_RE = re.compile(r"^part\s+(\d+)", re.IGNORECASE)
-
-
-def _words(text):
-    return re.findall(r"[a-z']+", text.lower().replace("\u2019", "'"))
-
-
-def _title_is_read(paragraph, name):
-    """True when `paragraph` opens with the part's title: "part", then the
-    title's words (its number in figures or words either way)."""
-    said = _words(paragraph)
-    want = [w for w in _words(name) if w != "part"]
-    if not said or said[0] != "part":
-        return False
-    head = said[1:len(want) + 3]
-    return all(w in head for w in want if w not in _NUM_WORDS)
-
-
-_NUM_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
-              "nine", "ten", "eleven", "twelve"}
-
-
-def unread_part_titles(text):
-    """[(line index, part name, vo id, where, first line)] for every part
-    named "Part …" whose title is not the first narration in it.  `where`
-    is "into" (the part opens with a [VO] block: the title goes first in
-    it) or "before" (it opens with a pull: a [VO] block goes ahead of it).
-    Line indexes are 0-based into text.split("\n"); `first line` is the
-    header that opens the part."""
-    lines = text.split("\n")
-    heads = []
-    for i, raw in enumerate(lines):
-        m = _HEADER_RE.match(_strip_comment(raw).strip())
-        if m:
-            kind = ("part" if m.group("part") is not None else
-                    "vo" if m.group("void") is not None else "pull")
-            heads.append((i, kind, m))
-    out = []
-    for h, (i, kind, m) in enumerate(heads):
-        if kind != "part":
-            continue
-        name = m.group("part").strip()
-        if not _READ_TITLE_RE.match(name):
-            continue
-        rest = []
-        for j, k2, m2 in heads[h + 1:]:
-            if k2 == "part":
-                break
-            rest.append((j, k2, m2))
-        if not rest:
-            continue
-        vo_id = next((m2.group("void") for _j, k2, m2 in rest if k2 == "vo"), None)
-        if vo_id is None:
-            num = _PART_NUM_RE.match(name)
-            if not num:
-                continue
-            vo_id = "PART_{}_NARRATOR".format(int(num.group(1)))
-        j, k2, _m2 = rest[0]
-        if k2 == "vo":
-            first = next((_strip_comment(lines[x]).strip()
-                          for x in range(j + 1, len(lines))
-                          if _strip_comment(lines[x]).strip()), "")
-            if _title_is_read(first, name):
-                continue
-            out.append((i, name, vo_id, "into", j))
-        else:
-            out.append((i, name, vo_id, "before", j))
-    return out
-
-
-def _title_line(name):
-    """The title as narration: "Part 1: Evan" reads "Part 1. Evan." -- not
-    "Part 1: Evan", which is a section line to walk() and would be made a
-    [PART] header again."""
-    line = re.sub(r"^(part\s+\S+?)\s*[:\-–—]\s*", r"\1. ", name.strip(),
-                  count=1, flags=re.IGNORECASE)
-    return line if line[-1:] in ".!?" else line + "."
-
-
-def add_part_titles(text):
-    """(new text, how many added): each unread part title written in as the
-    narrator's first line of its part (see unread_part_titles).  Running it
-    again adds nothing."""
-    if re.search(r"(?m)^@(PULL|VO|PART)\b", text) or (
-            is_plain_script(text) and not has_loose_pulls(text)):
-        return text, 0
-    todo = unread_part_titles(text)
-    if not todo:
-        return text, 0
-    lines = text.split("\n")
-    # From the bottom up, so earlier line indexes still hold.
-    for _i, name, vo_id, where, j in sorted(todo, key=lambda t: -t[4]):
-        if where == "into":
-            lines[j + 1:j + 1] = [_title_line(name), ""]
-        else:
-            lines[j:j] = ["[VO {}]".format(vo_id), _title_line(name), ""]
-    return "\n".join(lines), len(todo)

@@ -1,4 +1,5 @@
 import os, sys, re, io, json, math, tempfile, subprocess, wave, hashlib, threading
+import difflib
 from utils import app_state_dir as _app_state_dir
 
 # All media subprocesses (ffmpeg / ffprobe) go through _run so the child
@@ -3688,6 +3689,13 @@ def refine_segment_endpoints(segments, blobs, snap_thresh=None):
 
 def _vo_base_result(vo_block):
     """Build the skeleton result dict for a VO block."""
+    out = _vo_base_fields(vo_block)
+    if vo_block.get("part_title"):
+        out["part_title"] = True     # the narrator reading a [PART] title
+    return out
+
+
+def _vo_base_fields(vo_block):
     return {
         "order":          vo_block["order"],
         "vo_id":          vo_block["id"],
@@ -3714,6 +3722,67 @@ def _vo_base_result(vo_block):
         "is_vo":          True,
         "gap_after":      vo_block.get("gap_after", True),
     }
+
+
+_NUMBER_WORDS = ("zero one two three four five six seven eight nine ten eleven "
+                 "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+                 "nineteen twenty").split()
+
+
+def _title_tok(w):
+    """A word as a part title is compared: lower case, no punctuation, a
+    number in figures and in words the same ("1" == "one")."""
+    t = re.sub(r"[^a-z0-9']", "", str(w).lower().replace("\u2019", "'"))
+    if t.isdigit() and int(t) < len(_NUMBER_WORDS):
+        return _NUMBER_WORDS[int(t)]
+    return t
+
+
+def match_part_title(title_text, words):
+    """Where the narrator reads a part's title ("Part 1: Evan.") in a take:
+    "part", its number, then the title's words, said together.  A title is
+    short and narrators read it more than once, so this wants the words in
+    a row, not scattered through the read as the narration matcher would
+    take them, and the last complete reading wins -- as for every other
+    line.  Without one, the last "part <number>" alone, at low confidence.
+    Returns a match dict as _match_best does, or None."""
+    want = [t for t in (_title_tok(w) for w in str(title_text).split()) if t]
+    if len(want) < 2 or want[0] != "part":
+        return None
+    said = [(i, _title_tok(w.get("word", ""))) for i, w in enumerate(words or [])]
+    said = [(i, t) for i, t in said if t]
+    num, tail = want[1], want[2:]
+
+    def _same(x, y):
+        return x == y or difflib.SequenceMatcher(None, x, y).ratio() >= 0.8
+
+    # The number may be missing: a transcript can drop a figure ("Part 1"
+    # comes out "part"), so "part" then the title's words is a reading too.
+    full, bare = None, None
+    for k in range(len(said)):
+        if said[k][1] != "part":
+            continue
+        j = k + 1
+        numbered = j < len(said) and said[j][1] == num
+        if numbered:
+            j += 1
+            bare = (k, k + 1)
+        if not tail:
+            if numbered:
+                full = (k, k + 1)
+            continue
+        run = said[j:j + len(tail)]
+        if len(run) == len(tail) and all(_same(x, y) for (_i, x), y in zip(run, tail)):
+            full = (k, j + len(tail) - 1)
+    hit, conf = (full, 1.0) if full is not None else (bare, 0.5)
+    if hit is None:
+        return None
+    a, b = said[hit[0]][0], said[hit[1]][0]
+    seg = (float(words[a]["start"]), float(words[b].get("end", words[b]["start"])))
+    return {"segments": [seg], "confidence": conf,
+            "matched_text": " ".join(str(words[i].get("word", "")).strip()
+                                     for i in range(a, b + 1)),
+            "n_internal_cuts": 0, "n_gap_cuts": 0}
 
 
 def reconcile_vo_part(vo_blocks, takes):
@@ -3776,8 +3845,11 @@ def reconcile_vo_part(vo_blocks, takes):
                 takes_data.append(None)
                 continue
 
-            # Window: only search words at or after (cursor - lookback)
-            window_start = max(0.0, cursors[ti] - _LOOKBACK_S)
+            # Window: only search words at or after (cursor - lookback).
+            # A part title is looked for in the whole take: it is read at the
+            # top, often more than once.
+            window_start = 0.0 if vo_block.get("part_title") else \
+                max(0.0, cursors[ti] - _LOOKBACK_S)
             window = [w for w in audio_words if w.get("start", 0.0) >= window_start]
             if not window:
                 takes_data.append(None)
@@ -3787,7 +3859,8 @@ def reconcile_vo_part(vo_blocks, takes):
             # this window.  It also advances past failed anchors (truncated
             # false starts, slates) instead of giving up on a None return,
             # so multi-take files with intros/retakes are handled correctly.
-            match = _match_best(text, window)
+            match = (match_part_title(text, window) if vo_block.get("part_title")
+                     else _match_best(text, window))
             if match is None or not match["segments"]:
                 takes_data.append(None)
                 continue
@@ -3860,8 +3933,10 @@ def reconcile_vo_part(vo_blocks, takes):
 
         # Advance cursor for the winning take so the next block starts here.
         # Cursor is advanced to the actual last word end — before the tail —
-        # so the next block doesn't search unnecessarily far ahead.
-        cursors[best_take_index] = best_segs[-1][1]
+        # so the next block doesn't search unnecessarily far ahead.  Not for
+        # a part title: its last reading can come after narration began.
+        if not vo_block.get("part_title"):
+            cursors[best_take_index] = best_segs[-1][1]
 
         # Extend the last segment by VO_TAIL_SECS so Whisper's last-word
         # timestamp doesn't abruptly cut off natural decay / room tone.

@@ -180,6 +180,68 @@ def _normalize_tc(s):
 DEFAULT_DOC_TITLE = "PostBridge Episode"
 
 
+# A part named "Part 1: Evan" has its title read by the narrator; Intro,
+# Outro, Cold Open and the like are only names.
+_READ_TITLE_RE = re.compile(r"^part\s+\S+", re.IGNORECASE)
+_PART_NUM_RE = re.compile(r"^part\s+(\d+)", re.IGNORECASE)
+_SMALL_NUMS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
+               "nine", "ten", "eleven", "twelve"}
+
+
+def _title_text(name):
+    name = name.strip()
+    return name if name[-1:] in ".!?" else name + "."
+
+
+def _title_is_read(text, name):
+    """True when narration `text` opens with the part's title: "part", then
+    the title's words (its number in figures or words, either way)."""
+    said = re.findall(r"[a-z']+", text.lower().replace("\u2019", "'"))
+    want = [w for w in re.findall(r"[a-z']+", name.lower()) if w != "part"]
+    if not said or said[0] != "part":
+        return False
+    head = said[1:len(want) + 3]
+    return all(w in head for w in want if w not in _SMALL_NUMS)
+
+
+def _settle_part_titles(pulls, vo_blocks):
+    """Each part title's narrator and place, once the whole script is read.
+
+    Its id is the first [VO] id in its part (else PART_<n>_NARRATOR from the
+    part's own number).  It goes when the script already has it read --
+    the part's first block is narration that opens with it -- or when
+    there is no narrator to read it.  The numbering closes up after any
+    that go."""
+    titles = [v for v in vo_blocks if v.get("part_title")]
+    if not titles:
+        return
+    items = sorted(pulls + vo_blocks, key=lambda x: x["order"])
+    drop = set()
+    for t in titles:
+        pi = t["part_index"]
+        rest = [x for x in items if x["part_index"] == pi and x is not t]
+        vo = next((x for x in rest if "id" in x and not x.get("part_title")),
+                  None)
+        name = t["text"][:-1] if t["text"].endswith(".") else t["text"]
+        if vo is not None and rest and rest[0] is vo and \
+                _title_is_read(vo["text"], name):
+            drop.add(id(t))
+            continue
+        if vo is not None:
+            t["id"] = vo["id"]
+            continue
+        num = _PART_NUM_RE.match(name)
+        if num and rest:
+            t["id"] = "PART_{}_NARRATOR".format(int(num.group(1)))
+        else:
+            drop.add(id(t))
+    if drop:
+        vo_blocks[:] = [v for v in vo_blocks if id(v) not in drop]
+        for n, x in enumerate(sorted(pulls + vo_blocks,
+                                     key=lambda x: x["order"]), 1):
+            x["order"] = n
+
+
 def parse_script(text):
     """Parse a script in the bracketed syntax.
 
@@ -188,7 +250,9 @@ def parse_script(text):
       parts    : [{index, name}]
       pulls    : [{order, token, in_tc, out_tc, in_seconds, out_seconds,
                    part_index, quote_text, quote_paragraphs, gap_after}]
-      vo_blocks: [{order, id, part_index, text, paragraphs, gap_after}]
+      vo_blocks: [{order, id, part_index, text, paragraphs, gap_after}];
+                 a part's title the narrator reads is one of them, with
+                 "part_title": True (see _READ_TITLE_RE)
       doc_title: str
       warnings : [str]
     """
@@ -283,7 +347,22 @@ def parse_script(text):
         # ── PART ─────────────────────────────────────────────────────────
         if m.group("part") is not None:
             cur_part += 1
-            parts.append({"index": cur_part, "name": m.group("part").strip()})
+            name = m.group("part").strip()
+            parts.append({"index": cur_part, "name": name})
+            if _READ_TITLE_RE.match(name):
+                # The narrator reads this title out: it is the first line
+                # of narration in the part, ahead of whatever opens it.
+                # Its id is the part's narrator's, settled below.
+                vo_blocks.append({
+                    "order":      order,
+                    "id":         None,
+                    "part_index": cur_part,
+                    "text":       _title_text(name),
+                    "paragraphs": [_title_text(name)],
+                    "gap_after":  True,
+                    "part_title": True,
+                })
+                order += 1
             i += 1
             continue
 
@@ -355,6 +434,8 @@ def parse_script(text):
             "gap_after":        gap_after,
         })
         order += 1
+
+    _settle_part_titles(pulls, vo_blocks)
 
     if vo_blocks and not parts:
         parts.append({"index": 1, "name": "Episode VO"})

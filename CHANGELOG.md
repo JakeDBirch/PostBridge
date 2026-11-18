@@ -9,11 +9,14 @@
 - **Place the insertion point on the join, in either region beside it, or in the dimmed cut audio** with Show surrounding audio on. The nearest join in that pull is healed. **Highlight across several joins** to heal them all at once.
 - A join that jumps back in the recording (a pickup from earlier in the read) can't be one region, so it's left, and the status line says so.
 
-### Script: the part titles the narrator reads are narration
-- **The narrator reads each part's title** ("Part 1: Evan"), but the script only had it in the `[PART Part 1: Evan]` header. A header isn't narration, so nothing looked for that reading in the narrator's recording, and the titles never reached the cut.
-- **Script Check now warns** when a part named "Part …" has no narration reading its title, and lists those parts. Intro, Outro and other unnumbered parts aren't flagged.
-- **FIX FORMAT writes the title in** as the first narration of the part, as "Part 1. Evan." (the matcher ignores figures and punctuation, so it finds "Part one, Evan" or "Part 1, Evan"). A part that opens with narration gets the title as its first paragraph. A part that opens with a pull gets a `[VO PART_n_NARRATOR]` block of its own ahead of the pull, so the title plays before the clip. Running it again adds nothing, and FIX FORMAT IN DOC does the same in a Google Doc.
-- This adds new narration lines, so the episode has to be matched again (Step 3) for the titles to reach the cut.
+### Part titles: PostBridge knows the narrator reads them
+- **A part named "Part …" now has its title read by the narrator,** as part of the script, with nothing written in. "[PART Part 1: Evan]" is Jordan's first line of narration in that part: matched in his recording for the part and placed ahead of whatever opens it. When the part opens with a pull, the title plays before the clip. Intro, Outro and other unnumbered parts are only names. A script that already has the narrator reading the title doesn't get it twice.
+- **The title has a matcher of its own.** Narrators read a title more than once at the top of the take, so it looks for "part", its number and the title's words said together, and takes the last complete reading, as for any other line. A number the transcript dropped ("Part 1" written "part") still counts, and so does a near spelling ("Tanto" for "Tonto"). On Arizona Teens all six titles land on one clean reading each.
+- **An episode already in Step 4 gets its titles when it opens.** Its saved work is renumbered onto the same lines, each title is matched in the part's recording, and nothing has to be matched again. If the saved results don't line up with the script one for one, they're left exactly as saved and the log says so; Step 3 then matches the titles.
+- An earlier version of this today had Script Check warn and Fix Format write the title into the script. That's gone: there's nothing to write.
+
+### Assembly: Snap on and off (G)
+- **G turns snapping off and on**, with a **Snap** button in the Edit panel. Off, edges, highlights and rolls go exactly where they're dragged, as holding Ctrl does, and the snap ticks aren't drawn. It applies in Find in recording too. On is the default.
 
 ### Assembly: Normalize, and a cut drags whole
 - **Normalize** (in PLAY · MONITOR, on by default) plays every pull at the one level: a quiet recording is brought up (by up to +32 dB) and a hot one brought down, and its waveform is drawn at that level too. The level is taken from a pull's speech peaks, not its single loudest moment. Playback only: the AAF and the files are untouched. Turn it off to hear the recordings as they are.

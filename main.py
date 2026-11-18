@@ -1895,7 +1895,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # If results were saved and loaded, skip straight to Step 4
         if getattr(self, "_pending_results", None) is not None:
-            self.results = self._pending_results
+            self.results = self._with_part_titles(self._pending_results)
             del self._pending_results
             self.after(50, self._step4)
         elif getattr(self, "_pending_mark_saved", False):
@@ -1904,6 +1904,63 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # capture it as the clean baseline for the close prompt.
             self._pending_mark_saved = False
             self._mark_saved()
+
+    def _with_part_titles(self, results):
+        """Saved results from before the script's part titles were lines of
+        narration (parsers._settle_part_titles): renumbered to make room for
+        them, and each title matched in its part's narrator recording, so
+        an episode already in Step 4 gets them without being matched again.
+
+        Renumbered only when the saved rows line up one for one with the
+        script's other lines (the same token or narrator id at each place);
+        otherwise left exactly as saved, and Step 3 matches the titles."""
+        titles = [v for v in (self.vo_blocks or []) if v.get("part_title")]
+        if not titles or not results or self._monolog or \
+                any(r.get("part_title") for r in results):
+            return results
+        items = sorted(list(self.pulls or []) + list(self.vo_blocks or []),
+                       key=lambda x: x["order"])
+        others = [x for x in items if not x.get("part_title")]
+        saved = sorted(results, key=lambda r: r.get("order", 0))
+        if len(saved) != len(others) or \
+                [r.get("order") for r in saved] != list(range(1, len(saved) + 1)):
+            return results
+        for r, x in zip(saved, others):
+            same = (r.get("vo_id") == x.get("id") if "id" in x
+                    else r.get("token") == x.get("token"))
+            if not same:
+                self._log_line("Part titles: the saved results don't line up "
+                               "with the script at #{}; left as saved, and "
+                               "Step 3 will match the titles".format(r.get("order")))
+                return results
+        out = [dict(r, order=x["order"]) for r, x in zip(saved, others)]
+        for t in titles:
+            res = engines._vo_base_result(t)
+            res["status"] = "no_match"
+            # The part's narrator recording, from its other narration.
+            near = next((r for r in out if r.get("is_vo")
+                         and r.get("part_index") == t["part_index"]
+                         and (r.get("source_audio") or r.get("takes_data"))), None)
+            apath = None
+            if near is not None:
+                td = near.get("takes_data") or []
+                bi = near.get("best_take_index") or 0
+                apath = (td[bi].get("apath") if bi < len(td) and
+                         isinstance(td[bi], dict) else None) or near.get("source_audio")
+            words, blobs = engines.pb_transcript_load(apath) if apath \
+                else (None, None)
+            if not words and apath:
+                words, blobs = engines.cache_load(apath), None
+            if words:
+                try:
+                    self._s4_reconcile_vo_row(res, apath, words, blobs)
+                except Exception:
+                    pass             # stays no_match: Step 3 finds it
+            out.append(res)
+        out.sort(key=lambda r: r["order"])
+        self._log_line("Part titles: {} read by the narrator, added to the "
+                       "cut".format(len(titles)))
+        return out
 
     def _setup_sidecar_path(self):
         if not hasattr(self, '_script_path') or not self._script_path:

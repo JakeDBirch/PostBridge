@@ -376,85 +376,11 @@ def test_fix_keeps_every_vo_block_in_its_part():
 
 
 def test_fix_never_changes_the_words():
-    """Nothing the script says changes.  The one thing added is a part
-    title the narrator reads, as a line of narration of its own."""
-    read = ("Part 1. The Lake.", "Part 1. Bill.", "Part 2. The Hit Men.")
     for script in (SWALLOWED, NUMBERS_BELOW):
         fixed, _ = normalize(script, title="T")
         section = ("Part 1: The Lake", "Part 1: Bill", "Part 2: The Hit Men")
         assert ([w for w in _words(script) if w not in section]
-                == [w for w in _words(fixed) if w != "T" and w not in read])
-
-
-# ── Part titles the narrator reads ───────────────────────────────────────
-
-TITLES = """Ep 7
-
-[PART Intro]
-
-[VO PART_0_NARRATOR]
-That's next.
-
-[PART Part 1: Evan]
-
-[SANDRA1 00:00:29-00:00:57]
-“He was a very happy person.”
-
-[VO PART_1_NARRATOR]
-It is a mother's prerogative.
-
-[PART Part 2 – The Tonto]
-
-[VO PART_2_NARRATOR]
-That's Arizona resident Joey Hergatt.
-
-[PART Part 3: Read Already]
-
-[VO PART_3_NARRATOR]
-Part three. Read already.
-
-More narration.
-
-[PART Outro]
-
-[VO PART_4_NARRATOR]
-Thanks for listening.
-"""
-
-
-def test_script_check_names_a_part_title_nobody_reads():
-    found = [f for f in run_checks(TITLES) if "Part title" in f.title]
-    assert len(found) == 1 and found[0].severity == WARN
-    assert "“Part 1: Evan”" in found[0].detail
-    assert "“Part 2 – The Tonto”" in found[0].detail
-    assert "Read Already" not in found[0].detail     # its narration says it
-    assert "Intro" not in found[0].detail and "Outro" not in found[0].detail
-
-
-def test_fix_format_reads_the_titles_in_and_twice_changes_nothing():
-    fixed, changes = normalize(TITLES, title="Ep 7")
-    assert any("part title" in c for c in changes)
-    # A part that opens with a pull: a [VO] block of its own ahead of it.
-    assert ("[PART Part 1: Evan]\n\n[VO PART_1_NARRATOR]\nPart 1. Evan.\n\n"
-            "[SANDRA1 00:00:29-00:00:57]") in fixed
-    # A part that opens with narration: the title first in it.
-    assert ("[VO PART_2_NARRATOR]\nPart 2. The Tonto.\n\n"
-            "That's Arizona resident Joey Hergatt.") in fixed
-    assert fixed.count("Read already") == 1
-    again, more = normalize(fixed, title="Ep 7")
-    assert again == fixed and not more
-    assert not [f for f in run_checks(fixed) if "Part title" in f.title]
-
-
-def test_a_read_title_is_narration_in_its_part_before_the_pull():
-    fixed, _ = normalize(TITLES, title="Ep 7")
-    _t, parts, pulls, vos, _d, _w = parse_script(fixed)
-    part1 = next(p["index"] for p in parts if p["name"] == "Part 1: Evan")
-    title = next(v for v in vos if v["text"] == "Part 1. Evan.")
-    sandra = next(p for p in pulls if p["token"] == "SANDRA1")
-    assert title["part_index"] == part1 == sandra["part_index"]
-    assert title["id"] == "PART_1_NARRATOR"
-    assert title["order"] < sandra["order"]
+                == [w for w in _words(fixed) if w != "T"])
 
 
 def test_fix_rewrites_a_loose_pull_and_keeps_its_quote():
@@ -549,7 +475,9 @@ def test_fix_format_saves_a_copy_and_opens_it(tmp_path):
         assert os.path.basename(path) == "Episode_fixed.txt"
         assert src.read_text(encoding="utf-8") == SWALLOWED
         assert app._script_path == os.path.abspath(path)
-        assert len(app.vo_blocks) == 5
+        # Five blocks of narration, and the part title the narrator reads.
+        assert len([v for v in app.vo_blocks if not v.get("part_title")]) == 5
+        assert [v["text"] for v in app.vo_blocks if v.get("part_title")] == ["Part 1: The Lake."]
         assert os.path.basename(app._fix_format_save(fixed)) == "Episode_fixed_fixed.txt"
     finally:
         app.destroy()

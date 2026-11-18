@@ -396,8 +396,8 @@ def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch
     _open_fresh(app, monkeypatch, project)
     broken = ("Ep 7\nPart 1\n[VO PART_1_NARRATOR]\nA quiet morning.\n---\n"
               "[BUTLER 00:00:05-00:00:20]\n“We went out.”\n")
-    fixed = "Ep 7\n[PART Part 1]\n[VO PART_1_NARRATOR]\nPart 1.\n\n" \
-            "A quiet morning.\n[BUTLER 00:00:05-00:00:20]\n“We went out.”\n"
+    fixed = "Ep 7\n[PART Part 1]\n[VO PART_1_NARRATOR]\nA quiet morning.\n" \
+            "[BUTLER 00:00:05-00:00:20]\n“We went out.”\n"
     doc = {"text": broken}
     calls = []
     monkeypatch.setattr(gdocs, "is_configured", lambda: True)
