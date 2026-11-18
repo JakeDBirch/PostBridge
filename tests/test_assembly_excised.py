@@ -415,3 +415,20 @@ def test_preroll_is_the_finished_cut_ahead_not_a_skipped_handle(view, monkeypatc
     # Hearing the surrounding audio, the pre-roll is what is on the track.
     monkeypatch.setitem(assembly_view._MONITOR, "skip_cuts", False)
     assert win._preroll_start(o2) == pytest.approx(o2 - 2.0)
+
+
+def test_the_speeds_are_three_quarter_one_one_and_a_half_two_three(view, monkeypatch):
+    app, win = view
+    monkeypatch.setattr(assembly_view.match_review, "_LAST_PLAY_RATE", 1.0)
+    win._rate = 1.0
+    seen = []
+    for _ in range(4):
+        win.step_rate(1)
+        seen.append(win._rate)
+    assert seen == [1.5, 2.0, 3.0, 3.0]
+    for _ in range(5):
+        win.step_rate(-1)
+    assert win._rate == 0.75
+    win._rate = 1.25                     # a speed from before: the nearest one up
+    win.step_rate(1)
+    assert win._rate in (1.5, 2.0)
