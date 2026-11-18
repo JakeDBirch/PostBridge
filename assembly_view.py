@@ -1,17 +1,22 @@
 """Assembly view -- the reconciled episode as one continuous track, and
 the recording behind any pull of it.
 
-Two views of the one cut.  The CUT view is the track described below.
-Shift+S (or Enter) flips to the SOURCE view: the pull at the insertion
-point drawn against its whole recording, with its edit points, cuts and
-marks on it -- the waveform editor (match_review.MatchReviewDialog), built
-into this window.  The playhead stays on the same moment of audio either
-way.  Each view plays what it shows: the cut, or the recording straight
-through.  An edit in the source view is saved as it is made, like one on
-the track, through the same accept and undo.  The keys are the same in
-both: Space plays, B splits at the playhead, C takes half a second out
-from it, M / X / N drop marks, , and . nudge the edge or region last
-taken, arrows step to the next pull, Ctrl+Z is Step 4's undo.
+One track, two ways of looking at it.  Enter shows the SURROUNDING
+audio on it: every cut inside a pull opened up to show the tape
+it takes out, dimmed, and a handle of the recording either side of each
+pull (_open_up).  What plays is still the finished cut, jumping the
+dimmed audio, unless Skip edits (Shift+S) is off.  Every edit works the
+same opened up; an edge drags into the dimmed audio, and double-clicking
+a cut's brings it back.  The ruler and timecode read the finished cut's
+time either way (_to_cut / _to_open).
+
+Ctrl+F shows the pull at the insertion point against its whole
+recording -- the waveform editor (match_review.MatchReviewDialog), built
+into this window -- for hunting a line far from where it was pulled, or
+in another recording.  Edits there save as they are made, through the
+same accept and undo, and the keys are the same: Space plays, B splits,
+C takes half a second out, M / X / N drop marks, , and . nudge, arrows
+step pulls, Ctrl+Z is Step 4's undo.
 
 Step 4 reviews one pull at a time.  This is the other way of looking at the
 same data: every placed pull laid end to end, exactly where build_aaf will
@@ -141,6 +146,7 @@ TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without o
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
+EXCISED_MAX_S = 30.0  # tape cut out of a pull shows, dimmed, up to this long
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -164,6 +170,8 @@ _C_SAID     = "#e8c98a"   # words said that aren't in the script
 _C_TXSEL    = "#35597a"   # highlighted words
 _C_SNAP_TICK = "#556070"  # where an edge will snap, as in the waveform editor
 _C_SNAPPED  = "#ffaa00"   # an edge that has snapped
+_C_GHOST_BG = "#17191c"   # excised audio and handles on show
+_C_GHOST_WORD = "#5d6168"  # their words
 SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too closely
 
 
@@ -256,6 +264,17 @@ class _KeyButton(object):
         return self
 
 
+def _dim(col, k=0.35):
+    """A colour faded k of the way from the ground to itself."""
+    try:
+        c = [int(col[i:i + 2], 16) for i in (1, 3, 5)]
+        g = [int(_C_GHOST_BG[i:i + 2], 16) for i in (1, 3, 5)]
+    except (ValueError, TypeError, IndexError):
+        return col
+    return "#{:02x}{:02x}{:02x}".format(
+        *(int(round(b + (a - b) * k)) for a, b in zip(c, g)))
+
+
 def _fmt_tc(t, places=1):
     """Timeline position as M:SS.s (H:MM:SS.s past the hour), to `places`
     decimals of a second."""
@@ -295,6 +314,16 @@ class _Clip(object):
             self.src_hi = max(si + du for _, du, si in self.pieces)
         else:
             self.src_lo = self.src_hi = 0.0
+        # With the excised audio shown (_open_up): the tape the pull's cuts
+        # take out, and a handle either side of it, dimmed on the track --
+        # (timeline start, duration, source in, "cut" | "handle", k), k the
+        # region a cut comes before.  Not in the cut, so not in the AAF.
+        self.ghosts    = [(st / float(sr), du / float(sr), si / float(sr), kind, k)
+                          for st, du, si, kind, k in entry.get("ghosts") or ()]
+        self.vis_lo    = min([self.start] + [g[0] for g in self.ghosts])
+        self.vis_hi    = max([self.end] + [g[0] + g[1] for g in self.ghosts])
+        self.need_lo   = min([self.src_lo] + [g[2] for g in self.ghosts])
+        self.need_hi   = max([self.src_hi] + [g[2] + g[1] for g in self.ghosts])
         self.words = None              # [(tl_start, tl_end, text)] once loaded
         self.load_error = None
         self.tint = _C_VO                # the token's colour (see _layout)
@@ -322,6 +351,98 @@ class _Clip(object):
             if tl <= t < tl + du:
                 return k
         return None
+
+    def ghost_at(self, t):
+        """The excised audio or handle under timeline time t, or None."""
+        return next((g for g in self.ghosts if g[0] <= t < g[0] + g[1]), None)
+
+
+def _open_up(placed, part_starts, sr, handle_s=HANDLE_S, max_cut_s=EXCISED_MAX_S):
+    """layout_timeline's placement with the excised audio shown: every cut
+    inside a pull opened up to show the tape it takes out (up to max_cut_s
+    of it; a longer jump, or one back in the recording, stays closed), and
+    a handle of the recording either side of each pull.  The finished cut
+    keeps its order and its silences; only room is made.
+
+    Returns (placed, part_starts, shifts).  Each entry gets "ghosts":
+    [(start, dur, source in, "cut" | "handle", k)] in samples, k the region
+    a cut comes before.  shifts: [(cut time, seconds of room, inclusive)]
+    in seconds, where room was made, in order -- what _to_open / _to_cut
+    turn finished-cut time and timeline time into each other with."""
+    H = int(round(handle_s * sr))
+    cap = max_cut_s * sr
+    shift, shifts, out, moved = 0, [], [], {}
+    for e in placed:
+        pieces = e.get("pieces") or []
+        start0 = e["start"]
+        if not pieces:
+            moved[start0] = start0 + shift
+            out.append(dict(e, start=start0 + shift, end=e["end"] + shift,
+                            ghosts=[]))
+            continue
+        ghosts, new = [], []
+        h0 = min(H, int(pieces[0][2]))
+        moved[start0] = start0 + shift          # where the pull's room begins
+        if h0 > 0:
+            ghosts.append((pieces[0][0] + shift, h0, pieces[0][2] - h0,
+                           "handle", 0))
+            shift += h0
+            shifts.append((pieces[0][0] / float(sr), h0 / float(sr), True))
+        for k, (st, du, si) in enumerate(pieces):
+            if k:
+                pst, pdu, psi = pieces[k - 1]
+                ex = si - (psi + pdu)
+                if 0 < ex <= cap:
+                    ghosts.append((pst + pdu + shift, ex, psi + pdu, "cut", k))
+                    shifts.append(((pst + pdu) / float(sr), ex / float(sr), False))
+                    shift += ex
+            new.append((st + shift, du, si))
+        end = e["end"] + shift
+        lst, ldu, lsi = pieces[-1]
+        ghosts.append((end, H, lsi + ldu, "handle", len(pieces)))
+        shifts.append((e["end"] / float(sr), H / float(sr), False))
+        shift += H
+        out.append(dict(e, start=new[0][0], end=end, pieces=new, ghosts=ghosts))
+    parts = {pi: moved.get(sa, sa) for pi, sa in part_starts.items()}
+    return out, parts, shifts
+
+
+def _to_open(t, shifts):
+    """Finished-cut time t on the opened-up timeline (see _open_up)."""
+    add = 0.0
+    for p, room, inclusive in shifts:
+        if p < t or (inclusive and p <= t):
+            add += room
+        else:
+            break
+    return t + add
+
+
+def _to_cut(d, shifts):
+    """Timeline time d, opened up, as finished-cut time: in excised audio or
+    a handle, the moment the cut moves on from it."""
+    add = 0.0
+    for p, room, _inc in shifts:
+        at = p + add                     # where the room starts, opened up
+        if d < at:
+            break
+        if d < at + room:
+            return p
+        add += room
+    return d - add
+
+
+def _kept_spans(ghosts, lo, hi):
+    """[lo, hi] less the ghosts' spans: what plays when only the finished
+    cut is heard."""
+    out, cur = [], lo
+    for a, du in sorted((g[0], g[1]) for g in ghosts):
+        if a > cur:
+            out.append((cur, a))
+        cur = max(cur, a + du)
+    if cur < hi:
+        out.append((cur, hi))
+    return out
 
 
 def _tidy(segments, gaps=None):
@@ -638,10 +759,13 @@ class _AssemblyAudio(object):
     def __len__(self):
         return self._len
 
-    def set_clips(self, clips, total_s):
+    def set_clips(self, clips, total_s, ghosts=False):
+        """The pieces to compose; with `ghosts`, the excised audio and
+        handles on show too (heard, not skipped)."""
         pieces = []
         for c in clips:
-            for tl, du, si in c.pieces:
+            for tl, du, si in list(c.pieces) + (
+                    [g[:3] for g in c.ghosts] if ghosts else []):
                 pieces.append((int(round(tl * self.sr)) + self._lead,
                                int(round(du * self.sr)), c.order, si))
         pieces.sort()
@@ -758,6 +882,9 @@ class AssemblyWindow(object):
         self.sel_marker = None           # (order, index) of the chosen mark
         self._rename    = None           # (entry widget, (order, index))
         self.view       = "cut"          # "cut" | "source" (see toggle_view)
+        self.excised    = False          # the cut audio shown on the track
+        self._shifts    = []             # where it made room (_open_up)
+        self._gwords    = {}             # order -> (key, excised words)
         self.src        = None           # the source view: the waveform editor
         self._src_order = None           # the pull it shows
         self._pool = concurrent.futures.ThreadPoolExecutor(
@@ -939,7 +1066,7 @@ class AssemblyWindow(object):
                               toggle=True)
         self.script_key = key(p, "Script follows words", "Shift+F",
                               self.toggle_script_follow, toggle=True)
-        self.skip_key = key(p, "Skip cuts in the source view", "K",
+        self.skip_key = key(p, "Skip edits", "Shift+S",
                             self.toggle_skip_cuts, toggle=True)
 
         p = self._panel("EDIT")
@@ -967,8 +1094,9 @@ class AssemblyWindow(object):
         key(p, "Accept & next", "Ctrl+Enter", self.accept_next)
         key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
-        self.view_key = key(p, "Source view", "Shift+S", self.toggle_view,
-                            toggle=True)
+        self.view_key = key(p, "Show surrounding audio", "Enter",
+                            self.toggle_view, toggle=True)
+        key(p, "Find in recording", "Ctrl+F", self.find_in_recording)
         gap = tk.Frame(p, bg=SURF)
         tk.Label(gap, text="Default gap", font=(FB[0], 10), bg=SURF,
                  fg=TEXT).pack(side="left", padx=(0, 4))
@@ -1021,7 +1149,9 @@ class AssemblyWindow(object):
                        anchor="w", text=(
             "Top half of a region: select (click = insertion point, drag = "
             "highlight).  Bottom half: grab (click = region, drag = move, "
-            "double-click = waveform editor).  Edge: trim.  Gap: drag to "
+            "double-click = show the surrounding audio).  Edge: trim, into "
+            "the dimmed audio too.  Dimmed: click to listen from there, "
+            "double-click a cut to bring it back.  Gap: drag to "
             "retime.  Flag: drag, double-click to name, Ctrl+click or "
             "right-click to delete.  "
             "Edges and highlights snap to speech starts and stops; hold Ctrl "
@@ -1182,6 +1312,12 @@ class AssemblyWindow(object):
                       if r.get("order") in overrides else r for r in edited]
         placed, _skipped, part_starts = engines.layout_timeline(
             edited, app.gap_var.get(), LAYOUT_SR, int_assets)
+        # Spotting marks ride on the finished cut's placement.
+        marks = engines.place_markers(placed, LAYOUT_SR)
+        self._shifts = []
+        if self.excised:
+            placed, part_starts, self._shifts = _open_up(
+                placed, part_starts, LAYOUT_SR)
         by_order = {r.get("order"): r for r in app.results}
         review   = set(app.REVIEW_STATUSES) | {"provisional"}
         host_lc  = HOST_NAME.lower()
@@ -1241,9 +1377,12 @@ class AssemblyWindow(object):
         self.part_marks = [] if app._monolog else sorted(
             (sa / float(LAYOUT_SR), names.get(pi, ""))
             for pi, sa in part_starts.items())
-        self.audio.set_clips(clips, self.total_s)
-        self.markers = [dict(m, t=m["pos"] / float(LAYOUT_SR))
-                        for m in engines.place_markers(placed, LAYOUT_SR)]
+        if clips:
+            self.total_s = max(c.vis_hi for c in clips)
+        self._set_play_spans()
+        self.markers = [dict(m, t=_to_open(m["pos"] / float(LAYOUT_SR),
+                                           self._shifts))
+                        for m in marks]
         if self.sel_marker is not None and not any(
                 (m["order"], m["index"]) == self.sel_marker for m in self.markers):
             self.sel_marker = None
@@ -1323,8 +1462,11 @@ class AssemblyWindow(object):
             buf = self.audio.buffer(c.order)
             if buf is not None:
                 path, t0, pcm = buf
-                if path == c.play_path and t0 <= c.src_lo + 1e-6 and \
-                        t0 + len(pcm) / float(PLAY_SR) >= c.src_hi - 1e-6:
+                end = t0 + len(pcm) / float(PLAY_SR)
+                if path == c.play_path and \
+                        t0 <= max(0.0, c.need_lo) + 1e-6 and \
+                        (end >= c.need_hi - 1e-6 or
+                         self._file_end.get(path, float("inf")) <= end + 1e-3):
                     if c.words is None:
                         todo.append(c)
                     continue
@@ -1342,13 +1484,13 @@ class AssemblyWindow(object):
         try:
             buf = self.audio.buffer(c.order)
             if buf is not None and buf[0] == c.play_path and \
-                    buf[1] <= c.src_lo and \
-                    buf[1] + len(buf[2]) / float(PLAY_SR) >= c.src_hi:
+                    buf[1] <= max(0.0, c.need_lo) and \
+                    buf[1] + len(buf[2]) / float(PLAY_SR) >= c.need_hi:
                 path, t0, pcm = buf
             else:
                 path = c.play_path
-                t0   = max(0.0, c.src_lo - HANDLE_S)
-                want = (c.src_hi + HANDLE_S) - t0
+                t0   = max(0.0, c.need_lo - HANDLE_S)
+                want = (c.need_hi + HANDLE_S) - t0
                 pcm  = engines.extract_pcm_range(path, t0, want, PLAY_SR)
                 if len(pcm) < (want - 0.05) * PLAY_SR:
                     # Ran off the end of the file: a trim stops there.
@@ -2469,10 +2611,13 @@ class AssemblyWindow(object):
         step = next((s for s in RULER_STEPS
                      if self._measure(_fmt_tc(t1, _places(s))) + 24 <= s * self.pps),
                     1200)
-        n = math.floor(t0 / step)
-        while n * step <= t1:
+        # The ruler reads the finished cut's time, the excised audio on
+        # show or not: room made for it has no time of its own.
+        c0, c1 = self._to_cut_t(t0), self._to_cut_t(t1)
+        n = math.floor(c0 / step)
+        while n * step <= c1:
             k = n * step                 # not a running sum: it drifts at small steps
-            x = self._x(k)
+            x = self._x(self._to_open_t(k))
             cv.create_line(x, 2, x, ls + 2, fill=BORDER)
             if k >= 0:
                 cv.create_text(x + 4, 2, text=_fmt_tc(k, _places(step)),
@@ -2499,14 +2644,19 @@ class AssemblyWindow(object):
         lane_mid = (lane_top + lane_bot) / 2.0
         lane_h   = (lane_bot - lane_top) / 2.0
         show_words = self.pps >= 20
+        if self.excised:
+            i0 = max(0, i0 - 1)          # a handle reaches back into view
         for c in self.clips[i0:]:
-            if c.start > t1:
+            if c.vis_lo > t1:
                 break
-            if c.end < t0:
+            if c.vis_hi < t0:
                 continue
             xs, xe = self._x(c.start), self._x(c.end)
             col = c.colour()
             cv.create_rectangle(xs, y0, xe, y1, fill=_C_CLIP_BG, outline=BORDER)
+            if c.ghosts:
+                self._draw_ghosts(c, y0, y1, lane_mid, lane_h, col, w,
+                                  show_words)
             cv.create_rectangle(xs, y0, xe, y0 + (5 if c.flagged else 3),
                                 fill=_C_FLAG if c.flagged else col, outline="")
             for k, (tl, du, si) in enumerate(c.pieces[1:], 1):
@@ -2649,7 +2799,62 @@ class AssemblyWindow(object):
                                  self._marker_row(self._lane(m))[0] - 2,
                                  anchor="nw", window=entry)
 
-    def _draw_wave(self, c, xs, xe, mid, half, col, w):
+    def _draw_ghosts(self, c, y0, y1, mid, half, col, w, show_words):
+        """The excised audio and handles of a pull, dimmed: a darker
+        ground, the waveform faint, its words faint -- in view to trim
+        into, double-click a cut's to bring it back."""
+        cv = self.cv
+        buf = self.audio.buffer(c.order)
+        have = (buf[1], buf[1] + len(buf[2]) / float(PLAY_SR)) \
+            if buf is not None and buf[0] == c.play_path else None
+        dim = _dim(col)
+        for tl, du, si, kind, _k in c.ghosts:
+            xa, xb = self._x(tl), self._x(tl + du)
+            if xb < 0 or xa > w:
+                continue
+            cv.create_rectangle(xa, y0 + 4, xb, y1, fill=_C_GHOST_BG,
+                                outline="")
+            if have is not None:
+                a, b = max(si, have[0]), min(si + du, have[1])
+                if b > a:
+                    self._draw_wave(c, self._x(tl + a - si), self._x(tl + b - si),
+                                    mid, half, dim, w,
+                                    pieces=[(tl + a - si, b - a, a)])
+            if kind == "cut" and self._fits("cut", xb - xa - 8):
+                cv.create_text((xa + xb) / 2.0, y0 + 6, text="cut",
+                               anchor="n", font=self._font, fill=SUB)
+        if show_words:
+            last = -1e9
+            for ws, word in self._ghost_words(c):
+                x = self._x(ws)
+                if x < last or x < -200 or x > w:
+                    continue
+                cv.create_text(x + 2, y1 - 4, text=word, anchor="sw",
+                               font=self._font, fill=_C_GHOST_WORD)
+                last = x + 2 + self._measure(word) + self._measure(" ")
+
+    def _ghost_words(self, c):
+        """The transcript's words in a pull's excised audio and handles:
+        [(timeline start, word)]."""
+        words = self._raw_words(c, load=False) or []
+        key = (id(words), tuple(g[:3] for g in c.ghosts))
+        memo = self._gwords.get(c.order)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        ordered, starts = _indexed(words)
+        out = []
+        for tl, du, si, _kind, _k in c.ghosts:
+            i = bisect.bisect_left(starts, si)
+            while i < len(ordered) and starts[i] < si + du:
+                for s0, s1, text, _g, _src in _word_units(ordered[i]):
+                    if si <= _word_point(s0, s1) < si + du:
+                        out.append((tl + s0 - si, text))
+                i += 1
+        self._gwords[c.order] = (key, out)
+        return out
+
+    def _draw_wave(self, c, xs, xe, mid, half, col, w, pieces=None):
+        pieces = c.pieces if pieces is None else pieces
         cv = self.cv
         env = self._env.get(c.order)
         a, b = max(0, int(xs)), min(w, int(xe))
@@ -2661,13 +2866,14 @@ class AssemblyWindow(object):
         e_t0, e = env
         if not len(e):
             return
-        if self.pps >= ENV_HZ and self._draw_samples(c, a, b, mid, half, col):
+        if self.pps >= ENV_HZ and self._draw_samples(c, a, b, mid, half, col,
+                                                     pieces):
             return
         # A region at a time: one shape across them all would bridge the
         # silence between them, and the peak of a join's pixel would reach
         # into the tape cut there.
         per = max(1, int(math.ceil(ENV_HZ / self.pps)))
-        for tl, du, si in c.pieces:
+        for tl, du, si in pieces:
             pa = max(a, int(math.ceil(self._x(tl))))
             pb = min(b, int(math.ceil(self._x(tl + du))))
             if pb <= pa:
@@ -2691,7 +2897,7 @@ class AssemblyWindow(object):
             bot = np.column_stack((px[::-1], (mid + amp + 0.5)[::-1])).ravel()
             cv.create_polygon(np.concatenate((top, bot)).tolist(), fill=col, outline="")
 
-    def _draw_samples(self, c, a, b, mid, half, col):
+    def _draw_samples(self, c, a, b, mid, half, col, pieces=None):
         """Up close the envelope has no more detail to give: draw the audio
         itself, a region at a time so nothing cut shows through.  Each pixel
         spans its lowest and highest sample; with less than a sample to a
@@ -2705,7 +2911,7 @@ class AssemblyWindow(object):
         per_px = PLAY_SR / self.pps
         k = half * 0.95 / (max(self._env_scale, 1e-4) * 32768.0)
         last = len(pcm) - 1
-        for tl, du, si in c.pieces:
+        for tl, du, si in (c.pieces if pieces is None else pieces):
             pa = max(a, int(math.ceil(self._x(tl))))
             pb = min(b, int(math.ceil(self._x(tl + du))))
             if pb - pa < 2:
@@ -2816,7 +3022,8 @@ class AssemblyWindow(object):
 
     def _tc_text(self):
         """The playhead's time, to the millisecond once zoomed in that far."""
-        return _fmt_tc(self.playhead, 3 if self.pps >= ENV_HZ else 1)
+        return _fmt_tc(self._to_cut_t(self.playhead),
+                       3 if self.pps >= ENV_HZ else 1)
 
     def _move_playhead(self):
         x = self._x(self.playhead)
@@ -2971,6 +3178,11 @@ class AssemblyWindow(object):
                         best = (d, ("out", c, k))
         if best is not None:
             return best[1]
+        if self.excised:
+            for c in self.clips[max(0, i - 1):i + 2]:
+                g = c.ghost_at(t)
+                if g is not None:
+                    return ("ghost", c, g)
         c = self._clip_at(t)
         if c is not None:
             k = c.piece_at(t)
@@ -3004,7 +3216,7 @@ class AssemblyWindow(object):
         cur = {"in": "sb_h_double_arrow", "out": "sb_h_double_arrow",
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
                "select": "xterm", "grab": "fleur",
-               "ruler": "hand2"}.get(kind, "arrow")
+               "ruler": "hand2", "ghost": "xterm"}.get(kind, "arrow")
         if self.cv.cget("cursor") != cur:
             self.cv.config(cursor=cur)
         self.cv.delete("hover")
@@ -3043,6 +3255,13 @@ class AssemblyWindow(object):
         if kind == "ruler":
             self._drag = {"mode": "scrub"}
             self.seek(t)
+            return
+        if kind == "ghost":
+            # Excised audio: a place to listen from and trim into.
+            self._range = None
+            self.sel_region = None
+            self.set_insert(t)
+            self.redraw()
             return
         seam = self._roll_at(e, kind, c, k)
         if seam is not None:
@@ -3793,6 +4012,9 @@ class AssemblyWindow(object):
         kind, hit, _k = self._hit(e.x, e.y)
         if kind == "marker":
             self._begin_rename((hit["order"], hit["index"]))
+        elif kind == "ghost":
+            if _k[3] == "cut":
+                self.restore_cut(hit.order, _k[4])
         elif kind in ("grab", "in", "out"):
             self.open_card(hit.order)         # the grabber steps into the editor
         elif kind == "select":
@@ -3802,16 +4024,37 @@ class AssemblyWindow(object):
             self._status_range()
 
     def open_card(self, order):
-        """The pull in the source view: its whole recording, for finding
-        an edit outside what was pulled."""
+        """A pull, to work on: on the track with the excised audio shown,
+        the view on it.  A line not in the cut (never found) has nowhere
+        on the track to be: the source view, on its recording."""
         if order is None:
             return
-        self.show_source(order)
+        if self._clip(order) is None:
+            self.show_source(order)
+            return
+        if self.view == "source":
+            self._leave_source()
+        if not self.excised:
+            self.toggle_excised()
+        c = self._clip(order)
+        if c is None:
+            return
+        self.select(order)
+        self.seek(c.start, center=True)
 
     # ── The source view ──────────────────────────────────────────────────
     def toggle_view(self):
-        """Shift+S: the recording behind the pull at the insertion point,
-        or back to the cut.  The playhead stays on the same moment of audio."""
+        """Enter: the surrounding audio shown on the track, or hidden
+        (toggle_excised); from the source view, back to the track."""
+        if self.view == "source":
+            self._leave_source()
+            return
+        self.toggle_excised()
+
+    def find_in_recording(self):
+        """Ctrl+F: the recording behind the pull at the insertion point,
+        whole -- to hunt a line far from where it was pulled, or in another
+        recording ("all pulls").  Ctrl+F again comes back to the track."""
         if self.view == "source":
             self._leave_source()
             return
@@ -3899,7 +4142,7 @@ class AssemblyWindow(object):
             self.src._set_point_from_cursor(side)
         else:
             self.status.config(fg=SUB, text="Set IN / OUT work in the source "
-                               "view (Shift+S), on the recording itself.")
+                               "view (Ctrl+F), on the recording itself.")
 
     def _leave_source(self):
         src = self.src
@@ -3928,12 +4171,67 @@ class AssemblyWindow(object):
         self._light_script_word(False if t is None else t)
 
     def toggle_skip_cuts(self):
-        """K: the source view plays only the pull's kept audio, skipping
-        what its cuts take out -- or the recording straight through."""
+        """Shift+S, Skip edits: play only the finished cut, skipping the excised audio on
+        show -- or hear it as well.  The same in the source view."""
         _MONITOR["skip_cuts"] = not _MONITOR["skip_cuts"]
         if self.src is not None:
             self.src.skip_cuts = _MONITOR["skip_cuts"]
+        self._set_play_spans()
         self._show_monitor()
+
+    def _set_play_spans(self):
+        """What the track's player composes and where it may play: the
+        finished cut, jumping the excised audio on show -- or, with Skip
+        cuts off, that audio heard too."""
+        hear = self.excised and not _MONITOR["skip_cuts"]
+        self.audio.set_clips(self.clips, self.total_s, ghosts=hear)
+        if self.player is None:
+            return
+        ghosts = [g for c in self.clips for g in c.ghosts]
+        self.player.set_segments(
+            _kept_spans(ghosts, -LEAD_S, self.total_s + 1.0)
+            if ghosts and not hear else None)
+
+    def toggle_excised(self):
+        """Enter: show the surrounding audio -- every cut opened up
+        to show its tape, dimmed, with a handle of the recording either
+        side of each pull -- or hide it again.  The one track either way:
+        the same edits, the playhead on the same moment of the cut."""
+        if self.view == "source":
+            self._leave_source()
+        self.stop()
+        ph, ins = self._to_cut_t(self.playhead), self._to_cut_t(self.insert)
+        x = self._x(self.playhead)
+        self.excised = not self.excised
+        self.refresh()
+        self.playhead = self._to_open_t(ph)
+        self.insert = self._to_open_t(ins)
+        self.view0 = self.playhead - x / self.pps
+        self.redraw()
+        self._show_monitor()
+        self._update_status()
+
+    def _to_cut_t(self, t):
+        return _to_cut(t, self._shifts)
+
+    def _to_open_t(self, t):
+        return _to_open(t, self._shifts)
+
+    def restore_cut(self, order, k):
+        """Bring back the tape cut out before region k of a pull: the two
+        regions either side of it become one again (one undo step)."""
+        c = self._clip(order)
+        if c is None or not 0 < k < len(c.segments):
+            return
+        segs = list(c.segments)
+        gaps = list(c.seg_gaps)
+        segs[k - 1:k + 1] = [(segs[k - 1][0], segs[k][1])]
+        if k - 1 < len(gaps):
+            del gaps[k - 1]
+        self.app._assembly_set_segments(order, segs, gaps)
+        self.refresh()
+        self.status.config(fg=TEXT, text="{}   ·   the cut before region {} "
+                           "is back".format(c.label, k + 1))
 
     def accept_next(self):
         """Ctrl+Enter: accept the pull on show as it is, and on to the next
@@ -3957,7 +4255,7 @@ class AssemblyWindow(object):
             return
         nxt = self.clips[i + 1]
         self.select(nxt.order)
-        self.seek(nxt.start)
+        self.seek(nxt.start, center=self.excised)
         if self.view == "source":
             self.show_source(nxt.order)
 
@@ -3981,9 +4279,9 @@ class AssemblyWindow(object):
             self._src_frame.pack(fill="both", expand=True, before=self._foot)
             self.src._cv.focus_set()
             c = self._clip(self._src_order)
-            self.status.config(fg=SUB, text="SOURCE   {}   ·   the whole "
+            self.status.config(fg=SUB, text="RECORDING   {}   ·   the whole "
                                "recording, the pull's edit points on it   ·   "
-                               "Shift+S back to the cut".format(
+                               "Ctrl+F or Enter back to the track".format(
                                    c.label if c else ""))
         else:
             self._src_frame.pack_forget()
@@ -4289,7 +4587,7 @@ class AssemblyWindow(object):
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
         self.skip_key.set_on(_MONITOR["skip_cuts"])
-        self.view_key.set_on(self.view == "source")
+        self.view_key.set_on(self.excised)
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])
 
@@ -4338,10 +4636,12 @@ class AssemblyWindow(object):
             self.copy_words()
         elif ctrl and k in ("Return", "KP_Enter"):
             self.accept_next()
-        elif not ctrl and k.lower() == "k":
+        elif k == "S" and not ctrl:
             self.toggle_skip_cuts()
-        elif k == "S" and not ctrl or k == "Return":
+        elif k in ("Return", "KP_Enter"):
             self.toggle_view()
+        elif ctrl and k.lower() == "f":
+            self.find_in_recording()
         elif k == "F" and not ctrl:
             self.toggle_script_follow()
         elif k == "N" and not ctrl:

@@ -8762,11 +8762,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                             "No source available", _msg,
                             parent=_open._win if _open is not None else self)
                         return
-                    # The pull in the Assembly window's source view: its
-                    # whole recording, with its edit points on it.
+                    # The pull on the Assembly's track, its excised audio
+                    # shown (a line not in the cut: its recording).
                     self._open_assembly()
                     if self._assembly is not None:
-                        self._assembly.show_source(r.get("order"))
+                        self._assembly.open_card(r.get("order"))
 
                 # ── Bind labels ────────────────────────────────────────────────────
                 ignore_lbl.bind("<Button-1>",

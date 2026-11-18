@@ -280,14 +280,14 @@ def test_sfx_spot_opens_its_name_field_and_enter_only_names_it(view):
     assert win.view == "cut"
 
 
-def test_enter_on_the_track_shows_the_source_view(view):
+def test_enter_on_the_track_shows_the_excised_audio(view):
     app, win = view
     win.select(2)
     win.cv.focus_force()
     app.update()
     win.cv.event_generate("<KeyPress>", keysym="Return", when="now")
     app.update()
-    assert win.view == "source" and win._src_order == 2
+    assert win.view == "cut" and win.excised
 
 
 def test_script_lights_the_word_being_said(view):
@@ -349,11 +349,12 @@ def test_double_click_with_the_grabber_opens_the_editor(view):
             self.x, self.y = x, y
     x = win._x(1.0)
     win._on_track_double(_E(x, y1 - 4))
-    assert win.view == "source" and win._src_order == 1
+    # The grabber opens the pull up: its excised audio shows, on the track.
+    assert win.view == "cut" and win.excised and win.sel_order == 1
     # The selector's double-click takes the whole region instead.
-    win._on_track_double(_E(x, y0 + 6))
-    assert win._src_order == 1
-    assert win.sel_region == (1, 0) and win._range[1:] == (0.0, 4.0)
+    c = win._clip(1)
+    win._on_track_double(_E(win._x(c.start + 1.0), y0 + 6))
+    assert win.sel_region == (1, 0) and win._range[1:] == (c.start, c.end)
 
 
 def test_step4_and_save_from_the_assembly(view):
@@ -438,12 +439,16 @@ def _app_on_step4(tmp_path, n, status="ok"):
 
 
 def _open_source_from_card(app, order):
-    """Step 4's card opens the pull in the Assembly window's source view."""
+    """Step 4's card opens the pull on the Assembly's track, its excised
+    audio shown; Ctrl+F there shows its whole recording."""
     next(e for e in app._rv if e["res"]["order"] == order)["open_review_fn"]()
     for _ in range(20):
         app.update()
     asm = app._assembly
-    assert asm is not None and asm.view == "source" and asm._src_order == order
+    assert asm is not None and asm.view == "cut" and asm.excised
+    assert asm.sel_order == order
+    asm.find_in_recording()
+    assert asm.view == "source" and asm._src_order == order
     return asm
 
 
@@ -888,7 +893,7 @@ def test_opening_and_swapping_during_playback_mean_the_ghost_cursors_pull(view):
     finally:
         win._playing = False
         win.stop = lambda key=False: None
-    assert win._src_order == 1
+    assert win.sel_order == 1
     del win.stop
 
 

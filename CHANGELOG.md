@@ -4,8 +4,17 @@
 
 ## November 18, 2026
 
+### Assembly: Show surrounding audio on the track (Enter), Skip edits (Shift+S)
+- **Enter now shows the surrounding audio on the track itself.** Every cut inside a pull opens to show the tape it takes out, dimmed and marked "cut", with its words faint along the bottom. Each pull also gets 3 seconds of its recording either side, dimmed the same way. Enter again closes it all back up. The playhead stays on the same moment of the cut either way. The window used to switch to a separate source view instead.
+- **What plays is still the finished assembly,** straight across pulls, jumping the dimmed audio. **Skip edits** (**Shift+S**, on by default) off plays the dimmed audio too, so you can hear what was taken out. Shift+S does the same in Find in recording, and no longer switches views.
+- **Every edit works the same opened up.** Drag an edge into the dimmed audio to bring some of it back. Highlight kept audio and Delete to take it out. **Double-click a cut's dimmed audio to bring the whole cut back.** Click in dimmed audio to put the insertion point there.
+- **The ruler and timecode read the finished cut's time** either way. Dimmed audio has no time of its own, and spotting marks stay on their audio.
+- **A Step 4 card, or a double-click with the grabber, opens its pull on the track,** opened up and in view, not in a separate view.
+- Cuts longer than 30 seconds, and jumps back in the recording (a monolog pickup), stay closed.
+- **The whole-recording view is now Find in recording (Ctrl+F)**, for hunting a line far from where it was pulled or in another recording ("all pulls" and ADOPT). Ctrl+F or Enter comes back to the track. A line that was never found still opens there.
+
 ### Assembly source view: Skip cuts, Accept & next, one script
-- **Skip cuts is back in the source view** (**K**, or the button in PLAY · MONITOR). On, which is the default, Space plays only the pull's kept audio from the playhead and jumps over what its cuts take out. From inside a cut it starts where the audio picks up again, and from past the pull it plays the pull from its start. Off, it plays the recording straight through, as before. The setting holds while PostBridge is open.
+- **Skip edits is back in the source view** (**Shift+S**, or the button in PLAY · MONITOR). On, which is the default, Space plays only the pull's kept audio from the playhead and jumps over what its cuts take out. From inside a cut it starts where the audio picks up again, and from past the pull it plays the pull from its start. Off, it plays the recording straight through, as before. The setting holds while PostBridge is open.
 - **Accept & next** (**Ctrl+Enter**, or the button in EDIT) accepts the pull on show as it is and moves to the next one, in the source view on that pull's recording. On the track it selects the next pull. An edit was already accepted as you made it, and a pull that's already accepted isn't accepted twice.
 - **The script is shown once.** The source view no longer has its own script box above the waveform. The script pane on the left is the one script, and it lights the word being heard and scrolls to keep it in view in the source view too (Shift+F still turns that off). Audio outside the pull has no word lit.
 

@@ -1,5 +1,5 @@
 """The Assembly window's source view: the waveform editor built into it,
-Shift+S between it and the cut, the playhead kept on the same audio, edits
+Ctrl+F between it and the track, the playhead kept on the same audio, edits
 saved live through Step 4, and the one set of keys for both views.
 
 Built on test_assembly_edit's stand-in app.  Needs tkinter and a display;
@@ -19,37 +19,37 @@ from test_assembly_edit import view, _key, _res, WAV  # noqa: E402,F401
 import assembly_view  # noqa: E402
 
 SHIFT = 0x0001
+CTRL = 0x0004
 
 
 def _segs(app, order):
     return [tuple(round(v, 4) for v in s) for s in _res(app, order)["segments"]]
 
 
-def test_shift_s_shows_the_recording_behind_the_insertion_point(view):
+def test_ctrl_f_shows_the_recording_behind_the_insertion_point(view):
     app, win = view
     win.set_insert(1.0)                      # pull 1: source 10-14 at 0-4
-    _key(app, win.cv, "S", SHIFT)
+    _key(app, win.cv, "f", CTRL)
     assert win.view == "source" and win._src_order == 1
     assert win.src._audio_path == WAV
     assert win.src._playhead_s == pytest.approx(11.0, abs=1e-3)
     assert win.src._edited_segments() == [(10.0, 14.0)]
     app.update()
     assert win._src_frame.winfo_ismapped() and not win._track_frame.winfo_ismapped()
-    assert win.view_key.on
 
     # Back: the insertion point lands where the editor's playhead was.
     win.src._playhead_s = 12.5
-    _key(app, win.src._cv, "S", SHIFT)
+    _key(app, win.src._cv, "Return")
     assert win.view == "cut"
     assert win.insert == pytest.approx(2.5, abs=1e-3)
     app.update()
     assert win._track_frame.winfo_ismapped() and not win._src_frame.winfo_ismapped()
 
 
-def test_enter_toggles_too_and_the_selected_pull_wins(view):
+def test_enter_comes_back_too_and_the_selected_pull_wins(view):
     app, win = view
     win.select(2)
-    _key(app, win.cv, "Return")
+    _key(app, win.cv, "f", CTRL)
     assert win.view == "source" and win._src_order == 2
     assert win.src._playhead_s == pytest.approx(20.0)   # its first moment
     _key(app, win.src._cv, "Return")
@@ -96,7 +96,7 @@ def test_b_splits_and_c_cuts_in_both_views(view):
     _key(app, win.src._cv, "c")
     assert _segs(app, 1) == [(10.0, 12.0), (12.0, 13.0), (13.5, 14.0)]
 
-    _key(app, win.src._cv, "S", SHIFT)
+    _key(app, win.src._cv, "Return")
     win.refresh()
     win.set_insert(win._clip(2).start + 0.5)
     _key(app, win.cv, "c")
@@ -138,8 +138,8 @@ def test_shift_f_is_script_follow_now(view):
     assert assembly_view._MONITOR["script"] is (not was)
     _key(app, win.cv, "F", SHIFT)
     assert assembly_view._MONITOR["script"] is was
-    _key(app, win.cv, "S", SHIFT)                 # the view, not the script
-    assert assembly_view._MONITOR["script"] is was and win.view == "source"
+    _key(app, win.cv, "Return")                   # the surrounding audio
+    assert assembly_view._MONITOR["script"] is was and win.excised
 
 
 def test_space_plays_the_view_on_show(view, monkeypatch):
@@ -168,7 +168,7 @@ def test_the_same_pull_again_only_moves_the_playhead(view, monkeypatch):
                         lambda *a, **k: loads.append(a))
     win.toggle_view()
     win.set_insert(3.0)
-    win.toggle_view()
+    win.find_in_recording()
     assert not loads and win.src._playhead_s == pytest.approx(13.0, abs=1e-3)
 
 
@@ -183,9 +183,10 @@ def test_the_panels_name_the_keys(view):
             out += labels(c)
         return out
     shown = labels(win._side)
-    for want in ("Source view", "Shift+S", "Cut ½ s out", "C",
+    for want in ("Show surrounding audio", "Enter", "Find in recording",
+                 "Ctrl+F", "Cut ½ s out", "C",
                  "Script follows words", "Shift+F", "Accept & next",
-                 "Ctrl+Enter", "Skip cuts in the source view", "K"):
+                 "Ctrl+Enter", "Skip edits", "Shift+S"):
         assert want in shown
     assert "Open in editor" not in shown
 
@@ -220,8 +221,6 @@ def test_adopting_a_match_from_another_file_reassigns_the_pull(view):
 
 # ── Skip cuts, Accept & next, and the script following the source view ───
 
-CTRL = 0x0004
-
 
 def test_ctrl_enter_accepts_the_pull_and_shows_the_next(view):
     app, win = view
@@ -252,15 +251,15 @@ def test_accept_and_next_on_the_track_selects_the_next_pull(view):
     assert win.view == "cut" and win.sel_order == 2
 
 
-def test_k_switches_skip_cuts_for_the_source_view(view):
+def test_shift_s_switches_skip_edits_for_the_source_view(view):
     app, win = view
     was = assembly_view._MONITOR["skip_cuts"]
     win.show_source(1)
     assert win.src.skip_cuts is was
-    _key(app, win.src._cv, "k")
+    _key(app, win.src._cv, "S", SHIFT)
     assert assembly_view._MONITOR["skip_cuts"] is (not was)
     assert win.src.skip_cuts is (not was) and win.skip_key.on is (not was)
-    _key(app, win.src._cv, "k")
+    _key(app, win.src._cv, "S", SHIFT)
     assert win.src.skip_cuts is was
 
 
