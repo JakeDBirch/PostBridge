@@ -4,6 +4,10 @@
 
 ## November 18, 2026
 
+### Assembly: Normalize, and a cut drags whole
+- **Normalize** (in PLAY · MONITOR, on by default) plays every pull at the one level: a quiet recording is brought up (by up to +32 dB) and a hot one brought down, and its waveform is drawn at that level too. The level is taken from a pull's speech peaks, not its single loudest moment. Playback only: the AAF and the files are untouched. Turn it off to hear the recordings as they are.
+- **Drag a cut's dimmed audio** (with Show surrounding audio on) to move both its edges together: the out before it and the in after it slide as one, so the same length of tape comes out from a little earlier or later. Nothing after it moves. A click there still just puts the insertion point there, and a double-click still brings the cut back.
+
 ### Assembly: Show surrounding audio on the track (Enter), Skip edits (Shift+S)
 - **Enter now shows the surrounding audio on the track itself.** Every cut inside a pull opens to show the tape it takes out, dimmed and marked "cut", with its words faint along the bottom. Each pull also gets 3 seconds of its recording either side, dimmed the same way. Enter again closes it all back up. The playhead stays on the same moment of the cut either way. The window used to switch to a separate source view instead.
 - **What plays is still the finished assembly,** straight across pulls, jumping the dimmed audio. **Skip edits** (**Shift+S**, on by default) off plays the dimmed audio too, so you can hear what was taken out. Shift+S does the same in Find in recording, and no longer switches views.

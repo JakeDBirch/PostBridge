@@ -146,7 +146,10 @@ TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without o
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
-EXCISED_MAX_S = 30.0  # tape cut out of a pull shows, dimmed, up to this long
+EXCISED_MAX_S = 30.0
+NORM_LEVEL  = 0.5     # Normalize: each pull's speech peaks brought to this
+NORM_MAX_GAIN = 40.0  # ... by at most this much (+32 dB), so hiss stays hiss
+NORM_MIN_GAIN = 0.25  # tape cut out of a pull shows, dimmed, up to this long
 
 _SMALL      = (FB[0], 9)
 _MONO       = ("Consolas", 10)
@@ -179,7 +182,7 @@ SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too clos
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
             "return_on": True, "script": True, "nudge_s": 0.1,
-            "skip_cuts": True}
+            "skip_cuts": True, "normalize": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -262,6 +265,23 @@ class _KeyButton(object):
     def pack(self, **kw):
         self.frame.pack(**kw)
         return self
+
+
+def _norm_gain(pcm):
+    """The gain that brings a pull's speech to NORM_LEVEL: its loud peaks,
+    not its one loudest transient (the 99.5th percentile of 2.5 ms
+    peaks), within NORM_MIN_GAIN..NORM_MAX_GAIN.  1 for silence."""
+    if pcm is None or not len(pcm):
+        return 1.0
+    blk = PLAY_SR // ENV_HZ
+    n = len(pcm) // blk
+    if not n:
+        return 1.0
+    env = np.abs(pcm[:n * blk].reshape(n, blk).astype(np.int32)).max(axis=1)
+    p = float(np.percentile(env, 99.5)) / 32768.0
+    if p < 1e-4:
+        return 1.0
+    return float(min(max(NORM_LEVEL / p, NORM_MIN_GAIN), NORM_MAX_GAIN))
 
 
 def _dim(col, k=0.35):
@@ -753,6 +773,7 @@ class _AssemblyAudio(object):
         self.sr     = sr
         self._lead  = int(LEAD_S * sr)
         self._bufs  = {}                 # order -> (path, t0_s, int16 pcm)
+        self._gains = {}                 # order -> playback gain (Normalize)
         self._index = ([], [])           # (starts, pieces)
         self._len   = self._lead
 
@@ -784,9 +805,14 @@ class _AssemblyAudio(object):
     def keep_only(self, orders):
         self._bufs = {o: b for o, b in self._bufs.items() if o in orders}
 
+    def set_gains(self, gains):
+        """{order: gain}, swapped whole; a pull not in it plays as it is."""
+        self._gains = dict(gains)
+
     def read(self, i, n):
         starts, pieces = self._index
         bufs = self._bufs
+        gains = self._gains
         out  = np.zeros(n, dtype=np.float32)
         end  = i + n
         j = max(0, bisect.bisect_right(starts, i) - 1)
@@ -804,7 +830,10 @@ class _AssemblyAudio(object):
             k0, k1 = max(off, 0), min(off + (b - a), len(pcm))
             if k1 > k0:
                 o = a - i + (k0 - off)
-                out[o:o + (k1 - k0)] = pcm[k0:k1] * (1.0 / 32768.0)
+                out[o:o + (k1 - k0)] = pcm[k0:k1] * (
+                    gains.get(order, 1.0) / 32768.0)
+        if gains:
+            np.clip(out, -1.0, 1.0, out=out)
         return out
 
 
@@ -846,6 +875,7 @@ class AssemblyWindow(object):
         self._env       = {}             # order -> (t0, envelope float32)
         self._env_scale = 0.25           # amplitude that fills the lane
         self._sil       = {}             # order -> its audio's snap points
+        self._gain      = {}             # order -> its Normalize gain
         self._loading   = set()
         self._dirty     = False          # a buffer landed; redraw pending
         self._refresh_after = None
@@ -1060,6 +1090,8 @@ class AssemblyWindow(object):
         self.preroll_key = key(p, "", "P", self.toggle_preroll, toggle=True)
         key(p, "−", "", lambda: self.step_preroll(-1))
         key(p, "+", "", lambda: self.step_preroll(1))
+        self.norm_key = key(p, "Normalize", "", self.toggle_normalize,
+                            toggle=True)
         self.return_key = key(p, "Return to start on stop", "Shift+N",
                               self.toggle_return, toggle=True)
         self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
@@ -1151,7 +1183,8 @@ class AssemblyWindow(object):
             "highlight).  Bottom half: grab (click = region, drag = move, "
             "double-click = show the surrounding audio).  Edge: trim, into "
             "the dimmed audio too.  Dimmed: click to listen from there, "
-            "double-click a cut to bring it back.  Gap: drag to "
+            "drag a cut to move both its edges, double-click it to bring "
+            "it back.  Gap: drag to "
             "retime.  Flag: drag, double-click to name, Ctrl+click or "
             "right-click to delete.  "
             "Edges and highlights snap to speech starts and stops; hold Ctrl "
@@ -1284,6 +1317,7 @@ class AssemblyWindow(object):
         clips = self.clips
         self.audio.keep_only({c.order for c in clips})
         self._env = {o: v for o, v in self._env.items() if o in self._by_order}
+        self._gain = {o: v for o, v in self._gain.items() if o in self._by_order}
         self._sil = {o: v for o, v in self._sil.items() if o in self._by_order}
         if self.sel_order is not None and \
                 not any(c.order == self.sel_order for c in clips):
@@ -1722,6 +1756,8 @@ class AssemblyWindow(object):
             self._show_loading()
             return
         self.audio.put(c.order, path, t0, pcm)
+        self._gain[c.order] = _norm_gain(pcm)
+        self._apply_gains()
         self._env[c.order] = (t0, env)
         self._sil[c.order] = list(sil)
         live.words = words if live.pieces == c.pieces else None
@@ -2889,7 +2925,7 @@ class AssemblyWindow(object):
                 amp[-1] = e[idx[-1]:idx[-1] + per].max()
             else:
                 amp = e[idx]
-            amp = np.minimum(amp / max(self._env_scale, 1e-4), 1.0) * half * 0.95
+            amp = np.minimum(amp * self._amp(c), 1.0) * half * 0.95
             if pb - pa < 2:              # a sliver: a shape needs some width
                 cv.create_line(pa, mid - amp[0] - 0.5, pa, mid + amp[0] + 0.5, fill=col)
                 continue
@@ -2909,7 +2945,7 @@ class AssemblyWindow(object):
         _path, t0, pcm = buf
         cv = self.cv
         per_px = PLAY_SR / self.pps
-        k = half * 0.95 / (max(self._env_scale, 1e-4) * 32768.0)
+        k = half * 0.95 * self._amp(c) / 32768.0
         last = len(pcm) - 1
         for tl, du, si in (c.pieces if pieces is None else pieces):
             pa = max(a, int(math.ceil(self._x(tl))))
@@ -3217,6 +3253,8 @@ class AssemblyWindow(object):
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
                "select": "xterm", "grab": "fleur",
                "ruler": "hand2", "ghost": "xterm"}.get(kind, "arrow")
+        if kind == "ghost" and k[3] == "cut":
+            cur = "sb_h_double_arrow"        # a cut drags
         if self.cv.cget("cursor") != cur:
             self.cv.config(cursor=cur)
         self.cv.delete("hover")
@@ -3257,9 +3295,18 @@ class AssemblyWindow(object):
             self.seek(t)
             return
         if kind == "ghost":
-            # Excised audio: a place to listen from and trim into.
+            # Surrounding audio: a click is a place to listen from; a cut
+            # dragged moves both its edges together -- the out before it
+            # and the in after it -- so the same length of tape comes out
+            # from a little earlier or later.
             self._range = None
             self.sel_region = None
+            g = k
+            if g[3] == "cut" and 0 < g[4] < len(c.pieces):
+                self._drag = self._roll_drag(((c, g[4] - 1), (c, g[4])), e.x)
+                self._drag["t"] = t
+                self.select(c.order)
+                return
             self.set_insert(t)
             self.redraw()
             return
@@ -3622,8 +3669,9 @@ class AssemblyWindow(object):
                 c = self._clip(o)
                 if c is not None and k < len(c.pieces):
                     self.set_insert(c.pieces[k][0])
-            elif d["mode"] == "gap" and "t" in d:
+            elif d["mode"] in ("gap", "roll") and "t" in d:
                 self.set_insert(d["t"])
+                self.redraw()
             return
         if d["mode"] == "marker":
             self._move_marker(d["key"], d["value"])
@@ -4170,6 +4218,26 @@ class AssemblyWindow(object):
                     break
         self._light_script_word(False if t is None else t)
 
+    def _apply_gains(self):
+        self.audio.set_gains(self._gain if _MONITOR["normalize"] else {})
+
+    def toggle_normalize(self):
+        """Normalize: every pull plays (and draws) at the one level, a quiet
+        recording brought up and a hot one down -- for hearing an edit.
+        Listening only: nothing in the AAF changes."""
+        _MONITOR["normalize"] = not _MONITOR["normalize"]
+        self._apply_gains()
+        self._show_monitor()
+        self.redraw()
+
+    def _amp(self, c):
+        """What a pull's envelope (0..1 of full scale) is multiplied by to
+        fill the lane: its own Normalize gain, or the loudest pull's level."""
+        g = self._gain.get(c.order) if _MONITOR["normalize"] else None
+        if g is not None:
+            return g / NORM_LEVEL
+        return 1.0 / max(self._env_scale, 1e-4)
+
     def toggle_skip_cuts(self):
         """Shift+S, Skip edits: play only the finished cut, skipping the excised audio on
         show -- or hear it as well.  The same in the source view."""
@@ -4587,6 +4655,7 @@ class AssemblyWindow(object):
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
         self.skip_key.set_on(_MONITOR["skip_cuts"])
+        self.norm_key.set_on(_MONITOR["normalize"])
         self.view_key.set_on(self.excised)
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])

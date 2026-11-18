@@ -209,3 +209,83 @@ def test_marks_stay_on_their_audio(view):
     win.toggle_excised()
     m = next(m for m in win.markers if m["kind"] == "sfx")
     assert m["t"] == pytest.approx(5.5)
+
+
+# ── Normalize, and a cut dragged whole ───────────────────────────────────
+
+def test_a_quiet_pull_plays_at_the_level_of_a_loud_one():
+    import numpy as np
+    sr = assembly_view.PLAY_SR
+    t = np.arange(sr) / float(sr)
+    quiet = (np.sin(2 * np.pi * 200 * t) * 600).astype(np.int16)
+    loud = (np.sin(2 * np.pi * 200 * t) * 20000).astype(np.int16)
+    gq, gl = assembly_view._norm_gain(quiet), assembly_view._norm_gain(loud)
+    assert gq * 600 == pytest.approx(gl * 20000, rel=0.02)
+    assert gq * 600 / 32768.0 == pytest.approx(assembly_view.NORM_LEVEL, rel=0.02)
+    assert assembly_view._norm_gain(np.zeros(sr, np.int16)) == 1.0
+    hiss = (np.random.RandomState(0).randn(sr) * 2).astype(np.int16)
+    assert assembly_view._norm_gain(hiss) == assembly_view.NORM_MAX_GAIN
+
+
+def test_normalize_is_a_gain_on_what_plays():
+    import numpy as np
+    a = assembly_view._AssemblyAudio(1000)
+
+    class _C(object):
+        order, pieces, ghosts = 1, [(0.0, 1.0, 0.0)], []
+    a.set_clips([_C()], 1.0)
+    a.put(1, "a.wav", 0.0, np.full(2000, 1000, np.int16))
+    lead = int(assembly_view.LEAD_S * 1000)
+    plain = a.read(lead, 10)
+    a.set_gains({1: 4.0})
+    assert a.read(lead, 10) == pytest.approx(plain * 4.0)
+    a.set_gains({1: 1000.0})
+    assert a.read(lead, 10).max() == pytest.approx(1.0)      # held in, not wrapped
+
+
+def test_the_normalize_button_switches_it(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "normalize", True)
+    win._gain = {1: 3.0}
+    win._apply_gains()
+    assert win.audio._gains == {1: 3.0}
+    win.toggle_normalize()
+    assert win.audio._gains == {} and not win.norm_key.on
+    win.toggle_normalize()
+    assert win.audio._gains == {1: 3.0} and win.norm_key.on
+
+
+class _Ev(object):
+    def __init__(self, x, y, state=0):
+        self.x, self.y, self.state = x, y, state
+
+
+def test_dragging_a_cut_moves_both_its_edges(view):
+    app, win = view
+    _cut_one(app, win)                            # 10-11 | cut 11-12 | 12-14
+    win.toggle_excised()
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    mid = (y0 + y1) / 2.0
+    x = win._x(4.5)                               # in the cut audio
+    win._on_track_press(_Ev(x, mid))
+    assert win._drag["mode"] == "roll"
+    win._on_track_drag(_Ev(x + 0.5 * win.pps, mid, 0x0004))   # Ctrl: no snap
+    win._on_track_release(_Ev(x + 0.5 * win.pps, mid, 0x0004))
+    segs = [tuple(round(v, 3) for v in sg) for sg in _res(app, 1)["segments"]]
+    assert segs == [(10.0, 11.5), (12.5, 14.0)]   # the same second, later
+
+
+def test_a_click_in_a_cut_is_still_a_place_to_listen_from(view):
+    app, win = view
+    _cut_one(app, win)
+    win.toggle_excised()
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    x = win._x(4.5)
+    win._on_track_press(_Ev(x, (y0 + y1) / 2.0))
+    win._on_track_release(_Ev(x, (y0 + y1) / 2.0))
+    assert win.insert == pytest.approx(4.5, abs=0.05)
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.0), (12.0, 14.0)]
