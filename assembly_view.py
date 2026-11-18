@@ -4619,6 +4619,21 @@ class AssemblyWindow(object):
                 self.show_source(c.order)
 
     # ── Playback ─────────────────────────────────────────────────────────
+    def _preroll_start(self, origin):
+        """Where play starts for the insertion point `origin`: the pre-roll
+        ahead of it, as heard.  With the surrounding audio shown and Skip
+        edits on, the dimmed audio isn't heard, so the pre-roll is that
+        much of the finished cut -- counted back in it, not across the
+        track, where it would land in a handle and be skipped straight
+        back to the insertion point."""
+        pre = _MONITOR["preroll_s"] if _MONITOR["preroll_on"] else 0.0
+        if not pre:
+            return max(0.0, origin)
+        if self.excised and _MONITOR["skip_cuts"] and self._shifts:
+            return max(0.0, self._to_open_t(
+                max(0.0, self._to_cut_t(origin) - pre)))
+        return max(0.0, origin - pre)
+
     def toggle_play(self):
         if self._playing:
             self.stop()
@@ -4637,7 +4652,7 @@ class AssemblyWindow(object):
         if origin >= self.total_s - 0.05:
             origin = self.insert = 0.0
         self._play_origin = origin
-        start = origin - (_MONITOR["preroll_s"] if _MONITOR["preroll_on"] else 0.0)
+        start = self._preroll_start(origin)
         self.player.set_rate(self._rate)
         if not self.player.play(start_s=max(0.0, start)):
             self.status.config(text="Couldn't open the audio device.", fg=ERR)

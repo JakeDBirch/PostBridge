@@ -392,3 +392,26 @@ def test_a_cuts_sides_take_one_boundary_and_its_middle_the_whole_cut(view):
     win.redraw()
     assert win._hit(win._x(4.0) + 10, mid)[0] == "out"
     assert win._hit(win._x(4.5), mid)[0] == "ghost"
+
+
+# ── Pre-roll with the surrounding audio shown ────────────────────────────
+
+def test_preroll_is_the_finished_cut_ahead_not_a_skipped_handle(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "preroll_on", True)
+    monkeypatch.setitem(assembly_view._MONITOR, "preroll_s", 2.0)
+    monkeypatch.setitem(assembly_view._MONITOR, "skip_cuts", True)
+    _cut_one(app, win)
+    win.toggle_excised()
+    # Pull 2 starts at 3.5 s of the cut: its 2 s of pre-roll is the end of
+    # pull 1 (2.5-3.0) and the gap, not pull 2's own handle.
+    o2 = win._clip(2).start
+    start = win._preroll_start(o2)
+    assert win._to_cut_t(start) == pytest.approx(1.5)
+    assert win._clip(1).src_at(start) == pytest.approx(12.5)
+    # Inside pull 1, across its opened-up cut.
+    o = win._to_open_t(1.5)                      # 12.5 s of the recording
+    assert win._to_cut_t(win._preroll_start(o)) == pytest.approx(0.0)
+    # Hearing the surrounding audio, the pre-roll is what is on the track.
+    monkeypatch.setitem(assembly_view._MONITOR, "skip_cuts", False)
+    assert win._preroll_start(o2) == pytest.approx(o2 - 2.0)

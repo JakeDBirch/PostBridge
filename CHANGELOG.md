@@ -15,6 +15,9 @@
 - **An episode already in Step 4 gets its titles when it opens.** Its saved work is renumbered onto the same lines, each title is matched in the part's recording, and nothing has to be matched again. If the saved results don't line up with the script one for one, they're left exactly as saved and the log says so; Step 3 then matches the titles.
 - An earlier version of this today had Script Check warn and Fix Format write the title into the script. That's gone: there's nothing to write.
 
+### Assembly: pre-roll with the surrounding audio shown
+- **Pre-roll works with Show surrounding audio on.** It used to step back on the track, where the seconds before a pull are its dimmed handle. Playback skips dimmed audio, so it jumped straight back to the insertion point and there was no pre-roll. Now, with Skip edits on, the pre-roll is that much of the finished cut ahead of the insertion point: the end of the pull before, across its gap. With Skip edits off it's what's on the track, dimmed audio included.
+
 ### Assembly: a cut's sides are its boundaries
 - **Only the middle half of a cut's dimmed audio drags the whole cut.** Near either side of it (its outer quarter, and at least 14 pixels however narrow the cut is), a press takes the boundary on that side alone, as on an edge. Grabbing a boundary no longer catches the whole cut by accident.
 
