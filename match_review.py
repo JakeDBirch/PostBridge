@@ -107,7 +107,7 @@ _LEAD_IN_MS = 120
 # not per-dialog: Step 4 opens a NEW MatchReviewDialog for every card, and
 # a speed that reset to 1x on each one would be worse than not having it.
 _PLAY_RATES     = (0.75, 1.0, 1.5, 2.0, 3.0)
-_LAST_PLAY_RATE = 1.0
+_LAST_PLAY_RATE = 1.5     # where every session starts
 _CONTEXT_S   = 6.0      # seconds of context on each side of the match
 _MARKER_HIT  = 10       # pixel radius for grabbing IN/OUT markers
 _CUT_HIT     = 18       # wider radius for interior CUT IN / CUT OUT lines —

@@ -6,6 +6,7 @@
 
 ### Playback speeds: five steps
 - **[ and ] now step through 0.75×, 1×, 1.5×, 2× and 3×**, in the Assembly and in Find in recording. The in-between speeds (1.25×, 1.75×, 2.5×) are gone. A speed picked before this moves to the nearest of the five on the next step.
+- **Playback starts at 1.5×** each time PostBridge opens. A speed you pick holds for the rest of the run, in both views.
 
 ### Assembly: Heal a cut (H)
 - **H heals the cut or split at the insertion point.** The two regions either side become one region of continuous audio. Whatever was cut out between them comes back, and any silence set at that join goes. It's one undo step, and the Edit panel has a **Heal cut** button.
