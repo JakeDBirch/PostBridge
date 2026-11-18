@@ -289,3 +289,55 @@ def test_a_click_in_a_cut_is_still_a_place_to_listen_from(view):
     win._on_track_release(_Ev(x, (y0 + y1) / 2.0))
     assert win.insert == pytest.approx(4.5, abs=0.05)
     assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.0), (12.0, 14.0)]
+
+
+# ── Heal: a cut or split that shouldn't be there ─────────────────────────
+
+def test_h_heals_the_cut_at_the_insertion_point(view):
+    app, win = view
+    _cut_one(app, win)                            # 10-11 | 12-14, at 0-1 | 1-3
+    win.set_insert(1.0)                           # on the join
+    _key(app, win.cv, "h")
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
+    assert app._rv[0]["accepted_flag"][0]
+
+
+def test_h_heals_a_split_too_and_drops_its_silence(view):
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    _res(app, 1)["seg_gaps"] = [0.4]
+    win.refresh()
+    win.set_insert(0.5)                           # inside the first region
+    win.heal()
+    r = _res(app, 1)
+    assert [tuple(s) for s in r["segments"]] == [(10.0, 14.0)]
+    assert not r.get("seg_gaps")
+
+
+def test_h_with_a_highlight_heals_every_join_in_it(view):
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 11.0), (11.5, 12.0), (12.5, 14.0)]
+    win.refresh()
+    c = win._clip(1)
+    win._range = (1, c.start + 0.2, c.end - 0.2)
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
+
+
+def test_h_opened_up_in_the_cut_audio(view):
+    app, win = view
+    _cut_one(app, win)
+    win.toggle_excised()
+    win.set_insert(4.5)                           # in the dimmed cut
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
+
+
+def test_a_join_back_in_the_recording_is_not_healed(view):
+    app, win = view
+    _res(app, 1)["segments"] = [(12.0, 14.0), (10.0, 11.0)]   # a pickup
+    win.refresh()
+    win.set_insert(2.0)
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(12.0, 14.0), (10.0, 11.0)]
+    assert "nothing to heal" in win.status.cget("text")

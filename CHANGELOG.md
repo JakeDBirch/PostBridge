@@ -4,6 +4,11 @@
 
 ## November 18, 2026
 
+### Assembly: Heal a cut (H)
+- **H heals the cut or split at the insertion point.** The two regions either side become one region of continuous audio. Whatever was cut out between them comes back, and any silence set at that join goes. It's one undo step, and the Edit panel has a **Heal cut** button.
+- **Place the insertion point on the join, in either region beside it, or in the dimmed cut audio** with Show surrounding audio on. The nearest join in that pull is healed. **Highlight across several joins** to heal them all at once.
+- A join that jumps back in the recording (a pickup from earlier in the read) can't be one region, so it's left, and the status line says so.
+
 ### Script: the part titles the narrator reads are narration
 - **The narrator reads each part's title** ("Part 1: Evan"), but the script only had it in the `[PART Part 1: Evan]` header. A header isn't narration, so nothing looked for that reading in the narrator's recording, and the titles never reached the cut.
 - **Script Check now warns** when a part named "Part …" has no narration reading its title, and lists those parts. Intro, Outro and other unnumbered parts aren't flagged.

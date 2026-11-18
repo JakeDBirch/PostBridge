@@ -1107,6 +1107,7 @@ class AssemblyWindow(object):
         key(p, "Delete selection", "Del", self._delete_key)
         key(p, "Split", "B", self.split)
         key(p, "Cut ½ s out", "C", self.cut_out)
+        key(p, "Heal cut", "H", self.heal)
         key(p, "Set IN", "I", lambda: self.set_point("in"))
         key(p, "Set OUT", "O", lambda: self.set_point("out"))
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
@@ -4288,18 +4289,74 @@ class AssemblyWindow(object):
     def restore_cut(self, order, k):
         """Bring back the tape cut out before region k of a pull: the two
         regions either side of it become one again (one undo step)."""
+        self._heal(order, [k])
+
+    def _heal(self, order, ks):
+        """Join region k-1 and region k of a pull into one, for each k in
+        ks: whatever was cut out between them comes back, and the silence
+        at the join goes.  A join that jumps back in the recording (a
+        pickup from earlier in the read) can't be one region, and is left.
+        One undo step.  Returns how many were joined."""
         c = self._clip(order)
-        if c is None or not 0 < k < len(c.segments):
-            return
+        if c is None:
+            return 0
         segs = list(c.segments)
         gaps = list(c.seg_gaps)
-        segs[k - 1:k + 1] = [(segs[k - 1][0], segs[k][1])]
-        if k - 1 < len(gaps):
-            del gaps[k - 1]
+        done = 0
+        for k in sorted(set(ks), reverse=True):
+            if not 0 < k < len(segs) or segs[k][1] <= segs[k - 1][0] or \
+                    segs[k][0] < segs[k - 1][1] - 1e-6:
+                continue
+            segs[k - 1:k + 1] = [(segs[k - 1][0], segs[k][1])]
+            if k - 1 < len(gaps):
+                del gaps[k - 1]
+            done += 1
+        if not done:
+            self.status.config(fg=SUB, text="{}   ·   nothing to heal there: "
+                               "that join goes back in the recording".format(
+                                   c.label))
+            return 0
         self.app._assembly_set_segments(order, segs, gaps)
         self.refresh()
-        self.status.config(fg=TEXT, text="{}   ·   the cut before region {} "
-                           "is back".format(c.label, k + 1))
+        self.status.config(fg=TEXT, text="{}   ·   {} join{} healed: one region "
+                           "of continuous audio".format(
+                               c.label, done, "" if done == 1 else "s"))
+        return done
+
+    def heal(self):
+        """H: heal the cut or split the insertion point is at -- the two
+        regions either side become one of continuous audio, and what was
+        cut out between them comes back.  With a highlight, every join
+        inside it."""
+        if self._range is not None:
+            o, a, b = self._range
+            lo, hi = min(a, b), max(a, b)
+            c = self._clip(o)
+            if c is not None:
+                ks = [k for k in range(1, len(c.pieces))
+                      if lo - 1e-6 <= c.pieces[k][0] and
+                      c.pieces[k - 1][0] + c.pieces[k - 1][1] <= hi + 1e-6]
+                if ks:
+                    self._heal(o, ks)
+                    return
+        t = self.insert
+        c = self._clip_at(t)
+        if c is None and self.excised:
+            c = next((x for x in self.clips if x.vis_lo <= t < x.vis_hi), None)
+        if c is None and self.sel_order is not None:
+            c = self._clip(self.sel_order)
+        if c is None or len(c.pieces) < 2:
+            self.status.config(fg=SUB, text="Nothing to heal here: put the "
+                               "insertion point at a cut or split inside a pull.")
+            return
+        # The join nearest the insertion point: either side of it, or in
+        # the cut audio or silence between.
+        def _dist(k):
+            a = c.pieces[k - 1][0] + c.pieces[k - 1][1]
+            b = c.pieces[k][0]
+            return 0.0 if a - 1e-6 <= t <= b + 1e-6 else min(abs(t - a), abs(t - b))
+        k = min(range(1, len(c.pieces)), key=_dist)
+        self._heal(c.order, [k])
 
     def accept_next(self):
         """Ctrl+Enter: accept the pull on show as it is, and on to the next
@@ -4764,6 +4821,8 @@ class AssemblyWindow(object):
             self.split()                     # Pro Tools: B, or Ctrl+E
         elif k.lower() == "c" and not ctrl:
             self.cut_out()
+        elif k.lower() == "h":
+            self.heal()                      # Pro Tools: Heal Separation
         elif not ctrl and k.lower() in ("i", "o"):
             self.set_point("in" if k.lower() == "i" else "out")
         elif k in ("comma", "period"):
