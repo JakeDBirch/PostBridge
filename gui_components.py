@@ -293,7 +293,17 @@ class _FlatDropdown(tk.Frame):
             except Exception: pass
             self._tip = None
 
+    def _alive(self):
+        """False once the row this dropdown sat in has been rebuilt."""
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
     def _tip_show(self, rx, ry, text):
+        self._tip_job = None
+        if not self._alive():
+            return
         self._tip = tw = tk.Toplevel(self)
         tw.wm_overrideredirect(True)
         tw.attributes("-topmost", True)
@@ -310,7 +320,7 @@ class _FlatDropdown(tk.Frame):
         tw.geometry("+{}+{}".format(x, y))
 
     def _tint(self, on):
-        if self._popup:
+        if self._popup or not self._alive():
             return
         c = SURF3 if on else self._base_bg
         b = ACCENT if on else BORDER
@@ -389,6 +399,10 @@ class _FlatDropdown(tk.Frame):
             except Exception:
                 pass
             self._close()
+        # Keep the window itself: by the time the popup closes, a pick may
+        # have rebuilt the row and destroyed this dropdown, and a dead widget
+        # cannot be asked for its window to take the binding back off.
+        self._outside_root = root
         self._outside_id = root.bind("<Button-1>", _outside, add="+")
 
         self._popup = top
@@ -425,23 +439,29 @@ class _FlatDropdown(tk.Frame):
 
     def _pick(self, lb):
         sel = lb.curselection()
-        if sel:
-            v = self._values[sel[0]]
-            if not self._is_sep(v):
-                self._var.set(v)
-                self.event_generate("<<ComboboxSelected>>")
+        v = self._values[sel[0]] if sel else None
+        # Close first: the selection handler may rebuild the row and destroy
+        # this dropdown, and nothing may touch it after that.
         self._close()
+        if v is not None and not self._is_sep(v):
+            self._var.set(v)
+            if self._alive():
+                self.event_generate("<<ComboboxSelected>>")
 
     def _close(self):
         if self._popup:
-            try:
-                root = self.winfo_toplevel()
-                if self._outside_id:
+            root = getattr(self, "_outside_root", None)
+            if root is not None and self._outside_id:
+                try:
                     root.unbind("<Button-1>", self._outside_id)
-                    self._outside_id = None
+                except Exception:
+                    pass
+            self._outside_id = None
+            self._outside_root = None
+            try:
+                self._popup.destroy()
             except Exception:
                 pass
-            self._popup.destroy()
             self._popup = None
         self._tint(False)
 
