@@ -34,7 +34,6 @@ from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     SUCCESS, WARN, ERR, FB, FBT, FH,
                     SNAP_IN_OFFSET, SNAP_OUT_OFFSET)
 import playback as _pb
-import play_highlight
 from engines import (extract_audio_segment, extract_mono_pcm,
                      get_media_duration,
                      time_stretch_wav as engines_time_stretch)
@@ -243,6 +242,11 @@ class MatchReviewDialog:
                  auto_snap=True, get_markers=None, set_markers=None,
                  on_edit=None):
         self._parent          = parent
+        # Set by the host: on_playhead(source time, or None when stopped)
+        # as the playhead moves, for its script; skip_cuts makes Space play
+        # only the pull's kept audio, skipping what its cuts take out.
+        self.on_playhead      = None
+        self.skip_cuts        = False
         self._sel_mark        = None    # index of the chosen mark
         self._mark_drag       = None    # {"idx", "x0", "t", "moved"} while dragging one
         self._mark_rename     = None    # (Entry, index) while naming one
@@ -448,7 +452,6 @@ class MatchReviewDialog:
         self._remove_seg_areas = []
         self._snap_lbl.config(text="")
         self._search_var.set("")
-        self._show_script()
         self._show_scripted_tc()
         self._show_word_row()
         self._refresh_displays()
@@ -490,82 +493,16 @@ class MatchReviewDialog:
                                      font=FBT, fg=SUB, bg=SURF)
         self._loading_lbl.place(relx=0.5, rely=0.5, anchor="center")
 
-    def _show_script(self):
-        """The script text above the waveform; hidden when a clip has none."""
-        qf, qt = self._script_frame, self._script_text
-        quote_text, scripted_tc = self._quote_text, self._scripted_tc
-        context_before, context_after = self._context_before, self._context_after
-        self._script_play_idx = []
-        if not (quote_text or context_before or context_after):
-            qf.pack_forget()
-            return
-        qf.pack(fill="x", padx=12, pady=(10, 2), before=self._wave_frame)
-
-        # Helper: truncate context to ~300 chars at a word boundary
-        def _trunc(text, maxch=300):
-            text = text.strip()
-            if len(text) <= maxch:
-                return text
-            cut = text.rfind(" ", 0, maxch)
-            return text[:cut if cut > 0 else maxch] + "…"
-
-        _rule = "─" * 60 + "\n"   # ────────────── divider
-
-        qt.config(state="normal")
-        qt.delete("1.0", "end")
-        # Scripted timecode header — first line so the user always has
-        # a reference for where the edit was originally placed in script.
-        if scripted_tc:
-            qt.insert("end", "SCRIPTED  {}\n".format(scripted_tc), "tc")
-            qt.insert("end", _rule, "rule")
-        if context_before:
-            qt.insert("end", _trunc(context_before) + "\n", "ctx")
-            qt.insert("end", _rule, "rule")
-        if quote_text:
-            qt.insert("end", quote_text, "main")
-        if context_after:
-            qt.insert("end", "\n" + _rule, "rule")
-            qt.insert("end", _trunc(context_after), "ctx")
-        qt.config(state="disabled")
-
-        # Scroll so the main quote text is visible (skip past the before-context)
-        if context_before and quote_text:
-            try:
-                # "main" tag starts right after the rule — scroll to it
-                ranges = qt.tag_ranges("main")
-                if ranges:
-                    qt.see(ranges[0])
-            except Exception:
-                pass
-        self._index_script_for_playback()
-
-    def _index_script_for_playback(self):
-        """Line the script quote up with the transcript, so playing the clip
-        can light up the script words as they are heard."""
-        qt, quote = self._script_text, self._quote_text
-        ranges = qt.tag_ranges("main") if quote else ()
-        if not ranges or not self._words:
-            return
-        line0, col0 = (int(x) for x in str(ranges[0]).split("."))
-        # Words around the clip: the matcher's span may be off, which is
-        # what this window is for, so look a little either side of it.
-        lo = bisect.bisect_left(self._word_starts, self._in_s - 10.0)
-        hi = bisect.bisect_right(self._word_starts, self._out_s + 10.0)
-        idx = play_highlight.align_text_to_words(
-            quote, self._words[lo:hi], span=(self._in_s, self._out_s))
-
-        def _tk(o):
-            nl = quote.count("\n", 0, o)
-            if not nl:
-                return "{}.{}".format(line0, col0 + o)
-            return "{}.{}".format(line0 + nl, o - quote.rfind("\n", 0, o) - 1)
-        self._script_play_idx = [(ws, we, _tk(a), _tk(b))
-                                 for ws, we, a, b in idx]
-
     def _show_playing_word(self):
-        """The script word under the playhead, lit and kept in view."""
-        play_highlight.show(self._script_text, "playing",
-                            self._script_play_idx, self._playhead_s)
+        """Tell the host where the playhead is, so its script can light the
+        word being heard and keep it in view: the script is the Assembly
+        window's, not this view's."""
+        fn = self.on_playhead
+        if fn is not None:
+            try:
+                fn(self._playhead_s if self._is_playing() else None)
+            except Exception:
+                _log.exception("on_playhead failed")
 
     def _show_scripted_tc(self):
         self._scripted_head.config(text="SCRIPTED" if self._scripted_tc else "")
@@ -584,44 +521,10 @@ class MatchReviewDialog:
     def _build_ui(self):
         win = self._body
 
-        # ── Script text — scrollable, capped height so controls always visible ──
-        import tkinter.font as _tkfont
-        _font_main = _tkfont.Font(family="Segoe UI", size=12)
-        _font_ctx  = _tkfont.Font(family="Segoe UI", size=11, slant="italic")
-
-        qf = tk.Frame(win, bg=SURF2,
-                      highlightbackground=BORDER, highlightthickness=1)
-        qt = tk.Text(qf, font=_font_main, bg=SURF2, fg=TEXT,
-                     relief="flat", bd=0, padx=8, pady=6,
-                     wrap="word", height=16, state="disabled",
-                     highlightthickness=0)
-
-        # Tag for context text: dimmer colour, italic, slightly smaller
-        _font_tc = _tkfont.Font(family="Segoe UI", size=10)
-        qt.tag_config("ctx",  font=_font_ctx,  foreground=SUB)
-        qt.tag_config("rule", font=_font_ctx,  foreground=BORDER)
-        qt.tag_config("main", font=_font_main, foreground=TEXT)
-        qt.tag_config("tc",   font=_font_tc,   foreground=SUB)
-        # The word being heard (see _show_playing_word); above the others.
-        qt.tag_config("playing", background=play_highlight.PLAY_BG)
-        qt.tag_raise("playing")
-        # Held on to: Tk font objects go away with their last reference.
-        self._script_fonts = (_font_main, _font_ctx, _font_tc)
-
-        _qsb = tk.Scrollbar(qf, orient="vertical", command=qt.yview,
-                            width=10, bg=SURF2, troughcolor=SURF2,
-                            highlightthickness=0, bd=0)
-        qt.config(yscrollcommand=_qsb.set)
-        _qsb.pack(side="right", fill="y")
-        qt.pack(side="left", fill="x", expand=True)
-        self._script_frame = qf
-        self._script_text  = qt
-
         # ── Canvas ────────────────────────────────────────────────────────
         cf = tk.Frame(win, bg=BORDER, bd=1, relief="solid")
         cf.pack(fill="both", expand=True, padx=12, pady=(4, 2))
         self._wave_frame = cf
-        self._show_script()
         self._cv = tk.Canvas(cf, bg=SURF, highlightthickness=0,
                              height=self._canvas_h)
         self._cv.pack(fill="both", expand=True)
@@ -2700,10 +2603,27 @@ class MatchReviewDialog:
             self._play_or_edit()
 
     def _play_or_edit(self):
-        """Play the recording from the playhead, as it is: hearing the cut
-        is the Assembly window's other view."""
+        """Play from the playhead: the recording as it is, or with
+        skip_cuts only the pull's kept audio, its cuts skipped."""
+        segs = self.kept_from(self._playhead_s) if self.skip_cuts else None
+        if segs:
+            if self._live_play(segs[0][0], segs[-1][1], segments=segs):
+                return
         remain = max(0.5, self._ctx_dur - self._playhead_s)
         self._play(self._playhead_s, min(remain, 60.0))
+
+    def kept_from(self, t):
+        """The pull's kept regions, [(in, out)] in source time, from t on:
+        from where t falls in one, else from the next one; from the first
+        when t is past them all.  Empty when the pull has none."""
+        segs = [[float(a), float(b)] for a, b in self._segments]
+        if segs:                          # IN / OUT bound the outer edges
+            segs[0][0], segs[-1][1] = float(self._in_s), float(self._out_s)
+        kept = [(a, b) for a, b in segs if b > a]
+        if not kept:
+            return []
+        rest = [(max(a, t), b) for a, b in kept if b > t + 0.01]
+        return rest or kept
 
     def _prune_empty_segments(self):
         """Drop any segments whose effective duration is below one frame
@@ -3154,15 +3074,15 @@ class MatchReviewDialog:
             return None
         return self._player
 
-    def _live_play(self, lo, hi):
-        """Start live playback of [lo, hi].  False means the caller should
-        fall back."""
+    def _live_play(self, lo, hi, segments=None):
+        """Start live playback of [lo, hi] -- of only `segments` inside it,
+        when given.  False means the caller should fall back."""
         p = self._live_ready(lo, hi)
         if p is None:
             return False
         self._stop()
         self._pre_play_pos = self._playhead_s
-        p.set_segments(None)
+        p.set_segments(segments)
         p.set_rate(self._play_rate)
         self._playback_end_file = hi
         if not p.play(lo, hi):
@@ -3308,7 +3228,7 @@ class MatchReviewDialog:
                 self._playhead_s   = self._pre_play_pos
                 self._pre_play_pos = None
             self._playhead_anim = None
-            play_highlight.clear(self._script_text, "playing")
+            self._show_playing_word()
             try:
                 self._draw()
             except Exception:
@@ -3356,7 +3276,8 @@ class MatchReviewDialog:
             except Exception:
                 pass
             self._playhead_anim = None
-        play_highlight.clear(getattr(self, "_script_text", None), "playing")
+        if getattr(self, "on_playhead", None) is not None:
+            self._show_playing_word()
         try:
             import winsound
             winsound.PlaySound(None, winsound.SND_PURGE)

@@ -170,7 +170,8 @@ SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too clos
 
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
-            "return_on": True, "script": True, "nudge_s": 0.1}
+            "return_on": True, "script": True, "nudge_s": 0.1,
+            "skip_cuts": True}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -938,6 +939,8 @@ class AssemblyWindow(object):
                               toggle=True)
         self.script_key = key(p, "Script follows words", "Shift+F",
                               self.toggle_script_follow, toggle=True)
+        self.skip_key = key(p, "Skip cuts in the source view", "K",
+                            self.toggle_skip_cuts, toggle=True)
 
         p = self._panel("EDIT")
         self.edit_flow = p
@@ -961,6 +964,7 @@ class AssemblyWindow(object):
             b.pack(side="left", padx=(0, 2))
             self.nudge_keys[v] = b
         p.add(amount)
+        key(p, "Accept & next", "Ctrl+Enter", self.accept_next)
         key(p, "Undo", "Ctrl+Z", self.app._s4_undo)
         key(p, "Redo", "Ctrl+Shift+Z", self.app._s4_redo)
         self.view_key = key(p, "Source view", "Shift+S", self.toggle_view,
@@ -2338,20 +2342,22 @@ class AssemblyWindow(object):
         if rng:
             t.tag_add("sel_pull", rng[0], rng[-1])
 
-    def _light_script_word(self):
-        """Karaoke: light the script word being said at the playhead.  A
-        lookup per tick, and two tag calls only when the word changes, so
-        it keeps up at playback rate."""
+    def _light_script_word(self, at=None):
+        """Karaoke: light the script word being said at the playhead -- or
+        at timeline time `at` (the source view's playhead; None there: no
+        word).  A lookup per tick, and two tag calls only when the word
+        changes, so it keeps up at playback rate."""
         hit = None
-        i = bisect.bisect_right(self._starts, self.playhead) - 1
+        t = self.playhead if at is None else at
+        i = bisect.bisect_right(self._starts, t) - 1 if t is not False else -1
         c = self.clips[i] if 0 <= i < len(self.clips) else None
         line = self._line(c.order) if c is not None else None
         if line is not None and line.kept:
-            j = bisect.bisect_right(line.kept_t0, self.playhead) - 1
+            j = bisect.bisect_right(line.kept_t0, t) - 1
             if j >= 0:
                 tok = line.kept[j]
                 nxt = line.kept_t0[j + 1] if j + 1 < len(line.kept) else c.end
-                if self.playhead < max(tok.t1, min(nxt, tok.t1 + WORD_HOLD_S)):
+                if t < max(tok.t1, min(nxt, tok.t1 + WORD_HOLD_S)):
                     hit = (c.order, tok.cs, tok.ce)
         if hit == self._lit_script:
             return
@@ -3866,8 +3872,10 @@ class AssemblyWindow(object):
             # A click on the waveform takes the keys back from a field.
             self.src._cv.bind("<Button-1>",
                               lambda e: self.src._cv.focus_set(), add="+")
+            self.src.on_playhead = self._src_playhead
         elif self._src_order != order or self.src._audio_path != sa:
             self.src.load_clip(sa, segs, **kw)
+        self.src.skip_cuts = _MONITOR["skip_cuts"]
         self._src_order = order
         self.src._playhead_s = at
         self.src._play_rate = self._rate
@@ -3896,11 +3904,62 @@ class AssemblyWindow(object):
     def _leave_source(self):
         src = self.src
         src._stop()
+        self._light_script_word(False)
         self._release_row()
         t = self._timeline_time(self._src_order, src._playhead_s)
         self._show_view("cut")
         if t is not None:
             self.seek(t)
+
+    def _src_playhead(self, s):
+        """The source view's playhead, at source time s of its pull (None:
+        stopped): the script lights the word being heard there and keeps
+        it in view, as it does for the cut.  Audio the pull leaves out
+        has no word of the script."""
+        if self._closed or self.view != "source":
+            return
+        t = None
+        c = self._clip(self._src_order) if s is not None else None
+        if c is not None:
+            for tl, du, si in c.pieces:
+                if si <= s < si + du:
+                    t = tl + (s - si)
+                    break
+        self._light_script_word(False if t is None else t)
+
+    def toggle_skip_cuts(self):
+        """K: the source view plays only the pull's kept audio, skipping
+        what its cuts take out -- or the recording straight through."""
+        _MONITOR["skip_cuts"] = not _MONITOR["skip_cuts"]
+        if self.src is not None:
+            self.src.skip_cuts = _MONITOR["skip_cuts"]
+        self._show_monitor()
+
+    def accept_next(self):
+        """Ctrl+Enter: accept the pull on show as it is, and on to the next
+        one -- in the source view, its recording.  An edit is accepted as
+        it is made; this is for a pull that needed none."""
+        order = self._src_order if self.view == "source" else self.sel_order
+        if order is None:
+            order = self._order_at(self.insert)
+        c = self._clip(order)
+        if c is None:
+            self.status.config(fg=SUB, text="Nothing to accept here: put the "
+                               "insertion point on a pull.")
+            return
+        if not c.res.get("_s4_accepted"):
+            segs = [tuple(sg) for sg in (c.res.get("segments") or c.segments)]
+            self.app._assembly_set_segments(order, segs)
+        i = next((n for n, k in enumerate(self.clips) if k.order == order), None)
+        if i is None or i + 1 >= len(self.clips):
+            self.status.config(fg=SUB, text="#{:03d} accepted   ·   that was "
+                               "the last pull".format(order))
+            return
+        nxt = self.clips[i + 1]
+        self.select(nxt.order)
+        self.seek(nxt.start)
+        if self.view == "source":
+            self.show_source(nxt.order)
 
     def _timeline_time(self, order, s):
         """Where source time s of a pull falls on the timeline: in a piece,
@@ -4229,6 +4288,7 @@ class AssemblyWindow(object):
         self.return_key.set_on(_MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
+        self.skip_key.set_on(_MONITOR["skip_cuts"])
         self.view_key.set_on(self.view == "source")
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])
@@ -4276,6 +4336,10 @@ class AssemblyWindow(object):
             self.app._s4_redo()
         elif ctrl and k.lower() == "c":
             self.copy_words()
+        elif ctrl and k in ("Return", "KP_Enter"):
+            self.accept_next()
+        elif not ctrl and k.lower() == "k":
+            self.toggle_skip_cuts()
         elif k == "S" and not ctrl or k == "Return":
             self.toggle_view()
         elif k == "F" and not ctrl:

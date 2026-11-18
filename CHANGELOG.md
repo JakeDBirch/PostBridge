@@ -2,6 +2,13 @@
 
 ---
 
+## November 18, 2026
+
+### Assembly source view: Skip cuts, Accept & next, one script
+- **Skip cuts is back in the source view** (**K**, or the button in PLAY · MONITOR). On, which is the default, Space plays only the pull's kept audio from the playhead and jumps over what its cuts take out. From inside a cut it starts where the audio picks up again, and from past the pull it plays the pull from its start. Off, it plays the recording straight through, as before. The setting holds while PostBridge is open.
+- **Accept & next** (**Ctrl+Enter**, or the button in EDIT) accepts the pull on show as it is and moves to the next one, in the source view on that pull's recording. On the track it selects the next pull. An edit was already accepted as you made it, and a pull that's already accepted isn't accepted twice.
+- **The script is shown once.** The source view no longer has its own script box above the waveform. The script pane on the left is the one script, and it lights the word being heard and scrolls to keep it in view in the source view too (Shift+F still turns that off). Audio outside the pull has no word lit.
+
 ## November 13, 2026
 
 ### Google Docs: SEND TO SCRIPT at the cursor

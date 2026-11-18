@@ -145,14 +145,11 @@ def test_loading_a_clip_replaces_everything_about_the_last_one(walking):
     assert (d._in_s, d._out_s, d._playhead_s) == (5.0, 6.0, 5.0)
     assert d._samples is None and d._undo_stack == []
     assert d._search_var.get() == ""
-    assert "second line" in d._script_text.get("1.0", "end")
-    assert "first line" not in d._script_text.get("1.0", "end")
     assert d._scripted_val.cget("text") == "00:00:05 -> 00:00:06"
     assert d._word_frame.winfo_manager() == "pack"
 
     d.load_clip("c.wav", [[7.0, 8.0]])          # no script text, no words
     root.update()
-    assert not d._script_frame.winfo_manager()
     assert not d._word_frame.winfo_manager()
     assert d._scripted_head.cget("text") == ""
 
@@ -198,12 +195,13 @@ def test_another_clip_of_a_file_already_loaded_does_not_load_it_again(walking,
     assert d._samples is None and started == [True]
 
 
-# ── The script lights up as the clip plays ────────────────────────────────
+# ── The host hears where the playhead is, for its script ─────────────────
 
 class _Player:
     """Stands in for the live engine: _animate_playhead reads position()."""
     def __init__(self):
         self.t, self.playing = 0.0, True
+        self.segments = "unset"
 
     def is_playing(self):
         return self.playing
@@ -217,104 +215,97 @@ class _Player:
     def close(self):
         pass
 
+    def covers(self, lo, hi):
+        return True
 
-N_WORDS = 300
-WORDS = [{"word": " w{}".format(i), "start": 50.0 + 0.3 * i,
-          "end": 50.0 + 0.3 * i + 0.25} for i in range(N_WORDS)]
-# What the script says: the read, except one word said differently.
-SCRIPT = " ".join("w{}".format(i) if i != 5 else "changed"
-                  for i in range(N_WORDS))
+    def set_segments(self, segs):
+        self.segments = segs
+
+    def set_rate(self, r):
+        pass
+
+    def play(self, lo, hi):
+        self.lo, self.hi, self.playing = lo, hi, True
+        return True
 
 
 @pytest.fixture
 def playing(monkeypatch):
     monkeypatch.setattr(match_review.MatchReviewDialog, "_start_extraction",
                         lambda self: None)
+    monkeypatch.setattr(match_review._pb, "available", lambda: True)
     try:
         root = tk.Tk()
     except tk.TclError as exc:
         pytest.skip("Tk unavailable: {}".format(exc))
     root.withdraw()
     d = match_review.MatchReviewDialog(
-        root, "a.wav", [[50.0, 50.0 + 0.3 * N_WORDS]], _host(root), title="BUTLER",
-        quote_text=SCRIPT, context_before="before\n" * 40,
-        words=WORDS, auto_snap=False)
+        root, "a.wav", [[50.0, 55.0], [58.0, 60.0]], _host(root),
+        title="BUTLER", quote_text="a line", auto_snap=False)
     _pump(root)
     d._samples = np.zeros(d._sr * 200, np.float32)
     d._ctx_start, d._ctx_dur = 0.0, 200.0
     p = d._player = _Player()
-    yield root, d, p
+    heard = []
+    d.on_playhead = heard.append
+    yield root, d, p, heard
     d.destroy()
     root.destroy()
 
 
-def _lit(d):
-    r = d._script_text.tag_ranges("playing")
-    return d._script_text.get(r[0], r[1]) if r else None
+def test_it_has_no_script_of_its_own(playing):
+    root, d, p, heard = playing
+    assert not hasattr(d, "_script_text")
 
 
-def _hear(root, d, p, t):
-    p.t = t
+def test_the_host_hears_the_playhead_then_the_stop(playing):
+    root, d, p, heard = playing
+    p.t = 51.5
     d._animate_playhead()
-    root.update()
-
-
-def test_the_script_word_being_heard_lights_up(playing):
-    root, d, p = playing
-    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
-    assert _lit(d) == "w3"
-    _hear(root, d, p, 50.0 + 0.3 * 4 + 0.1)
-    assert _lit(d) == "w4"
-    _hear(root, d, p, 50.0 + 0.3 * 4 + 0.28)     # between two words
-    assert _lit(d) is None
-
-
-def test_a_word_the_script_has_differently_stays_dark(playing):
-    root, d, p = playing
-    _hear(root, d, p, 50.0 + 0.3 * 5 + 0.1)
-    assert _lit(d) is None
-    _hear(root, d, p, 50.0 + 0.3 * 6 + 0.1)
-    assert _lit(d) == "w6"
-
-
-def test_the_script_scrolls_to_keep_the_word_in_view(playing):
-    root, d, p = playing
-    qt = d._script_text
-    qt.yview_moveto(0.0)                 # reading the lines before it
-    root.update()
-    word = qt.search("w3 ", "1.0")
-    assert qt.bbox(word) is None
-    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
-    assert _lit(d) == "w3"
-    assert qt.bbox(qt.tag_ranges("playing")[0]) is not None
-
-
-def test_stopping_clears_it(playing):
-    root, d, p = playing
-    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+    assert heard[-1] == 51.5
     d._stop()
-    root.update()
-    assert _lit(d) is None and d._playhead_anim is None
+    assert heard[-1] is None
 
 
-def test_playback_ending_on_its_own_clears_it(playing):
-    root, d, p = playing
-    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
+def test_playback_ending_on_its_own_says_so(playing):
+    root, d, p, heard = playing
+    p.t = 51.5
+    d._animate_playhead()
     p.playing = False
     d._animate_playhead()
-    assert _lit(d) is None
+    assert heard[-1] is None
 
 
-def test_another_clip_starts_dark_and_lights_its_own_script(playing):
-    root, d, p = playing
-    _hear(root, d, p, 50.0 + 0.3 * 3 + 0.1)
-    d.load_clip("a.wav", [[50.0 + 0.3 * 10, 50.0 + 0.3 * 14]],
-                quote_text="w10 w11 w12 w13", words=WORDS, auto_snap=False)
-    assert _lit(d) is None
-    d._player = p
-    p.playing = True
-    _hear(root, d, p, 50.0 + 0.3 * 12 + 0.1)
-    assert _lit(d) == "w12"
+def test_straight_through_by_default(playing):
+    root, d, p, heard = playing
+    d._playhead_s = 52.0
+    d._play_or_edit()
+    assert p.segments is None and p.lo == 52.0
+
+
+def test_skip_cuts_plays_only_the_kept_audio_from_the_playhead(playing):
+    root, d, p, heard = playing
+    d.skip_cuts = True
+    d._playhead_s = 52.0
+    d._play_or_edit()
+    assert p.segments == [(52.0, 55.0), (58.0, 60.0)]
+    assert (p.lo, p.hi) == (52.0, 60.0)
+
+
+def test_skip_cuts_in_a_cut_starts_where_the_audio_resumes(playing):
+    root, d, p, heard = playing
+    d.skip_cuts = True
+    d._playhead_s = 56.0
+    d._play_or_edit()
+    assert p.segments == [(58.0, 60.0)]
+
+
+def test_skip_cuts_past_the_end_plays_the_pull_from_its_start(playing):
+    root, d, p, heard = playing
+    d.skip_cuts = True
+    d._playhead_s = 70.0
+    d._play_or_edit()
+    assert p.segments == [(50.0, 55.0), (58.0, 60.0)]
 
 
 def test_a_lone_word_far_from_the_clip_is_not_taken_for_it():

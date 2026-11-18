@@ -184,7 +184,8 @@ def test_the_panels_name_the_keys(view):
         return out
     shown = labels(win._side)
     for want in ("Source view", "Shift+S", "Cut ½ s out", "C",
-                 "Script follows words", "Shift+F"):
+                 "Script follows words", "Shift+F", "Accept & next",
+                 "Ctrl+Enter", "Skip cuts in the source view", "K"):
         assert want in shown
     assert "Open in editor" not in shown
 
@@ -215,3 +216,75 @@ def test_adopting_a_match_from_another_file_reassigns_the_pull(view):
     win.refresh()
     assert win.src._audio_path == other
     assert win.src._edited_segments() == [(30.0, 33.0)]
+
+
+# ── Skip cuts, Accept & next, and the script following the source view ───
+
+CTRL = 0x0004
+
+
+def test_ctrl_enter_accepts_the_pull_and_shows_the_next(view):
+    app, win = view
+    win.show_source(1)
+    depth = len(app._s4_undo_stack)
+    _key(app, win.src._cv, "Return", CTRL)
+    assert app._rv[0]["accepted_flag"][0]            # through the card's accept
+    assert _segs(app, 1) == [(10.0, 14.0)]           # as it was
+    assert len(app._s4_undo_stack) == depth + 1
+    assert win.view == "source" and win._src_order == 2
+    assert win.src._edited_segments() == [(20.0, 22.0)]
+
+
+def test_accept_and_next_leaves_an_accepted_pull_alone(view):
+    app, win = view
+    _res(app, 1)["_s4_accepted"] = True
+    win.show_source(1)
+    depth = len(app._s4_undo_stack)
+    win.accept_next()
+    assert len(app._s4_undo_stack) == depth and win._src_order == 2
+
+
+def test_accept_and_next_on_the_track_selects_the_next_pull(view):
+    app, win = view
+    win.select(1)
+    _key(app, win.cv, "Return", CTRL)
+    assert app._rv[0]["accepted_flag"][0]
+    assert win.view == "cut" and win.sel_order == 2
+
+
+def test_k_switches_skip_cuts_for_the_source_view(view):
+    app, win = view
+    was = assembly_view._MONITOR["skip_cuts"]
+    win.show_source(1)
+    assert win.src.skip_cuts is was
+    _key(app, win.src._cv, "k")
+    assert assembly_view._MONITOR["skip_cuts"] is (not was)
+    assert win.src.skip_cuts is (not was) and win.skip_key.on is (not was)
+    _key(app, win.src._cv, "k")
+    assert win.src.skip_cuts is was
+
+
+def test_the_script_follows_the_source_views_playhead(view):
+    app, win = view
+    c = win._clip(1)
+    c.words = win._map_words(c)
+
+    def lit():
+        rng = win.text.tag_ranges("word")
+        return win.text.get(*rng) if rng else None
+    win.show_source(1)
+    win.src.on_playhead(11.4)                  # source time: "ridge"
+    assert lit() == "ridge"
+    win.src.on_playhead(12.9)
+    assert lit() == "dawn."
+    win.src.on_playhead(30.0)                  # outside the pull: no word
+    assert lit() is None
+    win.src.on_playhead(11.4)
+    win.src.on_playhead(None)                  # stopped
+    assert lit() is None
+
+
+def test_the_source_view_has_no_script_of_its_own(view):
+    app, win = view
+    win.show_source(1)
+    assert not hasattr(win.src, "_script_text")
