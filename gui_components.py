@@ -613,6 +613,10 @@ class MediaPool(tk.Frame):
         self._user_unassigned   = set()   # paths the user explicitly cleared
         self._sort_col          = "file"  # column the rows are shown by
         self._sort_dir          = "asc"
+        # Video left out: only the video that is all its token has stays.
+        self._video_off         = False
+        self.paired_videos      = set()   # normcased videos known to have audio
+        self.on_video_toggle    = None    # called with the new _video_off
 
         self._hdr = hdr = tk.Frame(self, bg=SURF)
         hdr.pack(fill="x", padx=12, pady=(10,4))
@@ -620,6 +624,13 @@ class MediaPool(tk.Frame):
                  font=FL, bg=SURF, fg=ACCENT).pack(side="left")
         self._count_lbl = tk.Label(hdr, text="", font=FB, bg=SURF, fg=SUB)
         self._count_lbl.pack(side="left", padx=(10, 0))
+        self._video_lbl = tk.Label(hdr, text="", font=FB, bg=SURF, fg=SUB,
+                                   cursor="hand2", padx=6, pady=2, bd=0,
+                                   highlightbackground=BORDER,
+                                   highlightthickness=1)
+        self._video_lbl.pack(side="right")
+        self._video_lbl.bind("<Button-1>", lambda e: self._toggle_video())
+        self._paint_video_lbl()
 
         hint = ("Drop all episode files here at once  "
                 "(Riverside audio + video + VO takes)"
@@ -754,8 +765,10 @@ class MediaPool(tk.Frame):
                 # A second token for the same file: nothing follows it.
                 _apply_token_style(_v.get())
                 self._schedule_starts()
+                self._video_changed()
                 return
             self._schedule_starts()
+            self._video_changed()
             if not getattr(self, "_in_mirror", False):
                 self._auto_assigned.discard(_p)
                 if _v.get() == "— unassigned —":
@@ -1194,15 +1207,102 @@ class MediaPool(tk.Frame):
             r["row"].pack_forget()
         for r in self._display_rows():
             r["row"].pack(fill="x", pady=1)
+        if self._video_off:
+            self._refresh_count()
 
     def _display_rows(self):
         """The rows in on-screen order.  Sorting by TYPE keeps each type's
-        files alphabetical in either direction (sorted() is stable)."""
+        files alphabetical in either direction (sorted() is stable).  Video
+        that is left out is not among them."""
         if self._sort_col == "type":
             key = lambda r: is_video(r["path"])    # AUDIO, then VIDEO
         else:
             key = lambda r: os.path.basename(r["path"]).lower()
-        return sorted(self._rows, key=key, reverse=self._sort_dir == "desc")
+        out = self._left_out()
+        return sorted((r for r in self._rows if id(r) not in out),
+                      key=key, reverse=self._sort_dir == "desc")
+
+    # ── Video in or out ───────────────────────────────────────────────────
+    # An AAF for Pro Tools is cut from audio, so a camera file is only wanted
+    # where it is all there is: an interrogation tape, a clip off the news.
+    # With video out, every other video row is hidden and is in nobody's
+    # assignments; it stays in the pool (and in a save) with the token it
+    # had, so putting video back in brings it back as it was.
+
+    def _left_out(self):
+        """{id(row)} of the video rows that are out: empty with video in.
+
+        A video stays when it is the only kind of media its token or VO part
+        has.  One nobody is assigned stays too -- it may be waiting for its
+        token -- unless an audio file in the pool is plainly the same
+        recording: the same name, the same length, or the caller said so
+        (paired_videos: an episode source's cameras)."""
+        if not self._video_off:
+            return set()
+        with_audio, names, links = set(), set(), set()
+        for r in self._rows:
+            if is_video(r["path"]):
+                continue
+            tok = r["var"].get()
+            if tok != "— unassigned —":
+                with_audio.add(tok)
+            names.update(_pool_norm(r["path"]))
+            if r.get("link_id") is not None:
+                links.add(r["link_id"])
+        out = set()
+        for r in self._rows:
+            if not is_video(r["path"]):
+                continue
+            tok = r["var"].get()
+            if tok != "— unassigned —":
+                gone = tok in with_audio
+            else:
+                gone = (os.path.normcase(r["path"]) in self.paired_videos
+                        or bool(names.intersection(_pool_norm(r["path"])))
+                        or (r.get("link_id") is not None
+                            and r["link_id"] in links))
+            if gone:
+                out.add(id(r))
+        return out
+
+    def video_off(self):
+        return bool(self._video_off)
+
+    def set_video_off(self, off):
+        """Leave video out (True) or put it back in, and redraw."""
+        self._video_off = bool(off)
+        self._paint_video_lbl()
+        self._sort_rows()
+        self._refresh_count()
+
+    def _toggle_video(self):
+        self.set_video_off(not self._video_off)
+        if self.on_video_toggle is not None:
+            self.on_video_toggle(self._video_off)
+
+    def restore_video(self, data):
+        """A saved setup's own choice of video in or out, when it has one."""
+        if "video_off" in (data or {}):
+            self.set_video_off(data["video_off"])
+            if self.on_video_toggle is not None:
+                self.on_video_toggle(self._video_off)
+
+    def _paint_video_lbl(self):
+        self._video_lbl.config(
+            text="\u2610 INCLUDE VIDEO" if self._video_off
+            else "\u2611 INCLUDE VIDEO",
+            fg=SUB if self._video_off else ACCENT)
+
+    def _video_changed(self):
+        """An assignment, a pairing or a row changed: with video out, which
+        rows show may have changed with it.  Redrawn once things settle."""
+        if not self._video_off or self._sort_scheduled:
+            return
+        self._sort_scheduled = True
+        try:
+            self.after(50, self._deferred_sort)
+        except tk.TclError:
+            self._sort_scheduled = False
 
     def _sort_by(self, col):
         """Sort the shown rows by col; second click on same col reverses."""
@@ -1408,6 +1508,7 @@ class MediaPool(tk.Frame):
                 r["link_id"] = dur_key
                 break
         self._schedule_link_refresh()
+        self._video_changed()
 
     def _schedule_link_refresh(self):
         _prev = getattr(self, "_link_refresh_after", None)
@@ -1519,6 +1620,7 @@ class MediaPool(tk.Frame):
             g["row"].destroy()
         self._refresh_count()
         self._update_link_visuals()
+        self._video_changed()
         if rec.get("start_frame") is not None:
             self._refresh_starts()
 
@@ -1735,13 +1837,19 @@ class MediaPool(tk.Frame):
 
     def _refresh_count(self):
         n = len(self._rows)
-        self._count_lbl.config(text="{} file{}".format(n, "s" if n!=1 else ""))
+        text = "{} file{}".format(n, "s" if n!=1 else "")
+        left = len(self._left_out())
+        if left:
+            text += "  \u00b7  {} video left out (audio covers {})".format(
+                left, "it" if left == 1 else "them")
+        self._count_lbl.config(text=text)
 
     def get_assignments(self):
         out = {}
+        left = self._left_out()
         for r in self._rows:
             tok = r["var"].get()
-            if tok == "— unassigned —": continue
+            if tok == "— unassigned —" or id(r) in left: continue
             if r["path"] not in out.setdefault(tok, []):
                 out[tok].append(r["path"])
         return out

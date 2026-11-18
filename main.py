@@ -1821,6 +1821,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._pool._sort_dir = _prev_pool._sort_dir
         self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
                   small=True).pack(side="left", padx=(10, 0))
+        # Video in or out: the last choice made, until a saved session
+        # brings its own (MediaPool.restore_video).
+        _paired = getattr(self, "_ep_paired_videos", None)
+        self._pool.paired_videos = _paired() if _paired else set()
+        self._pool.set_video_off(self._prefs.get("pool_video_off", False))
+        self._pool.on_video_toggle = self._pool_video_toggled
 
         # Pre-load any files dropped at Step 1
         for p in getattr(self, "_prefetch_media", []):
@@ -1850,6 +1856,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._apply_setup_data(_setup, then=self._step2_pool_ready)
         else:
             self._step2_pool_ready()
+
+    def _pool_video_toggled(self, off):
+        """Video went in or out of the pool (a click on INCLUDE VIDEO, or a
+        saved session's own choice): the next Step 2 opens the same way --
+        Back from Step 4 rebuilds the pool, and it must come back as it was."""
+        if self._prefs.get("pool_video_off", False) != bool(off):
+            self._prefs["pool_video_off"] = bool(off)
+            self._save_prefs()
 
     def _step2_pool_ready(self):
         """Step 2's pool holds everything it is going to."""
@@ -3774,6 +3788,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "assignments": dict(self._pool.assignment_pairs()) if self._pool else {},
             # Files more than one token holds: their second rows and starts.
             "shared":    self._pool.get_shared() if self._pool else [],
+            # Video left out of Step 2 (all but a token's only media).
+            "video_off": self._pool.video_off() if self._pool else False,
             "pad":       self.pad_var.get(),
             "gap":       self.gap_var.get(),
         }
@@ -4101,6 +4117,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             if saved_tok:
                 r["var"].set(saved_tok)
         self._pool.apply_shared(data.get("shared"))
+        self._pool.restore_video(data)
         self._pool._refresh_count()
         if missing:
             messagebox.showwarning("Missing files",
@@ -4156,6 +4173,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         def _finish():
             pool.apply_shared(data.get("shared"))
             pool._bulk_loading = False
+            pool.restore_video(data)
             pool._refresh_count()
             if missing:
                 self._report_missing_setup_files(missing)

@@ -1474,6 +1474,20 @@ class EpisodeWorkflowMixin:
         self.workflow = "script_session"
         self._load_script(script)
 
+    def _ep_paired_videos(self):
+        """The cameras of every source that also has a recording, normcased:
+        video Step 2 can leave out, since audio covers it, whatever the
+        files are called."""
+        ep = getattr(self, "_ep", None)
+        out = set()
+        for src in ((ep or {}).get("sources") or {}).values():
+            if src.get("audio"):
+                for r in src.get("video", []):
+                    p = EP.absp(ep, r)
+                    if p:
+                        out.add(os.path.normcase(p))
+        return out
+
     def _ep_launch_aaf(self):
         if not self._ep_ready():
             return
