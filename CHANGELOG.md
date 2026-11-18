@@ -4,6 +4,12 @@
 
 ## November 18, 2026
 
+### Script: the part titles the narrator reads are narration
+- **The narrator reads each part's title** ("Part 1: Evan"), but the script only had it in the `[PART Part 1: Evan]` header. A header isn't narration, so nothing looked for that reading in the narrator's recording, and the titles never reached the cut.
+- **Script Check now warns** when a part named "Part …" has no narration reading its title, and lists those parts. Intro, Outro and other unnumbered parts aren't flagged.
+- **FIX FORMAT writes the title in** as the first narration of the part, as "Part 1. Evan." (the matcher ignores figures and punctuation, so it finds "Part one, Evan" or "Part 1, Evan"). A part that opens with narration gets the title as its first paragraph. A part that opens with a pull gets a `[VO PART_n_NARRATOR]` block of its own ahead of the pull, so the title plays before the clip. Running it again adds nothing, and FIX FORMAT IN DOC does the same in a Google Doc.
+- This adds new narration lines, so the episode has to be matched again (Step 3) for the titles to reach the cut.
+
 ### Assembly: Normalize, and a cut drags whole
 - **Normalize** (in PLAY · MONITOR, on by default) plays every pull at the one level: a quiet recording is brought up (by up to +32 dB) and a hot one brought down, and its waveform is drawn at that level too. The level is taken from a pull's speech peaks, not its single loudest moment. Playback only: the AAF and the files are untouched. Turn it off to hear the recordings as they are.
 - **Drag a cut's dimmed audio** (with Show surrounding audio on) to move both its edges together: the out before it and the in after it slide as one, so the same length of tape comes out from a little earlier or later. Nothing after it moves. A click there still just puts the insertion point there, and a double-click still brings the cut back.

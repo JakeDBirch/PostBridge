@@ -127,6 +127,29 @@ def _check_vo_above_first_part(lines, parts, vo_blocks, out):
         line))
 
 
+def _check_part_titles(text, out):
+    """A part named "Part 1: Evan" has its title read by the narrator, but a
+    header is not narration: nothing asks for that reading to be found, so
+    it never reaches the cut unless a [VO] line says it."""
+    todo = script_normalize.unread_part_titles(text)
+    if not todo:
+        return
+    names = ", ".join("“{}”".format(t[1]) for t in todo[:6])
+    if len(todo) > 6:
+        names += " and {} more".format(len(todo) - 6)
+    out.append(Finding(
+        WARN, "Format",
+        "Part title{} not in the narration".format("" if len(todo) == 1 else "s"),
+        "{} {} only in a [PART …] header, so the narrator's reading of {} is "
+        "never matched and never reaches the cut.\n"
+        "Fix: put the title in as the first line of narration in the part: "
+        "first in its [VO] block, or in a [VO] block of its own ahead of a "
+        "pull it opens with.  FIX FORMAT does this.".format(
+            names, "is" if len(todo) == 1 else "are",
+            "it" if len(todo) == 1 else "them"),
+        todo[0][0] + 1))
+
+
 def _check_indented_headers(lines, out):
     """Indented headers are parsed normally — this is a tidiness note, not a
     defect.  Aggregated so a uniformly indented script reports once."""
@@ -751,6 +774,7 @@ def run_checks(text, script_path=None):
         return []
     _check_shape(parts, pulls, vo_blocks, out, legacy=_legacy)
     _check_vo_above_first_part(lines, parts, vo_blocks, out)
+    _check_part_titles(text, out)
     _check_indented_headers(lines, out)
     _check_unparsed_brackets(lines, out)
     swallowed, structure_lines = _check_structure(text, out)
