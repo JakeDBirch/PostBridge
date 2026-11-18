@@ -371,3 +371,24 @@ def test_snapping_off_reaches_find_in_recording(view, monkeypatch):
     win.toggle_snap()
     assert win.src.snap is False and win.src._snap_to_silence(11.0) == 11.0
     win.toggle_snap()
+
+
+def test_a_cuts_sides_take_one_boundary_and_its_middle_the_whole_cut(view):
+    app, win = view
+    _cut_one(app, win)                            # the cut: 4.0-5.0 opened up
+    win.toggle_excised()
+    win.pps = 200.0                               # 200 px of cut
+    win.view0 = 3.0
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    mid = (y0 + y1) / 2.0
+    assert win._hit(win._x(4.1), mid)[0::2] == ("out", 0)   # near its left side
+    assert win._hit(win._x(4.9), mid)[0::2] == ("in", 1)    # near its right
+    kind, _c, g = win._hit(win._x(4.5), mid)
+    assert kind == "ghost" and g[3] == "cut"                # the middle
+    # A narrow cut keeps a few pixels each side for its boundaries.
+    win.pps = 40.0
+    win.redraw()
+    assert win._hit(win._x(4.0) + 10, mid)[0] == "out"
+    assert win._hit(win._x(4.5), mid)[0] == "ghost"

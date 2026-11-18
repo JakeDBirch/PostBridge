@@ -687,7 +687,7 @@ def test_the_retired_keys_do_nothing(view):
     win.win.focus_force()
     win.text.focus_force()
     app.update()
-    for k in ("h", "w", "W"):
+    for k in ("w", "W"):                     # (H heals now)
         win.text.event_generate("<KeyPress>", keysym=k, when="now")
     app.update()
     assert (_all_text(win), _segs(app, 1)) == before

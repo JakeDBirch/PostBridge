@@ -66,7 +66,10 @@ def describe(text, script_path=None):
     tokens, parts, pulls, vo_blocks, _title, _w = parse_script(text)
     return {"kinds": kinds, "tokens": toks, "outline": outline,
             "findings": script_check.run_checks(text, script_path=script_path),
-            "counts": (len(pulls), len(vo_blocks), len(parts), len(tokens))}
+            # [VO] blocks as written: not the part titles the narrator reads.
+            "counts": (len(pulls),
+                       sum(1 for v in vo_blocks if not v.get("part_title")),
+                       len(parts), len(tokens))}
 
 
 def headline(findings):

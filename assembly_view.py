@@ -147,6 +147,7 @@ MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 EXCISED_MAX_S = 30.0
+CUT_EDGE_PX = 14      # this near a cut's side, the boundary, not the cut
 NORM_LEVEL  = 0.5     # Normalize: each pull's speech peaks brought to this
 NORM_MAX_GAIN = 40.0  # ... by at most this much (+32 dB), so hiss stays hiss
 NORM_MIN_GAIN = 0.25  # tape cut out of a pull shows, dimmed, up to this long
@@ -3219,8 +3220,19 @@ class AssemblyWindow(object):
         if self.excised:
             for c in self.clips[max(0, i - 1):i + 2]:
                 g = c.ghost_at(t)
-                if g is not None:
-                    return ("ghost", c, g)
+                if g is None:
+                    continue
+                if g[3] == "cut" and 0 < g[4] < len(c.pieces):
+                    # A cut's outer quarters (at least CUT_EDGE_PX) take
+                    # the boundary on that side alone; only its middle
+                    # drags the whole cut.
+                    xa, xb = self._x(g[0]), self._x(g[0] + g[1])
+                    zone = max(CUT_EDGE_PX, (xb - xa) * 0.25)
+                    if x - xa <= zone or xb - x <= zone:
+                        if x - xa <= xb - x:
+                            return ("out", c, g[4] - 1)
+                        return ("in", c, g[4])
+                return ("ghost", c, g)
         c = self._clip_at(t)
         if c is not None:
             k = c.piece_at(t)

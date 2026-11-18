@@ -1493,9 +1493,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     doc_title, len(vo_blocks)),
                 fg=SUCCESS)
         elif on_step1:
+            _titles = sum(1 for v in vo_blocks if v.get("part_title"))
             self._s1.config(
-                text="✓  {}  ·  {} pulls  ·  {} VO  ·  {} parts  ·  {} tokens: {}{}".format(
-                    doc_title, len(pulls), len(vo_blocks), len(parts), len(tokens),
+                text="✓  {}  ·  {} pulls  ·  {} VO{}  ·  {} parts  ·  {} tokens: {}{}".format(
+                    doc_title, len(pulls), len(vo_blocks) - _titles,
+                    "  ·  {} part titles read".format(_titles) if _titles else "",
+                    len(parts), len(tokens),
                     "  ".join(tokens),
                     "  ·  {} pulls missing quote text".format(no_quote) if no_quote else ""),
                 fg=SUCCESS if not no_quote else WARN)
@@ -1598,7 +1601,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         tk.Label(bar,
                  text="{}  ·  {} pulls  ·  {} VO  ·  {} parts"
                       "        {} error / {} warning / {} note".format(
-                          self.doc_title, len(self.pulls), len(self.vo_blocks),
+                          self.doc_title, len(self.pulls),
+                          sum(1 for v in self.vo_blocks if not v.get("part_title")),
                           len(self.parts), n_err, n_warn, n_info),
                  font=FB, bg=SURF, fg=SUB).pack(anchor="w", padx=12, pady=(0, 10))
 

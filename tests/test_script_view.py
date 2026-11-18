@@ -58,8 +58,9 @@ def test_fix_format_gives_that_narration_a_part():
     assert "Added [PART Intro] above the narration that came before the first part" in changes
     _tokens, parts, _pulls, vo, _t, _w = parse_script(fixed)
     assert [p["name"] for p in parts] == ["Intro", "Part 1: The Lake"]
-    assert [(v["id"], v["part_index"]) for v in vo] == [("INTRO_NARRATOR", 1),
-                                                         ("PART_1_NARRATOR", 2)]
+    # (and the part title the narrator reads, ahead of part 1's narration)
+    assert [(v["id"], v["part_index"]) for v in vo if not v.get("part_title")] == [
+        ("INTRO_NARRATOR", 1), ("PART_1_NARRATOR", 2)]
     assert not _named(script_check.run_checks(fixed), "above the first [PART")
     assert script_normalize.normalize(fixed, title="Ep 7") == (fixed, [])   # once is enough
 
