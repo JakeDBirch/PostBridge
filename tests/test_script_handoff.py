@@ -437,15 +437,15 @@ def test_ordinary_narration_is_not_mistaken_for_structure():
 
 
 def test_a_multi_paragraph_quote_stays_in_its_pull():
-    text = ("Title\n\n[LYNN 00:06:58-00:07:16]\n“And he would pop their heads off.\n\n"
-            "Oh wow.\n\nYeah, he was good.”\n\n[VO PART_0_NARRATOR]\nNext.\n\n[PART One]\n")
+    text = ("Title\n\n[PART One]\n\n[LYNN 00:06:58-00:07:16]\n“And he would pop their heads off.\n\n"
+            "Oh wow.\n\nYeah, he was good.”\n\n[VO PART_0_NARRATOR]\nNext.\n")
     assert normalize(text, title="T")[1] == []
     assert len(parse_script(text)[2][0]["quote_paragraphs"]) == 3
 
 
 def test_an_unquoted_pull_keeps_its_paragraphs():
-    text = ("Title\n\n[JENA 00:01:23-00:01:45]\nJORDAN: Tell me.\n\nJENA: We went out.\n\n"
-            "[VO PART_0_NARRATOR]\nNext.\n\n[PART One]\n")
+    text = ("Title\n\n[PART One]\n\n[JENA 00:01:23-00:01:45]\nJORDAN: Tell me.\n\nJENA: We went out.\n\n"
+            "[VO PART_0_NARRATOR]\nNext.\n")
     assert normalize(text, title="T")[1] == []
 
 

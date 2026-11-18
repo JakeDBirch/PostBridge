@@ -1518,6 +1518,16 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         else:
             self._ui(self._step2)
 
+    def _view_script(self, path=None):
+        """Show the script in its own window (script_view): the text, what
+        Script Check makes of it, and its parts."""
+        import script_view
+        path = path or getattr(self, "_script_path", None)
+        if not path or not os.path.isfile(path):
+            messagebox.showinfo("View script", "There is no script file to show yet.")
+            return None
+        return script_view.show(self, path)
+
     def _s1_alive(self, attr):
         """True when Step 1's widget `attr` exists and is still on screen."""
         w = getattr(self, attr, None)
@@ -1556,6 +1566,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._ui(self._step_check)
 
         self._btn(nav, "RE-CHECK", _recheck, small=True).pack(side="left", padx=(8, 0))
+        self._btn(nav, "VIEW SCRIPT", self._view_script, small=True
+                  ).pack(side="left", padx=(8, 0))
         self._btn(nav, "NEXT  →  ASSIGN MEDIA",
                   self._step2, color=ACCENT).pack(side="right")
 
@@ -1821,6 +1833,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self._pool._sort_dir = _prev_pool._sort_dir
         self._btn(self._pool._hdr, "\u27f3 REFRESH", self._refresh_pool,
                   small=True).pack(side="left", padx=(10, 0))
+        self._btn(self._pool._hdr, "VIEW SCRIPT", self._view_script,
+                  small=True).pack(side="left", padx=(6, 0))
         # Video in or out: the last choice made, until a saved session
         # brings its own (MediaPool.restore_video).
         _paired = getattr(self, "_ep_paired_videos", None)

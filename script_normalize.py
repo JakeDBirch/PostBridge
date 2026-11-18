@@ -206,6 +206,20 @@ def normalize(text, title=None):
     vo_num, any_part = 0, False
     after_divider = False
 
+    # Narration above the first part has no part to be assigned to: the
+    # script gets one above its first block.  (With no parts anywhere the
+    # parser puts all narration in one, so there is nothing to add.)
+    in_order = [by_line[k] for k in sorted(by_line)]
+    first_part = next((l.n for l in in_order if l.kind in ("part", "section")), None)
+    first_vo = next((l.n for l in in_order
+                     if l.kind in ("vo", "swallowed", "orphan")), None)
+    intro_at, n_intro = None, 0
+    if first_part is not None and first_vo is not None and first_vo < first_part:
+        intro_at = next(l.n for l in in_order if l.kind in (
+            "pull", "loose_pull", "vo", "swallowed", "orphan"))
+    intro_name = "Opening" if re.search(
+        r"(?im)^\[PART\s+intro\b.*\]$|^intro(?:duction)?$", text) else "Intro"
+
     def _last_part():
         """Index in `out` of a [PART …] with nothing but blanks after it."""
         for k in range(len(out) - 1, -1, -1):
@@ -226,6 +240,10 @@ def normalize(text, title=None):
 
     for n, raw in enumerate(lines, 1):
         l = by_line.get(n)
+        if n == intro_at:
+            out += ["[PART {}]".format(intro_name), ""]
+            _part_num(intro_name)
+            n_intro = 1
         if l is None or l.kind in ("comment", "body", "narration", "title",
                                    "pull", "placeholder"):
             if l is not None and l.kind in ("body", "narration", "placeholder", "pull"):
@@ -294,7 +312,8 @@ def normalize(text, title=None):
     used = [p["token"] for p in _pulls]
     missing = [t for t in dict.fromkeys(used) if t not in written]
     # The list is optional, so a sound script without one needs nothing done.
-    if not (m or n_vo or n_part or n_merge or n_div or n_pull or outro_added):
+    if not (m or n_vo or n_part or n_merge or n_div or n_pull or outro_added
+            or n_intro):
         return text, []
     token_block = "\n".join(["[TOKENS]"] + written + missing + ["[/TOKENS]"])
 
@@ -324,6 +343,9 @@ def normalize(text, title=None):
     if n_merge:
         changes.append("Folded {} section line{} into the [PART] header above"
                        .format(n_merge, "" if n_merge == 1 else "s"))
+    if n_intro:
+        changes.append("Added [PART {}] above the narration that came before "
+                       "the first part".format(intro_name))
     if outro_added:
         changes.append("Added [PART Outro] above “Thanks for listening”")
     if n_pull:

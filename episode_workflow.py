@@ -413,6 +413,15 @@ class EpisodeWorkflowMixin:
                 if not links.get("script"):
                     self._btn(r, "CHOOSE SCRIPT\u2026", self._ep_choose_script, small=True
                               ).pack(side="left", padx=(6, 0))
+                else:
+                    # Script Check, in a few words, without opening anything:
+                    # a script with a blocking issue is worth reading first.
+                    state = self._ep_script_state()
+                    if state:
+                        tk.Label(r, text="\u00b7  " + state[0], font=FB, bg=SURF,
+                                 fg=state[1]).pack(side="left", padx=(12, 0))
+                    self._btn(r, "VIEW SCRIPT", self._ep_view_script, small=True
+                              ).pack(side="left", padx=(12, 0))
 
     def _ep_render_sources(self, parent):
         ep = self._ep
@@ -615,6 +624,35 @@ class EpisodeWorkflowMixin:
             pass
         self._ep_script_cache = (key, (tokens, part_names))
         return tokens, part_names
+
+    def _ep_script_state(self):
+        """(text, colour) of Script Check's verdict on the linked script, or
+        None with no script to read.  Worked out again only when it changes."""
+        ep = self._ep
+        path = EP.absp(ep, ep.get("links", {}).get("script"))
+        try:
+            key = (path, os.path.getmtime(path)) if path else None
+        except OSError:
+            key = None
+        if key is None:
+            return None
+        cache = getattr(self, "_ep_state_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        try:
+            import script_check, script_view
+            with open(path, encoding="utf-8", errors="replace") as f:
+                state = script_view.headline(
+                    script_check.run_checks(f.read(), script_path=path))
+            state = ("script: " + state[0], state[1])
+        except Exception:
+            state = None
+        self._ep_state_cache = (key, state)
+        return state
+
+    def _ep_view_script(self):
+        ep = self._ep
+        self._view_script(EP.absp(ep, ep.get("links", {}).get("script")))
 
     def _ep_choose_script(self):
         """Link the episode's script from the review, so the sources can

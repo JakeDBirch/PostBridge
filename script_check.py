@@ -20,6 +20,7 @@ from episode import read_pq_session
 from parsers import (parse_script, parse_plain_script, is_plain_script,
                      discover_pq_sessions, _HEADER_RE, _normalize_tc, DEFAULT_DOC_TITLE)
 import script_normalize
+from parsers import _HEADER_RE, _strip_comment
 
 # Severity ordering is also the display ordering.
 ERROR, WARN, INFO = "error", "warn", "info"
@@ -96,6 +97,34 @@ def _check_shape(parts, pulls, vo_blocks, out, legacy=False):
         out.append(Finding(WARN, "Format", "No [PART …] section headers were found",
                            "Every item lands in one unnamed section, and VO takes are "
                            "binned per part, so there will be a single VO bin."))
+
+
+def _check_vo_above_first_part(lines, parts, vo_blocks, out):
+    """Narration that comes before the first [PART] belongs to no part.  A
+    narrator's recording is assigned to a part, so there is nothing to assign
+    this narration's recording to, and it is never matched."""
+    early = [v for v in vo_blocks if not v.get("part_index")]
+    if not early or not parts:
+        return
+    line = None
+    for i, raw in enumerate(lines, 1):
+        m = _HEADER_RE.match(_strip_comment(raw).strip())
+        if m and m.group("part") is not None:
+            break
+        if m and m.group("void") is not None:
+            line = i
+            break
+    out.append(Finding(
+        ERROR, "Format",
+        "Narration above the first [PART …] header",
+        "%d VO block%s (the first is [VO %s]) come%s before any [PART …].  A "
+        "narrator's recording is assigned to a part, so Step 2 has nothing to "
+        "assign this narration's recording to and it is never matched.\n"
+        "Fix: add a part header above it, such as [PART Intro].  FIX FORMAT "
+        "does this."
+        % (len(early), "" if len(early) == 1 else "s", early[0]["id"],
+           "s" if len(early) == 1 else ""),
+        line))
 
 
 def _check_indented_headers(lines, out):
@@ -721,6 +750,7 @@ def run_checks(text, script_path=None):
             and parse_plain_script(text)[3]):
         return []
     _check_shape(parts, pulls, vo_blocks, out, legacy=_legacy)
+    _check_vo_above_first_part(lines, parts, vo_blocks, out)
     _check_indented_headers(lines, out)
     _check_unparsed_brackets(lines, out)
     swallowed, structure_lines = _check_structure(text, out)
