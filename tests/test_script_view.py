@@ -123,3 +123,72 @@ def test_the_script_opens_in_a_window_and_a_finding_goes_to_its_line(tmp_path, m
         win.destroy()
     finally:
         app.destroy()
+
+
+# ── Fetching from the same window, and the review keeping up ──────────────
+
+if _HAVE_FFMPEG:
+    from test_episode import project  # noqa: E402,F401  (module-scoped fixture)
+    from test_episode_screens import app, _open_fresh, _wait, _pump, _click  # noqa: E402,F401
+
+
+def _labels(w):
+    import tkinter as tk
+    out = []
+    for c in w.winfo_children():
+        if isinstance(c, tk.Label):
+            out.append(c.cget("text"))
+        out += _labels(c)
+    return out
+
+
+@pytest.mark.skipif(not _HAVE_FFMPEG, reason="the app fixture's project needs ffmpeg")
+def test_the_script_is_fetched_where_it_is_read_and_the_review_follows(
+        app, monkeypatch, project):
+    """FETCH & CHECK used to be a button on the review and a dialog of its
+    own, and the review's line about the script stayed as it was read before
+    the fetch: an issue fixed in the Doc still showed as blocking."""
+    import gdocs
+    _open_fresh(app, monkeypatch, project)
+    fixed = SCRIPT.replace("[VO INTRO_NARRATOR]", "[PART Intro]\n\n[VO INTRO_NARRATOR]")
+    doc = {"text": SCRIPT}
+    monkeypatch.setattr(gdocs, "is_configured", lambda: True)
+    monkeypatch.setattr(gdocs, "is_ready", lambda: True)
+    monkeypatch.setattr(gdocs, "list_tabs", lambda creds, doc_id, docs=None: [("t.0", "Tab 1")])
+    monkeypatch.setattr(gdocs, "get_credentials", lambda interactive=True: object())
+    monkeypatch.setattr(gdocs, "fetch_text", lambda creds, doc_id, tab=None: (
+        doc["text"], {"name": "Ep 7 intro", "version": "3", "modifiedTime": "t"}))
+    app._ep["links"]["gdoc"] = {"id": "doc123", "name": "Ep 7 intro"}
+    app._ep_view()
+    _pump(app, 5)
+    assert "FETCH & CHECK" not in _labels(app.body)          # one way in
+
+    # Nothing fetched yet: VIEW SCRIPT brings the Doc in and shows it.
+    assert _click(app, app.body, "VIEW SCRIPT")
+    assert _wait(app, lambda: getattr(app, "_ep_fetch_count", 0) == 1, secs=10)
+    _pump(app, 5)
+    win = app._ep_findings_win
+    assert [f for f in win.info["findings"] if "above the first" in f.title]
+    assert any("fetched just now" in t for t in _labels(win))
+    assert any(t.startswith("\u00b7  script:") and "blocking" in t for t in _labels(app.body))
+
+    # Fixed in the Doc; fetched from the window it is read in.
+    doc["text"] = fixed
+    assert _click(app, win, "\u27f3 FETCH LATEST")
+    assert _wait(app, lambda: app._ep_fetch_count == 2, secs=10)
+    _pump(app, 5)
+    assert app._ep_findings_win is win and win.winfo_exists()
+    assert "[PART Intro]" in win._text.get("1.0", "end")
+    assert not [f for f in win.info["findings"] if "above the first" in f.title]
+    # ...and the review no longer calls it blocking.
+    assert not any("blocking" in t for t in _labels(app.body) if "script:" in t)
+
+    # Opened again just to read: the copy as last fetched, with a way to fetch.
+    _click(app, win, "CLOSE")
+    assert _click(app, app.body, "VIEW SCRIPT")
+    _pump(app, 5)
+    assert app._ep_fetch_count == 2
+    assert any("as last fetched" in t for t in _labels(app._ep_findings_win))
+    assert "\u27f3 FETCH LATEST" in _labels(app._ep_findings_win)
+    app._ep_findings_win.destroy()
+    assert not app._errors, "\n".join(app._errors)

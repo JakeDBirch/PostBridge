@@ -316,6 +316,7 @@ class EpisodeWorkflowMixin:
         # Header: title, root, actions
         hdr = tk.Frame(self.body, bg=BG)
         hdr.pack(fill="x", pady=(20, 6))
+        self._ep_review_mark = hdr          # the review is up while this is
         tk.Frame(hdr, bg=ACCENT, width=3, height=20).pack(side="left", padx=(0, 10))
         tk.Label(hdr, text="EPISODE", font=FL, bg=BG, fg=TEXT).pack(side="left")
         self._ep_title_var = tk.StringVar(value=ep["title"])
@@ -400,8 +401,6 @@ class EpisodeWorkflowMixin:
                                  gd.get("name", ""),
                                  "  \u203a  " + gd["tab_name"] if gd.get("tab_name") else ""),
                              font=FB, bg=SURF, fg=SUCCESS).pack(side="left", padx=(12, 0))
-                    self._btn(r, "FETCH & CHECK", self._ep_gdoc_fetch, small=True
-                              ).pack(side="left", padx=(12, 0))
                     if gd.get("tab_name"):
                         self._btn(r, "CHANGE TAB\u2026", self._ep_gdoc_change_tab, small=True
                                   ).pack(side="right", padx=(6, 0))
@@ -413,9 +412,11 @@ class EpisodeWorkflowMixin:
                 if not links.get("script"):
                     self._btn(r, "CHOOSE SCRIPT\u2026", self._ep_choose_script, small=True
                               ).pack(side="left", padx=(6, 0))
-                else:
+                if links.get("script") or gd.get("id"):
                     # Script Check, in a few words, without opening anything:
                     # a script with a blocking issue is worth reading first.
+                    # VIEW SCRIPT is where it is read, fetched again from
+                    # its Doc, checked and fixed.
                     state = self._ep_script_state()
                     if state:
                         tk.Label(r, text="\u00b7  " + state[0], font=FB, bg=SURF,
@@ -651,8 +652,7 @@ class EpisodeWorkflowMixin:
         return state
 
     def _ep_view_script(self):
-        ep = self._ep
-        self._view_script(EP.absp(ep, ep.get("links", {}).get("script")))
+        self._ep_script_window()
 
     def _ep_choose_script(self):
         """Link the episode's script from the review, so the sources can
@@ -1052,54 +1052,85 @@ class EpisodeWorkflowMixin:
             import script_check
             findings = script_check.run_checks(text, script_path=path)
             diff = gdocs.diff_pulls(prev_text, text) if prev_text else None
+            # The review's own line about the script was read before this.
+            self._ep_review_refresh()
             self._ep_show_findings(findings, text, meta, diff, then, local_fixes)
         self._ep_gdoc_bg(_work, _done)
 
     def _ep_show_findings(self, findings, text, meta, diff, then=None, local_fixes=()):
-        """Script Check results for a fetched Doc, with the Doc actions.
+        """A fetched Doc, shown: the script window on the project copy, with
+        what the fetch found and what can be written back to the Doc.
         *local_fixes*: what Fix Format changed in the project copy."""
-        import script_check
-        n_err, n_warn, n_info = script_check.summarize(findings)
-        win = tk.Toplevel(self)
-        win.title("Script check")
-        win.configure(bg=BG)
-        win.transient(self)
-        tk.Label(win, text="Script check \u2014 {}".format(meta.get("name", "")),
-                 font=FH, bg=BG, fg=TEXT, padx=20).pack(anchor="w", pady=(14, 2))
-        head = "{} error{}, {} warning{}, {} note{}".format(
-            n_err, "" if n_err == 1 else "s", n_warn, "" if n_warn == 1 else "s",
-            n_info, "" if n_info == 1 else "s")
-        if diff:
-            a, r, c = diff
-            head += "   \u00b7   since the last fetch: {} pull{} added, {} removed, {} changed".format(
-                a, "" if a == 1 else "s", r, c)
-        tk.Label(win, text=head, font=FB, bg=BG, fg=SUB, padx=20).pack(anchor="w", pady=(0, 8))
-        if local_fixes:
-            tk.Label(win, font=FB, bg=BG, fg=SUB, padx=20, justify="left",
-                     wraplength=900, anchor="w", text="Fixed in the project copy "
-                     "(the Doc is unchanged):  " + ";  ".join(local_fixes)
-                     ).pack(anchor="w", fill="x", pady=(0, 8))
-        box = tk.Frame(win, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
-        box.pack(fill="both", expand=True, padx=20)
-        lst = tk.Text(box, font=FB, bg=SURF, fg=TEXT, relief="flat", bd=0, wrap="word",
-                      height=16, width=96)
-        lst.pack(fill="both", expand=True, padx=8, pady=8)
-        colours = {"error": "#e05050", "warn": WARN, "info": SUB}
-        for f in findings:
-            tag = f.severity
-            lst.tag_configure(tag, foreground=colours.get(tag, TEXT))
-            loc = "line {}  ".format(f.line) if f.line else ""
-            lst.insert("end", "{}{}  {}\n".format(f.severity.upper().ljust(6), loc, f.title), tag)
-            if f.detail:
-                lst.insert("end", "        {}\n".format(" ".join(str(f.detail).split())), "info")
-        if not findings:
-            lst.insert("end", "Nothing to report. The script is ready to reconcile.\n", "info")
-        lst.configure(state="disabled")
-        self._ep_findings_win = win
+        self._ep_script_window(then, fetched={
+            "findings": findings, "text": text, "meta": meta, "diff": diff,
+            "local_fixes": list(local_fixes)})
 
-        nav = tk.Frame(win, bg=BG)
-        nav.pack(fill="x", padx=20, pady=(10, 14))
-        gd = self._ep.get("links", {}).get("gdoc") or {}
+    def _ep_review_refresh(self):
+        """Redraw the review if it is what is on screen: its line about the
+        script, and the tokens it offers, are read from the script."""
+        mark = getattr(self, "_ep_review_mark", None)
+        try:
+            if mark is not None and mark.winfo_exists():
+                self._ep_view()
+        except tk.TclError:
+            pass
+
+    def _ep_script_window(self, then=None, fetched=None):
+        """The episode's script in the script window, and everything done to
+        it from there: fetch the Google Doc again, write Script Check's notes
+        into it, fix its format.  *fetched* is what a fetch just brought
+        (see _ep_show_findings); *then()* makes it a step on the way
+        somewhere, with CONTINUE in place of CLOSE."""
+        import script_view
+        ep = self._ep
+        links = ep.setdefault("links", {})
+        gd = links.get("gdoc") or {}
+        path = EP.absp(ep, links.get("script"))
+        if not (path and os.path.isfile(path)):
+            if gd.get("id"):
+                self._ep_gdoc_fetch(then)       # nothing here yet: bring it in
+            else:
+                messagebox.showinfo("View script", "There is no script file to show yet.")
+            return None
+        win = script_view.show(self, path)
+        self._ep_findings_win = win
+        self._ep_fetch_count = getattr(self, "_ep_fetch_count", 0) + (1 if fetched else 0)
+        win.on_change = self._ep_review_refresh
+
+        def _close():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            if then is not None:
+                then()
+        right = [("CONTINUE  →", _close, True)] if then is not None \
+            else [("CLOSE", _close, False)]
+
+        if not gd.get("id"):
+            win.set_actions([], right)
+            return win
+
+        doc = "Google Doc: {}{}".format(
+            gd.get("name", ""), "  ›  " + gd["tab_name"] if gd.get("tab_name") else "")
+        fetch = ("⟳ FETCH LATEST", lambda: self._ep_gdoc_fetch(then), fetched is None)
+        if not fetched:
+            # Opened to read: this is the copy from the last fetch.
+            win.set_status(doc + "   ·   the project copy, as last fetched.  "
+                           "FETCH LATEST brings in the Doc as it is now, and checks it.")
+            win.set_actions([fetch], right)
+            return win
+
+        findings, text, meta = fetched["findings"], fetched["text"], fetched["meta"]
+        status = doc + "   ·   fetched just now"
+        if fetched["diff"]:
+            a, r, c = fetched["diff"]
+            status += "   ·   since the last fetch: {} pull{} added, {} removed, {} changed".format(
+                a, "" if a == 1 else "s", r, c)
+        if fetched["local_fixes"]:
+            status += "\nFixed in the project copy (the Doc is unchanged):  " + \
+                ";  ".join(fetched["local_fixes"])
+        win.set_status(status)
 
         def _write():
             notes = gdocs.findings_to_notes(findings, text)
@@ -1124,33 +1155,16 @@ class EpisodeWorkflowMixin:
             changes = script_normalize.normalize(text, title=title)[1]
             if not messagebox.askyesno("Fix format in the Doc", "\n".join(
                     ["This changes the Google Doc for everyone who has it open:", ""]
-                    + ["\u2022 " + c for c in changes]
-                    + ["\u2022 Removes PostBridge's notes", "",
+                    + ["• " + c for c in changes]
+                    + ["• Removes PostBridge's notes", "",
                        "Wording and timecodes stay as they are. "
-                       "File \u2192 Version history in the Doc can undo it."])):
+                       "File → Version history in the Doc can undo it."])):
                 return
             def _work():
                 return gdocs.fix_format(gdocs.get_credentials(), gd["id"], title=title, tab=gd.get("tab"))
-            def _done(_changes):
-                try:
-                    win.destroy()
-                except tk.TclError:
-                    pass
-                self._ep_gdoc_fetch(then)     # check what the Doc says now
-            self._ep_gdoc_bg(_work, _done)
+            # Then check what the Doc says now.
+            self._ep_gdoc_bg(_work, lambda _changes: self._ep_gdoc_fetch(then))
 
-        def _continue():
-            try:
-                win.destroy()
-            except tk.TclError:
-                pass
-            if then is not None:
-                then()
-
-        if then is not None:
-            self._btn(nav, "CONTINUE  \u2192", _continue, color=ACCENT).pack(side="right")
-        else:
-            self._btn(nav, "CLOSE", _continue).pack(side="right")
         name = meta.get("name", "the Doc")
         fix_local = bool(gd.get("fix_local"))
         local_changes = script_normalize.normalize(text, title=meta.get("name"))[1]
@@ -1169,42 +1183,33 @@ class EpisodeWorkflowMixin:
             else:
                 link.pop("fix_local", None)
             EP.save(self._ep)
-            try:
-                win.destroy()
-            except tk.TclError:
-                pass
             self._ep_gdoc_fetch(then)      # fetch again, fixed (or not) this time
 
+        left, notice = [fetch], None
         if not gdocs.can_edit(meta):
             # Shared view-only: it fetches and checks, but nothing can be
             # written back -- say so instead of offering buttons Google
             # would refuse.  The project copy can still be fixed.
             owner = gdocs.owner_name(meta) or "its owner"
-            tk.Label(nav, font=FB, bg=BG, fg=WARN, justify="left", anchor="w",
-                     wraplength=520, text=(
-                         "View only: “{}” belongs to {}, and this Google "
-                         "account can't edit it, so nothing can be written into the "
-                         "Doc.  Ask {} to share it with you as an Editor{}.").format(
-                             name, owner, owner,
-                             "" if fix_local or not local_changes
-                             else ", or fix the format in the project copy")
-                     ).pack(side="left", fill="x", expand=True)
+            notice = ("View only: “{}” belongs to {}, and this Google "
+                      "account can't edit it, so nothing can be written into the "
+                      "Doc.  Ask {} to share it with you as an Editor{}.").format(
+                          name, owner, owner,
+                          "" if fix_local or not local_changes
+                          else ", or fix the format in the project copy")
             if not fix_local and local_changes:
-                self._btn(nav, "FIX FORMAT IN PROJECT COPY", lambda: _set_fix_local(True),
-                          small=True, color=ACCENT).pack(side="left", padx=(8, 0))
+                left.append(("FIX FORMAT IN PROJECT COPY", lambda: _set_fix_local(True), True))
         else:
-            self._btn(nav, "CLEAR NOTES IN DOC", _clear, small=True).pack(side="left")
+            left.append(("CLEAR NOTES IN DOC", _clear, False))
             if findings:
-                self._btn(nav, "WRITE NOTES INTO DOC", _write, small=True, color=ACCENT
-                          ).pack(side="left", padx=(8, 0))
+                left.append(("WRITE NOTES INTO DOC", _write, True))
             if local_changes:
-                self._btn(nav, "FIX FORMAT IN DOC", _fix, small=True, color=ACCENT
-                          ).pack(side="left", padx=(8, 0))
+                left.append(("FIX FORMAT IN DOC", _fix, True))
         if fix_local:
             # Turned off, the next fetch saves the Doc exactly as it is.
-            self._btn(nav, "STOP FIXING THE COPY", lambda: _set_fix_local(False),
-                      small=True).pack(side="left", padx=(8, 0))
-        self._center_dialog(win, min_w=760, min_h=420)
+            left.append(("STOP FIXING THE COPY", lambda: _set_fix_local(False), False))
+        win.set_actions(left, right, notice)
+        return win
 
     # ── Write-backs from the stages ───────────────────────────────────────
 

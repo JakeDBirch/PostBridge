@@ -427,12 +427,12 @@ def test_google_doc_fix_format_repairs_the_doc_and_checks_again(app, monkeypatch
     # Saying yes fixes it, then fetches and checks again in a new window,
     # which has nothing left to fix.
     monkeypatch.setattr(ew_messagebox, "askyesno", lambda *a, **k: True)
+    _fetched = app._ep_fetch_count
     assert _click(app, first, "FIX FORMAT IN DOC")
-    assert _wait(app, lambda: app._ep_findings_win is not first
-                 and app._ep_findings_win.winfo_exists(), secs=10)
+    assert _wait(app, lambda: app._ep_fetch_count > _fetched, secs=10)
     _pump(app, 3)
     assert calls == [("doc123", "Ep 7 script")]
-    assert not first.winfo_exists()
+    assert app._ep_findings_win is first          # the same window, refreshed
     assert not _click(app, app._ep_findings_win, "FIX FORMAT IN DOC")
     assert open(os.path.join(project, "Ep 7 script.txt"), encoding="utf-8").read() == fixed
     _click(app, app._ep_findings_win, "CLOSE")
@@ -483,9 +483,9 @@ def test_a_view_only_doc_offers_no_writes_and_says_whose_it_is(app, monkeypatch,
     fixed = script_normalize.normalize(broken, title="Ep 7 script")[0]
     copy = os.path.join(project, "Ep 7 script.txt")
     assert open(copy, encoding="utf-8").read() == broken
+    _fetched = app._ep_fetch_count
     assert _click(app, win, "FIX FORMAT IN PROJECT COPY")
-    assert _wait(app, lambda: app._ep_findings_win is not win
-                 and app._ep_findings_win.winfo_exists(), secs=10)
+    assert _wait(app, lambda: app._ep_fetch_count > _fetched, secs=10)
     _pump(app, 3)
     win = app._ep_findings_win
     assert app._ep["links"]["gdoc"]["fix_local"] is True
@@ -493,17 +493,17 @@ def test_a_view_only_doc_offers_no_writes_and_says_whose_it_is(app, monkeypatch,
     assert not _click(app, win, "FIX FORMAT IN PROJECT COPY")
     assert any("Fixed in the project copy" in t for t in _texts(win))
     _click(app, win, "CLOSE")
+    _fetched = app._ep_fetch_count
     app._ep_gdoc_fetch()                    # a later fetch: still fixed
-    assert _wait(app, lambda: app._ep_findings_win is not win
-                 and app._ep_findings_win.winfo_exists(), secs=10)
+    assert _wait(app, lambda: app._ep_fetch_count > _fetched, secs=10)
     _pump(app, 3)
     win = app._ep_findings_win
     assert open(copy, encoding="utf-8").read() == fixed
 
     # Turned off, the Doc comes down exactly as it is again.
+    _fetched = app._ep_fetch_count
     assert _click(app, win, "STOP FIXING THE COPY")
-    assert _wait(app, lambda: app._ep_findings_win is not win
-                 and app._ep_findings_win.winfo_exists(), secs=10)
+    assert _wait(app, lambda: app._ep_fetch_count > _fetched, secs=10)
     _pump(app, 3)
     assert "fix_local" not in app._ep["links"]["gdoc"]
     assert open(copy, encoding="utf-8").read() == broken
@@ -537,7 +537,7 @@ def test_google_doc_link_fetch_notes_and_launch(app, monkeypatch, project):
     _pump(app, 3)
 
     # Fetch: the Doc becomes the episode's script, version-stamped, checked.
-    assert _click(app, app, "FETCH & CHECK")
+    assert _click(app, app, "VIEW SCRIPT")      # nothing fetched yet: it fetches
     assert _wait(app, lambda: getattr(app, "_ep_findings_win", None) is not None, secs=10)
     _pump(app, 3)
     script = os.path.join(project, "Ep 7 script.txt")

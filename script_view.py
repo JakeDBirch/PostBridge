@@ -105,16 +105,27 @@ class ScriptWindow(tk.Toplevel):
         self._name.pack(side="left")
         self._counts = tk.Label(top, text="", font=FB, bg=BG, fg=SUB)
         self._counts.pack(side="left", padx=(14, 0))
-        app._btn(top, "CLOSE", self.destroy, small=True).pack(side="right")
         app._btn(top, "OPEN IN EDITOR", lambda: open_in_editor(self.path),
-                 small=True).pack(side="right", padx=(0, 6))
+                 small=True).pack(side="right")
         app._btn(top, "⟳ RE-READ", self.reload, small=True
                  ).pack(side="right", padx=(0, 6))
-        tk.Label(self, text=path, font=(_SANS, 10), bg=BG, fg=SUB
-                 ).pack(anchor="w", padx=14)
+        self._path_lbl = tk.Label(self, text=path, font=(_SANS, 10), bg=BG, fg=SUB)
+        self._path_lbl.pack(anchor="w", padx=14)
+        # Where the script came from and what was just done to it (set_status).
+        self._status = tk.Label(self, text="", font=FB, bg=BG, fg=SUB, anchor="w",
+                                justify="left", wraplength=1220)
+
+        # What can be done to the script from here (set_actions): along the
+        # bottom, packed first so a short window keeps it.
+        self._bar = tk.Frame(self, bg=BG)
+        self._bar.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
+        # Called after the file is read again, so whatever else shows the
+        # script's state can follow.
+        self.on_change = None
 
         panes = tk.Frame(self, bg=BG)
-        panes.pack(fill="both", expand=True, padx=14, pady=(8, 12))
+        panes.pack(fill="both", expand=True, padx=14, pady=(8, 10))
+        self._panes = panes
 
         side = tk.Frame(panes, bg=SURF, width=400, highlightbackground=BORDER,
                         highlightthickness=1)
@@ -150,7 +161,37 @@ class ScriptWindow(tk.Toplevel):
 
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<F5>", lambda e: self.reload())
+        self.set_actions()
         self.reload()
+
+    # -- what the opener adds ---------------------------------------------
+
+    def set_status(self, text="", colour=None):
+        """A line under the path: where the script came from, what changed."""
+        self._status.config(text=text or "", fg=colour or SUB)
+        if text:
+            self._status.pack(anchor="w", fill="x", padx=14, pady=(2, 0),
+                              before=self._panes)
+        else:
+            self._status.pack_forget()
+
+    def set_actions(self, left=(), right=(), notice=None):
+        """The bottom bar.  *left* and *right* are [(label, command, accent)];
+        *notice* is said in the bar itself.  With nothing given there is
+        CLOSE."""
+        for w in self._bar.winfo_children():
+            w.destroy()
+        for label, cmd, accent in (right or [("CLOSE", self.destroy, False)]):
+            self.app._btn(self._bar, label, cmd, color=ACCENT if accent else None
+                          ).pack(side="right", padx=(8, 0))
+        if notice:
+            tk.Label(self._bar, text=notice, font=FB, bg=BG, fg=WARN, anchor="w",
+                     justify="left", wraplength=560
+                     ).pack(side="left", fill="x", expand=True)
+        for label, cmd, accent in left:
+            self.app._btn(self._bar, label, cmd, small=True,
+                          color=ACCENT if accent else None
+                          ).pack(side="left", padx=(0, 8))
 
     # -- content ----------------------------------------------------------
 
@@ -164,6 +205,8 @@ class ScriptWindow(tk.Toplevel):
             self._counts.config(text="could not be read: {}".format(e), fg=ERR)
         self.title("Script — {}".format(os.path.basename(self.path)))
         self._name.config(text=os.path.basename(self.path))
+        self._path_lbl.config(text=self.path)
+        self.text = text
         info = describe(text, script_path=self.path)
         self.info = info
         if text:
@@ -197,6 +240,8 @@ class ScriptWindow(tk.Toplevel):
         t.tag_raise("at")
         t.config(state="disabled")
         self._fill_side(info)
+        if self.on_change is not None:
+            self.on_change()
 
     def _fill_side(self, info):
         for w in self._side.winfo_children():
@@ -267,7 +312,12 @@ def show(app, path):
     except tk.TclError:
         alive = False
     if alive:
+        # Whoever opens it now says what it offers: nothing is left over
+        # from the last opener.
         win.path = path
+        win.on_change = None
+        win.set_status()
+        win.set_actions()
         win.reload()
         win.deiconify()
         win.lift()
