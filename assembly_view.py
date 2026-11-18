@@ -147,7 +147,8 @@ MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 EXCISED_MAX_S = 30.0
-CUT_EDGE_PX = 14      # this near a cut's side, the boundary, not the cut
+CUT_EDGE_PX = 14
+TICK_PX     = 6       # a click this near a speech start / stop tick lands on it      # this near a cut's side, the boundary, not the cut
 NORM_LEVEL  = 0.5     # Normalize: each pull's speech peaks brought to this
 NORM_MAX_GAIN = 40.0  # ... by at most this much (+32 dB), so hiss stays hiss
 NORM_MIN_GAIN = 0.25  # tape cut out of a pull shows, dimmed, up to this long
@@ -1191,7 +1192,9 @@ class AssemblyWindow(object):
             "retime.  Flag: drag, double-click to name, Ctrl+click or "
             "right-click to delete.  "
             "Edges and highlights snap to speech starts and stops (G turns "
-            "it off); hold Ctrl to place one freely.  Ctrl+wheel: zoom.  In the text: drag to "
+            "it off); hold Ctrl to place one freely.  Click a tick along "
+            "the top or bottom of the waveform to put the insertion point "
+            "on it.  Ctrl+wheel: zoom.  In the text: drag to "
             "highlight, double-click "
             "a word, triple-click its pull, right-click for everything.")),
             fill=True)
@@ -2985,7 +2988,7 @@ class AssemblyWindow(object):
         """Where an edge will snap: short ticks top and bottom of the lane, as
         the waveform editor draws them."""
         sil = self._sil.get(c.order)
-        if not sil or self.pps < SNAP_TICKS_PPS or not _MONITOR["snap"]:
+        if not sil or self.pps < SNAP_TICKS_PPS:
             return
         h = self._ls
         for tl, du, si in c.pieces:
@@ -2995,6 +2998,33 @@ class AssemblyWindow(object):
                 if 0 <= x < w:
                     self.cv.create_line(x, top, x, top + h, fill=_C_SNAP_TICK)
                     self.cv.create_line(x, bot - h, x, bot, fill=_C_SNAP_TICK)
+
+    def _tick_at(self, x, y):
+        """The speech start or stop a click at (x, y) is on -- in the tick
+        rows along the top and bottom of the lane, within TICK_PX of a
+        tick -- as timeline time, or None."""
+        if self.pps < SNAP_TICKS_PPS:
+            return None
+        y0, y1 = self._track_box()
+        ls = self._ls
+        top, bot = y0 + ls + 8, y1 - ls - 8
+        if not (top - 2 <= y <= top + ls + 2 or bot - ls - 2 <= y <= bot + 2):
+            return None
+        t = self._t(x)
+        best = None
+        for c in self._clips_in(t - TICK_PX / self.pps, t + TICK_PX / self.pps):
+            sil = self._sil.get(c.order) or ()
+            for tl, du, si in c.pieces:
+                lo = bisect.bisect_left(sil, si + (t - tl) - TICK_PX / self.pps)
+                hi = bisect.bisect_right(sil, si + (t - tl) + TICK_PX / self.pps)
+                for b in sil[lo:hi]:
+                    if not si <= b <= si + du:
+                        continue
+                    bt = tl + b - si
+                    d = abs(self._x(bt) - x)
+                    if d <= TICK_PX and (best is None or d < best[0]):
+                        best = (d, bt)
+        return None if best is None else best[1]
 
     def _draw_words(self, c, xs, xe, y, w):
         """Transcript words along the bottom of the lane, each at its own
@@ -3217,6 +3247,9 @@ class AssemblyWindow(object):
                         best = (d, ("out", c, k))
         if best is not None:
             return best[1]
+        tick = self._tick_at(x, y)
+        if tick is not None:
+            return ("tick", self._clip_at(tick), tick)
         if self.excised:
             for c in self.clips[max(0, i - 1):i + 2]:
                 g = c.ghost_at(t)
@@ -3266,7 +3299,8 @@ class AssemblyWindow(object):
         cur = {"in": "sb_h_double_arrow", "out": "sb_h_double_arrow",
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
                "select": "xterm", "grab": "fleur",
-               "ruler": "hand2", "ghost": "xterm"}.get(kind, "arrow")
+               "ruler": "hand2", "ghost": "xterm",
+               "tick": "hand2"}.get(kind, "arrow")
         if kind == "ghost" and k[3] == "cut":
             cur = "sb_h_double_arrow"        # a cut drags
         if self.cv.cget("cursor") != cur:
@@ -3307,6 +3341,13 @@ class AssemblyWindow(object):
         if kind == "ruler":
             self._drag = {"mode": "scrub"}
             self.seek(t)
+            return
+        if kind == "tick":
+            # A speech start or stop: the insertion point goes right there.
+            self._range = None
+            self.sel_region = None
+            self.set_insert(k)
+            self.redraw()
             return
         if kind == "ghost":
             # Surrounding audio: a click is a place to listen from; a cut

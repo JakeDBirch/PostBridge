@@ -4,6 +4,9 @@
 
 ## November 18, 2026
 
+### Assembly: click a speech tick to go there
+- **Click one of the ticks along the top or bottom of the waveform** (where speech starts and stops) and the insertion point lands exactly on it. The pointer turns to a hand over one. A click a few pixels off still takes it, and the middle of the waveform clicks as before. The ticks show when zoomed in far enough, with snapping on or off.
+
 ### Playback speeds: five steps
 - **[ and ] now step through 0.75×, 1×, 1.5×, 2× and 3×**, in the Assembly and in Find in recording. The in-between speeds (1.25×, 1.75×, 2.5×) are gone. A speed picked before this moves to the nearest of the five on the next step.
 - **Playback starts at 1.5×** each time PostBridge opens. A speed you pick holds for the rest of the run, in both views.
@@ -26,7 +29,7 @@
 - **Only the middle half of a cut's dimmed audio drags the whole cut.** Near either side of it (its outer quarter, and at least 14 pixels however narrow the cut is), a press takes the boundary on that side alone, as on an edge. Grabbing a boundary no longer catches the whole cut by accident.
 
 ### Assembly: Snap on and off (G)
-- **G turns snapping off and on**, with a **Snap** button in the Edit panel. Off, edges, highlights and rolls go exactly where they're dragged, as holding Ctrl does, and the snap ticks aren't drawn. It applies in Find in recording too. On is the default.
+- **G turns snapping off and on**, with a **Snap** button in the Edit panel. Off, edges, highlights and rolls go exactly where they're dragged, as holding Ctrl does. It applies in Find in recording too. On is the default.
 
 ### Assembly: Normalize, and a cut drags whole
 - **Normalize** (in PLAY · MONITOR, on by default) plays every pull at the one level: a quiet recording is brought up (by up to +32 dB) and a hot one brought down, and its waveform is drawn at that level too. The level is taken from a pull's speech peaks, not its single loudest moment. Playback only: the AAF and the files are untouched. Turn it off to hear the recordings as they are.

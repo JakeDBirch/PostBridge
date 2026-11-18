@@ -432,3 +432,27 @@ def test_the_speeds_are_three_quarter_one_one_and_a_half_two_three(view, monkeyp
     win._rate = 1.25                     # a speed from before: the nearest one up
     win.step_rate(1)
     assert win._rate in (1.5, 2.0)
+
+
+# ── Clicking a speech start / stop tick ──────────────────────────────────
+
+def test_clicking_a_tick_puts_the_insertion_point_on_it(view, monkeypatch):
+    app, win = view
+    win._sil[1] = [11.234]                        # a speech start, 1.234 s in
+    win.pps = 200.0
+    win.view0 = 0.0
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    top = y0 + win._ls + 8 + 3                    # in the tick row
+    x = win._x(1.234) + 4                         # a little off it
+    assert win._hit(x, top)[0] == "tick"
+    win._on_track_press(_Ev(x, top))
+    win._on_track_release(_Ev(x, top))
+    assert win.insert == pytest.approx(1.234)
+    # The same click in the middle of the lane is a click, not the tick.
+    mid = (y0 + y1) / 2.0
+    assert win._hit(x, mid)[0] != "tick"
+    # Ticks stay clickable with snapping off.
+    monkeypatch.setitem(assembly_view._MONITOR, "snap", False)
+    assert win._hit(x, top)[0] == "tick"
