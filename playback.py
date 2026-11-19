@@ -15,7 +15,10 @@ Three things fall out of doing it this way:
 
   * the playhead is read from the engine's own cursor rather than
     extrapolated from a wall clock, so it stays correct across speed
-    changes and cut jumps by construction;
+    changes and cut jumps by construction -- and it is the moment being
+    HEARD: the engine renders a buffer some 200 ms before the device
+    plays it, so position() goes by when each buffer reaches the
+    speaker (see _heard), not by how far rendering has got;
   * speed is a real-time time-stretch (WSOLA, pitch preserved) rather
     than an ffmpeg pass over a temp file;
   * playback stops being Windows-only -- PortAudio covers macOS and
@@ -24,6 +27,7 @@ Three things fall out of doing it this way:
 Requires sounddevice (PortAudio).  If it is missing the class still
 imports and reports unavailable, so callers can fall back.
 """
+import collections
 import threading
 
 import numpy as np
@@ -146,6 +150,12 @@ class LivePlayer(object):
         self._stream   = None
         self._wsola    = _Wsola()
         self._pending  = np.zeros(0, dtype=np.float32)   # spill-over samples
+        # What has been handed to the device and when it sounds: one
+        # (dac_time, seconds, pos_before, pos_after, rate) per buffer, on
+        # the stream's clock.  _anchor is the position to report until
+        # the first of them is audible.
+        self._marks    = collections.deque(maxlen=256)
+        self._anchor   = 0.0
 
     # ── Source ────────────────────────────────────────────────────────────
     def load(self, pcm, t0=0.0):
@@ -190,10 +200,38 @@ class LivePlayer(object):
             self._pos = float(t)
             self._pending = np.zeros(0, dtype=np.float32)
             self._wsola.reset()
+            self._marks.clear()
+            self._anchor = self._pos
 
     def position(self):
+        """Where the playhead is, in source seconds: while playing, the
+        moment coming out of the speaker now; stopped, where it stopped."""
         with self._lock:
+            if self._playing and not self._finished:
+                return self._heard()
             return self._pos
+
+    def _stream_now(self):
+        try:
+            return float(self._stream.time)
+        except Exception:
+            return None
+
+    def _heard(self):
+        """The source time being heard now (lock held).  Rendering runs
+        ahead of the speaker by the device's output latency -- about
+        0.2 s on Windows' default driver, half as much again in source
+        time at 1.5x -- so the engine's cursor is not it."""
+        now = self._stream_now() if self._stream is not None else None
+        if now is None or not self._marks:
+            return self._anchor if self._marks or now is not None else self._pos
+        heard = self._anchor
+        for dac, dur, p0, p1, rate in self._marks:
+            if now < dac:
+                break
+            lo, hi = min(p0, p1), max(p0, p1)
+            heard = min(hi, max(lo, p0 + (now - dac) * rate))
+        return heard
 
     def is_playing(self):
         with self._lock:
@@ -211,6 +249,8 @@ class LivePlayer(object):
             self._pending  = np.zeros(0, dtype=np.float32)
             self._wsola.reset()
             self._pos = self._snap_into_segment(self._pos)
+            self._marks.clear()
+            self._anchor = self._pos
             self._playing = True
         try:
             if self._stream is None:
@@ -226,12 +266,24 @@ class LivePlayer(object):
         return True
 
     def stop(self):
+        """Stop.  Stopped by hand, the sound ends now and the position is
+        the moment that was being heard -- not the end of what was already
+        queued for the device, which would otherwise play on for a fifth
+        of a second and leave the playhead past the spot.  Run out to its
+        end, the queued tail is played."""
         with self._lock:
+            cut = self._playing and not self._finished
+            if cut:
+                self._pos = self._heard()
+                self._pending = np.zeros(0, dtype=np.float32)
+                self._wsola.reset()
             self._playing = False
+            self._marks.clear()
+            self._anchor = self._pos
         st = self._stream
         if st is not None:
             try:
-                st.stop()
+                st.abort() if cut else st.stop()
             except Exception:
                 pass
 
@@ -337,6 +389,22 @@ class LivePlayer(object):
 
     def _callback(self, outdata, frames, time_info, status):
         try:
-            outdata[:, 0] = self._render(frames)
+            with self._lock:
+                p0, rate, live = self._pos, self._rate, self._playing
+                outdata[:, 0] = self._render(frames)
+                if live:
+                    self._mark(time_info, frames, p0, self._pos, rate)
         except Exception:
             outdata[:] = 0
+
+    def _mark(self, time_info, frames, p0, p1, rate):
+        """Note when the buffer just rendered will sound (lock held)."""
+        dac = float(getattr(time_info, "outputBufferDacTime", 0.0) or 0.0)
+        if dac <= 0.0:
+            # A host that does not say: now, plus the stream's latency.
+            now = float(getattr(time_info, "currentTime", 0.0) or 0.0)                 or self._stream_now() or 0.0
+            try:
+                dac = now + float(self._stream.latency)
+            except Exception:
+                dac = now
+        self._marks.append((dac, frames / float(self.sr), p0, p1, rate))

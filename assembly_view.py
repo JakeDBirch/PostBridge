@@ -4721,6 +4721,10 @@ class AssemblyWindow(object):
         self._playing = False
         if self.player is not None:
             self.player.stop()
+            if was:
+                # Where the sound stopped, not where the last tick saw it.
+                self.playhead = max(0.0, min(self.player.position(),
+                                             self.total_s))
         if self._tick_after is not None:
             try:
                 self.win.after_cancel(self._tick_after)
