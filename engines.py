@@ -6323,7 +6323,7 @@ def place_markers(placed, sr):
 def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
               seq_fps=24, seq_sr=48000, vo_takes_with_offset=None,
               out_path="output.aaf", progress_cb=None, cancel_event=None,
-              only_orders=None):
+              only_orders=None, fade_secs=0.0):
     """Build a multi-track AAF where:
       • Each guest token gets its own audio track.
       • All VO parts share a single "VO" track.
@@ -6337,6 +6337,15 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     else), the last three from the markers spotted in the Assembly view
     (see place_markers); an empty one is left out.  Each is
     named silent clips, since Pro Tools ignores AAF markers on import.
+
+    fade_secs: with a length, every clip edge carries a fade that long (an
+    AAF Transition holding a mono audio dissolve): a fade-in where a clip
+    follows silence, a fade-out where silence follows it, and where two
+    clips butt -- the cuts inside a pull -- a crossfade centred on the cut,
+    which plays half its length of each side's tape past the cut.  No clip
+    moves: every one sits and sounds where it does without fades.  A fade
+    never takes more than a quarter of its clip, and a butt join with no
+    tape to cross over (the very start or end of a file) stays a cut.
 
     only_orders: optional set of result "order" values.  The full timeline is
     still laid out (so positions and track names match a full export), but
@@ -6596,6 +6605,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         # is exactly the filename Pro Tools looks for when opening a linked AAF
         # (the same convention used by Premiere when exporting AAF + audio).
         file_mobs = {}
+        file_lens = {}     # src -> length of its converted audio, samples
         n_srcs    = len(unique_srcs)
 
         for src_i, src in enumerate(unique_srcs):
@@ -6684,24 +6694,63 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 slot_id=src_slot.slot_id, media_kind="sound")
             f.content.mobs.append(master)
             file_mobs[src] = (master, master_slot)
+            file_lens[src] = file_dur_sa
 
         _prog("Writing AAF timeline ({} clips)…".format(len(slots)))
 
-        for filepath, start_sa, dur_sa, src_in_sa, track_name in slots:
-            master, master_slot = file_mobs[filepath]
-            seq     = track_seqs[track_name]
-            cur_len = track_lengths[track_name]
+        fade_sa = max(0, s2sa(fade_secs or 0.0))
+        dissolve = _aaf_dissolve_maker(f) if fade_sa else None
 
-            # Pad this track to the correct timeline position
-            if start_sa > cur_len:
-                seq.components.append(
-                    f.create.Filler(media_kind="sound",
-                                    length=start_sa - cur_len))
+        by_track = {}
+        for sl in slots:
+            by_track.setdefault(sl[4], []).append(sl)
 
-            clip = master.create_source_clip(
-                slot_id=master_slot.slot_id, length=dur_sa, start=src_in_sa)
-            seq.components.append(clip)
-            track_lengths[track_name] = start_sa + dur_sa
+        for track_name, clips in by_track.items():
+            seq = track_seqs[track_name]
+            # What each join gets: ("x", half) a crossfade that reaches
+            # `half` samples either side of the cut, ("f", out, in) a fade
+            # out and a fade in around silence (or a hard cut: 0, 0).
+            joins = []
+            for i in range(len(clips) + 1):
+                a = clips[i - 1] if i else None
+                b = clips[i] if i < len(clips) else None
+                f_out = min(fade_sa, a[2] // 4) if a else 0
+                f_in  = min(fade_sa, b[2] // 4) if b else 0
+                if a and b and a[1] + a[2] == b[1]:
+                    half = min(fade_sa // 2, a[2] // 4, b[2] // 4, b[3],
+                               max(0, file_lens.get(a[0], 0) - (a[3] + a[2])))
+                    joins.append(("x", half) if half > 0 else ("f", 0, 0))
+                else:
+                    joins.append(("f", f_out, f_in))
+
+            prev_end = 0
+            for i, (filepath, start_sa, dur_sa, src_in_sa, _tn) in enumerate(clips):
+                master, master_slot = file_mobs[filepath]
+                head, tail = joins[i], joins[i + 1]
+                lead = head[1] if head[0] == "x" else 0
+                trail = tail[1] if tail[0] == "x" else 0
+                if head[0] == "f":
+                    # Silence up to the clip.  A fade overlaps what it
+                    # fades from or to, so the filler is longer by each.
+                    fill = (start_sa - prev_end) + head[1] + head[2]
+                    if fill > 0:
+                        seq.components.append(
+                            f.create.Filler(media_kind="sound", length=fill))
+                    if head[2]:
+                        seq.components.append(dissolve(head[2], 0))
+                clip = master.create_source_clip(
+                    slot_id=master_slot.slot_id,
+                    length=dur_sa + lead + trail, start=src_in_sa - lead)
+                seq.components.append(clip)
+                if tail[0] == "x":
+                    seq.components.append(dissolve(2 * tail[1], tail[1]))
+                elif tail[1]:
+                    seq.components.append(dissolve(tail[1], tail[1]))
+                    if i == len(clips) - 1:
+                        seq.components.append(
+                            f.create.Filler(media_kind="sound", length=tail[1]))
+                prev_end = start_sa + dur_sa
+            track_lengths[track_name] = prev_end
 
         # ── Marker clips ──────────────────────────────────────────────────────
         # DescriptiveMarker/EventMobSlot objects are not surfaced by Pro Tools
@@ -6756,6 +6805,45 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     mt_cur = pos_sa + dur_sa
 
     return out_path, skipped
+
+_AAF_MONO_DISSOLVE = "0c3bea41-fc05-11d2-8a29-0050040ef7d2"
+_AAF_PARAM_LEVEL   = "e4962320-2267-11d3-8a4c-0050040ef7d2"
+
+
+def _aaf_dissolve_maker(f):
+    """dissolve(length, cutpoint) -> a Transition for the open AAF file *f*:
+    the mono audio dissolve Avid writes for a fade or crossfade, its level
+    running 0 to 1 over the transition.  The definitions it needs go into
+    the file's dictionary once."""
+    from aaf2 import misc as _aaf_misc
+    op_def = f.create.OperationDef(_AAF_MONO_DISSOLVE, "Mono Audio Dissolve",
+                                   "Mono Audio Dissolve")
+    f.dictionary.register_def(op_def)
+    op_def.media_kind = "sound"
+    op_def.number_inputs = 2
+    op_def["IsTimeWarp"].value = False
+    op_def["Bypass"].value = 0
+    op_def["OperationCategory"].value = "OperationCategory_Effect"
+    param_def = f.create.ParameterDef(_AAF_PARAM_LEVEL, "Level", "Level",
+                                      "Rational")
+    f.dictionary.register_def(param_def)
+    op_def.parameters.append(param_def)
+    interp_def = f.create.InterpolationDef(_aaf_misc.LinearInterp,
+                                           "LinearInterp", "LinearInterp")
+    f.dictionary.register_def(interp_def)
+
+    def dissolve(length, cutpoint):
+        tr = f.create.Transition("sound", length)
+        tr.cutpoint = cutpoint
+        og = f.create.OperationGroup("Mono Audio Dissolve", length, "sound")
+        level = f.create.VaryingValue("Level", "LinearInterp")
+        level.add_keyframe(0, 0)
+        level.add_keyframe(1, 1)
+        og.parameters.append(level)
+        tr["OperationGroup"].value = og
+        return tr
+    return dissolve
+
 
 def generate_report(results, skipped, parts, seq_name, xml_path):
     import datetime
