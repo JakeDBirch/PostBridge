@@ -3079,6 +3079,11 @@ def reconcile_pull_from_session(pull, session_data):
         else:
             segments = [(snapped_in, snapped_out)]
 
+    # Word times put a cut near the word, not on its edge: move each edge
+    # that landed on sound to the silence beside it.
+    if segments and primary_audio:
+        segments = settle_cut_edges(segments, primary_audio, transcript)
+
     # Re-derive snapped_in/out from segments so any conform-driven
     # trim is reflected in the headline rec_in/out timecodes.
     if segments:
@@ -3263,6 +3268,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
 
                 if blobs:
                     abs_segs = refine_segment_endpoints(abs_segs, blobs)
+                abs_segs = settle_cut_edges(abs_segs, transcript_file, abs_words)
 
                 result.update({
                     "segments":        abs_segs,
@@ -3289,6 +3295,7 @@ def reconcile_interview_pull(pull, transcript_file, pad=PAD_SECS, min_start_s=0.
             abs_segs = [(snapped_in, snapped_out)]
             if blobs:
                 abs_segs = refine_segment_endpoints(abs_segs, blobs)
+            abs_segs = settle_cut_edges(abs_segs, transcript_file, abs_words)
 
             result.update({
                 "rec_in_s":   abs_segs[0][0],
@@ -3685,6 +3692,192 @@ def refine_segment_endpoints(segments, blobs, snap_thresh=None):
 
         refined.append((new_in, new_out))
     return refined
+
+
+# ── Cut edges that fall on sound ─────────────────────────────────────────────
+# A matched pull's edges are Whisper word times, good to a tenth of a second
+# or so.  A cut that far out lands on sound: an in-point after the word has
+# begun clips its attack, an out-point a little late chops the breath that
+# follows.  Both are heard as an edit.  settle_cut_edges moves such an edge
+# to the silence next to it, by ear's measure: the level of the audio itself.
+
+EDGE_FRAME_S   = 0.005   # level is measured over frames this long
+EDGE_QUIET_DB  = 22.0    # this far under the pull's speech level is silence
+EDGE_QUIET_S   = 0.030   # ...when it lasts at least this long
+EDGE_REACH_IN  = 0.30    # how far before an in-point its word may start
+EDGE_REACH_OUT = 0.35    # how far after an out-point its word may run on
+EDGE_BACK_OUT  = 0.25    # ...and how far before it the word may have ended
+EDGE_LEAD_S    = 0.060   # silence kept ahead of a word's attack
+EDGE_TAIL_S    = 0.080   # silence kept after a word's end
+EDGE_BODY_S    = 1.5     # speech level is taken from this much of the pull
+
+
+def _edge_pcm(path, start_s, end_s, sr=8000):
+    """Mono float32 audio for [start_s, end_s] of *path*, and its sample
+    rate.  A 16-bit WAV (every transcription mix) is read in place; anything
+    else comes through ffmpeg.  Short at the ends of the file."""
+    import numpy as np
+    start_s = max(0.0, start_s)
+    if end_s <= start_s:
+        return np.zeros(0, np.float32), sr
+    if path.lower().endswith(".wav"):
+        try:
+            with wave.open(path, "rb") as wf:
+                if wf.getsampwidth() == 2:
+                    fr, ch = wf.getframerate(), wf.getnchannels()
+                    wf.setpos(min(wf.getnframes(), int(round(start_s * fr))))
+                    raw = wf.readframes(int(round((end_s - start_s) * fr)))
+                    pcm = np.frombuffer(raw, np.int16).astype(np.float32)
+                    if ch > 1:
+                        pcm = pcm[:len(pcm) // ch * ch].reshape(-1, ch).mean(axis=1)
+                    return pcm / 32768.0, fr
+        except (wave.Error, EOFError, OSError):
+            pass
+    pcm = extract_pcm_range(path, start_s, end_s - start_s, sr)
+    return pcm.astype(np.float32) / 32768.0, sr
+
+
+def _edge_db(pcm, sr):
+    """Level per EDGE_FRAME_S frame, in dB."""
+    import numpy as np
+    n = max(1, int(round(sr * EDGE_FRAME_S)))
+    k = len(pcm) // n
+    if not k:
+        return np.zeros(0, np.float32)
+    return (10.0 * np.log10(
+        np.mean(pcm[:k * n].reshape(k, n) ** 2, axis=1) + 1e-12)).astype(np.float32)
+
+
+def _quiet_runs(quiet):
+    """[(first frame, frame after the last)] of each silence long enough
+    to count."""
+    need = max(1, int(round(EDGE_QUIET_S / EDGE_FRAME_S)))
+    runs, i, n = [], 0, len(quiet)
+    while i < n:
+        if quiet[i]:
+            j = i
+            while j < n and quiet[j]:
+                j += 1
+            if j - i >= need:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def settle_cut_edges(segments, path, words=None):
+    """A pull's segments with each edge that falls on sound moved to the
+    silence beside it, measured on *path* (the audio the segments' times
+    are in: the token's file or its transcription mix).
+
+      in-point  : to EDGE_LEAD_S before the attack of the word it starts
+                  on, when that attack is within EDGE_REACH_IN before it
+                  (or just after it);
+      out-point : into the nearest silence -- EDGE_TAIL_S into it when
+                  the word runs on up to EDGE_REACH_OUT past the out-point,
+                  the end of it when the word really ended up to
+                  EDGE_BACK_OUT before and the out-point is on what
+                  follows.
+
+    An edge already in silence stays where it is, and so does one with no
+    silence near it -- a cut made inside running speech.  An edge never
+    moves over a word the cut left out (*words*: the transcript, when
+    there is one), nor into the segment beside it.  Anything unreadable
+    and the segments come back as they were.
+    """
+    segs = [(float(a), float(b)) for a, b in segments or []]
+    if not segs or not path or not os.path.isfile(path):
+        return list(segments or [])
+    try:
+        import numpy as np
+    except ImportError:
+        return list(segments or [])
+    spans = sorted((float(w["start"]), float(w["end"])) for w in words or ()
+                   if isinstance(w, dict) and "start" in w and "end" in w
+                   and not w.get("break"))
+    out = []
+    for a, b in segs:
+        if b - a < 2 * EDGE_QUIET_S:
+            out.append((a, b))
+            continue
+        # Nothing the cut left out may come back: not the segment on the
+        # other side of the join, not a word just outside this one.
+        lo = max([e for _s, e in segs if e <= a + 1e-6] +
+                 [e for s, e in spans if e <= a + 0.02 and s < a - 0.02] + [0.0])
+        hi = min([s for s, _e in segs if s >= b - 1e-6] +
+                 [s for s, e in spans if s >= b - 0.02 and e > b + 0.02] +
+                 [float("inf")])
+        try:
+            new_a = _settle_in(a, b, lo, path, np)
+            new_b = _settle_out(a, b, hi, path, np)
+        except Exception:
+            new_a, new_b = a, b
+        if not new_a < new_b:
+            new_a, new_b = a, b
+        out.append((round(new_a, 4), round(new_b, 4)))
+    return out
+
+
+def _edge_window(path, w0, w1, a, b, np):
+    """(frame levels over [w0, w1], time of frame 0, silence threshold):
+    the threshold is EDGE_QUIET_DB under the speech in the part of the
+    window inside the segment [a, b]."""
+    w0 = max(0.0, w0)
+    pcm, sr = _edge_pcm(path, w0, w1)
+    db = _edge_db(pcm, sr)
+    if not len(db):
+        return db, w0, 0.0
+    i0 = max(0, int((a - w0) / EDGE_FRAME_S))
+    i1 = min(len(db), int((b - w0) / EDGE_FRAME_S))
+    body = db[i0:i1] if i1 - i0 >= 8 else db
+    return db, w0, float(np.percentile(body, 90)) - EDGE_QUIET_DB
+
+
+def _settle_in(a, b, lo, path, np):
+    fs = EDGE_FRAME_S
+    db, w0, thr = _edge_window(path, a - EDGE_REACH_IN - EDGE_QUIET_S,
+                               min(b, a + EDGE_BODY_S), a, b, np)
+    if len(db) < 8:
+        return a
+    i_a = int(round((a - w0) / fs))
+    # The attack this in-point belongs to: where the last silence at or
+    # before it (give or take the transcript's slack) gives way to sound.
+    latest = i_a + int(round(0.08 / fs))
+    runs = [r for r in _quiet_runs(db < thr) if r[1] <= latest]
+    if not runs:
+        return a                        # running speech: no better place
+    q0, q1 = runs[-1]
+    onset = w0 + q1 * fs
+    if a - onset > EDGE_REACH_IN:
+        return a
+    if w0 + q0 * fs <= a and onset - a >= EDGE_QUIET_S:
+        return a                        # already sitting in that silence
+    return max(lo, w0 + q0 * fs, onset - EDGE_LEAD_S, 0.0)
+
+
+def _settle_out(a, b, hi, path, np):
+    fs = EDGE_FRAME_S
+    db, w0, thr = _edge_window(path, max(a, b - EDGE_BODY_S),
+                               b + EDGE_REACH_OUT + EDGE_QUIET_S, a, b, np)
+    if len(db) < 8:
+        return b
+    i_b = int(round((b - w0) / fs))
+    first = i_b - int(round(EDGE_BACK_OUT / fs))
+    last  = i_b + int(round(EDGE_REACH_OUT / fs))
+    runs = [r for r in _quiet_runs(db < thr) if r[1] > first and r[0] <= last]
+    if not runs:
+        return b
+    # The silence nearest the out-point; one it is already in, first.
+    q0, q1 = min(runs, key=lambda r: 0 if r[0] <= i_b < r[1]
+                 else min(abs(r[0] - i_b), abs(r[1] - i_b)))
+    s0, s1 = w0 + q0 * fs, w0 + q1 * fs
+    if s0 + EDGE_QUIET_S <= b <= s1:
+        return b                        # already sitting in that silence
+    # Ahead of the out-point: the word runs on, so out to its tail.  Behind
+    # it: the out-point is on whatever comes next, so back to just short of
+    # that -- the pause before it is the speaker's own and stays.
+    return min(hi, max(s0, s1 - fs), max(b, s0 + EDGE_TAIL_S))
 
 
 def _vo_base_result(vo_block):
