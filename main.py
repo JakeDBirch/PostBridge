@@ -4032,6 +4032,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         except Exception:
             ep_dirty = False
         if not dirty and not ep_dirty:
+            self._keep_assembly_for_next_time()
             self.destroy()
             return
         # Save / Don't Save / Cancel via the native yes/no/cancel box.
@@ -4057,6 +4058,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # don't close and discard the work.
             if self._is_dirty() or (ep_dirty and self._ep_unsaved()):
                 return
+        self._keep_assembly_for_next_time()
         self.destroy()                  # No — discard and close
 
     def _build_full_session_data(self):
@@ -9022,6 +9024,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             if getattr(self, "_pending_mark_saved", False):
                 self._pending_mark_saved = False
                 self._mark_saved()
+                self.after(200, self._reopen_kept_assembly)
             # ...unless this is a stage of the open episode: a finished
             # reconcile goes straight into the episode file.
             elif not getattr(self, "_bg_reconcile_active", False):
@@ -9113,6 +9116,33 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         ex = ThreadPoolExecutor(max_workers=1)
         ex.submit(_do).add_done_callback(_done)
         ex.shutdown(wait=False)
+
+    def _keep_assembly_for_next_time(self):
+        """PostBridge closing: the Assembly's place and settings go into the
+        prefs, with it marked open so this episode opens it again."""
+        asm = getattr(self, "_assembly", None)
+        try:
+            if asm is not None:
+                asm.close(keep_open=True)
+            self._save_prefs()
+        except Exception:
+            pass
+
+    def _assembly_view_key(self):
+        """Which episode (or session file) the Assembly's kept place is for."""
+        ep = getattr(self, "_ep", None)
+        path = (ep.get("file_path") if isinstance(ep, dict) else None) or \
+            getattr(self, "_script_path", "") or ""
+        return os.path.normcase(os.path.abspath(path)) if path else None
+
+    def _reopen_kept_assembly(self):
+        """An episode opened at Step 4: its Assembly too, if it was open
+        when PostBridge last closed."""
+        key = self._assembly_view_key()
+        st = ((self._prefs or {}).get("assembly_views") or {}).get(key) \
+            if key else None
+        if isinstance(st, dict) and st.get("open") and self._assembly is None:
+            self._open_assembly()
 
     def _open_assembly(self):
         """The reconciled cut as one continuous track under the script."""
@@ -9412,6 +9442,19 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self._s4_push_undo()
         for r, side, t in todo:
             engines.set_edge_fade(r, side, t, fade_s)
+        self._s4_save()
+
+    def _assembly_set_edge_fades_many(self, groups):
+        """Several cuts faded at once (F over a highlight), as one undo
+        step: [([(order, side, source time)], seconds)]."""
+        rows = {r.get("order"): r for r in self.results}
+        todo = [(rows[o], side, t, secs) for edges, secs in groups
+                for o, side, t in edges if o in rows]
+        if not todo:
+            return
+        self._s4_push_undo()
+        for r, side, t, secs in todo:
+            engines.set_edge_fade(r, side, t, secs)
         self._s4_save()
 
     def _assembly_set_gap(self, order, gap_s):

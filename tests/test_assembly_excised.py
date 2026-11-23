@@ -538,3 +538,93 @@ def test_h_leaves_a_pickup_from_earlier_in_the_read(view):
     win.heal()
     assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
     assert "pickup" in win.status.cget("text")
+
+
+# ── Coming back to it as it was left ─────────────────────────────────────
+
+def _reopen(app):
+    import time as _time
+    from conftest import open_assembly
+    win = open_assembly(app)
+    end = _time.monotonic() + 0.4                # its restore timers
+    while _time.monotonic() < end:
+        app.update()
+    return win
+
+
+def test_the_listening_settings_come_back(view, monkeypatch):
+    app, win = view
+    for k in assembly_view._MONITOR:
+        monkeypatch.setitem(assembly_view._MONITOR, k, assembly_view._MONITOR[k])
+    monkeypatch.setattr(assembly_view.match_review, "_LAST_PLAY_RATE", 1.5)
+    win._rate = 1.5
+    win.step_rate(1)                              # 2x
+    win.toggle_snap()
+    win.toggle_normalize()
+    win.step_preroll(1)
+    want = dict(assembly_view._MONITOR)
+    app._assembly_view_key = lambda: "ep"
+    win.close()
+    assert app._prefs["assembly_monitor"]["rate"] == 2.0
+    # A fresh run: everything at its defaults again.
+    assembly_view._MONITOR.update(follow=False, snap=True, normalize=True,
+                                  preroll_s=2.0)
+    assembly_view.match_review._LAST_PLAY_RATE = 1.5
+    win2 = _reopen(app)
+    try:
+        assert dict(assembly_view._MONITOR) == want
+        assert win2._rate == 2.0 and not win2.snap_key.on and not win2.norm_key.on
+    finally:
+        win2.close()
+
+
+def test_the_place_comes_back_on_the_same_audio(view):
+    app, win = view
+    app._assembly_view_key = lambda: "ep"
+    _cut_one(app, win)
+    win.toggle_excised()
+    win.pps = 400.0
+    c2 = win._clip(2)
+    win.set_insert(c2.start + 0.5)                # 20.5 s of pull 2's audio
+    win.view0 = win.insert - 300 / win.pps        # 300 px in from the left
+    win.select(2)
+    win.close()
+    # Meanwhile pull 1 got longer: pull 2 has moved along the track.
+    _res(app, 1)["segments"] = [(10.0, 11.0), (12.0, 15.0)]
+    win2 = _reopen(app)
+    try:
+        assert win2.excised and win2.pps == pytest.approx(400.0)
+        assert win2._clip(2).src_at(win2.insert) == pytest.approx(20.5)
+        # 300 px in, as left -- held, as ever, so the cut's end stays on screen.
+        span = win2._span()
+        want = min(max(-span * 0.02, win2.insert - 300.0 / win2.pps),
+                   max(0.0, win2.total_s - span * 0.9))
+        assert win2.view0 == pytest.approx(want)
+        assert win2.sel_order == 2
+    finally:
+        win2.close()
+
+
+def test_an_episode_left_open_opens_it_again(view):
+    import main
+    app, win = view
+    app._assembly_view_key = lambda: "ep"
+    for n in ("_keep_assembly_for_next_time", "_reopen_kept_assembly",
+              "_open_assembly"):
+        setattr(app, n, getattr(main.App, n).__get__(app))
+    win.set_insert(1.5)
+    app._keep_assembly_for_next_time()            # PostBridge closing
+    assert app._assembly is None
+    assert app._prefs["assembly_views"]["ep"]["open"] is True
+    app._reopen_kept_assembly()
+    try:
+        assert app._assembly is not None
+        import time as _time
+        end = _time.monotonic() + 0.4
+        while _time.monotonic() < end:
+            app.update()
+        assert app._assembly.insert == pytest.approx(1.5)
+    finally:
+        app._assembly.close()
+    # Closed by hand: next time it stays closed.
+    assert app._prefs["assembly_views"]["ep"]["open"] is False

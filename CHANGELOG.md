@@ -4,6 +4,12 @@
 
 ## November 23, 2026
 
+### Assembly: it opens where you left it
+- **Your listening settings carry over** from one session to the next, for every episode: playback speed, pre-roll (on or off, and how long), Return to start on stop, Follow playhead, Script follows words, the nudge amount, Skip edits, Normalize and Snap. The first time, playback still starts at 1.5×.
+- **Each episode's Assembly opens where you left it:** the insertion point on the same moment of the same pull's audio (so an edit elsewhere since doesn't move it off), the same zoom, the insertion point the same distance across the screen, the same pull selected, surrounding audio shown or hidden, and the script scrolled to the same place.
+- **If the Assembly was open when you closed PostBridge,** opening that episode opens it again, at that place. Close the Assembly yourself first and the episode opens at Step 4 as before, and the Assembly comes back to that place when you open it.
+- This is kept in PostBridge's own preferences, not the episode file, so it holds even when you close without saving, and doesn't make an episode read as changed. The 40 most recent episodes are remembered. Find in recording isn't reopened: the Assembly opens on its track.
+
 ### Monolog: no more double starts at paragraph breaks
 - **When the narrator reads straight on from one paragraph into the next,** each paragraph is its own pull. The first one's tail could run on past its last word into the next one's opening words, and those words were heard twice at the break. On Gunfighters 12 that was 13 breaks, from a few hundredths of a second up to 4 seconds (the Tecovas read). Now the first pull ends exactly where the next comes in, and they play as one stretch of the read.
 - **Episodes saved before this are fixed when they open**, and the Step 3 log names how many pulls were ended. Only a tail that runs into the next pull's start is shortened. A next pull from earlier in the read (a pickup) or from another take is left alone.

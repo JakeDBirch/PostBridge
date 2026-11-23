@@ -177,6 +177,9 @@ _C_SAID     = "#e8c98a"   # words said that aren't in the script
 _C_TXSEL    = "#35597a"   # highlighted words
 _C_SNAP_TICK = "#556070"  # where an edge will snap, as in the waveform editor
 _C_SNAPPED  = "#ffaa00"   # an edge that has snapped
+_C_FADE     = "#c9ced6"   # a fade's line on the track; its own, brighter
+FADE_HANDLE_PX = 7        # the square at a region's top corner
+FADE_ZONE_PX   = 12       # how far down from the top it can be taken
 _C_GHOST_BG = "#17191c"   # excised audio and handles on show
 _C_GHOST_WORD = "#5d6168"  # their words
 SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too closely
@@ -286,6 +289,38 @@ def _norm_gain(pcm):
     if p < 1e-4:
         return 1.0
     return float(min(max(NORM_LEVEL / p, NORM_MIN_GAIN), NORM_MAX_GAIN))
+
+
+_MONITOR_TYPES = {"follow": bool, "preroll_on": bool, "preroll_s": float,
+                  "return_on": bool, "script": bool, "nudge_s": float,
+                  "skip_cuts": bool, "normalize": bool, "snap": bool}
+VIEWS_KEPT = 40       # episodes whose Assembly place the prefs remember
+
+
+def _load_monitor(prefs):
+    """The listening settings as they were last left (prefs
+    "assembly_monitor"): each one that is there and makes sense, and the
+    playback speed."""
+    saved = (prefs or {}).get("assembly_monitor")
+    if not isinstance(saved, dict):
+        return
+    for k, kind in _MONITOR_TYPES.items():
+        v = saved.get(k)
+        if isinstance(v, bool) if kind is bool else isinstance(v, (int, float)) \
+                and not isinstance(v, bool):
+            _MONITOR[k] = kind(v)
+    if _MONITOR["preroll_s"] not in _PREROLLS:
+        _MONITOR["preroll_s"] = min(_PREROLLS, key=lambda x: abs(x - _MONITOR["preroll_s"]))
+    if _MONITOR["nudge_s"] not in NUDGES:
+        _MONITOR["nudge_s"] = 0.1
+    rate = saved.get("rate")
+    if rate in match_review._PLAY_RATES:
+        match_review._LAST_PLAY_RATE = float(rate)
+
+
+def _keep_monitor(prefs, rate):
+    if isinstance(prefs, dict):
+        prefs["assembly_monitor"] = dict(_MONITOR, rate=rate)
 
 
 def _dim(col, k=0.35):
@@ -966,6 +1001,7 @@ class AssemblyWindow(object):
         saved = (self._layout_prefs() or {}).get("assembly_nudge")
         if saved in NUDGES:
             _MONITOR["nudge_s"] = saved
+        _load_monitor(self._layout_prefs())
 
         self.audio  = _AssemblyAudio(PLAY_SR)
         self.player = None
@@ -986,7 +1022,9 @@ class AssemblyWindow(object):
         self._build_ui()
         self.show_refine_status()
         self.refresh()
+        self._restored = False           # a kept place, not the first fit
         self.win.after(60, self._fit_initial)
+        self.win.after(80, self.restore_kept_view)
 
     # ── Construction ─────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1188,6 +1226,7 @@ class AssemblyWindow(object):
         self._gap_box.bind("<KP_Enter>", self._gap_from_box)
         self._gap_box.bind("<FocusOut>", self._gap_from_box)
         p.add(gap)
+        key(p, "Fade", "F", self.apply_fade)
         fade = tk.Frame(p, bg=SURF)
         tk.Label(fade, text="Default fade", font=(FB[0], 10), bg=SURF,
                  fg=TEXT).pack(side="left", padx=(0, 4))
@@ -1240,7 +1279,7 @@ class AssemblyWindow(object):
         p = self._panel("VIEW")
         key(p, "Zoom out", "R  −", lambda: self.zoom(1 / 1.5))
         key(p, "Zoom in", "T  +", lambda: self.zoom(1.5))
-        key(p, "Zoom out full", "Alt+A  F", self.fit)
+        key(p, "Zoom out full", "Alt+A", self.fit)
         key(p, "Prev pull", "←", lambda: self._neighbour(-1))
         key(p, "Next pull", "→", lambda: self._neighbour(1))
 
@@ -1427,6 +1466,25 @@ class AssemblyWindow(object):
         review   = set(app.REVIEW_STATUSES) | {"provisional"}
         host_lc  = HOST_NAME.lower()
 
+        # What each edge gets on the one track, joined as the AAF joins
+        # them: per piece ((kind, seconds), (kind, seconds)) -- "x" half a
+        # crossfade's length, "f" a fade in or out.
+        flat = [(p, f) for e in placed
+                for p, f in zip(e["pieces"], e.get("fades") or
+                                [(0, 0)] * len(e["pieces"]))]
+        flat_order = sorted(range(len(flat)), key=lambda n: flat[n][0][0])
+        joins = engines.join_fades([flat[n][0] for n in flat_order],
+                                   [flat[n][1] for n in flat_order])
+        shape_of = {}
+        for pos, n in enumerate(flat_order):
+            head, tail = joins[pos], joins[pos + 1]
+            shape_of[n] = (
+                ("x", head[1] / float(LAYOUT_SR)) if head[0] == "x"
+                else ("f", head[2] / float(LAYOUT_SR)),
+                ("x", tail[1] / float(LAYOUT_SR)) if tail[0] == "x"
+                else ("f", tail[1] / float(LAYOUT_SR)))
+        flat_n = 0
+
         old_by = {o.order: o for o in self.clips}
         clips = []
         for e in placed:
@@ -1447,6 +1505,8 @@ class AssemblyWindow(object):
                              if p and os.path.isfile(p)), None)
             c = _Clip(e, res, LAYOUT_SR, kind,
                       res.get("status", "") in review, path)
+            c.shapes = [shape_of[flat_n + k] for k in range(len(e["pieces"]))]
+            flat_n += len(e["pieces"])
             old = old_by.get(c.order)
             if old is not None:
                 c.load_error = old.load_error
@@ -1809,6 +1869,95 @@ class AssemblyWindow(object):
             self._sync_region_range()
         self.view0 = self.playhead + place["view"]
         self.redraw()
+
+    # ── The place kept between sessions ──────────────────────────────────
+    def view_state(self, open_=False):
+        """Where the window is, to come back to: the insertion point (as a
+        moment of a pull's audio, so an edit elsewhere doesn't move it, and
+        as time in the finished cut), how far across the screen it sits,
+        the zoom, the selected pull, the surrounding audio shown or not, the
+        script's scroll, and whether the window was open."""
+        c = self._clip_at(self.insert)
+        src = c.src_at(self.insert) if c is not None else None
+        try:
+            script = float(self.text.yview()[0])
+        except (tk.TclError, AttributeError):
+            script = 0.0
+        return {"open": bool(open_), "excised": bool(self.excised),
+                "pps": float(self.pps),
+                "insert": [c.order, src] if src is not None else None,
+                "insert_cut": float(self._to_cut_t(self.insert)),
+                "x": float((self.insert - self.view0) * self.pps),
+                "sel": self.sel_order, "script": script}
+
+    def apply_view_state(self, st):
+        """Come back to a view_state()."""
+        if self._closed or not isinstance(st, dict):
+            return
+        self._restored = True
+        if bool(st.get("excised")) != self.excised:
+            self.excised = bool(st.get("excised"))
+            self.refresh()
+        try:
+            self.pps = min(max(float(st.get("pps") or self.pps), self._min_pps()),
+                           MAX_PPS)
+        except (TypeError, ValueError):
+            pass
+        t = None
+        anchor = st.get("insert")
+        if isinstance(anchor, (list, tuple)) and len(anchor) == 2:
+            c = self._clip(anchor[0])
+            for tl, du, si in (c.pieces if c is not None else ()):
+                if si <= anchor[1] < si + du:
+                    t = tl + anchor[1] - si
+                    break
+        if t is None:
+            try:
+                t = self._to_open_t(float(st.get("insert_cut") or 0.0))
+            except (TypeError, ValueError):
+                t = 0.0
+        self.insert = self.playhead = max(0.0, min(t, self.total_s))
+        try:
+            x = float(st.get("x", self._span() * 0.1 * self.pps))
+        except (TypeError, ValueError):
+            x = 0.0
+        self.view0 = self.insert - x / self.pps
+        if st.get("sel") is not None and self._clip(st["sel"]) is not None:
+            self.select(st["sel"])
+        self.redraw()
+        self._show_monitor()
+        self._update_status()
+        frac = st.get("script")
+        if isinstance(frac, (int, float)):
+            # The text is laid out a moment after the track.
+            self._touched_at = time.monotonic()
+            self.win.after(250, lambda: self._closed or
+                           self.text.yview_moveto(float(frac)))
+
+    def _view_key(self):
+        key = getattr(self.app, "_assembly_view_key", None)
+        return key() if callable(key) else None
+
+    def keep_view(self, open_=False):
+        """The place into the prefs, for this episode."""
+        prefs, key = self._layout_prefs(), self._view_key()
+        if prefs is None or not key or self._closed:
+            return
+        views = prefs.get("assembly_views")
+        if not isinstance(views, dict):
+            views = prefs["assembly_views"] = {}
+        views.pop(key, None)
+        views[key] = self.view_state(open_)        # newest last
+        while len(views) > VIEWS_KEPT:
+            views.pop(next(iter(views)))
+        _keep_monitor(prefs, self._rate)
+
+    def restore_kept_view(self):
+        """At open: this episode's place as it was left, if there is one."""
+        prefs, key = self._layout_prefs(), self._view_key()
+        st = ((prefs or {}).get("assembly_views") or {}).get(key) if key else None
+        if st:
+            self.apply_view_state(st)
 
     def restore_view(self, pps, view0, playhead):
         """After the window is opened afresh over a new cut."""
@@ -2904,6 +3053,7 @@ class AssemblyWindow(object):
                 cv.create_text(lx, y0 + 6, text=lbl, anchor="nw",
                                font=self._font, fill=_C_FLAG if c.flagged else SUB)
             self._draw_wave(c, xs, xe, lane_mid, lane_h, col, w)
+            self._draw_fades(c, y0, y1, w)
             self._draw_snap_ticks(c, lane_top, lane_bot, w)
             if c.load_error and xe - xs > 80:
                 cv.create_text(max(xs, 0) + 6, lane_mid, text=c.load_error[:120],
@@ -2952,6 +3102,178 @@ class AssemblyWindow(object):
         self._light_word()
         self._light_script_word()
         self._draw_overview()
+
+    # ── Fades on the track ───────────────────────────────────────────────
+    def _fade_marks(self, c):
+        """Where a pull's fades are drawn and taken hold of:
+        [(k, side, edge time, handle time, seconds, crossfade?, own?)] --
+        side "in" or "out" of piece k; the handle sits at the far end of
+        the fade from its edge, or on the corner when there is none."""
+        rows = {}
+        out = []
+        shapes = getattr(c, "shapes", None) or ()
+        exact = c.segments if len(c.segments) == len(c.pieces) else None
+        for k, (tl, du, si) in enumerate(c.pieces):
+            if k >= len(shapes):
+                break
+            a, b = exact[k] if exact else (si, si + du)
+            for side, edge, src, (kind, secs) in (
+                    ("in", tl, a, shapes[k][0]), ("out", tl + du, b, shapes[k][1])):
+                own = engines._edge_fade_entry(c.res, side, src) is not None
+                if kind == "x":
+                    reach = secs             # half the crossfade, each side
+                    ht = edge + reach if side == "in" else edge - reach
+                    out.append((k, side, edge, ht, 2 * secs, True, own))
+                else:
+                    ht = edge + secs if side == "in" else edge - secs
+                    out.append((k, side, edge, ht, secs, False, own))
+        return out
+
+    def _draw_fades(self, c, y0, y1, w):
+        """Each fade as its slope across the region -- a crossfade as the
+        two slopes crossing over the cut -- and a handle at each region's
+        top corners to drag it by."""
+        cv = self.cv
+        top, hp = y0 + 4, FADE_HANDLE_PX
+        for k, side, edge, ht, secs, cross, own in self._fade_marks(c):
+            xe_, xh = self._x(edge), self._x(ht)
+            if max(xe_, xh) < -20 or min(xe_, xh) > w + 20:
+                continue
+            tl, du, _si = c.pieces[k]
+            if du * self.pps < 3 * hp:
+                continue                     # too narrow to take hold of
+            col = TEXT if own else _C_FADE
+            if secs > 0:
+                if cross:
+                    # This side's slope runs the whole crossfade: from
+                    # silence past the cut on the other side, up to full.
+                    xa, xb = (2 * xe_ - xh, xh) if side == "in" else (xh, 2 * xe_ - xh)
+                    cv.create_line(xa, y1 if side == "in" else top,
+                                   xb, top if side == "in" else y1,
+                                   fill=col, tags=("fade",))
+                else:
+                    cv.create_polygon(xe_, top, xh, top, xe_, y1, fill=BG,
+                                      stipple="gray50", outline="",
+                                      tags=("fade",))
+                    cv.create_line(xe_, y1, xh, top, fill=col, tags=("fade",))
+            # The handle: inside the region, at the fade's far end.
+            hx = min(max(xh, self._x(tl) + 1), self._x(tl + du) - 1)
+            x0, x1 = (hx, hx + hp) if side == "in" else (hx - hp, hx)
+            if secs > 0:
+                x0, x1 = hx - hp / 2.0, hx + hp / 2.0
+            cv.create_rectangle(x0, top, x1, top + hp, fill=col if secs > 0 else "",
+                                outline=col, tags=("fade",))
+
+    def _fade_handle_at(self, x, y):
+        """(clip, k, side) of the fade handle under the pointer, or None."""
+        y0, _y1 = self._track_box()
+        if not (y0 <= y <= y0 + FADE_ZONE_PX + 4):
+            return None
+        t = self._t(x)
+        i = bisect.bisect_right(self._starts, t) - 1
+        best = None
+        for c in self.clips[max(0, i - 1):i + 2]:
+            for k, side, edge, ht, secs, _cross, _own in self._fade_marks(c):
+                tl, du, _si = c.pieces[k]
+                if du * self.pps < 3 * FADE_HANDLE_PX or \
+                        not self._x(tl) - 2 <= x <= self._x(tl + du) + 2:
+                    continue                 # only from inside its region
+                hx = min(max(self._x(ht), self._x(tl) + 1), self._x(tl + du) - 1)
+                if secs <= 0:                # on the corner: reaches inward
+                    hx += FADE_HANDLE_PX / 2.0 if side == "in" else -FADE_HANDLE_PX / 2.0
+                d = abs(x - hx)
+                if d <= FADE_HANDLE_PX and (best is None or d < best[0]):
+                    best = (d, (c, k, side))
+        return best[1] if best else None
+
+    def _fade_edges(self, c, k, side):
+        """The edges one fade handle sets: its own, and at a butt join the
+        other side of the cut -- [(order, side, source time)]."""
+        tl, du, _si = c.pieces[k]
+        at = tl if side == "in" else tl + du
+        _t, edges = self._cut_edges(at)
+        mine = [e for e in edges if e[0] == c.order and e[1] == side]
+        crossing = len(c.shapes) > k and c.shapes[k][0 if side == "in" else 1][0] == "x"
+        return edges if crossing else mine
+
+    def _fade_overrides(self, edges, secs):
+        """Rows with these edges' fades set, for laying out a drag."""
+        rows = {r.get("order"): r for r in self.app.results or ()}
+        out = {}
+        for order, side, src in edges:
+            r = rows.get(order)
+            if r is None:
+                continue
+            tmp = {"fades": [dict(m) for m in out.get(order, {}).get(
+                "fades", r.get("fades") or ())]}
+            engines.set_edge_fade(tmp, side, src, secs)
+            out[order] = {"fades": tmp.get("fades", [])}
+        return out
+
+    def _fade_dragged(self, d, x):
+        """The length a fade handle at x asks for."""
+        xe_ = self._x(d["edge"])
+        reach = (x - xe_ if d["side"] == "in" else xe_ - x) / self.pps
+        secs = 2 * abs(reach) if d["cross"] else reach
+        # A fade takes a quarter of its region at most; a crossfade, that
+        # much of each side.
+        room = d["room"] * (0.5 if d["cross"] else 0.25)
+        return round(max(0.0, min(secs, room, FADE_MAX)), 4)
+
+    def apply_fade(self):
+        """F: fade what is highlighted.  A highlight across a cut where
+        two regions butt makes a crossfade its length; over a region's
+        start or end beside silence, a fade in or out as long as the part
+        of the region it covers.  Several cuts in one highlight each get
+        theirs.  One undo step."""
+        if self._range is None:
+            at, edges = self._cut_edges()
+            self.status.config(fg=SUB, text="Highlight across a cut for a "
+                               "crossfade, or over a region's start or end for "
+                               "a fade in or out, then F.  (Or drag the handle "
+                               "at a region's top corner.)")
+            return
+        _o, a, b = self._range
+        a, b = min(a, b), max(a, b)
+        eps = 1e-4
+        plan = {}                            # (order, side, src) -> seconds
+        made = []
+        for c in self._clips_in(a - eps, b + eps):
+            exact = c.segments if len(c.segments) == len(c.pieces) else None
+            for k, (tl, du, si) in enumerate(c.pieces):
+                sa, sb = exact[k] if exact else (si, si + du)
+                if a + eps < tl < b - eps:             # its start is inside
+                    plan[(c.order, "in", sa)] = (
+                        tl, min(min(b, tl + du) - tl, du / 4.0))
+                if a + eps < tl + du < b - eps:        # its end is inside
+                    plan[(c.order, "out", sb)] = (
+                        tl + du, min(tl + du - max(a, tl), du / 4.0))
+        if not plan:
+            self.status.config(fg=SUB, text="Nothing to fade there: the "
+                               "highlight has to cross a cut, or a region's "
+                               "start or end.")
+            return
+        # Two edges on one moment are one cut: a crossfade both sides long.
+        by_time = {}
+        for edge, (at, secs) in plan.items():
+            by_time.setdefault(round(at, 4), []).append((edge, secs))
+        groups = []
+        for at, items in sorted(by_time.items()):
+            sides = {e[1] for e, _s in items}
+            if sides == {"in", "out"}:
+                total = sum(s for _e, s in items)
+                groups.append(([e for e, _s in items], total))
+                made.append("crossfade {:.0f} ms".format(total * 1000))
+            else:
+                for e, s in items:
+                    groups.append(([e], s))
+                    made.append("fade {} {:.0f} ms".format(e[1], s * 1000))
+        self.app._assembly_set_edge_fades_many(
+            [(edges, round(min(secs, FADE_MAX), 4)) for edges, secs in groups])
+        self.refresh()
+        self.status.config(fg=TEXT, text="   ·   ".join(made[:4]) + (
+            "   ·   …" if len(made) > 4 else "") +
+            "   ·   drag a handle to change it")
 
     def _marker_row(self, lane=0):
         """Top and bottom of a marker lane on the ruler: 0 for music and
@@ -3412,6 +3734,9 @@ class AssemblyWindow(object):
             return ("ruler", None, None)
         if y > y1:
             return ("none", None, None)
+        fh = self._fade_handle_at(x, y)
+        if fh is not None:
+            return ("fade", fh[0], (fh[1], fh[2]))
         t = self._t(x)
         i = bisect.bisect_right(self._starts, t) - 1
         best = None
@@ -3484,7 +3809,7 @@ class AssemblyWindow(object):
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
                "select": "xterm", "grab": "fleur",
                "ruler": "hand2", "ghost": "xterm",
-               "tick": "hand2"}.get(kind, "arrow")
+               "tick": "hand2", "fade": "hand2"}.get(kind, "arrow")
         if kind == "ghost" and k[3] == "cut":
             cur = "sb_h_double_arrow"        # a cut drags
         if self.cv.cget("cursor") != cur:
@@ -3548,6 +3873,31 @@ class AssemblyWindow(object):
                 return
             self.set_insert(t)
             self.redraw()
+            return
+        if kind == "fade":
+            # A fade handle: drag it along the top of the region.
+            pk, side = k
+            tl, du, _si = c.pieces[pk]
+            mark = next((m for m in self._fade_marks(c)
+                         if m[0] == pk and m[1] == side), None)
+            edges = self._fade_edges(c, pk, side)
+            cross = bool(mark and mark[5])
+            room = du
+            if cross:
+                other = [e for e in edges if e[0] != c.order or e[1] != side]
+                oc = self._clip(other[0][0]) if other else None
+                od = min((p[1] for p in (oc.pieces if oc else ())
+                          if abs(p[0] - (tl if side == "out" else tl + du)) < 1e-4
+                          or abs(p[0] + p[1] - (tl if side == "in" else tl + du)) < 1e-4),
+                         default=du)
+                room = min(du, od)
+            self._range = None
+            self.sel_region = None
+            self._drag = {"mode": "fade", "x0": e.x, "moved": False,
+                          "side": side, "edge": tl if side == "in" else tl + du,
+                          "cross": cross, "edges": edges, "room": room,
+                          "secs0": mark[4] if mark else 0.0}
+            self.select(c.order)
             return
         seam = self._roll_at(e, kind, c, k)
         if seam is not None:
@@ -3652,6 +4002,14 @@ class AssemblyWindow(object):
             self.redraw()
             self.status.config(fg=TEXT, text="{}   {}".format(
                 m["label"] if m else "", _fmt_tc(d["value"])))
+            return
+        if mode == "fade":
+            d["value"] = self._fade_dragged(d, e.x)
+            self._layout(self._fade_overrides(d["edges"], d["value"]))
+            self.redraw()
+            self.status.config(fg=TEXT, text="{} {:.0f} ms".format(
+                "Crossfade" if d["cross"] else "Fade " + d["side"],
+                d["value"] * 1000))
             return
         if mode == "gap":
             sp = d["space"]
@@ -3914,6 +4272,12 @@ class AssemblyWindow(object):
             return
         if d["mode"] == "marker":
             self._move_marker(d["key"], d["value"])
+            return
+        if d["mode"] == "fade":
+            if abs(d["value"] - d["secs0"]) > 1e-6:
+                self.app._assembly_set_edge_fades(d["edges"], d["value"])
+            self.refresh()
+            self._show_cut_fade()
             return
         if d.get("grabbed") is None:
             self._range = None           # a moved region stays selected
@@ -4885,7 +5249,7 @@ class AssemblyWindow(object):
     def _fit_initial(self):
         # A minute across the screen: close enough to read the timing,
         # wide enough to hear a scene play out.
-        if self._closed:
+        if self._closed or self._restored:
             return
         self.pps = max(self._min_pps(), max(1, self.cv.winfo_width()) / 60.0)
         self.redraw()
@@ -5045,6 +5409,7 @@ class AssemblyWindow(object):
         self._show_monitor()
 
     def _show_monitor(self):
+        _keep_monitor(self._layout_prefs(), self._rate)
         self.preroll_key.set_text("Pre-roll  {:g} s".format(_MONITOR["preroll_s"]))
         self.preroll_key.set_on(_MONITOR["preroll_on"])
         self.return_key.set_on(_MONITOR["return_on"])
@@ -5065,6 +5430,7 @@ class AssemblyWindow(object):
         # Shared with the per-pull editor, so a speed picked here is the
         # speed the next card opens at, and the other way round.
         match_review._LAST_PLAY_RATE = self._rate
+        _keep_monitor(self._layout_prefs(), self._rate)
         if self.player is not None:
             self.player.set_rate(self._rate)
         if self.src is not None:         # one speed for both views
@@ -5172,7 +5538,7 @@ class AssemblyWindow(object):
         elif k == "slash":
             self.nudge_gap()
         elif k.lower() == "f" and not ctrl:
-            self.fit()
+            self.apply_fade()                # Pro Tools: F fades the selection
         elif k == "Escape":
             self._range = self.sel_region = None
             self._tx_clear()
@@ -5250,9 +5616,12 @@ class AssemblyWindow(object):
         except tk.TclError:
             pass
 
-    def close(self):
+    def close(self, keep_open=False):
+        """Close the window.  `keep_open`: PostBridge itself is closing, so
+        it opens again on this episode next time."""
         if self._closed:
             return
+        self.keep_view(open_=keep_open)
         self._save_layout()
         self._closed = True
         self.stop()
