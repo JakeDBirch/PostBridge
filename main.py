@@ -7714,8 +7714,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         _live = _was_bg and self._s4_is_live()
         if self._monolog:
             # The real cut for the paragraphs that stood in for it, by the
-            # second pass's rule: at once if nothing has been touched, otherwise
-            # when asked.
+            # second pass's rule: at once, around any pull that was worked on.
             if _live:
                 self._refine_monolog_ready(_final, getattr(self, "_vo_takes_by_part", {}))
                 self._bg_finish_live()

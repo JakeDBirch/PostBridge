@@ -17,9 +17,10 @@ it, and everything that stands on it is matched again:
     merge (_bg_apply_batch).  A pull you accepted or reassigned keeps your
     cut; your marks and gaps stay on every pull.
   * a monolog is cut again once all its recordings are done.  Its pulls are
-    numbered by the cut, so the new one replaces the old wholesale: at once
-    when nothing has been touched, otherwise only when you say so (Update the
-    cut), and then it keeps the pulls you worked on.
+    numbered by the cut, so the new one replaces the old: wholesale when
+    nothing has been touched, otherwise around the pulls you worked on, which
+    stay exactly as they are.  Only when one of those can't be placed against
+    the script does the cut wait to be asked (Update the cut).
 
 A draft is only ever a label on a saved transcript ("model": "tiny"), so a
 session closed part way picks up where it left off the next time Step 4 opens.
@@ -835,14 +836,30 @@ class RefineMixin(object):
             self.after(RETRY_MS, lambda: self._refine_monolog_ready(fresh, takes_by_part))
             return
         self.__dict__.setdefault("_vo_takes_by_part", {}).update(takes_by_part)
-        if self._refine_touched():
-            # Only the words are held.  The new cut is made when it is asked
-            # for, around whatever has been worked on by then.
-            self._rf().held = next(iter(takes_by_part.values()))
-            self._refine_fill_paragraphs(self._rf().held)
+        if not self._refine_touched():
+            self._refine_take_cut(fresh)
+            return
+        # Worked on: the pulls that were stay exactly as they are, and the
+        # rest of the script takes the new cut around them.
+        takes = next(iter(takes_by_part.values()))
+        self._refine_stamp_ignored()
+        rows = monolog.recut_around(list(self.vo_blocks), takes, self.results or [],
+                                    self._refine_row_touched)
+        if rows is None:
+            # A worked-on pull can't be placed against the script.  Nothing
+            # moves; only the words are held, and Update the cut says why.
+            self._rf().held = takes
+            self._refine_fill_paragraphs(takes)
             self._refine_show()
             return
-        self._refine_take_cut(fresh)
+        kept = sum(1 for r in rows if self._refine_row_touched(r))
+        self._refine_take_cut(rows)
+        self._rf().note = "The cut was updated from the new transcript." + (
+            "  The {} you worked on {} as you left {}.".format(
+                "pull" if kept == 1 else "{} pulls".format(kept),
+                "stays" if kept == 1 else "stay",
+                "it" if kept == 1 else "them") if kept else "")
+        self._refine_show()
 
     def _refine_fill_paragraphs(self, takes):
         """The whole read is heard but the cut is staying as it is: paragraphs

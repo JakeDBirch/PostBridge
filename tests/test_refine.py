@@ -1019,7 +1019,30 @@ def test_an_untouched_monolog_takes_the_new_cut_at_once(media, monkeypatch):
     assert not app._refine_held()
 
 
-def test_a_monolog_you_have_edited_waits_to_be_asked(media, monkeypatch):
+def test_a_monolog_you_have_edited_updates_around_your_pulls(media, monkeypatch):
+    """Nobody is asked: the rest of the script takes the refined cut when it
+    lands, and the pull that was worked on stays exactly as it is."""
+    stream = _Stream(monkeypatch)
+    monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes, keep=():
+                        [r for r in _new_cut(media) if tuple(r["script_span"]) not in keep])
+    app = _monolog_app(media, monkeypatch)
+    app._s4_is_live = lambda: True
+    edited = _cut_row(1, (0, 9), 0.5, 1.5, media, _s4_accepted=True)
+    app.results = [edited, _cut_row(2, (10, 29), 3.0, 6.0, media)]
+    app._s4_undo_stack = [{"1": {}}]
+    app._refine_resume()
+    assert _pump(app, lambda: bool(stream.sizes))
+    assert _finish(app, stream, [_word("we", 1.0, 1.2)])
+    assert _pump(app, lambda: len(app.results) == 3)
+    assert not app._refine_held()
+    assert app.built                             # Step 4's cards built anew
+    assert app.results[0] is edited and edited["segments"] == [(0.5, 1.5)]
+    assert [r["order"] for r in app.results] == [1, 2, 3]
+    assert [r["script_span"] for r in app.results] == [(0, 9), (10, 19), (20, 29)]
+    assert "The pull you worked on stays" in app._rf().note
+
+
+def test_a_worked_on_pull_that_cant_be_placed_holds_the_cut_until_asked(media, monkeypatch):
     stream = _Stream(monkeypatch)
     # The new cut leaves out the lines the edited pull answers for.
     monkeypatch.setattr(monolog, "reconcile", lambda blocks, takes, keep=():
@@ -1028,23 +1051,18 @@ def test_a_monolog_you_have_edited_waits_to_be_asked(media, monkeypatch):
     view = app._assembly = _View()
     view.pps, view.view0, view.playhead = 30.0, 0.0, 0.0
     view.restore_view = lambda *a: None
-    edited = _cut_row(1, (0, 9), 0.5, 1.5, media, _s4_accepted=True)
-    app.results = [edited, _cut_row(2, (10, 29), 3.0, 6.0, media)]
+    # Cut before spans were recorded, and its words are no longer the script's.
+    edited = _cut_row(1, None, 0.5, 1.5, media, _s4_accepted=True)
+    rows = [edited, _cut_row(2, (10, 29), 3.0, 6.0, media)]
+    app.results = rows
     app._s4_undo_stack = [{"1": {}}]
     app._refine_resume()
     assert _pump(app, lambda: bool(stream.sizes))
     assert _finish(app, stream, [_word("we", 1.0, 1.2)])
     assert _pump(app, app._refine_held)
-    assert len(app.results) == 2                 # nothing moved under you
+    assert app.results is rows and len(rows) == 2    # nothing moved under you
+    assert not app.built
     assert "update" in app._refine_status()
-
-    app._s4_is_live = lambda: True
-    app._refine_update_the_cut()
-    assert not app._refine_held()
-    assert app.built                             # Step 4's cards built anew
-    assert app.results[0] is edited              # your pull stands
-    assert [r["order"] for r in app.results] == [1, 2, 3]
-    assert [r["script_span"] for r in app.results] == [(0, 9), (10, 19), (20, 29)]
 
 
 # The read below is one take of these three paragraphs, straight through.
@@ -1296,7 +1314,9 @@ def test_paragraphs_left_over_fill_in_when_the_cut_stays_as_it_is(media, monkeyp
     app.vo_blocks = [{"order": 1, "id": "P1", "part_index": 0, "text": "worked on already here"},
                      {"order": 2, "id": "P2", "part_index": 0, "text": text}]
     rows = monolog.pending_rows(app.vo_blocks)
-    rows[0].update(status="ok", segments=[(0.0, 1.0)], _s4_accepted=True)
+    # Worked on, and no longer to be found in the script: the cut is held.
+    rows[0].update(status="ok", segments=[(0.0, 1.0)], _s4_accepted=True,
+                   script_span=None, quote_text="gone from the script since")
     app.results = rows
     words = [_word(w, 10.0 + i * 0.4, 10.3 + i * 0.4, "tiny") for i, w in enumerate(text.split())]
     app._refine_monolog_ready([], {0: [(words, 0.0, None, media, None)]})
