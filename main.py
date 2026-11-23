@@ -2651,6 +2651,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # Fades set on the pull's own edges (see engines.edge_fade)
             if r.get("fades"):
                 entry["fades"] = [dict(m) for m in r["fades"]]
+            # What the pull says -- a merge (_assembly_merge_pulls) changes it
+            for _k in ("quote_text", "matched_text", "script_span"):
+                if r.get(_k) is not None:
+                    entry[_k] = list(r[_k]) if _k == "script_span" else r[_k]
+            if r.get("_merged_into") is not None:
+                entry["merged_into"] = r["_merged_into"]
             # Persist VO takes_data so edited segments survive save/load cycles
             if r.get("is_vo") and r.get("takes_data"):
                 entry["takes_data"] = r["takes_data"]
@@ -2806,6 +2812,15 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 r["fades"] = [dict(m) for m in entry["fades"]]
             elif "fades" in r:
                 del r["fades"]
+            for _k in ("quote_text", "matched_text"):
+                if _k in entry:
+                    r[_k] = entry[_k]
+            if "script_span" in entry:
+                r["script_span"] = tuple(entry["script_span"])
+            if "merged_into" in entry:
+                r["_merged_into"] = entry["merged_into"]
+            else:
+                r.pop("_merged_into", None)
             # Restore VO takes_data (keeps edited per-take segments in sync)
             if "takes_data" in entry and r.get("is_vo"):
                 r["takes_data"] = entry["takes_data"]
@@ -9339,6 +9354,68 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         r["rec_in_s"],  r["rec_out_s"]  = segs[0][0], segs[-1][1]
         r["rec_in_tc"], r["rec_out_tc"] = secs_tc(segs[0][0]), secs_tc(segs[-1][1])
         self._s4_save()
+
+    def _assembly_merge_pulls(self, first, second):
+        """Two pulls whose audio runs straight on from one to the next made
+        one: the first takes the second's audio (the join is no longer a
+        cut: its last region runs on into the second's first), its words,
+        its marks and fades, and the gap after it; the second is IGNOREd,
+        marked as merged into the first.  One undo step."""
+        rows = {r.get("order"): r for r in self.results}
+        a, b = rows.get(first), rows.get(second)
+        if a is None or b is None or not a.get("segments") or not b.get("segments"):
+            return False
+        sa = [tuple(map(float, s)) for s in a["segments"]]
+        sb = [tuple(map(float, s)) for s in b["segments"]]
+        segs = sa[:-1] + [(sa[-1][0], sb[0][1])] + sb[1:]
+        ga = list(a.get("seg_gaps") or [0.0] * (len(sa) - 1))
+        gb = list(b.get("seg_gaps") or [0.0] * (len(sb) - 1))
+        gaps = ga + gb
+        a_out, b_in = sa[-1][1], sb[0][0]
+        self._s4_push_undo()
+        self._s4_undo_hold = True
+        try:
+            # What it says: both, as the script has them.
+            qa, qb = (a.get("quote_text") or "").rstrip(), (b.get("quote_text") or "").lstrip()
+            a["quote_text"] = (qa + "\n\n" + qb) if qa and qb else (qa or qb)
+            ma, mb = a.get("matched_text") or "", b.get("matched_text") or ""
+            a["matched_text"] = (ma + " " + mb).strip()
+            if a.get("script_span") and b.get("script_span"):
+                a["script_span"] = (a["script_span"][0], b["script_span"][1])
+            # Marks: a tail mark in the first's gap -- gone now -- sits at
+            # where that gap was, the join.
+            marks = []
+            for m in a.get("markers") or ():
+                m = dict(m)
+                if "tail" in m:
+                    m.pop("tail")
+                    m["src"] = a_out
+                marks.append(m)
+            marks += [dict(m) for m in b.get("markers") or ()]
+            if marks:
+                a["markers"] = marks
+            # Fades: none at the join, which is no edge any more.
+            fades = [dict(m) for m in a.get("fades") or ()
+                     if not (m.get("side") == "out" and abs(float(m.get("src", -1)) - a_out) < 0.25)]
+            fades += [dict(m) for m in b.get("fades") or ()
+                      if not (m.get("side") == "in" and abs(float(m.get("src", -1)) - b_in) < 0.25)]
+            if fades:
+                a["fades"] = fades
+            else:
+                a.pop("fades", None)
+            # The gap after it is the second's.
+            if "gap_after_s" in b:
+                a["gap_after"], a["gap_after_s"] = True, b["gap_after_s"]
+            else:
+                a.pop("gap_after_s", None)
+                a["gap_after"] = b.get("gap_after", True)
+            self._assembly_set_segments(first, segs, gaps)
+            b["_merged_into"] = first
+            self._assembly_ignore(second)
+        finally:
+            self._s4_undo_hold = False
+        self._s4_save()
+        return True
 
     def _assembly_ignore(self, order):
         """The whole pull deleted on the Assembly track: IGNORE it, exactly

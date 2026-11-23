@@ -144,6 +144,39 @@ def _collect_on_the_main_thread():
     gc.collect()
 
 
+@pytest.fixture(autouse=True)
+def _prefs_of_its_own(tmp_path_factory, monkeypatch):
+    """The app's prefs file is the user's own (~/.postbridge_prefs.json):
+    a test reads and writes a file of its own instead, so a test run
+    leaves nothing in theirs and nothing of theirs reaches a test."""
+    try:
+        import main
+    except Exception:
+        yield
+        return
+    path = str(tmp_path_factory.mktemp("prefs") / "postbridge_prefs.json")
+    monkeypatch.setattr(main.App, "_prefs_path", lambda self: path)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _listening_settings_as_they_were():
+    """The Assembly's listening settings and the playback speed are kept for
+    the run, module-wide: what one test sets doesn't reach the next."""
+    try:
+        import assembly_view
+        import match_review
+    except Exception:
+        yield
+        return
+    mon = dict(assembly_view._MONITOR)
+    rate = match_review._LAST_PLAY_RATE
+    yield
+    assembly_view._MONITOR.clear()
+    assembly_view._MONITOR.update(mon)
+    match_review._LAST_PLAY_RATE = rate
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     # A test skips when there is no display for Tk, as on a bare Linux box.

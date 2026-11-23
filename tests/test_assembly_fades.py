@@ -370,21 +370,23 @@ def test_heal_seals_a_crossfaded_split_and_its_fades_go(view):  # noqa: F811
     assert _res(app, 1).get("fades")
 
 
-def test_heal_between_two_butting_pulls_leaves_no_fade_on_the_seam(view):  # noqa: F811
+def test_heal_merging_two_pulls_takes_the_fades_at_the_join_away(view):  # noqa: F811
+    import main
     app, win = view
+    app._assembly_merge_pulls = main.App._assembly_merge_pulls.__get__(app)
+    app._assembly_ignore = lambda order: next(
+        e for e in app._rv if e["res"]["order"] == order)["skip_var"].set(True)
     _res(app, 1)["gap_after"], _res(app, 1)["gap_after_s"] = True, 0.0
     _res(app, 1)["segments"] = [(10.0, 14.0)]
     _res(app, 2)["segments"] = [(14.0, 16.0)]
-    app.fade_var.set(0.200)                     # the default: a crossfade there
+    _res(app, 1)["fades"] = [{"side": "out", "src": 14.0, "len": 0.3},
+                             {"side": "in", "src": 10.0, "len": 0.1}]
+    _res(app, 2)["fades"] = [{"side": "in", "src": 14.0, "len": 0.3}]
     win.refresh()
-    assert win._clip(1).shapes[-1][1][0] == "x"
     win.set_insert(4.0)
     win.heal()
-    win.refresh()
-    assert engines.edge_fade(_res(app, 1), "out", 14.0, 0.2) == 0.0
-    assert engines.edge_fade(_res(app, 2), "in", 14.0, 0.2) == 0.0
-    assert win._clip(1).shapes[-1][1] == ("f", 0.0)
-    assert win._clip(2).shapes[0][0] == ("f", 0.0)
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 16.0)]
+    assert _res(app, 1)["fades"] == [{"side": "in", "src": 10.0, "len": 0.1}]
 
 
 def test_a_fades_end_is_marked_top_to_bottom(view):  # noqa: F811

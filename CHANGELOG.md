@@ -4,6 +4,14 @@
 
 ## November 23, 2026
 
+### Assembly: Heal at a pull boundary joins the two pulls, or does nothing
+- **Where the audio runs straight on from one pull into the next** (the same recording, the next one coming in where the first goes out), **H makes them one pull and the boundary is gone.** The first takes on the second's audio, its words in the text, its marks, its fades away from the join, and the gap after it. The second is IGNOREd and marked as merged into the first. It's one undo step, and undo brings both pulls back as they were.
+- **Anywhere else, H at a pull boundary does nothing,** and the status line says why: different recordings, a gap in the recording, or an overlap. It used to move the first pull's end out to the next one's start and take away the gap between them, which shifted the rest of the cut while the boundary stayed.
+
+### Assembly: drag up or down to zoom
+- **While you scrub the playhead on the ruler,** moving the mouse up or down zooms: down zooms in, up zooms out, about the moment under the pointer. Moving across still scrubs.
+- **A click in the waveform that goes up or down rather than across** puts the insertion point there and zooms about it the same way. A drag across still highlights.
+
 ### Assembly: a fade's end is marked
 - **A dashed line runs top to bottom where each fade ends:** at the far end of a fade in or out (its other end is the region's own edge), and at both ends of a crossfade. It's the fade's colour, brighter for one you set yourself.
 
@@ -17,7 +25,7 @@
 - **A fade handle only goes one way.** Drag it back to its edge and the fade is gone; keep going past the edge and it stays gone. It used to grow again on the other side.
 - **Heal takes a crossfaded join from anywhere inside the crossfade**, not just within a few pixels of the cut, which zoomed in could be well inside the X.
 - **Healing a cut inside a pull takes its fades with it,** in the same undo step. They used to linger and could come back on a later split at the same place.
-- **Healing where two pulls meet leaves no fade on the seam:** they run on as one stretch of tape, so a crossfade there would only dip it. Each side is set to no fade, whatever the default.
+- **Healing where two pulls meet makes them one pull,** so there's no seam left to fade (see the Heal entry above).
 
 ### Assembly: fades at every cut, and in the AAF
 - **Every cut edge now has a fade, and the AAF carries it into Pro Tools.** A test import showed Pro Tools takes them. A fade in follows silence, a fade out comes before it, and where two regions butt there's a crossfade centred on the cut. The Assembly plays the fades exactly as the AAF joins them, so what you hear there is what Pro Tools opens. Both exports carry them. Nothing moves: every clip still sounds where it did without fades.
@@ -42,7 +50,7 @@
 - **Episodes saved before this are fixed when they open**, and the Step 3 log names how many pulls were ended. Only a tail that runs into the next pull's start is shortened. A next pull from earlier in the read (a pickup) or from another take is left alone.
 
 ### Assembly: Heal works where one pull meets the next
-- **H now heals a seam between two pulls,** not just a cut inside one. The first pull runs on to exactly where the next comes in, with no silence between them, so the two play as one stretch of the recording. If they overlapped (the same words at both, heard twice), the overlap comes off the first. If tape was cut out between them, it comes back. It's one undo step. It doesn't heal across two recordings, back to earlier in the read (a pickup), or across more than 30 seconds of tape, and the status line says which.
+- **H now heals a seam between two pulls,** not just a cut inside one. (Changed later the same day: see "Heal at a pull boundary joins the two pulls, or does nothing" above.)
 - **H only heals a join right at the insertion point** (within a few pixels of it), or every join inside a highlight. With none there it says so and changes nothing. It used to heal the nearest cut anywhere in the pull, which could bring back tape far from where you were and shift everything after it.
 
 

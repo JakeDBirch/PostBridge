@@ -151,7 +151,9 @@ NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 EXCISED_MAX_S = 30.0
 CUT_EDGE_PX = 14
-HEAL_PX     = 12      # H takes a join no further than this from the insertion point
+HEAL_CONTINUOUS_S = 0.02   # a pull boundary this close in the recording is one stretch
+HEAL_PX     = 12
+VZOOM_PER_PX = 1.01   # a pixel's drag up or down zooms this much      # H takes a join no further than this from the insertion point
 TICK_PX     = 6       # a click this near a speech start / stop tick lands on it      # this near a cut's side, the boundary, not the cut
 NORM_LEVEL  = 0.5     # Normalize: each pull's speech peaks brought to this
 NORM_MAX_GAIN = 40.0  # ... by at most this much (+32 dB), so hiss stays hiss
@@ -3867,7 +3869,7 @@ class AssemblyWindow(object):
             return
         self.sel_marker = None
         if kind == "ruler":
-            self._drag = {"mode": "scrub"}
+            self._drag = {"mode": "scrub", "y": e.y}
             self.seek(t)
             return
         if kind == "tick":
@@ -3959,7 +3961,8 @@ class AssemblyWindow(object):
                 self._range = (c.order, a, a)
                 placed = False
             self.sel_region = None
-            self._drag = {"mode": "range", "x0": e.x, "t": a, "placed": placed}
+            self._drag = {"mode": "range", "x0": e.x, "y0": e.y, "y": e.y,
+                          "t": a, "placed": placed}
             if c.order != self.sel_order:
                 self.sel_order = c.order
                 self._mark_selected_in_script()
@@ -3991,10 +3994,26 @@ class AssemblyWindow(object):
             return
         mode = d["mode"]
         if mode == "scrub":
-            self.seek(self._t(e.x))
+            # Up and down zoom about the moment under the pointer; across
+            # moves the playhead, as ever.
+            t = self._t(e.x)
+            self._vzoom(d, e, t, e.x)
+            self.seek(t)
+            return
+        if mode == "vzoom":
+            self._vzoom(d, e, d["t"], self._x(d["t"]))
             return
         if mode == "range":
             if self._range is None:
+                return
+            if not d["placed"] and abs(e.y - d["y0"]) > DRAG_PX and \
+                    abs(e.y - d["y0"]) > abs(e.x - d["x0"]):
+                # A click that goes up or down, not across: the insertion
+                # point at the click, and the drag zooms about it.
+                d["mode"] = "vzoom"
+                self._range = None
+                self.set_insert(d["t"])
+                self._vzoom(d, e, d["t"], self._x(d["t"]))
                 return
             o, a, _b = self._range
             free = bool(e.state & 0x0004)
@@ -4270,6 +4289,9 @@ class AssemblyWindow(object):
     def _on_track_release(self, e):
         d, self._drag = self._drag, None
         if d is None:
+            return
+        if d["mode"] in ("scrub", "vzoom"):
+            self.redraw()
             return
         if d["mode"] == "range":
             o, a, b = self._range
@@ -5049,50 +5071,36 @@ class AssemblyWindow(object):
         done += self._heal_pulls(pulls)
 
     def _heal_pulls(self, pairs):
-        """Where one pull meets the next in the same recording: the first
-        now runs on to exactly where the next comes in, and nothing is put
-        between them, so the two play as one stretch of the recording.  An
-        overlap (the same words at the end of one and the start of the
-        next, heard twice) is taken off the first; tape cut out between
-        them comes back.  Not across recordings, nor back in one (a
-        pickup), nor across more than EXCISED_MAX_S of tape.  One undo
-        step for all of them.  Returns how many were healed."""
-        edits, gaps_after, why, sealed = {}, {}, None, []
+        """Where one pull meets the next: if the audio runs straight on
+        there -- the same recording, the next coming in where the first goes
+        out (within HEAL_CONTINUOUS_S) -- the boundary goes: the two are
+        made one pull (App._assembly_merge_pulls).  Otherwise nothing
+        changes.  Returns how many were healed."""
+        done, why = 0, None
         for po, no in pairs:
             p, n = self._clip(po), self._clip(no)
             if p is None or n is None or not p.segments or not n.segments:
                 continue
+            a_out, b_in = p.segments[-1][1], n.segments[0][0]
             if p.play_path != n.play_path:
                 why = "those two pulls come from different recordings"
                 continue
-            a_last, b_in = p.segments[-1], n.segments[0][0]
-            if b_in <= a_last[0] + MIN_SEG_S or b_in - a_last[1] > EXCISED_MAX_S:
-                why = ("the next pull comes in before this one's last region "
-                       "-- a pickup from earlier in the read" if b_in <= a_last[0]
-                       else "too much tape between them")
+            if abs(b_in - a_out) > HEAL_CONTINUOUS_S:
+                why = ("the audio doesn't run on from one to the next there "
+                       "({:+.2f} s in the recording)".format(b_in - a_out))
                 continue
-            segs = list(edits.get(po, (p.segments, p.seg_gaps))[0])
-            segs[-1] = (segs[-1][0], b_in)
-            edits[po] = (segs, list(p.seg_gaps))
-            gaps_after[po] = 0.0
-            sealed.append((p.res, n.res, a_last[1], b_in))
-        if not edits:
-            if why and pairs:
+            merge = getattr(self.app, "_assembly_merge_pulls", None)
+            if merge is not None and merge(po, no):
+                done += 1
+        if not done:
+            if why:
                 self.status.config(fg=SUB, text="Nothing to heal there: " + why)
             return 0
-        self.app._assembly_edit_many(edits, gaps_after=gaps_after)
-        # The two now run on as one stretch of tape: no fade either side of
-        # the seam (a crossfade over contiguous audio only dips it).
-        for pres, nres, old_out, b_in in sealed:
-            engines.set_edge_fade(pres, "out", old_out, None)
-            engines.set_edge_fade(pres, "out", b_in, 0.0)
-            engines.set_edge_fade(nres, "in", b_in, 0.0)
-        self.app._s4_save()
         self.refresh()
-        self.status.config(fg=TEXT, text="{} join{} between pulls healed: "
-                           "they run on as one stretch of the recording".format(
-                               len(edits), "" if len(edits) == 1 else "s"))
-        return len(edits)
+        self.status.config(fg=TEXT, text="{} boundar{} between pulls healed: "
+                           "one pull, running on".format(
+                               done, "y" if done == 1 else "ies"))
+        return done
 
     def accept_next(self):
         """Ctrl+Enter: accept the pull on show as it is, and on to the next
@@ -5264,6 +5272,20 @@ class AssemblyWindow(object):
         t = e.x / max(1, self.ov.winfo_width()) * self.total_s
         self.view0 = t - self._span() / 2.0
         self.redraw()
+
+    def _vzoom(self, d, e, t, x):
+        """Zoom by the drag's movement up or down since last time: down in,
+        up out (VZOOM_PER_PX a pixel), with time t held at x on screen."""
+        dy = e.y - d.get("y", e.y)
+        d["y"] = e.y
+        if not dy:
+            return
+        pps = min(max(self.pps * VZOOM_PER_PX ** dy, self._min_pps()), MAX_PPS)
+        if pps == self.pps:
+            return
+        self.pps = pps
+        self.view0 = t - x / self.pps
+        self._redraw_soon()
 
     def _min_pps(self):
         return max(1, self.cv.winfo_width()) / max(10.0, self.total_s * 1.02)
