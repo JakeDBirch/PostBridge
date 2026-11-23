@@ -124,15 +124,19 @@ def test_crossfade_plays_tape_either_side_of_the_cut(tmp_path):
     assert (b[2], b[3]) == (int(1.5 * S) + h, int(2.5 * S) - h)   # starts early
 
 
-def test_a_join_with_no_tape_to_cross_stays_a_cut(tmp_path):
-    # The second piece starts at the very top of the file: nothing before it.
+def test_a_join_with_no_tape_before_it_crossfades_only_after_the_cut(tmp_path):
+    # The second piece starts at the very top of the file: nothing before it,
+    # so its crossfade starts at the cut and runs only after it.
     track, _ = _track(_build(tmp_path, [_pull(1, [(1.0, 2.0), (0.0, 1.0)])], FADE))
     kinds = [k for k, *_ in track]
-    assert kinds == ["Filler", "Transition", "SourceClip", "SourceClip",
-                     "Transition", "Filler"]
+    assert kinds == ["Filler", "Transition", "SourceClip", "Transition",
+                     "SourceClip", "Transition", "Filler"]
+    x = track[3]
+    assert x[4] == 0 and x[2] == int(FADE * 48000) // 2      # cut point at its start
+    assert track[4][3] == 0                                  # from the file's top
 
 
-def test_a_fade_takes_no_more_than_a_quarter_of_a_short_clip(tmp_path):
-    track, _ = _track(_build(tmp_path, [_pull(1, [(1.0, 1.02)])], FADE))
+def test_a_fade_takes_no_more_than_its_clip(tmp_path):
+    track, _ = _track(_build(tmp_path, [_pull(1, [(1.0, 1.005)])], FADE))
     clip = next(t for t in track if t[0] == "SourceClip")
-    assert all(t[2] <= clip[2] // 4 for t in track if t[0] == "Transition")
+    assert all(t[2] <= clip[2] for t in track if t[0] == "Transition")

@@ -4,6 +4,13 @@
 
 ## November 23, 2026
 
+### Assembly: a highlighted fade is the highlight
+- **Highlight, then F, and the fade covers exactly what's highlighted.** A fade used to be cut down to a quarter of its region, and a crossfade was always centred on the cut whatever was highlighted. Now a fade in or out runs as far as the highlight, up to its whole region. A crossfade runs from where the highlight starts before the cut to where it ends after, even or not, and its X is drawn that way.
+- **The AAF carries an uneven crossfade too:** the dissolve's cut point sits where the cut is, so Pro Tools gets the same shape.
+- **A crossfade's handles move one end each.** The one after the cut sets how far it runs after; the one before sets how far it starts before. They used to set both ends together.
+- **The longest fade is now 10 seconds**, up from 2.
+- A crossfade is kept on its two edges: the incoming edge's fade is twice the part before the cut, the outgoing edge's twice the part after. Equal fades either side centre it on the cut, as before, so existing crossfades are unchanged.
+
 ### Assembly: three default fades, true-sounding crossfades, fades drawn as heard, F to the nearest edge, Shift+Delete
 - **Separate defaults for fade in, fade out and crossfade** (in the Edit panel: *Default fades: in, out, cross*, in ms). A fade in after silence takes the first, a fade out before silence the second, and where two clips butt on one track the crossfade takes the third. That includes the cuts inside a pull, and a pull running straight on into the next of the same speaker. A fade set by hand on either side of a cut still decides it. The AAF carries all three. An episode saved before this opens with all three set to its one old default, so it sounds the same until you change them. Each is one undo step.
 - **Crossfades were true crossfades** (both sides play through the overlap, each running past the cut), **but they dipped.** Both sides ramped in straight lines, and two different sounds summed that way drop about 3 dB in the middle, which sounds like a fade out then a fade in. Over a real cut they now hold their power (an equal-power curve). Over a split, where both sides are one stretch of the recording, they still ramp straight, which is what keeps that level. This is the Assembly's playback; Pro Tools applies its own crossfade shape to the AAF's dissolves.

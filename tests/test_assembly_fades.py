@@ -75,10 +75,12 @@ def test_the_aaf_carries_a_cuts_own_fade(tmp_path):
         comp = next(f.content.toplevel())
         slot = next(sl for sl in comp.slots if sl.name == "GUEST")
         got = [(type(c).__name__, c.length) for c in slot.segment.components]
-    half = int(0.100 * sr) // 2
-    assert got == [("SourceClip", 1 * sr + half),                # no fade in
-                   ("Transition", 2 * half),                     # its own crossfade
-                   ("SourceClip", int(1.5 * sr) + half),
+    # The outgoing edge's own 100 ms sets the crossfade's end after the cut
+    # (half of it); the incoming edge's default 10 ms its start before.
+    post, pre = int(0.100 * sr) // 2, int(0.010 * sr) // 2
+    assert got == [("SourceClip", 1 * sr + post),                # no fade in
+                   ("Transition", pre + post),                   # its own crossfade
+                   ("SourceClip", int(1.5 * sr) + pre),
                    ("Transition", int(0.010 * sr)),              # the default out
                    ("Filler", int(0.010 * sr))]
 
@@ -235,11 +237,12 @@ def test_f_across_a_butt_cut_makes_a_crossfade_the_highlights_length(view):  # n
     win.refresh()
     win._range = (1, 0.9, 1.2)                  # the cut is at 1.0
     win.apply_fade()
-    assert _fade_of(app, 1, "out") == [pytest.approx(0.3)]
-    assert _fade_of(app, 1, "in") == [pytest.approx(0.3)]
+    # As highlighted: 0.1 s before the cut and 0.2 s after.
     c = win._clip(1)
-    assert c.shapes[0][1] == ("x", pytest.approx(0.15))
-    assert c.shapes[1][0] == ("x", pytest.approx(0.15))
+    assert c.shapes[0][1] == ("x", pytest.approx(0.1), pytest.approx(0.2))
+    assert c.shapes[1][0] == ("x", pytest.approx(0.1), pytest.approx(0.2))
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.2)]      # twice the part before
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.4)]     # twice the part after
 
 
 def test_f_across_a_gap_fades_out_and_in_as_one_undo(view):  # noqa: F811
@@ -290,7 +293,7 @@ def test_a_fade_handle_sits_on_each_top_corner_and_drags(view):  # noqa: F811
     assert _fade_of(app, 1, "in") == [0.0]
 
 
-def test_dragging_a_crossfade_handle_sets_both_sides(view):  # noqa: F811
+def test_dragging_a_crossfade_handle_moves_only_its_end(view):  # noqa: F811
     app, win = view
     _res(app, 1)["segments"] = [(10.0, 11.0), (12.0, 14.0)]
     app.fade_var.set(0.100)
@@ -299,14 +302,16 @@ def test_dragging_a_crossfade_handle_sets_both_sides(view):  # noqa: F811
     win.redraw()
     y0, _y1 = win._track_box()
     cut = win._x(1.0)
-    hx = win._x(1.0 + 0.05)                     # half of 100 ms, right side
+    hx = win._x(1.0 + 0.05)                     # its end after the cut
     kind, hc, hk = win._hit(hx, y0 + 6)
     assert (kind, hk) == ("fade", (1, "in"))
     win._on_track_press(_Ev(hx, y0 + 6))
     win._on_track_drag(_Ev(cut + 0.2 * win.pps, y0 + 6))
     win._on_track_release(_Ev(cut + 0.2 * win.pps, y0 + 6))
-    assert _fade_of(app, 1, "in") == [pytest.approx(0.4, abs=0.03)]
-    assert _fade_of(app, 1, "out") == [pytest.approx(0.4, abs=0.03)]
+    sh = win._clip(1).shapes[0][1]
+    assert sh[0] == "x"
+    assert sh[2] == pytest.approx(0.2, abs=0.03)        # its end: 0.2 s after
+    assert sh[1] == pytest.approx(0.05, abs=0.005)      # the start: as it was
 
 
 def test_a_crossfade_between_two_pulls_is_a_whole_x_with_no_handle_boxes(view):  # noqa: F811
@@ -476,7 +481,7 @@ def test_f_without_a_highlight_by_a_butt_cut_crossfades_either_side(view):  # no
     win.apply_fade()
     assert _fade_of(app, 1, "out") == [pytest.approx(0.4)]
     assert _fade_of(app, 1, "in") == [pytest.approx(0.4)]
-    assert win._clip(1).shapes[0][1] == ("x", pytest.approx(0.2))
+    assert win._clip(1).shapes[0][1] == ("x", pytest.approx(0.2), pytest.approx(0.2))
 
 
 # ── Separate defaults: fade in, fade out, crossfade ──────────────────────
@@ -523,3 +528,15 @@ def test_the_assembly_sets_each_default_on_its_own(view):  # noqa: F811
                                     app.fade_var.get())
     c = win._clip(1)
     assert c.fades[0] == (pytest.approx(0.030), pytest.approx(0.060))
+
+
+def test_a_highlighted_fade_is_as_long_as_the_highlight(view):  # noqa: F811
+    app, win = view
+    win._range = (1, -0.2, 1.5)                 # 1.5 s into a 4 s pull: not capped
+    win.apply_fade()
+    assert _fade_of(app, 1, "in") == [pytest.approx(1.5)]
+    c = win._clip(1)
+    assert c.shapes[0][0] == ("f", pytest.approx(1.5))
+    win._range = (1, 2.2, 4.3)                  # 1.8 s off its end
+    win.apply_fade()
+    assert _fade_of(app, 1, "out") == [pytest.approx(1.8)]

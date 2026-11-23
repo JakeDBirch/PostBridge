@@ -869,13 +869,15 @@ class _AssemblyAudio(object):
             for i, (st, du, order, si, _fi, _fo, _pth) in enumerate(raw):
                 head, tail = joins[i], joins[i + 1]
                 lead = head[1] if head[0] == "x" else 0
-                trail = tail[1] if tail[0] == "x" else 0
-                pow_in = bool(lead) and not _one_stretch(raw[i - 1], raw[i])
-                pow_out = bool(trail) and not _one_stretch(raw[i], raw[i + 1])
+                trail = tail[2] if tail[0] == "x" else 0
+                x_in = head[1] + head[2] if head[0] == "x" else 0
+                x_out = tail[1] + tail[2] if tail[0] == "x" else 0
+                pow_in = bool(x_in) and not _one_stretch(raw[i - 1], raw[i])
+                pow_out = bool(x_out) and not _one_stretch(raw[i], raw[i + 1])
                 pieces.append((st - lead, du + lead + trail, order,
                                si - lead / float(sr),
-                               2 * lead if lead else head[2] if head[0] == "f" else 0,
-                               2 * trail if trail else tail[1] if tail[0] == "f" else 0,
+                               x_in or (head[2] if head[0] == "f" else 0),
+                               x_out or (tail[1] if tail[0] == "f" else 0),
                                pow_in, pow_out))
         self._index = ([p[0] for p in pieces], pieces)
         # A second of tail so the stretcher can play the last word out.
@@ -1512,10 +1514,10 @@ class AssemblyWindow(object):
         for pos, n in enumerate(flat_order):
             head, tail = joins[pos], joins[pos + 1]
             shape_of[n] = (
-                ("x", head[1] / float(LAYOUT_SR)) if head[0] == "x"
-                else ("f", head[2] / float(LAYOUT_SR)),
-                ("x", tail[1] / float(LAYOUT_SR)) if tail[0] == "x"
-                else ("f", tail[1] / float(LAYOUT_SR)))
+                ("x", head[1] / float(LAYOUT_SR), head[2] / float(LAYOUT_SR))
+                if head[0] == "x" else ("f", head[2] / float(LAYOUT_SR)),
+                ("x", tail[1] / float(LAYOUT_SR), tail[2] / float(LAYOUT_SR))
+                if tail[0] == "x" else ("f", tail[1] / float(LAYOUT_SR)))
         flat_n = 0
 
         old_by = {o.order: o for o in self.clips}
@@ -3175,13 +3177,16 @@ class AssemblyWindow(object):
             if k >= len(shapes):
                 break
             a, b = exact[k] if exact else (si, si + du)
-            for side, edge, src, (kind, secs) in (
+            for side, edge, src, shape in (
                     ("in", tl, a, shapes[k][0]), ("out", tl + du, b, shapes[k][1])):
+                kind, secs = shape[0], shape[1]
                 own = engines._edge_fade_entry(c.res, side, src) is not None
                 if kind == "x":
-                    reach = secs             # half the crossfade, each side
-                    ht = edge + reach if side == "in" else edge - reach
-                    out.append((k, side, edge, ht, 2 * secs, True, own))
+                    # From pre before the cut to post after it; the handle
+                    # on this side is at that side's end.
+                    pre, post = shape[1], shape[2]
+                    ht = edge + post if side == "in" else edge - pre
+                    out.append((k, side, edge, ht, pre + post, True, own))
                 else:
                     ht = edge + secs if side == "in" else edge - secs
                     out.append((k, side, edge, ht, secs, False, own))
@@ -3204,8 +3209,12 @@ class AssemblyWindow(object):
             if secs > 0 and not (cross and side == "in"):
                 # The waveform as it plays here: faded, a crossfade's two
                 # sides mixed.  (A crossfade once, from its outgoing side.)
-                lo, hi = (min(xh, 2 * xe_ - xh), max(xh, 2 * xe_ - xh)) \
-                    if cross else (min(xe_, xh), max(xe_, xh))
+                if cross:
+                    far = self._x(edge - (secs - (ht - edge))) if side == "in" \
+                        else self._x(edge + (secs - (edge - ht)))
+                    lo, hi = min(xh, far), max(xh, far)
+                else:
+                    lo, hi = min(xe_, xh), max(xe_, xh)
                 self._draw_heard(c, lo, hi, y0, y1, w)
             if du * self.pps < 3 * hp:
                 continue                     # too narrow to take hold of
@@ -3214,7 +3223,9 @@ class AssemblyWindow(object):
                 if cross:
                     # This side's slope runs the whole crossfade: from
                     # silence past the cut on the other side, up to full.
-                    xa, xb = (2 * xe_ - xh, xh) if side == "in" else (xh, 2 * xe_ - xh)
+                    other = self._x(edge - (secs - (ht - edge))) if side == "in" \
+                        else self._x(edge + (secs - (edge - ht)))
+                    xa, xb = (other, xh) if side == "in" else (xh, other)
                     cv.create_line(xa, y1 if side == "in" else top,
                                    xb, top if side == "in" else y1,
                                    fill=col, tags=("fade",))
@@ -3287,14 +3298,19 @@ class AssemblyWindow(object):
         return best[1] if best else None
 
     def _fade_edges(self, c, k, side):
-        """The edges one fade handle sets: its own, and at a butt join the
-        other side of the cut -- [(order, side, source time)]."""
+        """The edge one fade handle sets -- [(order, side, source time)]:
+        its own; at a crossfade, the edge whose fade sets that handle's end
+        of it (the one after the cut is the outgoing edge's, the one before
+        it the incoming edge's)."""
         tl, du, _si = c.pieces[k]
         at = tl if side == "in" else tl + du
         _t, edges = self._cut_edges(at)
         mine = [e for e in edges if e[0] == c.order and e[1] == side]
         crossing = len(c.shapes) > k and c.shapes[k][0 if side == "in" else 1][0] == "x"
-        return edges if crossing else mine
+        if not crossing:
+            return mine
+        want = "out" if side == "in" else "in"
+        return [e for e in edges if e[1] == want] or mine
 
     def _fade_overrides(self, edges, secs):
         """Rows with these edges' fades set, for laying out a drag."""
@@ -3317,11 +3333,11 @@ class AssemblyWindow(object):
         # and past the edge it stays gone -- it doesn't come back the other
         # way round.
         reach = max(0.0, (x - xe_ if d["side"] == "in" else xe_ - x) / self.pps)
+        # A crossfade's end is half its edge's fade (join_fades); a fade or
+        # a crossfade's side takes at most its region.
+        reach = min(reach, d["room"])
         secs = 2 * reach if d["cross"] else reach
-        # A fade takes a quarter of its region at most; a crossfade, that
-        # much of each side.
-        room = d["room"] * (0.5 if d["cross"] else 0.25)
-        return round(max(0.0, min(secs, room, FADE_MAX)), 4)
+        return round(max(0.0, min(secs, FADE_MAX)), 4)
 
     def _fade_to_nearest_edge(self):
         """The span F with nothing highlighted fades over, as a highlight:
@@ -3376,11 +3392,9 @@ class AssemblyWindow(object):
             for k, (tl, du, si) in enumerate(c.pieces):
                 sa, sb = exact[k] if exact else (si, si + du)
                 if a + eps < tl < b - eps:             # its start is inside
-                    plan[(c.order, "in", sa)] = (
-                        tl, min(min(b, tl + du) - tl, du / 4.0))
+                    plan[(c.order, "in", sa)] = (tl, min(b, tl + du) - tl)
                 if a + eps < tl + du < b - eps:        # its end is inside
-                    plan[(c.order, "out", sb)] = (
-                        tl + du, min(tl + du - max(a, tl), du / 4.0))
+                    plan[(c.order, "out", sb)] = (tl + du, tl + du - max(a, tl))
         if not plan:
             self.status.config(fg=SUB, text="Nothing to fade there: the "
                                "highlight has to cross a cut, or a region's "
@@ -3394,9 +3408,15 @@ class AssemblyWindow(object):
         for at, items in sorted(by_time.items()):
             sides = {e[1] for e, _s in items}
             if sides == {"in", "out"}:
-                total = sum(s for _e, s in items)
-                groups.append(([e for e, _s in items], total))
-                made.append("crossfade {:.0f} ms".format(total * 1000))
+                # As highlighted: from where it starts before the cut to
+                # where it ends after.  The incoming edge's fade is twice
+                # the part before the cut, the outgoing's twice the part
+                # after (join_fades).
+                before = max(s for e, s in items if e[1] == "out")
+                after = max(s for e, s in items if e[1] == "in")
+                for e, _s in items:
+                    groups.append(([e], 2 * (before if e[1] == "in" else after)))
+                made.append("crossfade {:.0f} ms".format((before + after) * 1000))
             else:
                 for e, s in items:
                     groups.append(([e], s))
@@ -4019,15 +4039,9 @@ class AssemblyWindow(object):
                          if m[0] == pk and m[1] == side), None)
             edges = self._fade_edges(c, pk, side)
             cross = bool(mark and mark[5])
+            # Its end goes no further than its own region (a crossfade's
+            # end on this side lies over this region too).
             room = du
-            if cross:
-                other = [e for e in edges if e[0] != c.order or e[1] != side]
-                oc = self._clip(other[0][0]) if other else None
-                od = min((p[1] for p in (oc.pieces if oc else ())
-                          if abs(p[0] - (tl if side == "out" else tl + du)) < 1e-4
-                          or abs(p[0] + p[1] - (tl if side == "in" else tl + du)) < 1e-4),
-                         default=du)
-                room = min(du, od)
             self._range = None
             self.sel_region = None
             self._drag = {"mode": "fade", "x0": e.x, "moved": False,
@@ -5190,7 +5204,7 @@ class AssemblyWindow(object):
             sh = shapes[w[2] - 1][1] if len(shapes) >= w[2] else None
         else:
             sh = shapes[-1][1] if shapes else None
-        return float(sh[1]) if sh and sh[0] == "x" else 0.0
+        return float(max(sh[1], sh[2])) if sh and sh[0] == "x" else 0.0
 
     def heal(self):
         """H: heal the join at the insertion point -- a cut or split inside

@@ -6194,24 +6194,28 @@ def join_fades(pieces, fades, file_room=None):
     file_room : optional f(i) -> samples of tape after piece i's out.
 
     Returns len(pieces) + 1 joins, join i being the one before piece i:
-      ("x", half)     two pieces butt: a crossfade centred on the cut that
-                      reaches `half` samples into each side's tape past it;
+      ("x", pre, post) two pieces butt: a crossfade over the cut, from `pre`
+                      samples before it to `post` after -- the incoming
+                      piece starts `pre` early, the outgoing one plays
+                      `post` past its out.  The incoming edge's fade is
+                      twice its `pre`, the outgoing's twice its `post`, so
+                      equal fades centre it on the cut;
       ("f", out, in)  silence between (or a butt join with no fade or no
                       tape to cross): the fade out before it, the fade in
                       after it.
-    A fade never takes more than a quarter of its piece.
+    A fade takes at most the whole of its piece.
     """
     joins = []
     for i in range(len(pieces) + 1):
         a = pieces[i - 1] if i else None
         b = pieces[i] if i < len(pieces) else None
-        f_out = min(fades[i - 1][1], a[1] // 4) if a else 0
-        f_in  = min(fades[i][0], b[1] // 4) if b else 0
+        f_out = min(fades[i - 1][1], a[1]) if a else 0
+        f_in  = min(fades[i][0], b[1]) if b else 0
         if a and b and a[0] + a[1] == b[0]:
-            room = file_room(i - 1) if file_room else max(f_out, f_in)
-            half = min(max(fades[i - 1][1], fades[i][0]) // 2,
-                       a[1] // 4, b[1] // 4, b[2], max(0, room))
-            joins.append(("x", half) if half > 0 else ("f", 0, 0))
+            room = file_room(i - 1) if file_room else fades[i - 1][1]
+            pre = max(0, min(fades[i][0] // 2, a[1], b[2]))
+            post = max(0, min(fades[i - 1][1] // 2, b[1], room))
+            joins.append(("x", pre, post) if pre + post > 0 else ("f", 0, 0))
         else:
             joins.append(("f", f_out, f_in))
     return joins
@@ -6857,7 +6861,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 master, master_slot = file_mobs[filepath]
                 head, tail = joins[i], joins[i + 1]
                 lead = head[1] if head[0] == "x" else 0
-                trail = tail[1] if tail[0] == "x" else 0
+                trail = tail[2] if tail[0] == "x" else 0
                 if head[0] == "f":
                     # Silence up to the clip.  A fade overlaps what it
                     # fades from or to, so the filler is longer by each.
@@ -6872,7 +6876,9 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                     length=dur_sa + lead + trail, start=src_in_sa - lead)
                 seq.components.append(clip)
                 if tail[0] == "x":
-                    seq.components.append(dissolve(2 * tail[1], tail[1]))
+                    # From `pre` before the cut to `post` after it: the
+                    # cut point is `pre` into the transition.
+                    seq.components.append(dissolve(tail[1] + tail[2], tail[1]))
                 elif tail[1]:
                     seq.components.append(dissolve(tail[1], tail[1]))
                     if i == len(clips) - 1:
