@@ -385,3 +385,21 @@ def test_heal_between_two_butting_pulls_leaves_no_fade_on_the_seam(view):  # noq
     assert engines.edge_fade(_res(app, 2), "in", 14.0, 0.2) == 0.0
     assert win._clip(1).shapes[-1][1] == ("f", 0.0)
     assert win._clip(2).shapes[0][0] == ("f", 0.0)
+
+
+def test_a_fades_end_is_marked_top_to_bottom(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    app.fade_var.set(0.400)                     # crossfade at 2.0; fade in at 0
+    win.refresh()
+    win.restore_view(100.0, -0.5, 0.0)
+    win.redraw()
+    app.update()
+    cv = win.cv
+    y0, y1 = win._track_box()
+    ends = sorted(round(cv.coords(i)[0]) for i in cv.find_withtag("fade_end"))
+    for t in (0.4, 1.8, 2.2):                   # the fade in's end; the X's two
+        assert round(win._x(t)) in ends
+    for i in cv.find_withtag("fade_end"):
+        x0, ya, x1, yb = cv.coords(i)
+        assert x0 == x1 and yb - ya > (y1 - y0) / 2      # a vertical, top to bottom

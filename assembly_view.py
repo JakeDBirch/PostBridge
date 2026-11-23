@@ -3144,9 +3144,11 @@ class AssemblyWindow(object):
 
     def _draw_fades(self, c, y0, y1, w):
         """Each fade as its slope across the region -- a crossfade as an X,
-        the two slopes crossing over the cut.  Its handle, at the fade's
-        far end along the top (or the region's top corner), isn't drawn:
-        the pointer changes over it."""
+        the two slopes crossing over the cut -- with a dashed line top to
+        bottom where it ends (both ends of a crossfade; a fade's other end is
+        the region's own edge).  Its handle, at the fade's far end along the
+        top (or the region's top corner), isn't drawn: the pointer changes
+        over it."""
         cv = self.cv
         top, hp = y0 + 4, FADE_HANDLE_PX
         for k, side, edge, ht, secs, cross, own in self._fade_marks(c):
@@ -3170,6 +3172,9 @@ class AssemblyWindow(object):
                                       stipple="gray50", outline="",
                                       tags=("fade",))
                     cv.create_line(xe_, y1, xh, top, fill=col, tags=("fade",))
+                # Where the fade ends: for a crossfade, this side's end.
+                cv.create_line(xh, top, xh, y1, fill=col, dash=(2, 3),
+                               tags=("fade", "fade_end"))
 
     def _fade_handle_at(self, x, y):
         """(clip, k, side) of the fade handle under the pointer, or None."""

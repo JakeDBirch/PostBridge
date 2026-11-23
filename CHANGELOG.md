@@ -4,6 +4,9 @@
 
 ## November 23, 2026
 
+### Assembly: a fade's end is marked
+- **A dashed line runs top to bottom where each fade ends:** at the far end of a fade in or out (its other end is the region's own edge), and at both ends of a crossfade. It's the fade's colour, brighter for one you set yourself.
+
 ### Assembly: Shift-drag rolls a boundary, or trims into silence
 - **Where two regions touch, Shift-drag the boundary to roll it:** the out before it and the in after it move together by the same amount, so the boundary slides and the audio either side stays where it is. Drag left and the earlier region ends sooner while the later one starts sooner. It works from either side of the boundary, inside a pull or between two, with the cut opened up (Show surrounding audio) or not. It used to roll only when you pressed right on the seam.
 - **Where an edge has silence beside it, Shift-drag trims that edge alone:** the silence takes up the difference. Drag an in point left to fill the silence in front of it, right to widen it, and the audio before isn't touched. An out point works the same way into the silence after it. Nothing after the edit moves either way.
