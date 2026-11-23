@@ -3218,8 +3218,11 @@ class AssemblyWindow(object):
     def _fade_dragged(self, d, x):
         """The length a fade handle at x asks for."""
         xe_ = self._x(d["edge"])
-        reach = (x - xe_ if d["side"] == "in" else xe_ - x) / self.pps
-        secs = 2 * abs(reach) if d["cross"] else reach
+        # Only towards its own side: dragged back to the edge it is gone,
+        # and past the edge it stays gone -- it doesn't come back the other
+        # way round.
+        reach = max(0.0, (x - xe_ if d["side"] == "in" else xe_ - x) / self.pps)
+        secs = 2 * reach if d["cross"] else reach
         # A fade takes a quarter of its region at most; a crossfade, that
         # much of each side.
         room = d["room"] * (0.5 if d["cross"] else 0.25)
@@ -4938,10 +4941,12 @@ class AssemblyWindow(object):
         segs = list(c.segments)
         gaps = list(c.seg_gaps)
         done = 0
+        gone = []                        # the healed joins' edges: (out, in)
         for k in sorted(set(ks), reverse=True):
             if not 0 < k < len(segs) or segs[k][1] <= segs[k - 1][0] or \
                     segs[k][0] < segs[k - 1][1] - 1e-6:
                 continue
+            gone.append((segs[k - 1][1], segs[k][0]))
             segs[k - 1:k + 1] = [(segs[k - 1][0], segs[k][1])]
             if k - 1 < len(gaps):
                 del gaps[k - 1]
@@ -4952,6 +4957,14 @@ class AssemblyWindow(object):
                                    c.label))
             return 0
         self.app._assembly_set_segments(order, segs, gaps)
+        # Its fades go with the join (in the same undo step: the accept
+        # took the snapshot before this).  Left, they would come back on
+        # a later split at the same place.
+        for out_src, in_src in gone:
+            engines.set_edge_fade(c.res, "out", out_src, None)
+            engines.set_edge_fade(c.res, "in", in_src, None)
+        if gone:
+            self.app._s4_save()
         self.refresh()
         self.status.config(fg=TEXT, text="{}   ·   {} join{} healed: one region "
                            "of continuous audio".format(
@@ -4974,6 +4987,16 @@ class AssemblyWindow(object):
             prev = c
         return out
 
+    def _join_cross(self, w):
+        """Half the crossfade over a join, in seconds (0 for none)."""
+        c = self._clip(w[1])
+        shapes = getattr(c, "shapes", None) or ()
+        if w[0] == "cut":
+            sh = shapes[w[2] - 1][1] if len(shapes) >= w[2] else None
+        else:
+            sh = shapes[-1][1] if shapes else None
+        return float(sh[1]) if sh and sh[0] == "x" else 0.0
+
     def heal(self):
         """H: heal the join at the insertion point -- a cut or split inside
         a pull, or where one pull meets the next -- so the audio either side
@@ -4992,9 +5015,12 @@ class AssemblyWindow(object):
         else:
             t = self.insert
             reach = HEAL_PX / self.pps
-            near = [(0.0 if a - 1e-6 <= t <= b + 1e-6 else
-                     min(abs(t - a), abs(t - b)), (a, b, w))
-                    for a, b, w in joins]
+            near = []
+            for a, b, w in joins:
+                x = self._join_cross(w)      # a crossfade over it is the join too
+                d = 0.0 if a - x - 1e-6 <= t <= b + x + 1e-6 else \
+                    min(abs(t - (a - x)), abs(t - (b + x)))
+                near.append((d, (a, b, w)))
             near = [n for n in near if n[0] <= reach]
             if not near:
                 self.status.config(fg=SUB, text="Nothing to heal here: put the "
@@ -5022,7 +5048,7 @@ class AssemblyWindow(object):
         them comes back.  Not across recordings, nor back in one (a
         pickup), nor across more than EXCISED_MAX_S of tape.  One undo
         step for all of them.  Returns how many were healed."""
-        edits, gaps_after, why = {}, {}, None
+        edits, gaps_after, why, sealed = {}, {}, None, []
         for po, no in pairs:
             p, n = self._clip(po), self._clip(no)
             if p is None or n is None or not p.segments or not n.segments:
@@ -5040,11 +5066,19 @@ class AssemblyWindow(object):
             segs[-1] = (segs[-1][0], b_in)
             edits[po] = (segs, list(p.seg_gaps))
             gaps_after[po] = 0.0
+            sealed.append((p.res, n.res, a_last[1], b_in))
         if not edits:
             if why and pairs:
                 self.status.config(fg=SUB, text="Nothing to heal there: " + why)
             return 0
         self.app._assembly_edit_many(edits, gaps_after=gaps_after)
+        # The two now run on as one stretch of tape: no fade either side of
+        # the seam (a crossfade over contiguous audio only dips it).
+        for pres, nres, old_out, b_in in sealed:
+            engines.set_edge_fade(pres, "out", old_out, None)
+            engines.set_edge_fade(pres, "out", b_in, 0.0)
+            engines.set_edge_fade(nres, "in", b_in, 0.0)
+        self.app._s4_save()
         self.refresh()
         self.status.config(fg=TEXT, text="{} join{} between pulls healed: "
                            "they run on as one stretch of the recording".format(

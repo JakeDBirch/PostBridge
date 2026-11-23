@@ -335,3 +335,53 @@ def test_a_fade_handle_shows_as_the_pointer(view):  # noqa: F811
     x_out = win._x(win._clip(1).end)
     win._on_motion(_Ev(x_out - 4, y0 + 6))
     assert str(win.cv.cget("cursor")) == "size_nw_se"
+
+
+# ── A fade's handle doesn't flip over; Heal seals a fade over its join ─────
+
+def test_a_handle_dragged_past_its_edge_leaves_no_fade(view):  # noqa: F811
+    app, win = view
+    c = win._clip(1)
+    xe = win._x(c.start)
+    d = {"edge": c.start, "side": "in", "cross": False, "room": 4.0}
+    assert win._fade_dragged(d, xe + 0.3 * win.pps) == pytest.approx(0.3)
+    assert win._fade_dragged(d, xe - 0.3 * win.pps) == 0.0      # not 0.3 again
+    d = {"edge": 2.0, "side": "in", "cross": True, "room": 2.0}
+    xe = win._x(2.0)
+    assert win._fade_dragged(d, xe + 0.1 * win.pps) == pytest.approx(0.2)
+    assert win._fade_dragged(d, xe - 0.1 * win.pps) == 0.0
+
+
+def test_heal_seals_a_crossfaded_split_and_its_fades_go(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    win.refresh()
+    win._range = (1, 1.8, 2.2)                  # a 400 ms crossfade at 2.0
+    win.apply_fade()
+    assert _res(app, 1).get("fades")
+    win._range = None
+    win.pps = 400.0                             # 80 px either side of the cut
+    win.set_insert(2.15)                        # inside the crossfade, 60 px off
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
+    assert not _res(app, 1).get("fades")
+    app._s4_undo()                              # one step: both come back
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 12.0), (12.0, 14.0)]
+    assert _res(app, 1).get("fades")
+
+
+def test_heal_between_two_butting_pulls_leaves_no_fade_on_the_seam(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["gap_after"], _res(app, 1)["gap_after_s"] = True, 0.0
+    _res(app, 1)["segments"] = [(10.0, 14.0)]
+    _res(app, 2)["segments"] = [(14.0, 16.0)]
+    app.fade_var.set(0.200)                     # the default: a crossfade there
+    win.refresh()
+    assert win._clip(1).shapes[-1][1][0] == "x"
+    win.set_insert(4.0)
+    win.heal()
+    win.refresh()
+    assert engines.edge_fade(_res(app, 1), "out", 14.0, 0.2) == 0.0
+    assert engines.edge_fade(_res(app, 2), "in", 14.0, 0.2) == 0.0
+    assert win._clip(1).shapes[-1][1] == ("f", 0.0)
+    assert win._clip(2).shapes[0][0] == ("f", 0.0)

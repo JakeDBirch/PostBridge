@@ -4,6 +4,12 @@
 
 ## November 23, 2026
 
+### Assembly: fade handles stop at nothing; Heal seals a crossfade
+- **A fade handle only goes one way.** Drag it back to its edge and the fade is gone; keep going past the edge and it stays gone. It used to grow again on the other side.
+- **Heal takes a crossfaded join from anywhere inside the crossfade**, not just within a few pixels of the cut, which zoomed in could be well inside the X.
+- **Healing a cut inside a pull takes its fades with it,** in the same undo step. They used to linger and could come back on a later split at the same place.
+- **Healing where two pulls meet leaves no fade on the seam:** they run on as one stretch of tape, so a crossfade there would only dip it. Each side is set to no fade, whatever the default.
+
 ### Assembly: fades at every cut, and in the AAF
 - **Every cut edge now has a fade, and the AAF carries it into Pro Tools.** A test import showed Pro Tools takes them. A fade in follows silence, a fade out comes before it, and where two regions butt there's a crossfade centred on the cut. The Assembly plays the fades exactly as the AAF joins them, so what you hear there is what Pro Tools opens. Both exports carry them. Nothing moves: every clip still sounds where it did without fades.
 - **Default fade** (in the Edit panel, beside the default gap) sets one length for every cut you haven't set yourself. It's 10 ms on a new session. A session saved before fades opens with none, so a cut plays as it was checked.
