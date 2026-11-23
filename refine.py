@@ -35,7 +35,7 @@ from tkinter import messagebox
 
 import engines
 import monolog
-from config import SURF, TEXT, INFO, SUCCESS, FB
+from config import BG, SURF, TEXT, SUB, INFO, SUCCESS, WARN, BORDER, FB, FL
 from pq_workflow import PqWorkflowMixin
 from utils import secs_tc, is_video
 
@@ -830,8 +830,64 @@ class RefineMixin(object):
             return True
         return any(self._refine_row_touched(r) for r in self.results or [])
 
+    # ── Is the whole script in the cut? ──────────────────────────────────
+    def _coverage(self):
+        """A monolog's script against the tape its cut plays (monolog.audit):
+        the lines that are said nowhere.  None when there is nothing to
+        check, or the check can't be made."""
+        rows = getattr(self, "results", None) or []
+        if not getattr(self, "_monolog", False) or not rows:
+            return None
+        self._refine_stamp_ignored()
+
+        def _words(path):
+            return (self._refine_words(path) or engines.cache_load(path)
+                    or engines.pb_transcript_load(path)[0])
+        try:
+            return monolog.audit(list(self.vo_blocks), rows, _words)
+        except Exception as exc:
+            print("Coverage check failed: {}".format(exc), file=sys.stderr)
+            return None
+
+    def _coverage_panel(self, parent):
+        """Step 5: say whether every line of the script is in the cut, and
+        list the ones that aren't, before anything is built."""
+        found = self._coverage()
+        if found is None:
+            return None
+        frame = tk.Frame(parent, bg=BG)
+        frame.pack(fill="x", pady=(0, 12))
+        if not found:
+            tk.Label(frame, text="SCRIPT COVERAGE  \u2014  every line of the script "
+                     "is in the cut", font=FL, bg=BG, fg=SUCCESS).pack(anchor="w")
+            return frame
+        n_words = sum(d["span"][1] - d["span"][0] + 1 for d in found)
+        tk.Label(frame, font=FL, bg=BG, fg=WARN,
+                 text="SCRIPT COVERAGE  \u2014  {} line{} of the script ({} words) "
+                      "{} not in the cut".format(
+                          len(found), "" if len(found) == 1 else "s", n_words,
+                          "is" if len(found) == 1 else "are")).pack(anchor="w")
+        tk.Label(frame, font=FB, bg=BG, fg=SUB, justify="left", anchor="w",
+                 text="Checked against the transcript of the audio each pull "
+                      "plays.  A line read in other words than the script's can "
+                      "show here too.").pack(anchor="w", pady=(0, 4))
+        box = tk.Text(frame, height=min(8, 2 * len(found)), wrap="word", font=FB,
+                      bg=SURF, fg=TEXT, relief="flat", padx=8, pady=6,
+                      highlightthickness=1, highlightbackground=BORDER)
+        for d in found:
+            where = "#{:03d}".format(d["order"]) if d["order"] is not None else "no pull"
+            box.insert("end", "{}   {}\n    \u201c{}\u201d\n".format(
+                where, d["why"], " ".join(d["text"].split())))
+        box.config(state="disabled")
+        box.pack(fill="x")
+        return frame
+
     def _refine_monolog_ready(self, fresh, takes_by_part):
         a = getattr(self, "_assembly", None)
+        if getattr(self, "_s4_building", False):
+            # Step 4's cards hold what has been ignored; not before they're in.
+            self.after(RETRY_MS, lambda: self._refine_monolog_ready(fresh, takes_by_part))
+            return
         if a is not None and a.busy():
             self.after(RETRY_MS, lambda: self._refine_monolog_ready(fresh, takes_by_part))
             return

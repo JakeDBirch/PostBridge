@@ -383,3 +383,145 @@ def test_a_tail_over_the_next_pulls_start_ends_where_it_comes_in():
     assert rows[1]["segments"] == [(20.0, 25.0)]
     assert rows[3]["segments"] == [(31.0, 33.0)]
     assert monolog._no_overlap(rows) == 0                     # once is all
+
+
+# ── A paragraph's stand-in holds the whole paragraph, or says it doesn't ──
+_S1 = "The marshal rode north out of Abilene before the sun was fully up that morning."
+_S2 = "Nobody in town expected to see him alive again after what happened there."
+
+
+def _all_paragraphs(blocks, read):
+    return monolog.paragraphs_past(blocks, [(read.words, 0.0, None, "take1.wav", None)],
+                                   None, float("inf"), set(), ahead=None)
+
+
+def test_a_stretch_from_earlier_in_the_tape_does_not_swallow_the_rest():
+    """Episode 12: a scrap of tape from further on sat second in a paragraph,
+    and every stretch after it was merged away into it -- 152 words of script
+    left with nine seconds of tape, and marked ok."""
+    assert monolog._in_script_order([[10, 20], [50, 52], [21, 30], [30, 40]]) == \
+        [[10, 20], [50, 52], [21, 40]]
+    assert monolog._join([[10, 20], [50, 52], [21, 30], [30, 40]]) == [[10, 20], [50, 52]]
+
+
+def test_a_first_line_picked_up_afterwards_keeps_the_line_after_it():
+    blocks = _blocks(_S1 + " " + _S2, "", _P2)
+    rd = Read().say(_S1).say(_S2).pause(1.0).say(_P2).pause(3.0).say(_S1).pause(10.0)
+    got = _all_paragraphs(blocks, rd)
+    kept = _kept(got[:1], rd).split()
+    said = (_S1 + " " + _S2).lower().replace(".", "").split()
+    assert kept == said                       # the pickup, then the line it never retook
+    assert got[0]["segments"][0][0] > got[0]["segments"][1][0]
+
+
+def test_a_paragraph_takes_no_scraps_of_another_paragraphs_tape():
+    """Cut on its own, a paragraph was offered the whole read, and filled a
+    word it lacked from wherever else it was said."""
+    blocks = _blocks(_P1, "", _P2, "", _P3)
+    rd = Read().say(_P1).pause(1.0).say(_P2).pause(1.0).say(_P3).pause(10.0)
+    got = _all_paragraphs(blocks, rd)
+    assert [r["order"] for r in got] == [1, 2, 3]
+    for r, nxt in zip(got, got[1:]):
+        assert len(r["segments"]) == 1
+        assert r["segments"][-1][1] <= nxt["segments"][0][0] + 0.01
+
+
+def test_a_paragraph_missing_a_line_is_never_ok():
+    blocks = _blocks(_S1 + " " + _S2, "", _P3)
+    rd = Read().say(_S1).pause(1.0).say(_P3).pause(10.0)        # _S2 never read
+    got = {r["order"]: r for r in _all_paragraphs(blocks, rd)}
+    assert got[1]["status"] == "low_confidence"
+    assert "expected to see him alive again" in got[1]["diag"]
+    assert got[2]["status"] == "ok" and "diag" not in got[2]
+
+
+# ── Is the whole script in the cut? ──────────────────────────────────────
+def _audit_cut(blocks, rd):
+    rows = _all_paragraphs(blocks, rd)
+    return rows, (lambda path: rd.words)
+
+
+def test_a_cut_that_says_every_line_has_nothing_to_report():
+    blocks = _blocks(_P1, "", _P2, "", _P3)
+    rd = Read().say(_P1).pause(1.0).say(_P2).pause(1.0).say(_P3).pause(10.0)
+    rows, words_of = _audit_cut(blocks, rd)
+    assert monolog.audit(blocks, rows, words_of) == []
+
+
+def test_a_line_trimmed_out_of_its_pull_is_reported_whatever_the_pull_says():
+    blocks = _blocks(_S1 + " " + _S2, "", _P2)
+    rd = Read().say(_S1).say(_S2).pause(1.0).say(_P2).pause(10.0)
+    rows, words_of = _audit_cut(blocks, rd)
+    assert monolog.audit(blocks, rows, words_of) == []
+    cut_at = rd.words[len(_S1.split()) - 1]["end"] + 0.05      # an edit: _S2 gone
+    rows[0]["segments"] = [(rows[0]["segments"][0][0], cut_at)]
+    assert rows[0]["status"] == "ok"                            # and nothing says so
+    found = monolog.audit(blocks, rows, words_of)
+    assert len(found) == 1 and found[0]["order"] == 1
+    assert found[0]["text"].startswith("Nobody in town expected")
+    assert found[0]["why"] == "not in this pull's audio"
+
+
+def test_a_line_put_back_inside_another_pull_is_not_missing():
+    """Episode 12: half the show was rebuilt by hand inside one pull, and the
+    paragraphs it replaced were ignored."""
+    blocks = _blocks(_P1, "", _P2, "", _P3)
+    rd = Read().say(_P1).pause(1.0).say(_P2).pause(1.0).say(_P3).pause(10.0)
+    rows, words_of = _audit_cut(blocks, rd)
+    rows[1]["_s4_ignored"] = True
+    found = monolog.audit(blocks, rows, words_of)
+    assert [(d["order"], d["why"]) for d in found] == [(2, "its pull is ignored")]
+    rows[0]["segments"] = list(rows[0]["segments"]) + list(rows[1]["segments"])
+    assert monolog.audit(blocks, rows, words_of) == []
+
+
+def test_a_line_no_pull_answers_for_is_reported():
+    blocks = _blocks(_P1, "", _P2, "", _P3)
+    rd = Read().say(_P1).pause(1.0).say(_P2).pause(1.0).say(_P3).pause(10.0)
+    rows, words_of = _audit_cut(blocks, rd)
+    found = monolog.audit(blocks, [rows[0], rows[2]], words_of)
+    assert [(d["order"], d["why"]) for d in found] == [(None, "no pull covers this")]
+    assert found[0]["text"] == _P2
+
+
+def test_a_number_written_out_is_not_a_missing_line():
+    blocks = _blocks("It took someone a hundred and twenty years to ask the question at all.")
+    rd = Read().say("it took someone 120 years to ask the question at all").pause(10.0)
+    rows, words_of = _audit_cut(blocks, rd)
+    assert rows and monolog.audit(blocks, rows, words_of) == []
+
+
+def test_the_export_screen_lists_what_is_not_in_the_cut():
+    import pytest
+    tk = pytest.importorskip("tkinter")
+    import refine
+
+    class _App(refine.RefineMixin):
+        _monolog = True
+
+    blocks = _blocks(_S1 + " " + _S2, "", _P3)
+    rd = Read().say(_S1).say(_S2).pause(1.0).say(_P3).pause(10.0)
+    rows, _w = _audit_cut(blocks, rd)
+    app = _App()
+    app.vo_blocks, app.results = blocks, rows
+    app._refine_words = lambda path: rd.words
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        root.withdraw()
+        said = lambda f: " ".join(w.cget("text") for w in f.winfo_children()
+                                  if isinstance(w, tk.Label))
+        assert "every line of the script is in the cut" in said(app._coverage_panel(root))
+        cut_at = rd.words[len(_S1.split()) - 1]["end"] + 0.05
+        rows[0]["segments"] = [(rows[0]["segments"][0][0], cut_at)]
+        frame = app._coverage_panel(root)
+        assert "1 line of the script" in said(frame) and "is not in the cut" in said(frame)
+        box = next(w for w in frame.winfo_children() if isinstance(w, tk.Text))
+        listed = box.get("1.0", "end")
+        assert "#001" in listed and "expected to see him alive again" in listed
+        app._monolog = False
+        assert app._coverage_panel(root) is None       # a script of pulls: nothing to say
+    finally:
+        root.destroy()

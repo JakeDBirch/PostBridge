@@ -10177,6 +10177,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     tk.Label(_rrow, text="({} segs)".format(len(_segs)),
                              font=FS, bg=_bg, fg=WARN, anchor="w").pack(side="left", padx=(4,0))
 
+        # A narrator's read: is every line of the script in the cut?
+        try:
+            self._coverage_panel(self.body)
+        except Exception as _exc:
+            print("Coverage panel failed: {}".format(_exc), file=sys.stderr)
+
         nav = tk.Frame(self.body, bg=BG); nav.pack(side="bottom", fill="x", pady=(8,0))
         self._btn(nav, "← BACK", self._step4).pack(side="left")
         self._btn(nav, "VIEW RECONCILE LOG", self._show_reconcile_log,

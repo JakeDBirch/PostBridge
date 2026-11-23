@@ -29,6 +29,7 @@ the last time it was delivered.
      other delivery of a pull's lines rides along as an alternative take.
 """
 import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from difflib import SequenceMatcher
 
@@ -696,20 +697,10 @@ def _join(segs):
     return out
 
 
-def reconcile(vo_blocks, takes, keep=()):
-    """Cut the raw read down to the script.
-
-    vo_blocks : the plain script's paragraphs (parsers.parse_plain_script).
-    takes     : as for engines.reconcile_vo_part -- (words, v_offset,
-                vpath, apath[, blobs]) per recording, in recording order.
-    keep      : script token spans (first, last) that pulls already in the
-                cut answer for.  Those lines are left alone: no tape is cut
-                for them and they aren't reported missing.
-
-    Returns VO results, one per kept stretch of tape (a paragraph read in
-    one go is one pull) plus a no_match row for any part of the script that
-    was never read, numbered 1.. in script order.
-    """
+def _cut(vo_blocks, takes, keep=()):
+    """The read against the script: (S, R, dels, pieces, tk, kept), every
+    piece with the tape it keeps (segs).  reconcile groups the pieces into
+    pulls; paragraphs_past into paragraphs."""
     tk = []
     for entry in takes:
         words, v_offset, vpath, apath = entry[:4]
@@ -734,6 +725,30 @@ def reconcile(vo_blocks, takes, keep=()):
         if pc.joined and prev.segs and pc.segs:
             mid = (R.word(prev.i_b)["end"] + R.word(pc.i_a)["start"]) / 2.0
             prev.segs[-1][1] = pc.segs[0][0] = mid
+    return S, R, dels, pieces, tk, kept
+
+
+def _heard(R, pcs):
+    """The words the tape of pieces `pcs` says, as the transcript has them."""
+    return " ".join(R.word(i)["word"] for pc in pcs for i in range(pc.i_a, pc.i_b + 1)
+                    if R.tok[i] is not None and (i == pc.i_a or R.wi[i] != R.wi[i - 1]))
+
+
+def reconcile(vo_blocks, takes, keep=()):
+    """Cut the raw read down to the script.
+
+    vo_blocks : the plain script's paragraphs (parsers.parse_plain_script).
+    takes     : as for engines.reconcile_vo_part -- (words, v_offset,
+                vpath, apath[, blobs]) per recording, in recording order.
+    keep      : script token spans (first, last) that pulls already in the
+                cut answer for.  Those lines are left alone: no tape is cut
+                for them and they aren't reported missing.
+
+    Returns VO results, one per kept stretch of tape (a paragraph read in
+    one go is one pull) plus a no_match row for any part of the script that
+    was never read, numbered 1.. in script order.
+    """
+    S, R, dels, pieces, tk, kept = _cut(vo_blocks, takes, keep)
 
     # Group into pulls: same recording and forward in it, so each pull plays
     # as one stretch of one take.  A paragraph break starts a new one only
@@ -896,32 +911,45 @@ def paragraphs_past(vo_blocks, takes, path, frontier, landed, ahead=3, margin=5.
     rows = pending_rows(vo_blocks)
     done = [i for i, r in enumerate(rows) if r["order"] in landed]
     todo = rows if ahead is None else rows[(done[-1] + 1 if done else 0):][:ahead]
+    todo = [r for r in todo if r["order"] not in landed]
+    if not todo:
+        return []
+    # The whole script against the read, as the real cut is made, and then a
+    # paragraph's share of it.  A paragraph cut on its own was offered the
+    # whole read, and took scraps of other paragraphs' tape for words its own
+    # reading lacked.
+    S, R, dels, pieces, tk, _kept = _cut(vo_blocks, takes)
+    by_para = {}
+    for pc in pieces:
+        if pc.segs:
+            by_para.setdefault(S.blk[pc.a], []).append(pc)
     out = []
     for row in todo:
-        if row["order"] in landed:
-            continue
         first, last = row["script_span"]
-        block = dict(next(b for b in sorted(vo_blocks, key=lambda b: b["order"])
-                          if b["id"] == row["vo_id"]))
-        pulls = [r for r in reconcile([block], takes) if r.get("segments")]
-        if not pulls:
+        pcs = by_para.get(row["order"] - 1)
+        if not pcs:
             continue
-        src = pulls[-1]["source_audio"]      # where it was read last
-        pulls = [r for r in pulls if r["source_audio"] == src]
+        take_i = dels[pcs[-1].k].take        # where it was read last
+        pcs = [pc for pc in pcs if dels[pc.k].take == take_i]
+        t = tk[take_i]
+        src = t["apath"]
         n_tok = last - first + 1
-        said = sum((r["script_span"][1] - r["script_span"][0] + 1) * r["confidence"]
-                   for r in pulls)
-        segs = _join([list(s) for r in pulls for s in r["segments"]])
+        said = sum(dels[pc.k].matched(pc.a, pc.b) for pc in pcs)
+        segs = _in_script_order([list(sg) for pc in pcs for sg in pc.segs])
         # Part of a paragraph may yet be read while any of the read is to come.
         if path is not None and said < MIN_SHOW * n_tok:
             continue
-        if src == path and segs[-1][1] + margin > frontier:
+        if src == path and max(sg[1] for sg in segs) + margin > frontier:
             continue
-        chosen = dict(pulls[-1]["takes_data"][pulls[-1]["best_take_index"]],
-                      segments=[tuple(s) for s in segs])
+        # Asked of the tape, as audit does: are the paragraph's words in it?
+        mids = [(w["start"] + w["end"]) / 2.0 for w in t["words"]]
+        gaps = [g for g in _unsaid(S, first, last, _tape_tokens(t["words"], mids, segs))
+                if not all(x in _NUMBER_WORDS for x in S.tok[g[0]:g[1] + 1])]
+        chosen = {"segments": [tuple(sg) for sg in segs], "vpath": t["vpath"],
+                  "apath": src, "v_offset": t["v_offset"], "kept": True}
         filled = dict(row)
         filled.update({
-            "segments":        [tuple(s) for s in segs],
+            "segments":        [tuple(sg) for sg in segs],
             "rec_in_s":        segs[0][0],
             "rec_out_s":       segs[-1][1],
             "rec_in_tc":       secs_tc(segs[0][0]),
@@ -929,14 +957,75 @@ def paragraphs_past(vo_blocks, takes, path, frontier, landed, ahead=3, margin=5.
             "in_tc":           secs_tc(segs[0][0]),
             "out_tc":          secs_tc(segs[-1][1]),
             "confidence":      round(said / float(n_tok), 3),
-            "matched_text":    " ".join(r["matched_text"] for r in pulls),
+            "matched_text":    _heard(R, pcs),
             "n_internal_cuts": len(segs) - 1,
             "takes_data":      [chosen],
             "best_take_index": 0,
             "source_audio":    src,
-            "status":          "ok" if said >= MIN_SHOW * n_tok else "low_confidence",
+            "status":          "ok" if said >= MIN_SHOW * n_tok and not gaps
+                               else "low_confidence",
         })
+        if gaps:
+            # Never "ok" over a line with no tape: that is how a missing line
+            # gets as far as the mix.
+            filled["diag"] = "not in the cut: " + "  /  ".join(
+                "\u201c{}\u201d".format(S.text(a, b)) for a, b in gaps)
         out.append(filled)
+    return out
+
+
+def _in_script_order(segs):
+    """A paragraph's tape, in the order its lines are read.  Two stretches
+    are one only where the second carries straight on from the first; one
+    from earlier in the recording (a line picked up before the line it
+    follows) is its own stretch.  _join would have swallowed it, and every
+    stretch after it, into whatever came before."""
+    out = []
+    for a, b in segs:
+        if b <= a:
+            continue
+        if out and out[-1][0] <= a <= out[-1][1] + 1e-3:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _tape_tokens(words, mids, segs):
+    """The match keys of the words (their middles at `mids`) that `segs` play."""
+    out = []
+    for s0, s1 in segs:
+        for k in range(bisect_left(mids, s0), bisect_right(mids, s1)):
+            out.extend(_key(x) for x in _tokens(words[k]["word"]))
+    return out
+
+
+def _unsaid(S, a, b, tape, least=4):
+    """Runs of script tokens a..b, `least` or more, not among `tape`, in order."""
+    script = [_key(x) for x in S.tok[a:b + 1]]
+    hit = set()
+    for m in SequenceMatcher(None, script, tape, autojunk=False).get_matching_blocks():
+        hit.update(range(a + m.a, a + m.a + m.size))
+    return _unanswered(a, b, [(j, j) for j in hit], least)
+
+
+def _unanswered(first, last, spans, least=4):
+    """Runs of script tokens first..last that no (a, b) of `spans` covers,
+    `least` tokens or more: a word or three is not a missing line."""
+    have = set()
+    for a, b in spans:
+        have.update(range(a, b + 1))
+    out, j = [], first
+    while j <= last:
+        if j in have:
+            j += 1
+            continue
+        a = j
+        while j + 1 <= last and j + 1 not in have:
+            j += 1
+        if j - a + 1 >= least:
+            out.append((a, j))
+        j += 1
     return out
 
 
@@ -1043,4 +1132,87 @@ def _alternatives(dels, pl, R, tk, a0, b1):
         out.append({"segments": [tuple(s) for s in _edges(R, i_a, i_b, tk)],
                     "vpath": t["vpath"],
                     "apath": t["apath"], "v_offset": t["v_offset"]})
+    return out
+
+
+_NUMBER_WORDS = frozenset(
+    "a and zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty "
+    "forty fifty sixty seventy eighty ninety hundred thousand million".split())
+
+
+def audit(vo_blocks, rows, words_of, least=4):
+    """What of the script the cut does not say -- asked of the tape itself,
+    not of what the matcher (or an edit) believes a pull holds.
+
+    rows     : the cut (results), each with its script_span.
+    words_of : path -> that recording's transcript words.
+
+    Every pull's lines are looked for among the words its own tape plays.
+    What isn't there -- and every line of an ignored pull, a pull with no
+    tape, or no pull at all -- is then looked for in everything else the cut
+    plays, since a line can be put back by hand inside another pull.  A run
+    of `least` script words or more found nowhere is reported.
+
+    Returns [{"order", "span", "text", "why"}] in script order; "order" is
+    None for a line in no pull."""
+    S = _Script(vo_blocks)
+    n = len(S.tok)
+    rows = sorted((r for r in rows if r.get("script_span")),
+                  key=lambda r: tuple(r["script_span"]))
+    cache = {}
+
+    def _tape(r):
+        """The tokens r's tape plays; nothing for an ignored pull."""
+        if r.get("_s4_ignored") or r.get("status") == "no_match":
+            return []
+        path = r.get("source_audio")
+        if path not in cache:
+            ws = [w for w in (words_of(path) or []) if not w.get("break")]
+            cache[path] = (ws, [(w["start"] + w["end"]) / 2.0 for w in ws])
+        ws, mids = cache[path]
+        return _tape_tokens(ws, mids, r.get("segments") or [])
+
+    def _elsewhere(a, b, tape):
+        """Runs of script a..b the cut says nowhere.  Any word turns up
+        somewhere in an hour of tape, so the lines are first found where
+        several of their words are said together, and then looked for there."""
+        script = [_key(t) for t in S.tok[a:b + 1]]
+        need = min(least, len(script))
+        at = [m for m in SequenceMatcher(None, script, tape,
+                                         autojunk=False).get_matching_blocks()
+              if m.size >= need]
+        if not at:
+            return [(a, b)] if b - a + 1 >= least else []
+        pad = len(script)
+        lo = max(0, min(m.b for m in at) - pad)
+        hi = max(m.b + m.size for m in at) + pad
+        return _unsaid(S, a, b, tape[lo:hi], least)
+
+    tapes = [(r, _tape(r)) for r in rows]
+    everything = [t for _r, tape in tapes for t in tape]
+    first = []                      # (order, a, b, why): not where it should be
+    claimed = set()
+    for r, tape in tapes:
+        a, b = r["script_span"][0], min(r["script_span"][1], n - 1)
+        if b < a:
+            continue
+        claimed.update(range(a, b + 1))
+        if r.get("_s4_ignored"):
+            first.append((r.get("order"), a, b, "its pull is ignored"))
+        elif not tape:
+            first.append((r.get("order"), a, b, "not found in the recording"))
+        else:
+            first.extend((r.get("order"), x, y, "not in this pull's audio")
+                         for x, y in _unsaid(S, a, b, tape, least))
+    first.extend((None, x, y, "no pull covers this")
+                 for x, y in _unanswered(0, n - 1, [(j, j) for j in claimed], least))
+    out = []
+    for order, a, b, why in first:
+        for x, y in _elsewhere(a, b, everything):
+            # "a hundred and twenty" is "120" in a transcript: not a miss.
+            if all(t in _NUMBER_WORDS for t in S.tok[x:y + 1]):
+                continue
+            out.append({"order": order, "span": (x, y), "text": S.text(x, y), "why": why})
+    out.sort(key=lambda d: d["span"])
     return out
