@@ -3024,6 +3024,7 @@ class AssemblyWindow(object):
         show_words = self.pps >= 20
         if self.excised:
             i0 = max(0, i0 - 1)          # a handle reaches back into view
+        faded = []                       # fades go on top of every pull
         for c in self.clips[i0:]:
             if c.vis_lo > t1:
                 break
@@ -3058,7 +3059,7 @@ class AssemblyWindow(object):
                 cv.create_text(lx, y0 + 6, text=lbl, anchor="nw",
                                font=self._font, fill=_C_FLAG if c.flagged else SUB)
             self._draw_wave(c, xs, xe, lane_mid, lane_h, col, w)
-            self._draw_fades(c, y0, y1, w)
+            faded.append(c)
             self._draw_snap_ticks(c, lane_top, lane_bot, w)
             if c.load_error and xe - xs > 80:
                 cv.create_text(max(xs, 0) + 6, lane_mid, text=c.load_error[:120],
@@ -3077,6 +3078,11 @@ class AssemblyWindow(object):
                     cv.create_text((gx0 + gx1) / 2.0, y1 + self._gap_h / 2.0,
                                    text=txt, font=self._font,
                                    fill=TEXT if "gap_after_s" in c.res else SUB)
+
+        # Fades last: a crossfade between two pulls crosses into the next
+        # one, whose ground would otherwise paint over half of it.
+        for c in faded:
+            self._draw_fades(c, y0, y1, w)
 
         # Where the cut skips tape: a tick on the track, and a badge under
         # it when there is room (hover one for what was taken out).
@@ -3135,9 +3141,10 @@ class AssemblyWindow(object):
         return out
 
     def _draw_fades(self, c, y0, y1, w):
-        """Each fade as its slope across the region -- a crossfade as the
-        two slopes crossing over the cut -- and a handle at each region's
-        top corners to drag it by."""
+        """Each fade as its slope across the region -- a crossfade as an X,
+        the two slopes crossing over the cut.  Its handle, at the fade's
+        far end along the top (or the region's top corner), isn't drawn:
+        the pointer changes over it."""
         cv = self.cv
         top, hp = y0 + 4, FADE_HANDLE_PX
         for k, side, edge, ht, secs, cross, own in self._fade_marks(c):
@@ -3161,13 +3168,6 @@ class AssemblyWindow(object):
                                       stipple="gray50", outline="",
                                       tags=("fade",))
                     cv.create_line(xe_, y1, xh, top, fill=col, tags=("fade",))
-            # The handle: inside the region, at the fade's far end.
-            hx = min(max(xh, self._x(tl) + 1), self._x(tl + du) - 1)
-            x0, x1 = (hx, hx + hp) if side == "in" else (hx - hp, hx)
-            if secs > 0:
-                x0, x1 = hx - hp / 2.0, hx + hp / 2.0
-            cv.create_rectangle(x0, top, x1, top + hp, fill=col if secs > 0 else "",
-                                outline=col, tags=("fade",))
 
     def _fade_handle_at(self, x, y):
         """(clip, k, side) of the fade handle under the pointer, or None."""
@@ -3814,7 +3814,11 @@ class AssemblyWindow(object):
                "gap": "sb_h_double_arrow", "marker": "sb_h_double_arrow",
                "select": "xterm", "grab": "fleur",
                "ruler": "hand2", "ghost": "xterm",
-               "tick": "hand2", "fade": "hand2"}.get(kind, "arrow")
+               "tick": "hand2"}.get(kind, "arrow")
+        if kind == "fade":
+            # A fade handle: the diagonal of its slope (up for a fade in,
+            # down for a fade out).
+            cur = "size_ne_sw" if k[1] == "in" else "size_nw_se"
         if kind == "ghost" and k[3] == "cut":
             cur = "sb_h_double_arrow"        # a cut drags
         if self.cv.cget("cursor") != cur:

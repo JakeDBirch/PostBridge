@@ -292,3 +292,46 @@ def test_dragging_a_crossfade_handle_sets_both_sides(view):  # noqa: F811
     win._on_track_release(_Ev(cut + 0.2 * win.pps, y0 + 6))
     assert _fade_of(app, 1, "in") == [pytest.approx(0.4, abs=0.03)]
     assert _fade_of(app, 1, "out") == [pytest.approx(0.4, abs=0.03)]
+
+
+def test_a_crossfade_between_two_pulls_is_a_whole_x_with_no_handle_boxes(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["gap_after"], _res(app, 1)["gap_after_s"] = True, 0.0
+    _res(app, 1)["segments"] = [(10.0, 14.0)]
+    _res(app, 2)["segments"] = [(14.0, 16.0)]   # butts on: one stretch of tape
+    app.fade_var.set(0.400)
+    win.refresh()
+    win.restore_view(100.0, 0.0, 3.0)
+    win.redraw()
+    app.update()
+    cv = win.cv
+    fades = cv.find_withtag("fade")
+    assert fades and all(cv.type(i) in ("line", "polygon") for i in fades)
+    # Both slopes span the whole crossfade, 3.8 to 4.2 s, top to bottom.
+    cut = win._x(4.0)
+    lines = [cv.coords(i) for i in fades if cv.type(i) == "line"
+             and min(cv.coords(i)[0::2]) < cut < max(cv.coords(i)[0::2])]
+    assert len(lines) == 2
+    for xy in lines:
+        assert sorted(round(v) for v in xy[0::2]) == [round(win._x(3.8)),
+                                                      round(win._x(4.2))]
+        assert abs(xy[1] - xy[3]) > 100          # top to bottom: an X, not a Y
+    # ...drawn over both pulls' ground, so pull 2's doesn't hide half of one.
+    x2 = win._x(win._clip(2).start)
+    ground2 = [i for i in cv.find_all() if cv.type(i) == "rectangle"
+               and abs(cv.coords(i)[0] - x2) < 1 and cv.itemcget(i, "fill")]
+    assert ground2 and min(fades) > max(ground2)
+
+
+def test_a_fade_handle_shows_as_the_pointer(view):  # noqa: F811
+    app, win = view
+    win.restore_view(100.0, 0.0, 0.0)
+    win.redraw()
+    app.update()
+    y0, _y1 = win._track_box()
+    x_in = win._x(win._clip(1).start)
+    win._on_motion(_Ev(x_in + 4, y0 + 6))
+    assert str(win.cv.cget("cursor")) == "size_ne_sw"
+    x_out = win._x(win._clip(1).end)
+    win._on_motion(_Ev(x_out - 4, y0 + 6))
+    assert str(win.cv.cget("cursor")) == "size_nw_se"

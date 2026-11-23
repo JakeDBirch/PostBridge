@@ -9,7 +9,7 @@
 - **Default fade** (in the Edit panel, beside the default gap) sets one length for every cut you haven't set yourself. It's 10 ms on a new session. A session saved before fades opens with none, so a cut plays as it was checked.
 - **Fade at this cut** gives the cut nearest the insertion point its own length; **use default** puts it back. A fade rides with its edge through a trim of up to a quarter second. It's one undo step.
 - **F fades what's highlighted.** Across a cut where two regions butt, it makes a crossfade the length of the highlight. Over a region's start or end beside silence, it makes a fade in or out as long as the part of the region highlighted. Every cut in one highlight gets its own fade, as one undo step.
-- **Fades are drawn on the track:** a slope across the region, and a crossfade as the two slopes crossing over the cut. One you set yourself reads brighter. A handle on each region's top corners drags the fade's length, live; at a crossfade either handle sets both sides. The edge below the corner still trims.
+- **Fades are drawn on the track:** a slope across the region, and a crossfade as an X, the two slopes crossing over the cut. Between two pulls the X is whole: the second pull's background used to cover half of it, so it read as a Y. One you set yourself reads brighter. Drag a fade by its handle, at the top where the slope ends (or the region's top corner), to set its length, live; at a crossfade either one sets both sides. The handles aren't drawn: the pointer turns to the slope's diagonal over one. The edge below still trims.
 - No fades are heard while the surrounding audio is being heard (Skip edits off).
 
 ### Assembly: key changes
