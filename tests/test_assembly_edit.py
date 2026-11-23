@@ -1403,20 +1403,34 @@ def test_a_roll_stops_short_of_emptying_a_region(wide):
 
 # ── Shift rolls any boundary ─────────────────────────────────────────────
 
-def test_shift_on_a_pulls_out_rolls_it_with_the_next_pulls_in(wide):
-    """Not just a butt seam: the out of pull 1 and the in of pull 2, a gap
-    apart, move together, and nothing on the track moves but the
-    boundary."""
+def test_shift_on_an_edge_beside_silence_trims_it_into_the_silence(wide):
+    """Pull 2's in has the gap after pull 1 in front of it: Shift-dragging
+    it left fills that silence, right widens it, and pull 1 isn't
+    touched."""
     app, win = wide
     c1, c2 = win._clip(1), win._clip(2)
-    start2, end2 = c2.start, c2.end
+    end2 = c2.end
+    in_x = win._x(c2.start)
+    d = _drag_to(win, in_x + 2, in_x - 30, SHIFT_CTRL, in_x)           # 0.3 s earlier
+    assert d["mode"] == "in" and d["hold"] is not None
+    assert _segs(app, 2) == [(19.7, 22.0)]
+    assert _segs(app, 1) == [(10.0, 14.0)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(0.2)
+    assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
+
+
+def test_shift_on_a_butt_boundary_between_pulls_rolls_it(wide):
+    app, win = wide
+    _res(app, 1)["gap_after"], _res(app, 1)["gap_after_s"] = True, 0.0
+    win.refresh()
+    c1, c2 = win._clip(1), win._clip(2)
+    end2 = c2.end
     out_x = win._x(c1.end)
     d = _drag_to(win, out_x - 2, out_x - 50, SHIFT_CTRL, out_x)        # 0.5 s earlier
     assert d["mode"] == "roll"
     assert _segs(app, 1) == [(10.0, 13.5)]
     assert _segs(app, 2) == [(19.5, 22.0)]
     assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
-    assert win._clip(2).start == pytest.approx(start2 - 0.5, abs=1e-3)
 
 
 def test_shift_beside_a_split_rolls_it_too(wide):

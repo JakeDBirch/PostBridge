@@ -51,12 +51,13 @@ AAF:
     trim -- shuffle-style, so everything after it moves up or back.  An edge
     snaps to where speech starts and stops, and to the playhead, as in the
     waveform editor (the ticks on the track); Ctrl places it freely;
-  * hold Shift and nothing after the edit moves.  Shift-drag any boundary
-    -- either side of it, or the silence between -- to roll it: the out
-    before and the in after move together by the same amount, so the
-    boundary slides and the audio either side stays where it is.  Alt-drag
-    either side of a seam to trim that side alone, the silence there taking
-    up the difference (it goes as far as the silence does);
+  * hold Shift and nothing after the edit moves.  Shift-drag a boundary
+    where two regions butt -- either side of it -- or the silence between
+    two, to roll it: the out before and the in after move together by the
+    same amount, so the boundary slides and the audio either side stays
+    where it is.  Shift-drag an edge with silence beside it to trim that
+    edge alone, the silence taking up the difference (it goes as far as the
+    silence does); Alt-drag does that at any edge;
   * drag a region, or the gap in front of it, to change that gap -- the
     gap after the pull before it, or inside a pull, the silence at that
     join;
@@ -3931,9 +3932,10 @@ class AssemblyWindow(object):
                           "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
                           "moved": False,
                           "ph": None if near else c.src_at(self.insert)}
-            if e.state & ALT_MASK:
-                # Alt: the silence on the far side of this edge takes up
-                # the trim, so nothing after it moves.
+            if e.state & (ALT_MASK | 0x0001):
+                # Alt, or Shift beside silence: the silence on the far side
+                # of this edge takes up the trim, so nothing after it moves
+                # and the audio on the other side isn't touched.
                 across = self._region_across(c, k, kind)
                 if across is not None:
                     rc, rk = (across if kind == "out" else (c, k))
@@ -4062,9 +4064,11 @@ class AssemblyWindow(object):
 
     def _roll_at(self, e, kind, c, k):
         """The seam a Shift-press at e would roll, as ((left clip, index),
-        (right clip, index)), or None: on either side of any boundary --
-        regions that butt or not, inside a pull or between two -- or in the
-        silence between.  Alt is the one-sided trim instead."""
+        (right clip, index)), or None: either side of a boundary where the
+        two regions butt -- inside a pull or between two, the cut opened up
+        or not -- or anywhere in the silence between two regions.  An edge
+        with silence beside it isn't rolled: Shift there trims that edge
+        alone into the silence (the press's "hold"), as Alt does anywhere."""
         if not e.state & 0x0001 or e.state & ALT_MASK or c is None:
             return None
         if kind == "gap":
@@ -4077,6 +4081,10 @@ class AssemblyWindow(object):
         across = self._region_across(c, k, kind)
         if across is None:
             return None
+        rc, rk = (across if kind == "out" else (c, k))
+        sp = self._space(rc.order, rk)
+        if sp is not None and sp["value"] > 1e-4:
+            return None                  # silence beside it: trim into that
         return ((c, k), across) if kind == "out" else (across, (c, k))
 
     def _roll_drag(self, seam, x):
