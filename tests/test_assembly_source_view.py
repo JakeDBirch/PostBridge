@@ -131,15 +131,29 @@ def test_the_arrows_step_pulls_in_the_source_view_too(view):
     assert win._src_order == 1
 
 
-def test_shift_f_is_script_follow_now(view):
+def test_shift_f_follows_the_playhead_and_alt_f_the_script(view):
     app, win = view
-    was = assembly_view._MONITOR["script"]
+    follow, script = assembly_view._MONITOR["follow"], assembly_view._MONITOR["script"]
     _key(app, win.cv, "F", SHIFT)
-    assert assembly_view._MONITOR["script"] is (not was)
+    assert assembly_view._MONITOR["follow"] is (not follow)
+    assert assembly_view._MONITOR["script"] is script     # not the script's now
     _key(app, win.cv, "F", SHIFT)
-    assert assembly_view._MONITOR["script"] is was
+    assert assembly_view._MONITOR["follow"] is follow
+    _key(app, win.cv, "s")                        # S is no longer a key
+    assert assembly_view._MONITOR["follow"] is follow
+    # Alt+F: the script follows the words, and nothing gets a fade.
+    undo = len(app._s4_undo_stack)
+    win.cv.focus_force()
+    app.update()
+    win.cv.event_generate("<Alt-f>", when="now")
+    app.update()
+    assert assembly_view._MONITOR["script"] is (not script)
+    win.cv.event_generate("<Alt-f>", when="now")
+    app.update()
+    assert assembly_view._MONITOR["script"] is script
+    assert len(app._s4_undo_stack) == undo
     _key(app, win.cv, "Return")                   # the surrounding audio
-    assert assembly_view._MONITOR["script"] is was and win.excised
+    assert assembly_view._MONITOR["script"] is script and win.excised
 
 
 def test_space_plays_the_view_on_show(view, monkeypatch):

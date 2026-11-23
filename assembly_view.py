@@ -1129,6 +1129,11 @@ class AssemblyWindow(object):
         # Pro Tools' Zoom to Session.
         for seq in ("<Alt-a>", "<Alt-A>"):
             self.win.bind(seq, lambda e: (self.fit(), "break")[1])
+        # The script keeping up with the words: Alt+F, beside Shift+F for
+        # the track keeping up with the playhead.
+        for seq in ("<Alt-f>", "<Alt-F>"):
+            self.win.bind(seq, lambda e: (self.toggle_script_follow(),
+                                          "break")[1])
 
     def _panel(self, title):
         """One control panel: a title and its buttons, wrapping to the
@@ -1175,9 +1180,9 @@ class AssemblyWindow(object):
                             toggle=True)
         self.return_key = key(p, "Return to start on stop", "Shift+N",
                               self.toggle_return, toggle=True)
-        self.follow_key = key(p, "Follow playhead", "S", self.toggle_follow,
-                              toggle=True)
-        self.script_key = key(p, "Script follows words", "Shift+F",
+        self.follow_key = key(p, "Follow playhead", "Shift+F",
+                              self.toggle_follow, toggle=True)
+        self.script_key = key(p, "Script follows words", "Alt+F",
                               self.toggle_script_follow, toggle=True)
         self.skip_key = key(p, "Skip edits", "Shift+S",
                             self.toggle_skip_cuts, toggle=True)
@@ -5477,7 +5482,7 @@ class AssemblyWindow(object):
         elif ctrl and k.lower() == "f":
             self.find_in_recording()
         elif k == "F" and not ctrl:
-            self.toggle_script_follow()
+            self.toggle_follow()             # Shift+F; the script's is Alt+F
         elif k == "N" and not ctrl:
             self.toggle_return()
         elif k == "bracketleft":
@@ -5486,8 +5491,6 @@ class AssemblyWindow(object):
             self.step_rate(1)
         elif not ctrl and k.lower() == "p":
             self.toggle_preroll()
-        elif not ctrl and k == "s":
-            self.toggle_follow()
         elif k == "Right":
             self._neighbour(1)
         elif k == "Left":
