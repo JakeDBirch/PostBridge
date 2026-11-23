@@ -51,11 +51,12 @@ AAF:
     trim -- shuffle-style, so everything after it moves up or back.  An edge
     snaps to where speech starts and stops, and to the playhead, as in the
     waveform editor (the ticks on the track); Ctrl places it freely;
-  * hold Shift and nothing after the edit moves.  Shift-drag right on a
-    seam, or in the silence between two regions, to roll it: the out before
-    and the in after move together.  Shift-drag either side of a seam to
-    trim that side alone, the silence there taking up the difference (it
-    goes as far as the silence does);
+  * hold Shift and nothing after the edit moves.  Shift-drag any boundary
+    -- either side of it, or the silence between -- to roll it: the out
+    before and the in after move together by the same amount, so the
+    boundary slides and the audio either side stays where it is.  Alt-drag
+    either side of a seam to trim that side alone, the silence there taking
+    up the difference (it goes as far as the silence does);
   * drag a region, or the gap in front of it, to change that gap -- the
     gap after the pull before it, or inside a pull, the silence at that
     join;
@@ -134,7 +135,7 @@ LOAD_WORKERS = 3
 MIN_SEG_S   = 0.04    # shortest segment a trim or cut may leave
 DRAG_PX     = 4       # movement before a press on a pull becomes a drag
 CUT_OUT_S   = 0.5     # C takes this much out from the insertion point
-ROLL_PX     = 3       # Shift on a seam this near its line rolls it
+ALT_MASK    = 0x20000  # Tk's Alt bit on Windows
 CUT_SHOW_S  = 1.0     # tape taken out at a joint before it gets a badge
 WORD_HOLD_S = 0.3     # a script word stays lit this far into the pause after it
 SCRIPT_HOLD_S = 4.0   # the script stops following this long after you scroll it
@@ -3930,8 +3931,8 @@ class AssemblyWindow(object):
                           "segs0": list(c.segments), "gaps0": list(c.seg_gaps),
                           "moved": False,
                           "ph": None if near else c.src_at(self.insert)}
-            if e.state & 0x0001:
-                # Shift: the silence on the far side of this edge takes up
+            if e.state & ALT_MASK:
+                # Alt: the silence on the far side of this edge takes up
                 # the trim, so nothing after it moves.
                 across = self._region_across(c, k, kind)
                 if across is not None:
@@ -4061,9 +4062,10 @@ class AssemblyWindow(object):
 
     def _roll_at(self, e, kind, c, k):
         """The seam a Shift-press at e would roll, as ((left clip, index),
-        (right clip, index)), or None: right on a seam's line, or anywhere
-        in the silence between two regions."""
-        if not e.state & 0x0001 or c is None:
+        (right clip, index)), or None: on either side of any boundary --
+        regions that butt or not, inside a pull or between two -- or in the
+        silence between.  Alt is the one-sided trim instead."""
+        if not e.state & 0x0001 or e.state & ALT_MASK or c is None:
             return None
         if kind == "gap":
             if k is None or not 0 <= k < len(c.pieces):
@@ -4075,13 +4077,7 @@ class AssemblyWindow(object):
         across = self._region_across(c, k, kind)
         if across is None:
             return None
-        left, right = ((c, k), across) if kind == "out" else (across, (c, k))
-        (cl, kl), (cr, kr) = left, right
-        x_out = self._x(cl.pieces[kl][0] + cl.pieces[kl][1])
-        x_in = self._x(cr.pieces[kr][0])
-        if abs(e.x - x_out) <= ROLL_PX and abs(e.x - x_in) <= ROLL_PX:
-            return left, right
-        return None
+        return ((c, k), across) if kind == "out" else (across, (c, k))
 
     def _roll_drag(self, seam, x):
         (cl, kl), (cr, kr) = seam

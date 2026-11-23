@@ -1271,6 +1271,7 @@ def test_a_mark_made_in_the_source_view_is_the_assembly_tracks(view):
     assert [m["kind"] for m in dlg._marks()] == ["music_inflection"]
 # ── Shift: edits that move nothing after them ────────────────────────────
 SHIFT, SHIFT_CTRL = 0x0001, 0x0005          # Ctrl too: no snap, exact numbers
+ALT_CTRL = 0x20004                          # Alt: one side alone, into silence
 
 
 def _mid_y(win):
@@ -1303,11 +1304,11 @@ def wide(view):
     return app, win
 
 
-def test_shift_trimming_an_out_leaves_silence_and_moves_nothing_after(wide):
+def test_alt_trimming_an_out_leaves_silence_and_moves_nothing_after(wide):
     app, win = wide
     start2, depth = win._clip(2).start, len(app._s4_undo_stack)
     out_x = win._x(win._clip(1).end)
-    d = _drag_to(win, out_x - 2, out_x - 100, SHIFT_CTRL, out_x)      # 1 s earlier
+    d = _drag_to(win, out_x - 2, out_x - 100, ALT_CTRL, out_x)        # 1 s earlier
     assert d["mode"] == "out" and d["hold"] is not None
     assert _segs(app, 1) == [(10.0, 13.0)]
     assert _res(app, 1)["gap_after_s"] == pytest.approx(1.5)
@@ -1318,21 +1319,21 @@ def test_shift_trimming_an_out_leaves_silence_and_moves_nothing_after(wide):
     assert "gap_after_s" not in _res(app, 1)
 
 
-def test_shift_trimming_an_in_keeps_the_rest_of_the_region_in_place(wide):
+def test_alt_trimming_an_in_keeps_the_rest_of_the_region_in_place(wide):
     app, win = wide
     end2 = win._clip(2).end
     in_x = win._x(win._clip(2).start)
-    _drag_to(win, in_x + 2, in_x + 50, SHIFT_CTRL, in_x)             # 0.5 s later
+    _drag_to(win, in_x + 2, in_x + 50, ALT_CTRL, in_x)               # 0.5 s later
     assert _segs(app, 2) == [(20.5, 22.0)]
     assert _res(app, 1)["gap_after_s"] == pytest.approx(1.0)
     assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
 
 
-def test_a_shift_trim_opens_out_only_as_far_as_the_silence(wide):
+def test_an_alt_trim_opens_out_only_as_far_as_the_silence(wide):
     app, win = wide
     start2 = win._clip(2).start
     out_x = win._x(win._clip(1).end)
-    _drag_to(win, out_x - 2, out_x + 200, SHIFT_CTRL, out_x)          # 2 s; 0.5 s free
+    _drag_to(win, out_x - 2, out_x + 200, ALT_CTRL, out_x)            # 2 s; 0.5 s free
     assert _segs(app, 1) == [(10.0, 14.5)]
     assert _res(app, 1)["gap_after_s"] == pytest.approx(0.0)
     assert win._clip(2).start == pytest.approx(start2, abs=1e-3)
@@ -1361,13 +1362,13 @@ def test_shift_on_a_split_rolls_it(wide):
     assert win.insert == pytest.approx(tl + du + 0.5, abs=1e-3)   # on the seam
 
 
-def test_shift_beside_a_split_trims_one_side_into_silence(wide):
+def test_alt_beside_a_split_trims_one_side_into_silence(wide):
     app, win = wide
     _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
     win.refresh()
     tl, du, _si = win._clip(1).pieces[1]
     end1 = win._clip(1).end
-    d = _drag_to(win, win._x(tl) + 5, win._x(tl) + 50, SHIFT_CTRL,
+    d = _drag_to(win, win._x(tl) + 5, win._x(tl) + 50, ALT_CTRL,
                  win._x(tl))
     assert d["mode"] == "in"
     assert _segs(app, 1) == [(10.0, 12.0), (12.5, 14.0)]
@@ -1398,3 +1399,31 @@ def test_a_roll_stops_short_of_emptying_a_region(wide):
     _drag_to(win, x, x + 1000, SHIFT_CTRL)                     # 10 s: too far
     a, b = _segs(app, 2)[0]
     assert b == 22.0 and 0 < b - a < 0.1
+
+
+# ── Shift rolls any boundary ─────────────────────────────────────────────
+
+def test_shift_on_a_pulls_out_rolls_it_with_the_next_pulls_in(wide):
+    """Not just a butt seam: the out of pull 1 and the in of pull 2, a gap
+    apart, move together, and nothing on the track moves but the
+    boundary."""
+    app, win = wide
+    c1, c2 = win._clip(1), win._clip(2)
+    start2, end2 = c2.start, c2.end
+    out_x = win._x(c1.end)
+    d = _drag_to(win, out_x - 2, out_x - 50, SHIFT_CTRL, out_x)        # 0.5 s earlier
+    assert d["mode"] == "roll"
+    assert _segs(app, 1) == [(10.0, 13.5)]
+    assert _segs(app, 2) == [(19.5, 22.0)]
+    assert win._clip(2).end == pytest.approx(end2, abs=1e-3)
+    assert win._clip(2).start == pytest.approx(start2 - 0.5, abs=1e-3)
+
+
+def test_shift_beside_a_split_rolls_it_too(wide):
+    app, win = wide
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    win.refresh()
+    tl, _du, _si = win._clip(1).pieces[1]
+    d = _drag_to(win, win._x(tl) + 5, win._x(tl) + 55, SHIFT_CTRL)
+    assert d["mode"] == "roll"
+    assert _segs(app, 1) == [(10.0, 12.5), (12.5, 14.0)]

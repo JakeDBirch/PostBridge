@@ -4,6 +4,10 @@
 
 ## November 23, 2026
 
+### Assembly: Shift-drag rolls any boundary
+- **Shift-drag a boundary to roll it:** the out before it and the in after it move together by the same amount, so the boundary slides and the audio either side stays where it is. Drag left and the earlier region ends sooner while the later one starts sooner. It works on either side of any boundary: two regions that touch, a cut opened up with Show surrounding audio, or where one pull ends and the next begins with a gap between. It used to roll only when you pressed right on a seam where the two regions touched; anywhere else, Shift trimmed one side.
+- **That one-sided trim is now Alt-drag:** one side of a boundary alone, with the silence there taking up the difference so nothing after it moves.
+
 ### Assembly: fade handles stop at nothing; Heal seals a crossfade
 - **A fade handle only goes one way.** Drag it back to its edge and the fade is gone; keep going past the edge and it stays gone. It used to grow again on the other side.
 - **Heal takes a crossfaded join from anywhere inside the crossfade**, not just within a few pixels of the cut, which zoomed in could be well inside the X.
