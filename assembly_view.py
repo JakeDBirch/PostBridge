@@ -5705,6 +5705,9 @@ class AssemblyWindow(object):
         k = e.keysym
         ctrl = bool(e.state & 0x0004)
         shift = bool(e.state & 0x0001)
+        if len(k) == 1 and k.isalpha():
+            # Caps Lock doesn't count: a letter is a capital only with Shift.
+            k = k.upper() if shift else k.lower()
         # The window's keys, the same in both views; then the view's own.
         if ctrl and k in ("equal", "plus"):
             self.to_step4()                  # Pro Tools' Edit / Mix toggle

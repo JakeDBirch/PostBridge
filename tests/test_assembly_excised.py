@@ -754,3 +754,28 @@ def test_plain_delete_still_closes_up(view):
     _key(app, win.cv, "Delete")
     win.refresh()
     assert win._clip(2).start == pytest.approx(s2 - 0.5)
+
+
+# ── Caps Lock doesn't change what a key does ─────────────────────────────
+
+class _KeyEv(object):
+    def __init__(self, widget, keysym, state):
+        self.widget, self.keysym, self.state = widget, keysym, state
+
+
+CAPS = 0x0002
+
+
+def test_caps_lock_doesnt_turn_a_key_into_its_shifted_one(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "skip_cuts", True)
+    win.set_insert(1.5)
+    # B with Caps Lock on arrives as "B": still a split, not Shift+B.
+    win._on_key(_KeyEv(win.cv, "B", CAPS))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.5), (11.5, 14.0)]
+    # S with Caps Lock: plain S (nothing), not Shift+S (Skip edits).
+    win._on_key(_KeyEv(win.cv, "S", CAPS))
+    assert assembly_view._MONITOR["skip_cuts"] is True
+    # Shift with Caps Lock arrives as "s": still Shift+S.
+    win._on_key(_KeyEv(win.cv, "s", CAPS | SHIFT))
+    assert assembly_view._MONITOR["skip_cuts"] is False

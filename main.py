@@ -252,8 +252,12 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         # Global keyboard shortcuts — active on every screen
         self.bind_all("<Control-s>",       lambda e: self._quick_save(self._footer_save_btn))
-        self.bind_all("<Control-S>",       lambda e: self._save_as())
+        # Caps Lock turns Ctrl+s into Ctrl+S: Save As only with Shift held.
+        self.bind_all("<Control-S>",       lambda e: self._save_as()
+                      if e.state & 0x0001 else
+                      self._quick_save(self._footer_save_btn))
         self.bind_all("<Control-o>",       lambda e: self._open_session())
+        self.bind_all("<Control-O>",       lambda e: self._open_session())
         # Step 4 <-> Assembly, like Pro Tools' Edit / Mix toggle (the
         # Assembly window handles its own Ctrl+= to come back here).
         self.bind_all("<Control-equal>",   lambda e: self._step4_to_assembly())

@@ -4,6 +4,10 @@
 
 ## November 23, 2026
 
+### Keys ignore Caps Lock
+- **The Assembly's keys work the same with Caps Lock on.** It used to make a plain letter read as Shift+letter: B still split, but S took Skip edits and F took Follow playhead. Now only Shift makes a letter its shifted command.
+- **Ctrl+S saves with Caps Lock on** (it used to open Save As; that's Ctrl+Shift+S), and **Ctrl+O opens** with it on too.
+
 ### Assembly: a highlighted fade is the highlight
 - **Highlight, then F, and the fade covers exactly what's highlighted.** A fade used to be cut down to a quarter of its region, and a crossfade was always centred on the cut whatever was highlighted. Now a fade in or out runs as far as the highlight, up to its whole region. A crossfade runs from where the highlight starts before the cut to where it ends after, even or not, and its X is drawn that way.
 - **The AAF carries an uneven crossfade too:** the dissolve's cut point sits where the cut is, so Pro Tools gets the same shape.
