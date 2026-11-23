@@ -360,3 +360,26 @@ def test_the_real_cut_keeps_a_paragraph_you_worked_on_and_cuts_round_it():
     assert rows[0]["_s4_accepted"] and rows[0]["segments"] == worked["segments"]
     assert rows[0]["order"] == 1
     assert _kept(rows[1:], rd).startswith("nobody in the valley")
+
+
+# ── One paragraph's tail over the next one's start ───────────────────────
+
+def _row(order, segs, path="read.wav"):
+    return {"order": order, "segments": [tuple(s) for s in segs],
+            "source_audio": path, "best_take_index": 0,
+            "takes_data": [{"segments": [tuple(s) for s in segs], "apath": path}],
+            "rec_out_s": segs[-1][1]}
+
+
+def test_a_tail_over_the_next_pulls_start_ends_where_it_comes_in():
+    import monolog
+    rows = [_row(1, [(10.0, 15.0), (16.0, 20.6)]), _row(2, [(20.0, 25.0)]),
+            _row(3, [(24.0, 30.0)], path="other.wav"),       # another take
+            _row(4, [(31.0, 33.0)]), _row(5, [(5.0, 8.0)])]   # a pickup
+    assert monolog._no_overlap(rows) == 1
+    assert rows[0]["segments"] == [(10.0, 15.0), (16.0, 20.0)]
+    assert rows[0]["takes_data"][0]["segments"] == [(10.0, 15.0), (16.0, 20.0)]
+    assert rows[0]["rec_out_s"] == 20.0
+    assert rows[1]["segments"] == [(20.0, 25.0)]
+    assert rows[3]["segments"] == [(31.0, 33.0)]
+    assert monolog._no_overlap(rows) == 0                     # once is all

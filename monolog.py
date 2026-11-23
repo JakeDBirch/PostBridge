@@ -831,7 +831,40 @@ def reconcile(vo_blocks, takes, keep=()):
         results.append(r)
     _missing_before(len(S.tok))
     results.sort(key=lambda r: r["order"])
+    _no_overlap(results)
     return results
+
+
+def _no_overlap(results):
+    """Where one pull's tail runs over the start of the next in the same
+    recording -- a read carried straight on from one paragraph into the
+    next, its last word's tail reaching into the next one's first -- the
+    first ends exactly where the next comes in.  Otherwise those words
+    play twice, a double start at the paragraph break.  A next pull that
+    comes in before this one's last region (a pickup) is left alone.
+    Returns how many it ended there."""
+    placed = [r for r in results if r.get("segments")]
+    fixed = 0
+    for r, n in zip(placed, placed[1:]):
+        if r.get("source_audio") != n.get("source_audio"):
+            continue
+        segs = [list(sg) for sg in r["segments"]]
+        b_in = n["segments"][0][0]
+        if not segs[-1][0] < b_in < segs[-1][1]:
+            continue
+        segs[-1][1] = b_in
+        new = [tuple(sg) for sg in segs]
+        td = r.get("takes_data") or []
+        bi = r.get("best_take_index")
+        if bi is not None and bi < len(td) and \
+                [tuple(x) for x in td[bi].get("segments") or ()] == \
+                [tuple(x) for x in r["segments"]]:
+            td[bi] = dict(td[bi], segments=new)
+        r["segments"] = new
+        r["rec_out_s"] = b_in
+        r["rec_out_tc"] = r["out_tc"] = secs_tc(b_in)
+        fixed += 1
+    return fixed
 
 
 def pending_rows(vo_blocks):

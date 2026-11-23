@@ -2,7 +2,17 @@
 
 ---
 
-## November 18, 2026
+## November 23, 2026
+
+### Monolog: no more double starts at paragraph breaks
+- **When the narrator reads straight on from one paragraph into the next,** each paragraph is its own pull. The first one's tail could run on past its last word into the next one's opening words, and those words were heard twice at the break. On Gunfighters 12 that was 13 breaks, from a few hundredths of a second up to 4 seconds (the Tecovas read). Now the first pull ends exactly where the next comes in, and they play as one stretch of the read.
+- **Episodes saved before this are fixed when they open**, and the Step 3 log names how many pulls were ended. Only a tail that runs into the next pull's start is shortened. A next pull from earlier in the read (a pickup) or from another take is left alone.
+
+### Assembly: Heal works where one pull meets the next
+- **H now heals a seam between two pulls,** not just a cut inside one. The first pull runs on to exactly where the next comes in, with no silence between them, so the two play as one stretch of the recording. If they overlapped (the same words at both, heard twice), the overlap comes off the first. If tape was cut out between them, it comes back. It's one undo step. It doesn't heal across two recordings, back to earlier in the read (a pickup), or across more than 30 seconds of tape, and the status line says which.
+- **H only heals a join right at the insertion point** (within a few pixels of it), or every join inside a highlight. With none there it says so and changes nothing. It used to heal the nearest cut anywhere in the pull, which could bring back tape far from where you were and shift everything after it.
+
+
 
 ### Assembly: Show surrounding audio doesn't stop playback
 - **Enter shows or hides the surrounding audio while the cut plays,** and playback carries on from the same moment of the cut at its new place on the track. It used to stop. A moment of surrounding audio being heard (Skip edits off) has no place once it's hidden, so the cut picks up where it resumes.
