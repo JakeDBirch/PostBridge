@@ -4,6 +4,18 @@
 
 ## November 23, 2026
 
+### Assembly: fades at every cut, and in the AAF
+- **Every cut edge now has a fade, and the AAF carries it into Pro Tools.** A test import showed Pro Tools takes them. A fade in follows silence, a fade out comes before it, and where two regions butt there's a crossfade centred on the cut. The Assembly plays the fades exactly as the AAF joins them, so what you hear there is what Pro Tools opens. Both exports carry them. Nothing moves: every clip still sounds where it did without fades.
+- **Default fade** (in the Edit panel, beside the default gap) sets one length for every cut you haven't set yourself. It's 10 ms on a new session. A session saved before fades opens with none, so a cut plays as it was checked.
+- **Fade at this cut** gives the cut nearest the insertion point its own length; **use default** puts it back. A fade rides with its edge through a trim of up to a quarter second. It's one undo step.
+- **F fades what's highlighted.** Across a cut where two regions butt, it makes a crossfade the length of the highlight. Over a region's start or end beside silence, it makes a fade in or out as long as the part of the region highlighted. Every cut in one highlight gets its own fade, as one undo step.
+- **Fades are drawn on the track:** a slope across the region, and a crossfade as the two slopes crossing over the cut. One you set yourself reads brighter. A handle on each region's top corners drags the fade's length, live; at a crossfade either handle sets both sides. The edge below the corner still trims.
+- No fades are heard while the surrounding audio is being heard (Skip edits off).
+
+### Assembly: key changes
+- **F is Fade** now. **Zoom out full** is **Alt+A** only, as in Pro Tools.
+- **Follow playhead is Shift+F**, and **Script follows words is Alt+F**, so the two follows share a letter. Plain **S** does nothing now. **Shift+S** is still Skip edits, and **Ctrl+S** still saves.
+
 ### Assembly: it opens where you left it
 - **Your listening settings carry over** from one session to the next, for every episode: playback speed, pre-roll (on or off, and how long), Return to start on stop, Follow playhead, Script follows words, the nudge amount, Skip edits, Normalize and Snap. The first time, playback still starts at 1.5×.
 - **Each episode's Assembly opens where you left it:** the insertion point on the same moment of the same pull's audio (so an edit elsewhere since doesn't move it off), the same zoom, the insertion point the same distance across the screen, the same pull selected, surrounding audio shown or hidden, and the script scrolled to the same place.
