@@ -715,7 +715,8 @@ class MediaPool(tk.Frame):
                 for fn in sorted(files):
                     if os.path.splitext(fn)[1].lower() in EXTS:
                         paths.append(os.path.join(root, fn))
-            self.after(0, lambda ps=paths: [self._add(p) for p in ps])
+            self.after(0, lambda ps=paths: self._alive()
+                       and [self._add(p) for p in ps])
         threading.Thread(target=_walk, daemon=True).start()
 
     def _add(self, path, twin=False):
@@ -965,7 +966,8 @@ class MediaPool(tk.Frame):
         def _fetch_dur(_p=path):
             dk = _get_dur_key(_p)
             if dk is not None:
-                self.after(0, lambda: self._set_link_group(_p, dk))
+                self.after(0, lambda: self._alive()
+                           and self._set_link_group(_p, dk))
         threading.Thread(target=_fetch_dur, daemon=True).start()
 
     # ── A file under more than one token ──────────────────────────────────
@@ -1370,13 +1372,23 @@ class MediaPool(tk.Frame):
         tk.Label(df, text="ASSIGNMENT", font=("Courier New", 8, "bold"),
                  bg=SURF, fg=SUB, anchor="w", padx=6).pack(fill="both", expand=True)
 
+    def _alive(self):
+        """False once the pool is destroyed.  Tk still fires an after()
+        callback then, so each deferred one asks first."""
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
     def _deferred_sort(self):
         self._sort_scheduled = False
-        self._sort_rows()
+        if self._alive():
+            self._sort_rows()
 
     def _deferred_prune(self):
         self._prune_scheduled = False
-        self.prune_redundant_videos()
+        if self._alive():
+            self.prune_redundant_videos()
 
     def prune_redundant_videos(self):
         """Remove a video row only when an audio file with an *identical*
@@ -1523,7 +1535,8 @@ class MediaPool(tk.Frame):
 
     def _flush_link_refresh(self):
         self._link_refresh_after = None
-        self._update_link_visuals()
+        if self._alive():
+            self._update_link_visuals()
 
     def _handle_link_change(self, path, new_token):
         """Called when the user changes a token (not via mirror or propagation).

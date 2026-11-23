@@ -119,3 +119,31 @@ def test_a_file_added_while_sorted_lands_in_the_sorted_order(pool):
     pool._sort_rows()
     assert _shown(pool) == ["b_new.wav", "c_host.wav", "d_guest.wav",
                             "a_guest.mov", "b_host.mp4"]
+
+
+def test_pending_sort_after_pool_is_destroyed(monkeypatch):
+    """A pool torn down by Tk itself (its window goes away under it) keeps
+    its after() callbacks; the deferred sort and prune must not touch the
+    dead header."""
+    tk = pytest.importorskip("tkinter")
+    import time
+    import gui_components as GC
+    monkeypatch.setattr(GC, "HAS_DND", False)
+    monkeypatch.setattr(GC, "_get_dur_key", lambda path: None)
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    errors = []
+    root.report_callback_exception = lambda *exc: errors.append(exc)
+    p = GC.MediaPool(root, [], [])
+    p.pack()
+    p._aaf_mode = True
+    p._add(os.path.join(ROOT, "no_such_dir", FILES[0]))
+    assert p._sort_scheduled and p._prune_scheduled
+    root.tk.call("destroy", p._w)
+    end = time.time() + 0.3
+    while time.time() < end:
+        root.update()
+    root.destroy()
+    assert not errors, errors[0][1]
