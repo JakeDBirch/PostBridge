@@ -525,3 +525,82 @@ def test_the_export_screen_lists_what_is_not_in_the_cut():
         assert app._coverage_panel(root) is None       # a script of pulls: nothing to say
     finally:
         root.destroy()
+
+
+def test_step_4_and_the_assembly_hear_when_a_line_drops_out():
+    import pytest
+    tk = pytest.importorskip("tkinter")
+    import refine
+
+    class _Clip(object):
+        start = 12.5
+
+    class _Assembly(object):
+        def __init__(self, win):
+            self.win, self.heard, self.went = win, [], []
+        show_coverage = lambda self, found: self.heard.append(found)
+        _clip = lambda self, order: _Clip()
+        select = lambda self, order: self.went.append(("select", order))
+        seek = lambda self, t, center=False: self.went.append(("seek", t))
+
+    class _App(refine.RefineMixin):
+        _monolog = True
+        _s4_is_live = lambda self: True
+
+    blocks = _blocks(_S1 + " " + _S2, "", _P3)
+    rd = Read().say(_S1).say(_S2).pause(1.0).say(_P3).pause(10.0)
+    rows, _w = _audit_cut(blocks, rd)
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("Tk unavailable: {}".format(exc))
+    try:
+        root.withdraw()
+        app = _App()
+        app.vo_blocks, app.results = blocks, rows
+        app._refine_words = lambda path: rd.words
+        app.after, app.after_cancel = root.after, root.after_cancel
+        app.body = tk.Frame(root)
+        tk.Label(app.body, text="STEP 4").pack()
+        tk.Label(app.body, text="cards").pack()
+        ignore = tk.BooleanVar(root, value=False)
+        app._rv = [{"res": rows[1], "skip_var": ignore}]
+        a = app._assembly = _Assembly(root)
+
+        assert app._coverage_refresh() == []
+        frame, label, show = app._cov_strip
+        assert app.body.pack_slaves()[1] is frame          # under the title
+        assert "every line of the script is in the cut" in label.cget("text")
+        assert not show.winfo_manager() and a.heard == [[]]
+
+        # An edit takes the second sentence out of pull 1.
+        cut_at = rd.words[len(_S1.split()) - 1]["end"] + 0.05
+        rows[0]["segments"] = [(rows[0]["segments"][0][0], cut_at)]
+        app._coverage_changed()
+        app._coverage_changed()                            # a burst of edits: one check
+        assert len(a.heard) == 1
+        root.after(refine.COVERAGE_MS + 200, root.quit)
+        root.mainloop()
+        assert len(a.heard) == 2 and len(a.heard[1]) == 1
+        assert "1 line of the script" in label.cget("text") and show.winfo_manager()
+
+        # Ignoring a pull is Step 4's to say, and is not written on the row.
+        ignore.set(True)
+        found = app._coverage_refresh()
+        assert [d["order"] for d in found] == [1, 2] and "_s4_ignored" not in rows[1]
+        ignore.set(False)
+        assert [d["order"] for d in app._coverage_refresh()] == [1]
+
+        # The list, and a click on a line of it.
+        top = app._coverage_show(root)
+        _t, head, box = app._cov_win
+        assert "1 line of the script" in head.cget("text")
+        assert "#001" in box.get("1.0", "end")
+        app._coverage_goto(app._cov_rows[0][1])
+        assert a.went == [("select", 1), ("seek", 12.5)]
+        rows[0]["segments"] = [(rows[0]["segments"][0][0], rd.t)]     # put back
+        app._coverage_refresh()
+        assert "every line" in head.cget("text") and box.get("1.0", "end").strip() == ""
+        top.destroy()
+    finally:
+        root.destroy()

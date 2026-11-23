@@ -1295,6 +1295,7 @@ class AssemblyWindow(object):
             p.add(picker(p, bg=SURF))
         self.refine_key = key(p, "", "", self._refine_again)
         self.recut_key = None
+        self.cov_key = None
         # On the panel's title row: it still shows in a panel squeezed thin,
         # and the panel doesn't change height when a pass starts.
         title = p.master.winfo_children()[0]
@@ -1475,6 +1476,9 @@ class AssemblyWindow(object):
         self._queue_loads()
         self.redraw()
         self._update_status()
+        changed = getattr(self.app, "_coverage_changed", None)
+        if changed is not None:
+            changed()
 
     def _layout(self, overrides=None):
         """Lay the cut out from Step 4's state, with an edit that is still
@@ -1838,6 +1842,35 @@ class AssemblyWindow(object):
             return
         if running != self._tx_fading:
             self._schedule_tx_render()
+
+    def show_coverage(self, found):
+        """The TRANSCRIPT panel's word on whether the whole script is in the
+        cut (a narrator's read; `found` is None for anything else).  Lit when
+        lines are missing; a click lists them."""
+        if self._closed:
+            return
+        try:
+            if found is None:
+                if self.cov_key is not None:
+                    self.tx_flow.remove(self.cov_key.frame)
+                    self.cov_key.frame.destroy()
+                    self.cov_key = None
+                    self.tx_flow._reflow()
+                return
+            text = ("Script: all in the cut" if not found else
+                    "Script: {} line{} missing".format(
+                        len(found), "" if len(found) == 1 else "s"))
+            if self.cov_key is None:
+                self.cov_key = _KeyButton(
+                    self.tx_flow, text, "",
+                    lambda: self.app._coverage_show(self.win))
+                self.tx_flow.add(self.cov_key.frame)
+            elif text != self.cov_key.lbl.cget("text"):
+                self.cov_key.set_text(text)
+                self.tx_flow._reflow()
+            self.cov_key.set_on(bool(found))
+        except tk.TclError:
+            pass
 
     def _refine_again(self):
         """The TRANSCRIPT panel's button: start a pass, or cancel the one running."""

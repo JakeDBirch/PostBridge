@@ -42,6 +42,7 @@ from utils import secs_tc, is_video
 TICK_S = 1.2            # between redraws as words stream in, as Pull Quotes
 DONE_NOTE_MS = 10000    # how long Step 4 says the pass has finished
 RETRY_MS = 500          # a merge held back while the Assembly is in use waits this
+COVERAGE_MS = 600       # edits settle this long before the script is checked again
 LAND_EVERY_S = 3.0      # how often a first pass looks for lines it has got past
 LAND_MARGIN_S = 5.0     # how far past a line, so it isn't taken mid-sentence
 LAND_AHEAD = 3          # VO lines looked for at a time past the last one found
@@ -617,6 +618,9 @@ class RefineMixin(object):
         st = self._rf()
         if path is not None:
             st.tick_pending = False
+            # Its words changed: the saved copy is stale, and so is the check.
+            self.__dict__.get("_cov_words", {}).pop(path, None)
+            self._coverage_changed()
         self._refine_show_strip()
         a = getattr(self, "_assembly", None)
         if a is None:
@@ -838,16 +842,184 @@ class RefineMixin(object):
         rows = getattr(self, "results", None) or []
         if not getattr(self, "_monolog", False) or not rows:
             return None
-        self._refine_stamp_ignored()
+        # What is ignored is Step 4's to say, as it stands now; the rows are
+        # not marked with it here, or an un-ignored pull would stay ignored.
+        cards = {id(e["res"]): bool(e["skip_var"].get())
+                 for e in getattr(self, "_rv", None) or []}
+        rows = [dict(r, _s4_ignored=cards.get(id(r), bool(r.get("_s4_ignored"))))
+                for r in rows]
+        saved = self.__dict__.setdefault("_cov_words", {})
 
         def _words(path):
-            return (self._refine_words(path) or engines.cache_load(path)
-                    or engines.pb_transcript_load(path)[0])
+            live = self._refine_words(path)
+            if live:
+                return live
+            if path not in saved:
+                saved[path] = (engines.cache_load(path)
+                               or engines.pb_transcript_load(path)[0])
+            return saved[path]
         try:
             return monolog.audit(list(self.vo_blocks), rows, _words)
         except Exception as exc:
             print("Coverage check failed: {}".format(exc), file=sys.stderr)
             return None
+
+    @staticmethod
+    def _coverage_headline(found):
+        """One line for wherever the check is shown."""
+        if not found:
+            return "every line of the script is in the cut"
+        words = sum(d["span"][1] - d["span"][0] + 1 for d in found)
+        return "{} line{} of the script ({} words) {} not in the cut".format(
+            len(found), "" if len(found) == 1 else "s", words,
+            "is" if len(found) == 1 else "are")
+
+    @staticmethod
+    def _coverage_fill(box, found):
+        """List `found` in Text widget `box`; returns the line each starts on."""
+        box.config(state="normal")
+        box.delete("1.0", "end")
+        starts = []
+        for d in found:
+            starts.append(int(box.index("end-1c").split(".")[0]))
+            where = "#{:03d}".format(d["order"]) if d["order"] is not None else "no pull"
+            box.insert("end", "{}   {}\n    \u201c{}\u201d\n".format(
+                where, d["why"], " ".join(d["text"].split())))
+        box.config(state="disabled")
+        return starts
+
+    # Step 4 and the Assembly: checked again as the cut changes, so a line
+    # that drops out is seen when it does, not at the mix.
+    def _coverage_changed(self):
+        """The cut or its transcript changed: check again once it settles."""
+        if not getattr(self, "_monolog", False):
+            return
+        prev = self.__dict__.get("_cov_after")
+        try:
+            if prev is not None:
+                self.after_cancel(prev)
+            self.__dict__["_cov_after"] = self.after(COVERAGE_MS, self._coverage_refresh)
+        except (tk.TclError, AttributeError):
+            self.__dict__["_cov_after"] = None
+
+    def _coverage_refresh(self):
+        """Main thread: check now, and tell Step 4, the Assembly and the list."""
+        self.__dict__["_cov_after"] = None
+        found = self.__dict__["_cov"] = self._coverage()
+        try:
+            self._coverage_strip(found)
+        except (tk.TclError, AttributeError):
+            pass
+        a = getattr(self, "_assembly", None)
+        show = getattr(a, "show_coverage", None)
+        if show is not None:
+            show(found)
+        win = self.__dict__.get("_cov_win")
+        if win is not None:
+            try:
+                if win[0].winfo_exists():
+                    self._coverage_list(found)
+            except tk.TclError:
+                pass
+        return found
+
+    def _coverage_strip(self, found):
+        """A line under Step 4's title: the whole script is in, or what isn't."""
+        strip = self.__dict__.get("_cov_strip")
+        alive = strip is not None and strip[0].winfo_exists()
+        if found is None or not self._s4_is_live():
+            if alive:
+                strip[0].destroy()
+            return
+        colour = WARN if found else SUCCESS
+        if not alive:
+            frame = tk.Frame(self.body, bg=SURF, highlightthickness=1,
+                             highlightbackground=colour)
+            label = tk.Label(frame, font=FB, bg=SURF, fg=TEXT, anchor="w",
+                             justify="left", padx=10, pady=6)
+            label.pack(side="left", fill="x", expand=True)
+            show = tk.Label(frame, text="SHOW", font=FL, bg=SURF, fg=WARN,
+                            cursor="hand2", padx=10)
+            show.bind("<Button-1>", lambda e: self._coverage_show())
+            under = self.body.pack_slaves()[1:2]         # below the title
+            frame.pack(fill="x", pady=(0, 8),
+                       **({"before": under[0]} if under else {}))
+            strip = self.__dict__["_cov_strip"] = (frame, label, show)
+        strip[0].config(highlightbackground=colour)
+        strip[1].config(text="SCRIPT COVERAGE  \u2014  " + self._coverage_headline(found))
+        if found:
+            strip[2].pack(side="right")
+        else:
+            strip[2].pack_forget()
+
+    def _coverage_show(self, parent=None):
+        """The lines that aren't in the cut, in a window of their own.  A
+        click on one goes to its pull."""
+        win = self.__dict__.get("_cov_win")
+        try:
+            if win is not None and win[0].winfo_exists():
+                win[0].lift()
+                self._coverage_list(self.__dict__.get("_cov"))
+                return win[0]
+        except tk.TclError:
+            pass
+        top = tk.Toplevel(parent if parent is not None else self)
+        top.title("Script coverage")
+        top.configure(bg=BG)
+        top.geometry("720x420")
+        head = tk.Label(top, font=FL, bg=BG, fg=TEXT, anchor="w", justify="left")
+        head.pack(fill="x", padx=12, pady=(12, 2))
+        tk.Label(top, font=FB, bg=BG, fg=SUB, anchor="w", justify="left", wraplength=690,
+                 text="Checked against the transcript of the audio each pull plays, "
+                      "as the cut stands now.  A line read in other words than the "
+                      "script's can show here too.  Click a line to go to its pull."
+                 ).pack(fill="x", padx=12, pady=(0, 8))
+        box = tk.Text(top, wrap="word", font=FB, bg=SURF, fg=TEXT, relief="flat",
+                      padx=10, pady=8, cursor="hand2", highlightthickness=1,
+                      highlightbackground=BORDER)
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.__dict__["_cov_win"] = (top, head, box)
+        box.bind("<Button-1>", self._coverage_click)
+        self._coverage_list(self.__dict__.get("_cov") if "_cov" in self.__dict__
+                            else self._coverage_refresh())
+        return top
+
+    def _coverage_list(self, found):
+        top, head, box = self.__dict__["_cov_win"]
+        found = found or []
+        head.config(text="SCRIPT COVERAGE  \u2014  " + self._coverage_headline(found),
+                    fg=WARN if found else SUCCESS)
+        starts = self._coverage_fill(box, found)
+        self.__dict__["_cov_rows"] = [(ln, d["order"]) for ln, d in zip(starts, found)]
+
+    def _coverage_click(self, event):
+        try:
+            line = int(event.widget.index("@{},{}".format(event.x, event.y)).split(".")[0])
+        except (tk.TclError, ValueError):
+            return
+        order = None
+        for ln, o in self.__dict__.get("_cov_rows") or []:
+            if ln <= line:
+                order = o
+        if order is not None:
+            self._coverage_goto(order)
+
+    def _coverage_goto(self, order):
+        """To pull `order`: in the Assembly when it is open, else its card."""
+        a = getattr(self, "_assembly", None)
+        clip = a._clip(order) if a is not None else None
+        if clip is not None:
+            a.select(order)
+            a.seek(clip.start, center=True)
+            try:
+                a.win.lift()
+            except tk.TclError:
+                pass
+            return
+        for e in getattr(self, "_rv", None) or []:
+            if e["res"].get("order") == order:
+                self._scroll_card_to_top(e["card"])
+                return
 
     def _coverage_panel(self, parent):
         """Step 5: say whether every line of the script is in the cut, and
@@ -857,16 +1029,11 @@ class RefineMixin(object):
             return None
         frame = tk.Frame(parent, bg=BG)
         frame.pack(fill="x", pady=(0, 12))
+        tk.Label(frame, font=FL, bg=BG, fg=WARN if found else SUCCESS,
+                 text="SCRIPT COVERAGE  \u2014  " + self._coverage_headline(found)
+                 ).pack(anchor="w")
         if not found:
-            tk.Label(frame, text="SCRIPT COVERAGE  \u2014  every line of the script "
-                     "is in the cut", font=FL, bg=BG, fg=SUCCESS).pack(anchor="w")
             return frame
-        n_words = sum(d["span"][1] - d["span"][0] + 1 for d in found)
-        tk.Label(frame, font=FL, bg=BG, fg=WARN,
-                 text="SCRIPT COVERAGE  \u2014  {} line{} of the script ({} words) "
-                      "{} not in the cut".format(
-                          len(found), "" if len(found) == 1 else "s", n_words,
-                          "is" if len(found) == 1 else "are")).pack(anchor="w")
         tk.Label(frame, font=FB, bg=BG, fg=SUB, justify="left", anchor="w",
                  text="Checked against the transcript of the audio each pull "
                       "plays.  A line read in other words than the script's can "
@@ -874,11 +1041,7 @@ class RefineMixin(object):
         box = tk.Text(frame, height=min(8, 2 * len(found)), wrap="word", font=FB,
                       bg=SURF, fg=TEXT, relief="flat", padx=8, pady=6,
                       highlightthickness=1, highlightbackground=BORDER)
-        for d in found:
-            where = "#{:03d}".format(d["order"]) if d["order"] is not None else "no pull"
-            box.insert("end", "{}   {}\n    \u201c{}\u201d\n".format(
-                where, d["why"], " ".join(d["text"].split())))
-        box.config(state="disabled")
+        self._coverage_fill(box, found)
         box.pack(fill="x")
         return frame
 

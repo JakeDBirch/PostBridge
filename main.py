@@ -2696,6 +2696,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # Assembly view hears about it.
         if self._assembly is not None:
             self._assembly.schedule_refresh()
+        # ...and where a narrator's script is checked against the cut again.
+        _cov = getattr(self, "_coverage_changed", None)
+        if _cov is not None:
+            _cov()
         if not self._step4_state_path():
             return
         self._s4_save_pending = True
@@ -8953,6 +8957,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # The Assembly window shows these cards now.
             if self._assembly is not None:
                 self._assembly.schedule_refresh()
+            _cov = getattr(self, "_coverage_changed", None)
+            if _cov is not None:
+                _cov()
 
             # Store tally callbacks on self so _s4_apply_state can reach them
             self._s4_increment_confirmed = _increment_confirmed

@@ -967,3 +967,14 @@ def test_closing_takes_every_timer_with_it(view):
     assert job not in pending and glide not in pending
     assert other in pending
     app.after_cancel(other)
+
+
+def test_the_transcript_panel_says_whether_the_script_is_all_in_the_cut(view):
+    app, win = view
+    assert win.cov_key is None
+    win.show_coverage([])
+    assert win.cov_key.lbl.cget("text") == "Script: all in the cut" and not win.cov_key.on
+    win.show_coverage([{"order": 2}, {"order": 5}])
+    assert win.cov_key.lbl.cget("text") == "Script: 2 lines missing" and win.cov_key.on
+    win.show_coverage(None)                  # not a narrator's read: nothing to say
+    assert win.cov_key is None
