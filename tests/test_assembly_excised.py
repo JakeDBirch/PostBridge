@@ -179,7 +179,7 @@ def test_playback_skips_the_surrounding_audio_unless_shift_s_says_hear_it(view, 
     assert p.segments is None and not assembly_view._MONITOR["skip_cuts"]
     # ...and the audio composed now has the cut audio in it.
     assert any(o == 1 and abs(si - 11.0) < 1e-6
-               for _st, _du, o, si, _fi, _fo in win.audio._index[1])
+               for _st, _du, o, si, *_rest in win.audio._index[1])
     win.player = None
 
 
@@ -705,3 +705,52 @@ def test_a_click_dragged_across_still_highlights(view):
     win._on_track_drag(_Ev(x + 80, y + 10))
     win._on_track_release(_Ev(x + 80, y + 10))
     assert win._range is not None and win.pps == base
+
+
+# ── Shift+Delete: taken out, the time left ───────────────────────────────
+
+def _starts(win):
+    return [round(c.start, 4) for c in win.clips]
+
+
+def test_shift_delete_inside_a_pull_leaves_silence_and_moves_nothing(view):
+    app, win = view
+    before = (_starts(win), round(win._clip(1).end, 4))
+    win._range = (1, 1.0, 1.5)                    # 11.0-11.5 s of the read
+    _key(app, win.cv, "Delete", SHIFT)
+    win.refresh()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.0), (11.5, 14.0)]
+    assert _res(app, 1)["seg_gaps"] == [pytest.approx(0.5)]
+    assert (_starts(win), round(win._clip(1).end, 4)) == before
+
+
+def test_shift_delete_off_a_pulls_end_grows_the_gap_after(view):
+    app, win = view
+    before = _starts(win)
+    win._range = (1, 3.4, 4.0)
+    win.delete_range(lift=True)
+    win.refresh()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 13.4)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(0.5 + 0.6)
+    assert _starts(win) == before
+
+
+def test_shift_delete_off_a_pulls_start_grows_the_gap_in_front(view):
+    app, win = view
+    s2 = win._clip(2).start
+    before_end = win._clip(2).end
+    win._range = (2, s2, s2 + 0.5)
+    win.delete_range(lift=True)
+    win.refresh()
+    assert [tuple(s) for s in _res(app, 2)["segments"]] == [(20.5, 22.0)]
+    assert _res(app, 1)["gap_after_s"] == pytest.approx(0.5 + 0.5)
+    assert win._clip(2).end == pytest.approx(before_end)
+
+
+def test_plain_delete_still_closes_up(view):
+    app, win = view
+    s2 = win._clip(2).start
+    win._range = (1, 1.0, 1.5)
+    _key(app, win.cv, "Delete")
+    win.refresh()
+    assert win._clip(2).start == pytest.approx(s2 - 0.5)

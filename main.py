@@ -217,7 +217,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self.seq_name   = tk.StringVar()
         self.out_path   = tk.StringVar()
         self.gap_var    = tk.DoubleVar(value=DEFAULT_GAP)
-        self.fade_var   = tk.DoubleVar(value=DEFAULT_FADE)   # seconds
+        # Default fades, seconds: fade_var the crossfade where two clips
+        # butt, the other two a fade in after silence and out before it.
+        self.fade_var     = tk.DoubleVar(value=DEFAULT_FADE)
+        self.fade_in_var  = tk.DoubleVar(value=DEFAULT_FADE)
+        self.fade_out_var = tk.DoubleVar(value=DEFAULT_FADE)
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
         self._load_prefs()
@@ -2761,6 +2765,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self.gap_var.set(snap["_default_gap"])
         if "_default_fade" in snap:
             self.fade_var.set(snap["_default_fade"])
+        if "_default_fade_in" in snap:
+            self.fade_in_var.set(snap["_default_fade_in"])
+        if "_default_fade_out" in snap:
+            self.fade_out_var.set(snap["_default_fade_out"])
         inc = getattr(self, "_s4_increment_confirmed", lambda s="": None)
         dec = getattr(self, "_s4_decrement_confirmed", lambda s="": None)
         _was_building     = getattr(self, "_s4_building", False)
@@ -2855,6 +2863,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         snap = dict(self._s4_snapshot())
         snap["_default_gap"] = float(self.gap_var.get())
         snap["_default_fade"] = float(self.fade_var.get())
+        if hasattr(self, "fade_in_var"):
+            snap["_default_fade_in"] = float(self.fade_in_var.get())
+            snap["_default_fade_out"] = float(self.fade_out_var.get())
         return snap
 
     def _s4_push_undo(self):
@@ -3904,7 +3915,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "video_off": self._pool.video_off() if self._pool else False,
             "pad":       self.pad_var.get(),
             "gap":       self.gap_var.get(),
-            "fade":      self.fade_var.get(),
+            "fade":      self.fade_var.get(),        # the crossfade
+            "fade_in":   self.fade_in_var.get(),
+            "fade_out":  self.fade_out_var.get(),
         }
         # Embed match results so the file is self-contained and restores to Step 4
         if getattr(self, "results", None):
@@ -4664,6 +4677,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # A session from before fades keeps the cuts it was checked with.
         self.fade_var.set(data.get(
             "fade", 0.0 if data.get("results") else DEFAULT_FADE))
+        # One default for all three before they were set apart.
+        self.fade_in_var.set(data.get("fade_in", self.fade_var.get()))
+        self.fade_out_var.set(data.get("fade_out", self.fade_var.get()))
 
         self._load_script(script_path)
 
@@ -9493,15 +9509,25 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self.gap_var.set(gap_s)
         self._s4_save()
 
-    def _assembly_set_default_fade(self, fade_s):
-        """The cut's default fade -- the fade at every cut edge that has
-        none of its own (engines.edge_fade) -- set from the Assembly view,
-        as one undo step.  Saved with the session as "fade"."""
+    def _fade_defaults(self):
+        """(fade in, fade out, crossfade) defaults, seconds."""
+        x = float(self.fade_var.get())
+        return (float(getattr(self, "fade_in_var", self.fade_var).get()),
+                float(getattr(self, "fade_out_var", self.fade_var).get()), x)
+
+    def _assembly_set_default_fade(self, fade_s, kind="x"):
+        """A default fade -- the crossfade where two clips butt ("x"), the
+        fade in after silence ("in") or the fade out before it ("out"), at
+        every edge with none of its own (engines.edge_fade) -- set from the
+        Assembly view, as one undo step.  Saved with the session as "fade",
+        "fade_in" and "fade_out"."""
+        var = {"in": getattr(self, "fade_in_var", None),
+               "out": getattr(self, "fade_out_var", None)}.get(kind) or self.fade_var
         fade_s = round(max(0.0, min(FADE_MAX, float(fade_s))), 4)
-        if abs(fade_s - float(self.fade_var.get())) < 1e-6:
+        if abs(fade_s - float(var.get())) < 1e-6:
             return
         self._s4_push_undo()
-        self.fade_var.set(fade_s)
+        var.set(fade_s)
         self._s4_save()
 
     def _assembly_set_edge_fades(self, edges, fade_s):
@@ -10382,7 +10408,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             return
 
         gap_secs = self.gap_var.get()
-        fade_secs = self.fade_var.get()
+        fade_secs = self._fade_defaults()
         parts    = list(self.parts)
         vo_takes = dict(getattr(self, "_vo_takes_by_part", {}))
 
@@ -10464,7 +10490,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         seq_name = self.seq_name.get()
         gap_secs = self.gap_var.get()
-        fade_secs = self.fade_var.get()
+        fade_secs = self._fade_defaults()
         out_path = self.out_path.get()
         is_aaf   = self._is_aaf_mode()
         fmt      = "AAF" if is_aaf else "XML"

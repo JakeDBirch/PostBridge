@@ -6136,6 +6136,24 @@ def _edge_fade_entry(res, side, t):
     return best[1] if best else None
 
 
+def fade_defaults(fade_secs):
+    """(fade in, fade out, crossfade) default seconds: fade_secs is one
+    length for all three, or the three."""
+    if isinstance(fade_secs, (tuple, list)) and len(fade_secs) == 3:
+        out = []
+        for v in fade_secs:
+            try:
+                out.append(max(0.0, min(FADE_MAX, float(v or 0.0))))
+            except (TypeError, ValueError):
+                out.append(0.0)
+        return tuple(out)
+    try:
+        v = max(0.0, min(FADE_MAX, float(fade_secs or 0.0)))
+    except (TypeError, ValueError):
+        v = 0.0
+    return (v, v, v)
+
+
 def edge_fade(res, side, t, default=0.0):
     """Seconds of fade on a pull's edge: `side` is "in" or "out", t the
     edge's source time.  A fade set on that edge by hand
@@ -6216,7 +6234,9 @@ def layout_timeline(results, gap_secs, sr, int_assets,
       placed      : [{"res", "segments", "seg_gaps", "paths", "pieces",
                       "fades", "start", "end", "gap"}] in timeline order.
                       "fades" is [(fade in, fade out)] per piece, samples:
-                      each edge's own (edge_fade), else fade_secs.  "res" is
+                      each edge's own (edge_fade), else the default --
+                      fade_secs, one length or (in, out, crossfade), the
+                      crossfade's where two clips butt on one track.  "res" is
                       the caller's own dict; "segments" may be capped (see
                       below); "seg_gaps" is the silence (s) at each of
                       their joins; "pieces" is [(tl_start_sa, dur_sa,
@@ -6226,6 +6246,7 @@ def layout_timeline(results, gap_secs, sr, int_assets,
       part_starts : part_index -> sample position of that part's first pull.
     """
     gap_sa = round(gap_secs * sr)
+    f_in, f_out, f_x = fade_defaults(fade_secs)
 
     def s2sa(secs):
         return round(secs * sr)
@@ -6328,13 +6349,39 @@ def layout_timeline(results, gap_secs, sr, int_assets,
         entry["end"] = cursor
         entry["gap"] = gap
         entry["fades"] = [
-            (s2sa(edge_fade(res, "in", a, fade_secs)),
-             s2sa(edge_fade(res, "out", b, fade_secs)))
+            (s2sa(edge_fade(res, "in", a, f_in)),
+             s2sa(edge_fade(res, "out", b, f_out)))
+            for a, b in entry["segments"]][:len(entry["pieces"])]
+        entry["fade_own"] = [
+            (_edge_fade_entry(res, "in", a) is not None,
+             _edge_fade_entry(res, "out", b) is not None)
             for a, b in entry["segments"]][:len(entry["pieces"])]
         cursor += gap
         placed.append(entry)
 
+    _crossfade_defaults(placed, s2sa(f_x))
     return placed, skipped, part_starts
+
+
+def _crossfade_defaults(placed, x_sa):
+    """Where two clips butt on one track -- the cuts inside a pull, and a
+    pull running straight on into the next of the same speaker -- the join
+    is a crossfade: both sides take the crossfade default, unless one of
+    them has a fade of its own (which then sets it, join_fades)."""
+    flat = []
+    for e in placed:
+        r = e["res"]
+        key = "VO" if r.get("is_vo") else r.get("token")
+        own = e.get("fade_own") or [(False, False)] * len(e["pieces"])
+        for k, (st, du, _si) in enumerate(e["pieces"]):
+            if k < len(e["fades"]):
+                flat.append((st, du, key, e, k, own[k] if k < len(own) else (False, False)))
+    flat.sort(key=lambda x: x[0])
+    for (s1, d1, k1, e1, i1, o1), (s2, _d2, k2, e2, i2, o2) in zip(flat, flat[1:]):
+        if s1 + d1 != s2 or k1 != k2 or o1[1] or o2[0]:
+            continue
+        e1["fades"][i1] = (e1["fades"][i1][0], x_sa)
+        e2["fades"][i2] = (x_sa, e2["fades"][i2][1])
 
 
 # Spotting marks the Assembly view drops on pulls, exported as the MUSIC,

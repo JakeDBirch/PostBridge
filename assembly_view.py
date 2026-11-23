@@ -841,29 +841,42 @@ class _AssemblyAudio(object):
         sr, raw = self.sr, []
         for c in clips:
             fades = getattr(c, "fades", None) or [(0.0, 0.0)] * len(c.pieces)
+            path = getattr(c, "play_path", None)
             for (tl, du, si), (fi, fo) in zip(c.pieces, fades):
                 raw.append((int(round(tl * sr)) + self._lead, int(round(du * sr)),
-                            c.order, si, int(round(fi * sr)), int(round(fo * sr))))
+                            c.order, si, int(round(fi * sr)), int(round(fo * sr)),
+                            path))
             if ghosts:
                 for tl, du, si in (g[:3] for g in c.ghosts):
                     raw.append((int(round(tl * sr)) + self._lead,
-                                int(round(du * sr)), c.order, si, 0, 0))
-        raw.sort()
+                                int(round(du * sr)), c.order, si, 0, 0, path))
+        raw.sort(key=lambda p: p[:6])
         if ghosts:
-            pieces = [p[:4] + (0, 0) for p in raw]
+            pieces = [p[:4] + (0, 0, False, False) for p in raw]
         else:
             joins = engines.join_fades(
-                [(st, du, int(round(si * sr))) for st, du, _o, si, _i, _f in raw],
-                [(fi, fo) for _s, _d, _o, _si, fi, fo in raw])
+                [(st, du, int(round(si * sr))) for st, du, _o, si, _i, _f, _p in raw],
+                [(fi, fo) for _s, _d, _o, _si, fi, fo, _p in raw])
+
+            def _one_stretch(a, b):
+                """Two butting pieces that are one stretch of one recording:
+                a split.  A crossfade over it is the same sound on both
+                sides, so it ramps straight; over a real cut the two sides
+                differ, and it holds its power instead."""
+                return a[6] is not None and a[6] == b[6] and \
+                    abs(b[3] - (a[3] + a[1] / float(sr))) < 2.0 / sr
             pieces = []
-            for i, (st, du, order, si, _fi, _fo) in enumerate(raw):
+            for i, (st, du, order, si, _fi, _fo, _pth) in enumerate(raw):
                 head, tail = joins[i], joins[i + 1]
                 lead = head[1] if head[0] == "x" else 0
                 trail = tail[1] if tail[0] == "x" else 0
+                pow_in = bool(lead) and not _one_stretch(raw[i - 1], raw[i])
+                pow_out = bool(trail) and not _one_stretch(raw[i], raw[i + 1])
                 pieces.append((st - lead, du + lead + trail, order,
                                si - lead / float(sr),
                                2 * lead if lead else head[2] if head[0] == "f" else 0,
-                               2 * trail if trail else tail[1] if tail[0] == "f" else 0))
+                               2 * trail if trail else tail[1] if tail[0] == "f" else 0,
+                               pow_in, pow_out))
         self._index = ([p[0] for p in pieces], pieces)
         # A second of tail so the stretcher can play the last word out.
         self._len = self._lead + int((total_s + 1.0) * self.sr)
@@ -892,7 +905,7 @@ class _AssemblyAudio(object):
         # One piece back from the one under i: a crossfade's two overlap.
         j = max(0, bisect.bisect_right(starts, i) - 2)
         while j < len(pieces):
-            st, du, order, si, f_in, f_out = pieces[j]
+            st, du, order, si, f_in, f_out, pow_in, pow_out = pieces[j]
             j += 1
             if st >= end:
                 break
@@ -910,9 +923,11 @@ class _AssemblyAudio(object):
                     n = np.arange(k1 - k0, dtype=np.float32) + \
                         ((a - st) + (k0 - off) + 0.5)
                     if f_in:
-                        seg = seg * np.clip(n / f_in, 0.0, 1.0)
+                        g = np.clip(n / f_in, 0.0, 1.0)
+                        seg = seg * (np.sin(g * (np.pi / 2)) if pow_in else g)
                     if f_out:
-                        seg = seg * np.clip((du - n) / f_out, 0.0, 1.0)
+                        g = np.clip((du - n) / f_out, 0.0, 1.0)
+                        seg = seg * (np.sin(g * (np.pi / 2)) if pow_out else g)
                 out[o:o + (k1 - k0)] += seg
         if gains:
             np.clip(out, -1.0, 1.0, out=out)
@@ -1195,6 +1210,8 @@ class AssemblyWindow(object):
         self.edit_flow = p
         self.reading_key = None
         key(p, "Delete selection", "Del", self._delete_key)
+        key(p, "Delete, leave the time", "Shift+Del",
+            lambda: self.delete_range(lift=True))
         key(p, "Split", "B", self.split)
         key(p, "Cut ½ s out", "C", self.cut_out)
         key(p, "Heal cut", "H", self.heal)
@@ -1237,11 +1254,18 @@ class AssemblyWindow(object):
         p.add(gap)
         key(p, "Fade", "F", self.apply_fade)
         fade = tk.Frame(p, bg=SURF)
-        tk.Label(fade, text="Default fade", font=(FB[0], 10), bg=SURF,
-                 fg=TEXT).pack(side="left", padx=(0, 4))
-        self._fade_box = self._ms_box(fade, self._fade_from_box)
+        tk.Label(fade, text="Default fades", font=(FB[0], 10), bg=SURF,
+                 fg=TEXT).pack(side="left", padx=(0, 6))
+        for label, kind in (("in", "in"), ("out", "out"), ("cross", "x")):
+            tk.Label(fade, text=label, font=(FB[0], 9), bg=SURF,
+                     fg=SUB).pack(side="left", padx=(0, 2))
+            box = self._ms_box(fade, lambda _e=None, k=kind:
+                               self._fade_from_box(_e, k))
+            box.pack_configure(padx=(0, 6))
+            setattr(self, {"in": "_fade_in_box", "out": "_fade_out_box",
+                           "x": "_fade_box"}[kind], box)
         tk.Label(fade, text="ms  (every cut you haven't set)", font=(FB[0], 9),
-                 bg=SURF, fg=SUB).pack(side="left", padx=(4, 0))
+                 bg=SURF, fg=SUB).pack(side="left", padx=(0, 0))
         p.add(fade)
         cut = tk.Frame(p, bg=SURF)
         tk.Label(cut, text="Fade at this cut", font=(FB[0], 10), bg=SURF,
@@ -1464,7 +1488,7 @@ class AssemblyWindow(object):
                       if r.get("order") in overrides else r for r in edited]
         placed, _skipped, part_starts = engines.layout_timeline(
             edited, app.gap_var.get(), LAYOUT_SR, int_assets,
-            fade_secs=self._default_fade())
+            fade_secs=self._default_fades())
         # Spotting marks ride on the finished cut's placement.
         marks = engines.place_markers(placed, LAYOUT_SR)
         self._shifts = []
@@ -2733,11 +2757,19 @@ class AssemblyWindow(object):
             box.bind(ev, command)
         return box
 
-    def _default_fade(self):
+    def _default_fade(self, kind="x"):
+        """A default fade, seconds: "x" the crossfade, "in" / "out" the
+        fades beside silence (the crossfade's, where an app has only it)."""
+        var = getattr(self.app, {"in": "fade_in_var", "out": "fade_out_var"}
+                      .get(kind, "fade_var"), None) or getattr(self.app, "fade_var", None)
         try:
-            return max(0.0, float(self.app.fade_var.get()))
+            return max(0.0, float(var.get()))
         except (AttributeError, ValueError, tk.TclError):
             return 0.0
+
+    def _default_fades(self):
+        return (self._default_fade("in"), self._default_fade("out"),
+                self._default_fade("x"))
 
     def _box_ms(self, box):
         try:
@@ -2759,19 +2791,27 @@ class AssemblyWindow(object):
         except (tk.TclError, AttributeError, ValueError):
             pass
 
-    def _fade_from_box(self, _e=None):
-        value = self._box_ms(self._fade_box)
+    def _fade_from_box(self, _e=None, kind="x"):
+        box = {"in": getattr(self, "_fade_in_box", None),
+               "out": getattr(self, "_fade_out_box", None)}.get(kind) or self._fade_box
+        value = self._box_ms(box)
         if value is not None:
-            self.app._assembly_set_default_fade(value)
+            try:
+                self.app._assembly_set_default_fade(value, kind)
+            except TypeError:            # an app with the one default
+                self.app._assembly_set_default_fade(value)
             self.refresh()
         self._show_default_fade()
         self._show_cut_fade()
         return "break"
 
     def _show_default_fade(self):
-        """The default fade as the app holds it (an undo can change it)."""
+        """The default fades as the app holds them (an undo can change them)."""
         if hasattr(self, "_fade_box"):
-            self._put_ms(self._fade_box, self._default_fade())
+            self._put_ms(self._fade_box, self._default_fade("x"))
+        if hasattr(self, "_fade_in_box"):
+            self._put_ms(self._fade_in_box, self._default_fade("in"))
+            self._put_ms(self._fade_out_box, self._default_fade("out"))
 
     def _cut_edges(self, t=None):
         """The cut nearest the insertion point: (timeline time, [(order,
@@ -2793,8 +2833,11 @@ class AssemblyWindow(object):
     def _cut_fade_now(self, edges):
         """(seconds, set by hand?) for a cut's edges as they stand."""
         rows = {r.get("order"): r for r in self.app.results or ()}
-        base, best, own = self._default_fade(), 0.0, False
+        # Both sides of a butt cut: the crossfade's default; one edge
+        # beside silence, its own side's.
+        best, own = 0.0, False
         for order, side, src in edges:
+            base = self._default_fade("x" if len(edges) > 1 else side)
             r = rows.get(order) or {}
             best = max(best, engines.edge_fade(r, side, src, base))
             own = own or engines._edge_fade_entry(r, side, src) is not None
@@ -3158,6 +3201,12 @@ class AssemblyWindow(object):
             if max(xe_, xh) < -20 or min(xe_, xh) > w + 20:
                 continue
             tl, du, _si = c.pieces[k]
+            if secs > 0 and not (cross and side == "in"):
+                # The waveform as it plays here: faded, a crossfade's two
+                # sides mixed.  (A crossfade once, from its outgoing side.)
+                lo, hi = (min(xh, 2 * xe_ - xh), max(xh, 2 * xe_ - xh)) \
+                    if cross else (min(xe_, xh), max(xe_, xh))
+                self._draw_heard(c, lo, hi, y0, y1, w)
             if du * self.pps < 3 * hp:
                 continue                     # too narrow to take hold of
             col = TEXT if own else _C_FADE
@@ -3177,6 +3226,43 @@ class AssemblyWindow(object):
                 # Where the fade ends: for a crossfade, this side's end.
                 cv.create_line(xh, top, xh, y1, fill=col, dash=(2, 3),
                                tags=("fade", "fade_end"))
+
+    def _draw_heard(self, c, xa, xb, y0, y1, w):
+        """Pixels xa..xb of the lane drawn from what the cut plays there
+        (_AssemblyAudio.read, fades and all), over the waveform as recorded:
+        how a fade or crossfade really sounds.  Nothing until the audio
+        either side is loaded."""
+        xa, xb = max(0, int(math.floor(xa))), min(w, int(math.ceil(xb)))
+        if xb - xa < 2 or self.audio.buffer(c.order) is None:
+            return
+        ls = self._ls
+        top, bot = y0 + ls + 8, y1 - ls - 8
+        mid, half = (top + bot) / 2.0, (bot - top) / 2.0
+        sr = self.audio.sr
+        lead = int(round(LEAD_S * sr))
+        i0 = int(round(self._t(xa) * sr)) + lead
+        i1 = int(round(self._t(xb) * sr)) + lead
+        if i1 - i0 < 2:
+            return
+        pcm = self.audio.read(i0, i1 - i0)
+        # The lane's scale: Normalize's gain is in what is read already.
+        g = self._gain.get(c.order) if _MONITOR["normalize"] else None
+        k = (1.0 / NORM_LEVEL) if g is not None else \
+            1.0 / max(self._env_scale, 1e-4)
+        edges = np.linspace(0, len(pcm), xb - xa + 1).astype(np.int64)
+        edges[-1] = len(pcm)
+        hi = np.maximum.reduceat(pcm, edges[:-1])
+        lo = np.minimum.reduceat(pcm, edges[:-1])
+        hi = np.clip(hi * k, -1.0, 1.0) * half * 0.95
+        lo = np.clip(lo * k, -1.0, 1.0) * half * 0.95
+        xs = np.arange(xa, xb, dtype=np.float64)
+        cv = self.cv
+        cv.create_rectangle(xa, top, xb, bot, fill=_C_CLIP_BG, outline="",
+                            tags=("fade_heard",))
+        poly = np.concatenate((np.column_stack((xs, mid - hi - 0.5)).ravel(),
+                               np.column_stack((xs[::-1], (mid - lo + 0.5)[::-1])).ravel()))
+        cv.create_polygon(poly.tolist(), fill=c.colour(), outline="",
+                          tags=("fade", "fade_heard"))
 
     def _fade_handle_at(self, x, y):
         """(clip, k, side) of the fade handle under the pointer, or None."""
@@ -3237,18 +3323,48 @@ class AssemblyWindow(object):
         room = d["room"] * (0.5 if d["cross"] else 0.25)
         return round(max(0.0, min(secs, room, FADE_MAX)), 4)
 
+    def _fade_to_nearest_edge(self):
+        """The span F with nothing highlighted fades over, as a highlight:
+        (order, a, b) from the insertion point to the nearer edge of its
+        region -- across a butt cut to as far beyond it -- or None."""
+        t = self.insert
+        c = self._clip_at(t)
+        k = c.piece_at(t) if c is not None else None
+        if k is None:
+            return None
+        tl, du, _si = c.pieces[k]
+        to_in, to_out = t - tl, tl + du - t
+        if min(to_in, to_out) < 1e-3:
+            return None                      # on the edge: nothing to fade
+        edge, d = (tl, to_in) if to_in <= to_out else (tl + du, to_out)
+        _at, edges = self._cut_edges(edge)
+        if len(edges) > 1:                   # two regions butt: a crossfade
+            return (c.order, edge - d, edge + d)
+        # A hair past the edge: F fades an edge that lies inside the span.
+        return (c.order, edge - 1e-3, t) if edge < t else (c.order, t, edge + 1e-3)
+
     def apply_fade(self):
         """F: fade what is highlighted.  A highlight across a cut where
         two regions butt makes a crossfade its length; over a region's
         start or end beside silence, a fade in or out as long as the part
         of the region it covers.  Several cuts in one highlight each get
-        theirs.  One undo step."""
+        theirs.  One undo step.
+
+        With nothing highlighted, from the insertion point to the nearer
+        edge of the region it's in: a fade in or out to an edge beside
+        silence, a crossfade as far either side of a butt cut."""
         if self._range is None:
-            at, edges = self._cut_edges()
-            self.status.config(fg=SUB, text="Highlight across a cut for a "
-                               "crossfade, or over a region's start or end for "
-                               "a fade in or out, then F.  (Or drag the handle "
-                               "at a region's top corner.)")
+            span = self._fade_to_nearest_edge()
+            if span is None:
+                self.status.config(fg=SUB, text="Put the insertion point in a "
+                                   "region, or highlight across a cut, then F.")
+                return
+            self._range = span
+            try:
+                self.apply_fade()
+            finally:
+                self._range = None
+                self.redraw()
             return
         _o, a, b = self._range
         a, b = min(a, b), max(a, b)
@@ -4435,9 +4551,11 @@ class AssemblyWindow(object):
                                "   ·   , . nudge it" if reg else
                                "   ·   B splits at both ends"))
 
-    def delete_range(self):
+    def delete_range(self, lift=False):
         """Take the highlighted span out, from every pull it touches: one
-        undo step, and a pull with nothing left is IGNOREd."""
+        undo step, and a pull with nothing left is IGNOREd.  With `lift`
+        (Shift+Delete) the time stays: what is taken out becomes silence,
+        and nothing after it moves."""
         if self._range is None:
             return
         _o, a, b = self._range
@@ -4446,6 +4564,11 @@ class AssemblyWindow(object):
         self._tx_clear()
         if b - a < MIN_CUT_S:
             self.redraw()
+            return
+        if lift:
+            self._lift(a, b)
+            self.refresh()
+            self.set_insert(a)
             return
         edits, gone = {}, []
         for c in self._clips_in(a, b):
@@ -4458,6 +4581,47 @@ class AssemblyWindow(object):
             self.app._assembly_edit_many(edits, gone)
         self.refresh()
         self.set_insert(a)
+
+    def _lift(self, a, b):
+        """Shift+Delete: the audio in timeline span a..b taken out and its
+        time left as silence -- between the regions either side of it in a
+        pull (the join's silence), in the gap in front of a pull that loses
+        its start, or the gap after one that loses its end.  A pull with
+        nothing left goes (IGNOREd) and its time joins the gap in front of
+        it.  Every kept region stays exactly where it was.  One undo step."""
+        clips = self._clips_in(a, b)
+        if not clips:
+            return
+        edits, gone, gaps_after = {}, [], {}
+        keeper = self._prev_clip(clips[0])        # whose gap is in front
+
+        def _grow(c, secs):
+            if c is not None and secs > 1e-6:
+                gaps_after[c.order] = gaps_after.get(c.order, c.gap) + secs
+        for c in clips:
+            segs, _gaps = _segments_without(c, a, b)
+            if not segs:
+                gone.append(c.order)
+                _grow(keeper, (c.end - c.start) + gaps_after.pop(c.order, c.gap))
+                continue
+
+            def _tl(src, c=c):
+                for tl, du, si in c.pieces:
+                    if si - 1e-6 <= src <= si + du + 1e-6:
+                        return tl + (src - si)
+                return None
+            starts = [_tl(sa) for sa, _sb in segs]
+            if any(st is None for st in starts):
+                continue                          # can't place it: leave it
+            ends = [st + (sb - sa) for st, (sa, sb) in zip(starts, segs)]
+            gaps = [round(max(0.0, starts[i + 1] - ends[i]), 4)
+                    for i in range(len(segs) - 1)]
+            edits[c.order] = (segs, gaps)
+            _grow(keeper, starts[0] - c.start)    # its start went: room in front
+            _grow(c, c.end - ends[-1])            # its end went: room after
+            keeper = c
+        if edits or gone:
+            self.app._assembly_edit_many(edits, gone, gaps_after=gaps_after)
 
     def split(self):
         """Split the region under the insertion point in two there -- or at
@@ -5542,6 +5706,9 @@ class AssemblyWindow(object):
             self.copy_words()
         elif ctrl and k in ("Return", "KP_Enter"):
             self.accept_next()
+        elif shift and not ctrl and k in ("Delete", "BackSpace") and \
+                self.view == "cut":
+            self.delete_range(lift=True)
         elif k == "S" and not ctrl:
             self.toggle_skip_cuts()
         elif not ctrl and k.lower() == "g":

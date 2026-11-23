@@ -106,18 +106,33 @@ def test_assembly_plays_a_fade_in_and_out_around_silence():
     assert abs(out[900] - 0.25) < 0.01 and out[999] < 0.01       # half way down
 
 
+def test_a_crossfade_over_a_split_ramps_straight():
+    # A split: the two pieces are one stretch of tape (2.0 s on into 2.0 s).
+    # Both sides are the same sound, so a straight crossfade holds it level.
+    audio, lead = _audio([(0, 200), (200, 0)],
+                         [(0, 1000, 1000), (1000, 1000, 2000)],
+                         [(1.0, 2.0), (2.0, 3.0)])
+    out = audio.read(lead, 2000)
+    assert np.allclose(out[:2000], 0.5, atol=0.005)
+
+
 def test_assembly_crossfades_a_butt_join_like_the_aaf():
-    # Two pieces butt at 1.0 s; 200 ms crossfade: 100 ms either side.
+    # A real cut: 1.0-2.0 s, then 3.0-4.0 s.  200 ms crossfade, 100 ms either
+    # side, at equal power: unrelated sounds either side keep their level
+    # (each side at sin 45 deg in the middle, not half).
     audio, lead = _audio([(0, 200), (200, 0)],
                          [(0, 1000, 1000), (1000, 1000, 3000)],
                          [(1.0, 2.0), (3.0, 4.0)])
     out = audio.read(lead, 2000)
-    # Constant tape either side: the two sides sum to it all the way across.
-    assert np.allclose(out[:2000], 0.5, atol=0.005)
+    assert np.allclose(out[:880], 0.5, atol=0.005)
+    assert np.allclose(out[1120:2000], 0.5, atol=0.005)
+    # Constant tape both sides: the sum peaks at 2 x 0.5 x sin(45 deg) mid-way.
+    assert out[1000] == pytest.approx(0.5 * 2 * np.sin(np.pi / 4), abs=0.01)
     # ...and each side really is playing past the cut: outgoing alone.
     from assembly_view import _AssemblyAudio  # noqa: F401
     starts, pieces = audio._index
     assert [(p[1], p[4], p[5]) for p in pieces] == [(1100, 0, 200), (1100, 200, 0)]
+    assert [(p[6], p[7]) for p in pieces] == [(False, True), (True, False)]
     assert pieces[1][0] - lead == 900                            # starts early
 
 
@@ -405,3 +420,106 @@ def test_a_fades_end_is_marked_top_to_bottom(view):  # noqa: F811
     for i in cv.find_withtag("fade_end"):
         x0, ya, x1, yb = cv.coords(i)
         assert x0 == x1 and yb - ya > (y1 - y0) / 2      # a vertical, top to bottom
+
+
+def test_the_waveform_over_a_fade_is_drawn_as_it_plays(view):  # noqa: F811
+    app, win = view
+    app.fade_var.set(0.500)                     # 500 ms fade in at pull 1's start
+    win.refresh()
+    sr = win.audio.sr
+    loud = np.full(10 * sr, 20000, dtype=np.int16)
+    win.audio.put(1, win._clip(1).play_path, 5.0, loud)
+    win._env[1] = (5.0, np.full(10 * 400, 20000 / 32768.0, np.float32))
+    win.restore_view(400.0, -0.1, 0.0)
+    win.redraw()
+    app.update()
+    cv = win.cv
+    heard = cv.find_withtag("fade_heard")
+    polys = [i for i in heard if cv.type(i) == "polygon"]
+    assert polys
+    xy = cv.coords(polys[0])
+    pts = list(zip(xy[0::2], xy[1::2]))
+    top_edge = pts[:len(pts) // 2]
+    y0, y1 = win._track_box()
+    mid = (y0 + win._ls + 8 + y1 - win._ls - 8) / 2.0
+    # Near nothing as the fade begins, full height by its end.
+    start = min(top_edge, key=lambda p: abs(p[0] - win._x(0.02)))
+    end = min(top_edge, key=lambda p: abs(p[0] - win._x(0.48)))
+    assert mid - start[1] < 0.15 * (mid - end[1])
+
+
+# ── F with nothing highlighted: the insertion point to the nearer edge ─────
+
+def test_f_without_a_highlight_fades_in_from_the_start_to_the_cursor(view):  # noqa: F811
+    app, win = view
+    win._range = None
+    win.set_insert(0.3)                         # pull 1 is 0-4 on the track
+    _key(app, win.cv, "f")
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.3)]
+    assert win._range is None
+
+
+def test_f_without_a_highlight_fades_out_from_the_cursor_to_the_end(view):  # noqa: F811
+    app, win = view
+    win._range = None
+    win.set_insert(3.6)
+    win.apply_fade()
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.4)]
+
+
+def test_f_without_a_highlight_by_a_butt_cut_crossfades_either_side(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
+    win.refresh()
+    win._range = None
+    win.set_insert(1.8)                         # 0.2 s before the cut at 2.0
+    win.apply_fade()
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.4)]
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.4)]
+    assert win._clip(1).shapes[0][1] == ("x", pytest.approx(0.2))
+
+
+# ── Separate defaults: fade in, fade out, crossfade ──────────────────────
+
+def test_the_three_defaults_go_where_they_belong():
+    sr = 1000
+    res = [{"order": 1, "token": "GUEST", "status": "ok", "part_index": 0,
+            "segments": [[1.0, 2.0], [2.5, 4.0]], "gap_after": True},
+           {"order": 2, "token": "GUEST", "status": "ok", "part_index": 0,
+            "segments": [[6.0, 7.0]], "gap_after": True}]
+    placed, _s, _p = engines.layout_timeline(
+        res, 0.5, sr, {"GUEST": ["guest.wav"]}, fade_secs=(0.010, 0.020, 0.050))
+    # Pull 1's two pieces butt: the crossfade's; its outer edges and pull 2's,
+    # beside silence, the fade in's and fade out's.
+    assert placed[0]["fades"] == [(10, 50), (50, 20)]
+    assert placed[1]["fades"] == [(10, 20)]
+
+
+def test_an_edge_of_its_own_keeps_it_at_a_butt_join():
+    sr = 1000
+    res = [{"order": 1, "token": "GUEST", "status": "ok", "part_index": 0,
+            "segments": [[1.0, 2.0], [2.5, 4.0]], "gap_after": True}]
+    engines.set_edge_fade(res[0], "in", 2.5, 0.100)
+    placed, _s, _p = engines.layout_timeline(
+        res, 0.5, sr, {"GUEST": ["guest.wav"]}, fade_secs=(0.010, 0.020, 0.050))
+    assert placed[0]["fades"] == [(10, 20), (100, 20)]   # not the crossfade's
+
+
+def test_the_assembly_sets_each_default_on_its_own(view):  # noqa: F811
+    from test_assembly_edit import _Var
+    app, win = view
+    app.fade_in_var, app.fade_out_var = _Var(0.0), _Var(0.0)
+    import main
+    app._assembly_set_default_fade = main.App._assembly_set_default_fade.__get__(app)
+    win._fade_in_box.delete(0, "end")
+    win._fade_in_box.insert(0, "30")
+    win._fade_from_box(kind="in")
+    win._fade_out_box.delete(0, "end")
+    win._fade_out_box.insert(0, "60")
+    win._fade_from_box(kind="out")
+    assert app.fade_in_var.get() == pytest.approx(0.030)
+    assert app.fade_out_var.get() == pytest.approx(0.060)
+    assert win._default_fades() == (pytest.approx(0.030), pytest.approx(0.060),
+                                    app.fade_var.get())
+    c = win._clip(1)
+    assert c.fades[0] == (pytest.approx(0.030), pytest.approx(0.060))
