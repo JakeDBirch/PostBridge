@@ -70,6 +70,10 @@ WHISPER_WINDOW_SEEK_S = 30    # how far back from a window's end to look for
 MATCH_THRESH     = 0.55       # minimum word-overlap score to accept a match
 GAP_THRESH       = 1.5        # seconds of silence triggering a cut within a clip
 DEFAULT_GAP      = 0.6        # silence after each pull, unless it has its own
+DEFAULT_FADE     = 0.010      # fade at every cut edge, unless it has its own (s)
+FADE_MAX         = 2.0        # the longest fade an edge can be given (s)
+FADE_PIN_S       = 0.25       # an edge keeps its own fade while it stays this
+                              # close to where the fade was set (source seconds)
                               # (set in the Assembly view; saved as "gap")
 CACHE_VERSION    = 1          # bump to invalidate all cached transcripts
 HOST_NAME        = "jordan"   # host's Riverside display name (case-insensitive)

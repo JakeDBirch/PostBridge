@@ -113,6 +113,7 @@ import engines
 import match_review
 import monolog
 import playback
+from config import FADE_MAX
 from config import (BG, SURF, SURF2, SURF3, BORDER, ACCENT, TEXT, SUB,
                     WARN, ERR, FB, FBT, HOST_NAME)
 from gui_components import _FlatProgressBar
@@ -148,6 +149,7 @@ NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
 LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
 EXCISED_MAX_S = 30.0
 CUT_EDGE_PX = 14
+HEAL_PX     = 12      # H takes a join no further than this from the insertion point
 TICK_PX     = 6       # a click this near a speech start / stop tick lands on it      # this near a cut's side, the boundary, not the cut
 NORM_LEVEL  = 0.5     # Normalize: each pull's speech peaks brought to this
 NORM_MAX_GAIN = 40.0  # ... by at most this much (+32 dB), so hiss stays hiss
@@ -331,6 +333,12 @@ class _Clip(object):
         gaps = [float(g) for g in entry.get("seg_gaps") or ()]
         self.seg_gaps  = gaps if len(gaps) == len(self.segments) - 1 else \
             [0.0] * max(0, len(self.segments) - 1)
+        # (fade in, fade out) per piece, seconds: what the AAF gives each
+        # edge (engines.layout_timeline).
+        fades = [(fi / float(sr), fo / float(sr))
+                 for fi, fo in entry.get("fades") or ()]
+        self.fades     = fades if len(fades) == len(self.pieces) else \
+            [(0.0, 0.0)] * len(self.pieces)
         if self.pieces:
             self.src_lo = min(si for _, _, si in self.pieces)
             self.src_hi = max(si + du for _, du, si in self.pieces)
@@ -784,14 +792,39 @@ class _AssemblyAudio(object):
 
     def set_clips(self, clips, total_s, ghosts=False):
         """The pieces to compose; with `ghosts`, the excised audio and
-        handles on show too (heard, not skipped)."""
-        pieces = []
+        handles on show too (heard, not skipped).
+
+        The finished cut plays with its fades, joined exactly as the AAF
+        joins them (engines.join_fades): a fade in and out around silence,
+        a crossfade over a butt join that plays a little of each side's
+        tape past the cut.  With the excised audio heard there is no cut
+        to fade."""
+        sr, raw = self.sr, []
         for c in clips:
-            for tl, du, si in list(c.pieces) + (
-                    [g[:3] for g in c.ghosts] if ghosts else []):
-                pieces.append((int(round(tl * self.sr)) + self._lead,
-                               int(round(du * self.sr)), c.order, si))
-        pieces.sort()
+            fades = getattr(c, "fades", None) or [(0.0, 0.0)] * len(c.pieces)
+            for (tl, du, si), (fi, fo) in zip(c.pieces, fades):
+                raw.append((int(round(tl * sr)) + self._lead, int(round(du * sr)),
+                            c.order, si, int(round(fi * sr)), int(round(fo * sr))))
+            if ghosts:
+                for tl, du, si in (g[:3] for g in c.ghosts):
+                    raw.append((int(round(tl * sr)) + self._lead,
+                                int(round(du * sr)), c.order, si, 0, 0))
+        raw.sort()
+        if ghosts:
+            pieces = [p[:4] + (0, 0) for p in raw]
+        else:
+            joins = engines.join_fades(
+                [(st, du, int(round(si * sr))) for st, du, _o, si, _i, _f in raw],
+                [(fi, fo) for _s, _d, _o, _si, fi, fo in raw])
+            pieces = []
+            for i, (st, du, order, si, _fi, _fo) in enumerate(raw):
+                head, tail = joins[i], joins[i + 1]
+                lead = head[1] if head[0] == "x" else 0
+                trail = tail[1] if tail[0] == "x" else 0
+                pieces.append((st - lead, du + lead + trail, order,
+                               si - lead / float(sr),
+                               2 * lead if lead else head[2] if head[0] == "f" else 0,
+                               2 * trail if trail else tail[1] if tail[0] == "f" else 0))
         self._index = ([p[0] for p in pieces], pieces)
         # A second of tail so the stretcher can play the last word out.
         self._len = self._lead + int((total_s + 1.0) * self.sr)
@@ -817,9 +850,10 @@ class _AssemblyAudio(object):
         gains = self._gains
         out  = np.zeros(n, dtype=np.float32)
         end  = i + n
-        j = max(0, bisect.bisect_right(starts, i) - 1)
+        # One piece back from the one under i: a crossfade's two overlap.
+        j = max(0, bisect.bisect_right(starts, i) - 2)
         while j < len(pieces):
-            st, du, order, si = pieces[j]
+            st, du, order, si, f_in, f_out = pieces[j]
             j += 1
             if st >= end:
                 break
@@ -832,8 +866,15 @@ class _AssemblyAudio(object):
             k0, k1 = max(off, 0), min(off + (b - a), len(pcm))
             if k1 > k0:
                 o = a - i + (k0 - off)
-                out[o:o + (k1 - k0)] = pcm[k0:k1] * (
-                    gains.get(order, 1.0) / 32768.0)
+                seg = pcm[k0:k1] * (gains.get(order, 1.0) / 32768.0)
+                if f_in or f_out:
+                    n = np.arange(k1 - k0, dtype=np.float32) + \
+                        ((a - st) + (k0 - off) + 0.5)
+                    if f_in:
+                        seg = seg * np.clip(n / f_in, 0.0, 1.0)
+                    if f_out:
+                        seg = seg * np.clip((du - n) / f_out, 0.0, 1.0)
+                out[o:o + (k1 - k0)] += seg
         if gains:
             np.clip(out, -1.0, 1.0, out=out)
         return out
@@ -1147,7 +1188,30 @@ class AssemblyWindow(object):
         self._gap_box.bind("<KP_Enter>", self._gap_from_box)
         self._gap_box.bind("<FocusOut>", self._gap_from_box)
         p.add(gap)
+        fade = tk.Frame(p, bg=SURF)
+        tk.Label(fade, text="Default fade", font=(FB[0], 10), bg=SURF,
+                 fg=TEXT).pack(side="left", padx=(0, 4))
+        self._fade_box = self._ms_box(fade, self._fade_from_box)
+        tk.Label(fade, text="ms  (every cut you haven't set)", font=(FB[0], 9),
+                 bg=SURF, fg=SUB).pack(side="left", padx=(4, 0))
+        p.add(fade)
+        cut = tk.Frame(p, bg=SURF)
+        tk.Label(cut, text="Fade at this cut", font=(FB[0], 10), bg=SURF,
+                 fg=TEXT).pack(side="left", padx=(0, 4))
+        self._cut_fade_box = self._ms_box(cut, self._cut_fade_from_box)
+        self._cut_fade_lbl = tk.Label(cut, text="ms", font=(FB[0], 9),
+                                      bg=SURF, fg=SUB)
+        self._cut_fade_lbl.pack(side="left", padx=(4, 6))
+        self._cut_fade_reset = tk.Label(
+            cut, text="use default", font=(FB[0], 9, "underline"), bg=SURF,
+            fg=SUB, cursor="hand2")
+        self._cut_fade_reset.pack(side="left")
+        self._cut_fade_reset.bind("<Button-1>",
+                                  lambda _e: self._cut_fade_set(None))
+        p.add(cut)
         self._show_default_gap()
+        self._show_default_fade()
+        self._show_cut_fade()
         self._show_other_reading()
 
         p = self._panel("TRANSCRIPT")
@@ -1351,7 +1415,8 @@ class AssemblyWindow(object):
             edited = [dict(r, **overrides[r.get("order")])
                       if r.get("order") in overrides else r for r in edited]
         placed, _skipped, part_starts = engines.layout_timeline(
-            edited, app.gap_var.get(), LAYOUT_SR, int_assets)
+            edited, app.gap_var.get(), LAYOUT_SR, int_assets,
+            fade_secs=self._default_fade())
         # Spotting marks ride on the finished cut's placement.
         marks = engines.place_markers(placed, LAYOUT_SR)
         self._shifts = []
@@ -2499,6 +2564,123 @@ class AssemblyWindow(object):
         self._show_default_gap()
         return "break"
 
+    # ── Fades ────────────────────────────────────────────────────────────
+    def _ms_box(self, parent, command):
+        box = tk.Spinbox(
+            parent, from_=0, to=int(FADE_MAX * 1000), increment=5, width=5,
+            font=(FB[0], 10), bg=SURF2, fg=TEXT, buttonbackground=SURF3,
+            insertbackground=TEXT, relief="flat", command=command)
+        box.pack(side="left")
+        for ev in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            box.bind(ev, command)
+        return box
+
+    def _default_fade(self):
+        try:
+            return max(0.0, float(self.app.fade_var.get()))
+        except (AttributeError, ValueError, tk.TclError):
+            return 0.0
+
+    def _box_ms(self, box):
+        try:
+            return max(0.0, float(box.get())) / 1000.0
+        except (ValueError, tk.TclError):
+            return None
+
+    def _put_ms(self, box, secs):
+        try:
+            if self.win.focus_get() is box:
+                return                   # being typed in
+        except (KeyError, tk.TclError):
+            pass
+        try:
+            v = "{:g}".format(round(secs * 1000.0, 1))
+            if box.get() != v:
+                box.delete(0, "end")
+                box.insert(0, v)
+        except (tk.TclError, AttributeError, ValueError):
+            pass
+
+    def _fade_from_box(self, _e=None):
+        value = self._box_ms(self._fade_box)
+        if value is not None:
+            self.app._assembly_set_default_fade(value)
+            self.refresh()
+        self._show_default_fade()
+        self._show_cut_fade()
+        return "break"
+
+    def _show_default_fade(self):
+        """The default fade as the app holds it (an undo can change it)."""
+        if hasattr(self, "_fade_box"):
+            self._put_ms(self._fade_box, self._default_fade())
+
+    def _cut_edges(self, t=None):
+        """The cut nearest the insertion point: (timeline time, [(order,
+        "in" | "out", source time)]) -- one edge beside silence, both sides
+        of a cut where two pieces butt.  (None, []) with nothing placed."""
+        t = self.insert if t is None else t
+        edges = []
+        for c in self.clips:
+            exact = c.segments if len(c.segments) == len(c.pieces) else None
+            for k, (tl, du, si) in enumerate(c.pieces):
+                a, b = exact[k] if exact else (si, si + du)
+                edges.append((tl, c.order, "in", a))
+                edges.append((tl + du, c.order, "out", b))
+        if not edges:
+            return None, []
+        at = min(edges, key=lambda e: abs(e[0] - t))[0]
+        return at, [e[1:] for e in edges if abs(e[0] - at) < 1e-4]
+
+    def _cut_fade_now(self, edges):
+        """(seconds, set by hand?) for a cut's edges as they stand."""
+        rows = {r.get("order"): r for r in self.app.results or ()}
+        base, best, own = self._default_fade(), 0.0, False
+        for order, side, src in edges:
+            r = rows.get(order) or {}
+            best = max(best, engines.edge_fade(r, side, src, base))
+            own = own or engines._edge_fade_entry(r, side, src) is not None
+        return best, own
+
+    def _cut_fade_from_box(self, _e=None):
+        value = self._box_ms(self._cut_fade_box)
+        if value is not None:
+            _at, edges = self._cut_edges()
+            if edges and abs(value - self._cut_fade_now(edges)[0]) > 1e-6:
+                self._cut_fade_set(value)
+                return "break"
+        self._show_cut_fade()
+        return "break"
+
+    def _cut_fade_set(self, secs):
+        """This cut's own fade; None hands it back to the default."""
+        _at, edges = self._cut_edges()
+        if not edges:
+            return
+        self.app._assembly_set_edge_fades(edges, secs)
+        self.refresh()
+        try:
+            self.win.focus_set()
+        except tk.TclError:
+            pass
+        self._show_cut_fade()
+
+    def _show_cut_fade(self):
+        """The fade at the cut nearest the insertion point, and whose it is."""
+        if not hasattr(self, "_cut_fade_box"):
+            return
+        at, edges = self._cut_edges()
+        if not edges:
+            return
+        secs, own = self._cut_fade_now(edges)
+        self._put_ms(self._cut_fade_box, secs)
+        try:
+            self._cut_fade_lbl.config(text="ms  at {}  ({})".format(
+                _fmt_tc(at), "its own" if own else "default"))
+            self._cut_fade_reset.config(fg=TEXT if own else SURF3)
+        except tk.TclError:
+            pass
+
     def _show_default_gap(self):
         """The default gap as the app holds it (an undo can change it)."""
         try:
@@ -3108,6 +3290,8 @@ class AssemblyWindow(object):
 
     # ── Status ───────────────────────────────────────────────────────────
     def _update_status(self):
+        self._show_default_fade()
+        self._show_cut_fade()
         m = self._marker(self.sel_marker)
         if m is not None:
             c = self._clip(m["order"])
@@ -4401,40 +4585,98 @@ class AssemblyWindow(object):
                                c.label, done, "" if done == 1 else "s"))
         return done
 
+    def _joins(self):
+        """Every join on the track, as (left x-time, right x-time, what):
+        what is ("cut", order, k) for region k of a pull and the one
+        before it, or ("pulls", order before, order) where one pull ends
+        and the next begins."""
+        out = []
+        prev = None
+        for c in self.clips:
+            for k in range(1, len(c.pieces)):
+                a = c.pieces[k - 1][0] + c.pieces[k - 1][1]
+                out.append((a, c.pieces[k][0], ("cut", c.order, k)))
+            if prev is not None and prev.pieces and c.pieces:
+                out.append((prev.end, c.start, ("pulls", prev.order, c.order)))
+            prev = c
+        return out
+
     def heal(self):
-        """H: heal the cut or split the insertion point is at -- the two
-        regions either side become one of continuous audio, and what was
-        cut out between them comes back.  With a highlight, every join
-        inside it."""
+        """H: heal the join at the insertion point -- a cut or split inside
+        a pull, or where one pull meets the next -- so the audio either side
+        runs on as one.  With a highlight, every join inside it.  Only a
+        join right there: nothing else on the track changes."""
+        joins = self._joins()
         if self._range is not None:
-            o, a, b = self._range
+            _o, a, b = self._range
             lo, hi = min(a, b), max(a, b)
-            c = self._clip(o)
-            if c is not None:
-                ks = [k for k in range(1, len(c.pieces))
-                      if lo - 1e-6 <= c.pieces[k][0] and
-                      c.pieces[k - 1][0] + c.pieces[k - 1][1] <= hi + 1e-6]
-                if ks:
-                    self._heal(o, ks)
-                    return
-        t = self.insert
-        c = self._clip_at(t)
-        if c is None and self.excised:
-            c = next((x for x in self.clips if x.vis_lo <= t < x.vis_hi), None)
-        if c is None and self.sel_order is not None:
-            c = self._clip(self.sel_order)
-        if c is None or len(c.pieces) < 2:
-            self.status.config(fg=SUB, text="Nothing to heal here: put the "
-                               "insertion point at a cut or split inside a pull.")
-            return
-        # The join nearest the insertion point: either side of it, or in
-        # the cut audio or silence between.
-        def _dist(k):
-            a = c.pieces[k - 1][0] + c.pieces[k - 1][1]
-            b = c.pieces[k][0]
-            return 0.0 if a - 1e-6 <= t <= b + 1e-6 else min(abs(t - a), abs(t - b))
-        k = min(range(1, len(c.pieces)), key=_dist)
-        self._heal(c.order, [k])
+            hits = [j for j in joins if lo - 1e-6 <= j[1] and j[0] <= hi + 1e-6]
+            if not hits:
+                self.status.config(fg=SUB, text="Nothing to heal in the "
+                                   "highlight: it has no cut or join between "
+                                   "pulls in it.")
+                return
+        else:
+            t = self.insert
+            reach = HEAL_PX / self.pps
+            near = [(0.0 if a - 1e-6 <= t <= b + 1e-6 else
+                     min(abs(t - a), abs(t - b)), (a, b, w))
+                    for a, b, w in joins]
+            near = [n for n in near if n[0] <= reach]
+            if not near:
+                self.status.config(fg=SUB, text="Nothing to heal here: put the "
+                                   "insertion point on a cut, or where one pull "
+                                   "meets the next.")
+                return
+            hits = [min(near, key=lambda n: n[0])[1]]
+        cuts, pulls = {}, []
+        for _a, _b, w in hits:
+            if w[0] == "cut":
+                cuts.setdefault(w[1], []).append(w[2])
+            else:
+                pulls.append((w[1], w[2]))
+        done = 0
+        for order, ks in cuts.items():
+            done += self._heal(order, ks)
+        done += self._heal_pulls(pulls)
+
+    def _heal_pulls(self, pairs):
+        """Where one pull meets the next in the same recording: the first
+        now runs on to exactly where the next comes in, and nothing is put
+        between them, so the two play as one stretch of the recording.  An
+        overlap (the same words at the end of one and the start of the
+        next, heard twice) is taken off the first; tape cut out between
+        them comes back.  Not across recordings, nor back in one (a
+        pickup), nor across more than EXCISED_MAX_S of tape.  One undo
+        step for all of them.  Returns how many were healed."""
+        edits, gaps_after, why = {}, {}, None
+        for po, no in pairs:
+            p, n = self._clip(po), self._clip(no)
+            if p is None or n is None or not p.segments or not n.segments:
+                continue
+            if p.play_path != n.play_path:
+                why = "those two pulls come from different recordings"
+                continue
+            a_last, b_in = p.segments[-1], n.segments[0][0]
+            if b_in <= a_last[0] + MIN_SEG_S or b_in - a_last[1] > EXCISED_MAX_S:
+                why = ("the next pull comes in before this one's last region "
+                       "-- a pickup from earlier in the read" if b_in <= a_last[0]
+                       else "too much tape between them")
+                continue
+            segs = list(edits.get(po, (p.segments, p.seg_gaps))[0])
+            segs[-1] = (segs[-1][0], b_in)
+            edits[po] = (segs, list(p.seg_gaps))
+            gaps_after[po] = 0.0
+        if not edits:
+            if why and pairs:
+                self.status.config(fg=SUB, text="Nothing to heal there: " + why)
+            return 0
+        self.app._assembly_edit_many(edits, gaps_after=gaps_after)
+        self.refresh()
+        self.status.config(fg=TEXT, text="{} join{} between pulls healed: "
+                           "they run on as one stretch of the recording".format(
+                               len(edits), "" if len(edits) == 1 else "s"))
+        return len(edits)
 
     def accept_next(self):
         """Ctrl+Enter: accept the pull on show as it is, and on to the next

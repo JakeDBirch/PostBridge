@@ -179,7 +179,7 @@ def test_playback_skips_the_surrounding_audio_unless_shift_s_says_hear_it(view, 
     assert p.segments is None and not assembly_view._MONITOR["skip_cuts"]
     # ...and the audio composed now has the cut audio in it.
     assert any(o == 1 and abs(si - 11.0) < 1e-6
-               for _st, _du, o, si in win.audio._index[1])
+               for _st, _du, o, si, _fi, _fo in win.audio._index[1])
     win.player = None
 
 
@@ -307,7 +307,7 @@ def test_h_heals_a_split_too_and_drops_its_silence(view):
     _res(app, 1)["segments"] = [(10.0, 12.0), (12.0, 14.0)]
     _res(app, 1)["seg_gaps"] = [0.4]
     win.refresh()
-    win.set_insert(0.5)                           # inside the first region
+    win.set_insert(2.2)                           # in the silence at the split
     win.heal()
     r = _res(app, 1)
     assert [tuple(s) for s in r["segments"]] == [(10.0, 14.0)]
@@ -491,3 +491,50 @@ def test_enter_while_playing_carries_on_from_the_same_moment(view):
     finally:
         win._playing = False
         win.player = None
+
+
+def test_h_far_from_any_join_changes_nothing(view):
+    app, win = view
+    _cut_one(app, win)                            # join at 1.0
+    win.pps = 100.0
+    win.set_insert(2.5)                           # 150 px from it
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 11.0), (12.0, 14.0)]
+    assert "Nothing to heal here" in win.status.cget("text")
+
+
+def test_h_heals_an_overlap_where_one_pull_meets_the_next(view):
+    """A read carried straight from one paragraph into the next: pull 1's
+    tail runs over the words pull 2 starts with, heard twice."""
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 20.6)]
+    _res(app, 2)["segments"] = [(20.0, 22.0)]
+    win.refresh()
+    win.set_insert(win._clip(2).start)            # on the seam
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 20.0)]
+    assert [tuple(s) for s in _res(app, 2)["segments"]] == [(20.0, 22.0)]
+    assert _res(app, 1)["gap_after_s"] == 0.0     # nothing put between them
+    win.refresh()
+    assert win._clip(2).start == pytest.approx(win._clip(1).end)
+
+
+def test_h_brings_back_the_tape_between_two_pulls(view):
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 14.0)]     # pull 2 is 20-22: 6 s cut
+    win.refresh()
+    c1, c2 = win._clip(1), win._clip(2)
+    win._range = (1, c1.end - 0.2, c2.start + 0.2)
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 20.0)]
+    assert _res(app, 1)["gap_after_s"] == 0.0
+
+
+def test_h_leaves_a_pickup_from_earlier_in_the_read(view):
+    app, win = view
+    _res(app, 2)["segments"] = [(5.0, 7.0)]       # earlier than pull 1
+    win.refresh()
+    win.set_insert(win._clip(2).start)
+    win.heal()
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == [(10.0, 14.0)]
+    assert "pickup" in win.status.cget("text")

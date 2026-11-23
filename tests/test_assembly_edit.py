@@ -29,6 +29,7 @@ WAV = os.path.join(ROOT, "tests", "_no_such_guest.wav")   # never loaded
 _APP_METHODS = ("_s4_snapshot", "_s4_undo_snapshot", "_s4_apply_state",
                 "_s4_apply_state_rows", "_s4_push_undo", "_s4_undo", "_s4_redo",
                 "_assembly_set_default_gap",
+                "_assembly_set_default_fade", "_assembly_set_edge_fades",
                 "_assembly_set_segments", "_assembly_set_gap",
                 "_assembly_set_markers", "_s4_open_editor",
                 "_s4_editor_markers_changed", "_s4_editor_clip", "_s4_editor_source", "_assembly_set_reading",
@@ -104,6 +105,7 @@ def view(monkeypatch):
     app.results = _results()
     app.parts, app._monolog = [], False
     app.gap_var = _Var(0.5)
+    app.fade_var = _Var(0.0)
     app.REVIEW_STATUSES = ("review",)
     app._seq_fps = FPS
     app._pool, app.vo_bins = _Pool(), {}

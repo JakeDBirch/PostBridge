@@ -6120,8 +6120,87 @@ def realign_seg_gaps(old_segments, seg_gaps, new_segments):
     return out if any(g > 0 for g in out) else None
 
 
+def _edge_fade_entry(res, side, t):
+    """The fade set on a pull's own edge at source time t, if it has one:
+    the nearest of res["fades"] on that side within FADE_PIN_S."""
+    best = None
+    for m in res.get("fades") or ():
+        try:
+            if m.get("side") != side:
+                continue
+            d = abs(float(m["src"]) - float(t))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if d <= FADE_PIN_S and (best is None or d < best[0]):
+            best = (d, m)
+    return best[1] if best else None
+
+
+def edge_fade(res, side, t, default=0.0):
+    """Seconds of fade on a pull's edge: `side` is "in" or "out", t the
+    edge's source time.  A fade set on that edge by hand
+    (res["fades"]: [{"side", "src", "len"}]) rides with it while the edge
+    stays within FADE_PIN_S of where it was set -- a trim keeps it, a
+    different cut starts from the default again."""
+    m = _edge_fade_entry(res, side, t)
+    try:
+        return max(0.0, min(FADE_MAX, float(m["len"]))) if m else \
+            max(0.0, float(default or 0.0))
+    except (KeyError, TypeError, ValueError):
+        return max(0.0, float(default or 0.0))
+
+
+def set_edge_fade(res, side, t, length):
+    """Give a pull's edge its own fade (seconds), or with None hand it
+    back to the default.  Returns True when anything changed."""
+    old = _edge_fade_entry(res, side, t)
+    fades = [m for m in res.get("fades") or () if m is not old]
+    if length is not None:
+        length = round(max(0.0, min(FADE_MAX, float(length))), 4)
+        fades.append({"side": side, "src": round(float(t), 4), "len": length})
+    changed = (old is not None) if length is None else (
+        old is None or abs(float(old.get("len", -1)) - length) > 1e-6
+        or abs(float(old.get("src", 0)) - float(t)) > 1e-4)
+    if fades:
+        res["fades"] = fades
+    else:
+        res.pop("fades", None)
+    return changed
+
+
+def join_fades(pieces, fades, file_room=None):
+    """What each join on one track gets, from its clips in timeline order.
+
+    pieces : [(timeline start, length, source in)] in samples.
+    fades  : [(fade in, fade out)] per piece, samples.
+    file_room : optional f(i) -> samples of tape after piece i's out.
+
+    Returns len(pieces) + 1 joins, join i being the one before piece i:
+      ("x", half)     two pieces butt: a crossfade centred on the cut that
+                      reaches `half` samples into each side's tape past it;
+      ("f", out, in)  silence between (or a butt join with no fade or no
+                      tape to cross): the fade out before it, the fade in
+                      after it.
+    A fade never takes more than a quarter of its piece.
+    """
+    joins = []
+    for i in range(len(pieces) + 1):
+        a = pieces[i - 1] if i else None
+        b = pieces[i] if i < len(pieces) else None
+        f_out = min(fades[i - 1][1], a[1] // 4) if a else 0
+        f_in  = min(fades[i][0], b[1] // 4) if b else 0
+        if a and b and a[0] + a[1] == b[0]:
+            room = file_room(i - 1) if file_room else max(f_out, f_in)
+            half = min(max(fades[i - 1][1], fades[i][0]) // 2,
+                       a[1] // 4, b[1] // 4, b[2], max(0, room))
+            joins.append(("x", half) if half > 0 else ("f", 0, 0))
+        else:
+            joins.append(("f", f_out, f_in))
+    return joins
+
+
 def layout_timeline(results, gap_secs, sr, int_assets,
-                    progress_cb=None, check_cancel=None):
+                    progress_cb=None, check_cancel=None, fade_secs=0.0):
     """Where every pull lands on the sequence timeline, in samples at `sr`.
 
     The single source of truth for placement: build_aaf writes clips at
@@ -6135,7 +6214,9 @@ def layout_timeline(results, gap_secs, sr, int_assets,
 
     Returns (placed, skipped, part_starts):
       placed      : [{"res", "segments", "seg_gaps", "paths", "pieces",
-                      "start", "end", "gap"}] in timeline order.  "res" is
+                      "fades", "start", "end", "gap"}] in timeline order.
+                      "fades" is [(fade in, fade out)] per piece, samples:
+                      each edge's own (edge_fade), else fade_secs.  "res" is
                       the caller's own dict; "segments" may be capped (see
                       below); "seg_gaps" is the silence (s) at each of
                       their joins; "pieces" is [(tl_start_sa, dur_sa,
@@ -6246,6 +6327,10 @@ def layout_timeline(results, gap_secs, sr, int_assets,
                 if (entry["segments"] and res.get("gap_after", True)) else 0
         entry["end"] = cursor
         entry["gap"] = gap
+        entry["fades"] = [
+            (s2sa(edge_fade(res, "in", a, fade_secs)),
+             s2sa(edge_fade(res, "out", b, fade_secs)))
+            for a, b in entry["segments"]][:len(entry["pieces"])]
         cursor += gap
         placed.append(entry)
 
@@ -6338,8 +6423,10 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     (see place_markers); an empty one is left out.  Each is
     named silent clips, since Pro Tools ignores AAF markers on import.
 
-    fade_secs: with a length, every clip edge carries a fade that long (an
-    AAF Transition holding a mono audio dissolve): a fade-in where a clip
+    fade_secs: the cut's default fade.  Every clip edge carries a fade
+    that long, or its own where one was set in the Assembly view
+    (edge_fade) -- an AAF Transition holding a mono audio dissolve, which
+    Pro Tools imports as a fade: a fade-in where a clip
     follows silence, a fade-out where silence follows it, and where two
     clips butt -- the cuts inside a pull -- a crossfade centred on the cut,
     which plays half its length of each side's tape past the cut.  No clip
@@ -6446,19 +6533,21 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     # slots: (filepath, start_sa, dur_sa, src_in_sa, track_name)
     slots       = []
     slot_orders = []  # parallel to slots: the result "order" each slot came from
+    slot_fades  = []  # parallel to slots: (fade in, fade out), samples
 
     placed, skipped, part_starts = layout_timeline(
         results, gap_secs, sr, int_assets,
-        progress_cb=_prog, check_cancel=_check_cancel)
+        progress_cb=_prog, check_cancel=_check_cancel, fade_secs=fade_secs)
 
     for entry in placed:
         res = entry["res"]
 
         # ── Track assignment ──────────────────────────────────────────────────
         if res.get("is_vo", False):
-            for st_sa, dur_sa, src_in in entry["pieces"]:
+            for (st_sa, dur_sa, src_in), fd in zip(entry["pieces"], entry["fades"]):
                 slots.append((entry["paths"][0], st_sa, dur_sa, src_in, "VO"))
                 slot_orders.append(res["order"])
+                slot_fades.append(fd)
             continue
         if res.get("token", "").lower() == HOST_LC:
             # All host lines share a single track (e.g. all JORDAN questions)
@@ -6475,7 +6564,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
         host_paths, guest_paths = split_host_guest(entry["paths"])
         _shift = dict(zip(entry["paths"], entry.get("starts") or []))
 
-        for st_sa, dur_sa, src_in in entry["pieces"]:
+        for (st_sa, dur_sa, src_in), fd in zip(entry["pieces"], entry["fades"]):
             # Each non-host file → its own track.  Primary file uses the
             # token name; additional files spill to "TOKEN (2)", … — not
             # TOKEN_2, which collided with a real token named ADAM_2.
@@ -6484,11 +6573,13 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
                 slots.append((gp, st_sa, dur_sa, src_in + _shift.get(gp, 0),
                               track_name))
                 slot_orders.append(res["order"])
+                slot_fades.append(fd)
             # All host-named files → shared JORDAN track
             for hp in host_paths:
                 slots.append((hp, st_sa, dur_sa, src_in + _shift.get(hp, 0),
                               HOST_NAME.upper()))
                 slot_orders.append(res["order"])
+                slot_fades.append(fd)
 
     # ── Overlap guard ─────────────────────────────────────────────────────────
     # A track holds one clip at a time.  The writer below can only append,
@@ -6516,6 +6607,7 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
     marks = place_markers(placed, sr)
     if only_orders is not None:
         _keep = set(only_orders)
+        slot_fades = [fd for fd, o in zip(slot_fades, slot_orders) if o in _keep]
         slots = [sl for sl, o in zip(slots, slot_orders) if o in _keep]
         part_starts = {}
         marks = []
@@ -6698,30 +6790,20 @@ def build_aaf(results, int_assets, vo_bins, parts, seq_name, gap_secs,
 
         _prog("Writing AAF timeline ({} clips)…".format(len(slots)))
 
-        fade_sa = max(0, s2sa(fade_secs or 0.0))
-        dissolve = _aaf_dissolve_maker(f) if fade_sa else None
+        dissolve = _aaf_dissolve_maker(f) \
+            if any(a or b for a, b in slot_fades) else None
 
-        by_track = {}
-        for sl in slots:
+        by_track, fades_by_track = {}, {}
+        for sl, fd in zip(slots, slot_fades):
             by_track.setdefault(sl[4], []).append(sl)
+            fades_by_track.setdefault(sl[4], []).append(fd)
 
         for track_name, clips in by_track.items():
             seq = track_seqs[track_name]
-            # What each join gets: ("x", half) a crossfade that reaches
-            # `half` samples either side of the cut, ("f", out, in) a fade
-            # out and a fade in around silence (or a hard cut: 0, 0).
-            joins = []
-            for i in range(len(clips) + 1):
-                a = clips[i - 1] if i else None
-                b = clips[i] if i < len(clips) else None
-                f_out = min(fade_sa, a[2] // 4) if a else 0
-                f_in  = min(fade_sa, b[2] // 4) if b else 0
-                if a and b and a[1] + a[2] == b[1]:
-                    half = min(fade_sa // 2, a[2] // 4, b[2] // 4, b[3],
-                               max(0, file_lens.get(a[0], 0) - (a[3] + a[2])))
-                    joins.append(("x", half) if half > 0 else ("f", 0, 0))
-                else:
-                    joins.append(("f", f_out, f_in))
+            joins = join_fades(
+                [(c[1], c[2], c[3]) for c in clips], fades_by_track[track_name],
+                lambda i, clips=clips: file_lens.get(clips[i][0], 0)
+                - (clips[i][3] + clips[i][2]))
 
             prev_end = 0
             for i, (filepath, start_sa, dur_sa, src_in_sa, _tn) in enumerate(clips):

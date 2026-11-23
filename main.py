@@ -217,6 +217,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self.seq_name   = tk.StringVar()
         self.out_path   = tk.StringVar()
         self.gap_var    = tk.DoubleVar(value=DEFAULT_GAP)
+        self.fade_var   = tk.DoubleVar(value=DEFAULT_FADE)   # seconds
         self.pad_var    = tk.IntVar(value=PAD_SECS)
 
         self._load_prefs()
@@ -1901,6 +1902,17 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if getattr(self, "_pending_results", None) is not None:
             self.results = self._with_part_titles(self._pending_results)
             del self._pending_results
+            if self._monolog:
+                # Saved before monolog.reconcile stopped one paragraph's
+                # tail running over the next one's start: those words were
+                # heard twice.  Ending it where the next comes in is all.
+                _n = monolog._no_overlap(self.results)
+                if _n:
+                    self._log_line("Monolog: {} pull{} ended where the next "
+                                   "comes in -- {} tail ran over the next "
+                                   "one's first words".format(
+                                       _n, "" if _n == 1 else "s",
+                                       "its" if _n == 1 else "their"))
             self.after(50, self._step4)
         elif getattr(self, "_pending_mark_saved", False):
             # Opened a session that lands at Step 2 (no saved Step 4
@@ -2636,6 +2648,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             # Assembly track (see engines.kept_segments)
             if r.get("seg_gaps"):
                 entry["seg_gaps"] = list(r["seg_gaps"])
+            # Fades set on the pull's own edges (see engines.edge_fade)
+            if r.get("fades"):
+                entry["fades"] = [dict(m) for m in r["fades"]]
             # Persist VO takes_data so edited segments survive save/load cycles
             if r.get("is_vo") and r.get("takes_data"):
                 entry["takes_data"] = r["takes_data"]
@@ -2738,6 +2753,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         """
         if "_default_gap" in snap:
             self.gap_var.set(snap["_default_gap"])
+        if "_default_fade" in snap:
+            self.fade_var.set(snap["_default_fade"])
         inc = getattr(self, "_s4_increment_confirmed", lambda s="": None)
         dec = getattr(self, "_s4_decrement_confirmed", lambda s="": None)
         _was_building     = getattr(self, "_s4_building", False)
@@ -2785,6 +2802,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                 r["seg_gaps"] = entry["seg_gaps"]
             elif "seg_gaps" in r:
                 del r["seg_gaps"]
+            if "fades" in entry:
+                r["fades"] = [dict(m) for m in entry["fades"]]
+            elif "fades" in r:
+                del r["fades"]
             # Restore VO takes_data (keeps edited per-take segments in sync)
             if "takes_data" in entry and r.get("is_vo"):
                 r["takes_data"] = entry["takes_data"]
@@ -2818,6 +2839,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         state sidecar, the edits diff) expect one entry per pull."""
         snap = dict(self._s4_snapshot())
         snap["_default_gap"] = float(self.gap_var.get())
+        snap["_default_fade"] = float(self.fade_var.get())
         return snap
 
     def _s4_push_undo(self):
@@ -3867,6 +3889,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             "video_off": self._pool.video_off() if self._pool else False,
             "pad":       self.pad_var.get(),
             "gap":       self.gap_var.get(),
+            "fade":      self.fade_var.get(),
         }
         # Embed match results so the file is self-contained and restores to Step 4
         if getattr(self, "results", None):
@@ -4621,6 +4644,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             self.pad_var.set(data["pad"])
         if "gap" in data:
             self.gap_var.set(data["gap"])
+        # A session from before fades keeps the cuts it was checked with.
+        self.fade_var.set(data.get(
+            "fade", 0.0 if data.get("results") else DEFAULT_FADE))
 
         self._load_script(script_path)
 
@@ -9360,6 +9386,34 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         self.gap_var.set(gap_s)
         self._s4_save()
 
+    def _assembly_set_default_fade(self, fade_s):
+        """The cut's default fade -- the fade at every cut edge that has
+        none of its own (engines.edge_fade) -- set from the Assembly view,
+        as one undo step.  Saved with the session as "fade"."""
+        fade_s = round(max(0.0, min(FADE_MAX, float(fade_s))), 4)
+        if abs(fade_s - float(self.fade_var.get())) < 1e-6:
+            return
+        self._s4_push_undo()
+        self.fade_var.set(fade_s)
+        self._s4_save()
+
+    def _assembly_set_edge_fades(self, edges, fade_s):
+        """Give cut edges their own fade (seconds), or with None hand them
+        back to the default, as one undo step.  `edges` is
+        [(order, "in" | "out", source time)] -- both sides of a cut."""
+        rows = {r.get("order"): r for r in self.results}
+        todo = [(rows[o], side, t) for o, side, t in edges if o in rows]
+        if not todo:
+            return
+        probe = [engines.set_edge_fade(dict(r, fades=list(r.get("fades") or ())),
+                                       side, t, fade_s) for r, side, t in todo]
+        if not any(probe):
+            return
+        self._s4_push_undo()
+        for r, side, t in todo:
+            engines.set_edge_fade(r, side, t, fade_s)
+        self._s4_save()
+
     def _assembly_set_gap(self, order, gap_s):
         """The silence after a pull, set from the Assembly track.  Lives on
         the result as gap_after_s, which the build and Step 4's undo
@@ -10208,6 +10262,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             return
 
         gap_secs = self.gap_var.get()
+        fade_secs = self.fade_var.get()
         parts    = list(self.parts)
         vo_takes = dict(getattr(self, "_vo_takes_by_part", {}))
 
@@ -10250,7 +10305,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                     vo_takes_with_offset=vo_takes,
                     out_path=out_path,
                     progress_cb=_set_status,
-                    only_orders={order})
+                    only_orders={order},
+                    fade_secs=fade_secs)
                 self._ui(_done)
             except Exception as e:
                 self._ui(lambda e=e: _done(e))
@@ -10288,6 +10344,7 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
 
         seq_name = self.seq_name.get()
         gap_secs = self.gap_var.get()
+        fade_secs = self.fade_var.get()
         out_path = self.out_path.get()
         is_aaf   = self._is_aaf_mode()
         fmt      = "AAF" if is_aaf else "XML"
@@ -10393,7 +10450,8 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                         vo_takes_with_offset=vo_takes,
                         out_path=out_path,
                         progress_cb=_set_status,
-                        cancel_event=cancel_evt)
+                        cancel_event=cancel_evt,
+                        fade_secs=fade_secs)
                     report_path = None
                 else:
                     _set_status("Building XML…")

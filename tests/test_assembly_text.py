@@ -110,6 +110,7 @@ def view(monkeypatch):
     app.results = _results()
     app.parts, app._monolog = [], False
     app.gap_var = _Var(0.5)
+    app.fade_var = _Var(0.0)
     app.REVIEW_STATUSES = ("review",)
     app._seq_fps = 24.0
     app._pool, app.vo_bins = _Pool(), {}
