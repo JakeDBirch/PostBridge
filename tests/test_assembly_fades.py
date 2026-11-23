@@ -194,3 +194,101 @@ def test_a_cut_inside_a_pull_sets_both_its_sides(view):  # noqa: F811
     win._cut_fade_from_box()
     assert win._clip(1).fades == [pytest.approx((0.0, 0.060)),
                                   pytest.approx((0.060, 0.0))]
+
+
+# ── F, and the handles on the track ──────────────────────────────────────────
+
+from test_assembly_edit import _Ev, _key  # noqa: E402
+
+
+def _fade_of(app, order, side):
+    return [m["len"] for m in _res(app, order).get("fades", ()) if m["side"] == side]
+
+
+def test_f_fades_out_a_region_end_under_the_highlight(view):  # noqa: F811
+    app, win = view
+    win._range = (1, 3.5, 4.2)                  # pull 1 ends at 4.0
+    _key(app, win.cv, "f")
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.5)]
+    assert _fade_of(app, 1, "in") == []
+    assert win._clip(1).shapes[0][1] == ("f", pytest.approx(0.5))
+
+
+def test_f_across_a_butt_cut_makes_a_crossfade_the_highlights_length(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 11.0), (12.0, 14.0)]
+    win.refresh()
+    win._range = (1, 0.9, 1.2)                  # the cut is at 1.0
+    win.apply_fade()
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.3)]
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.3)]
+    c = win._clip(1)
+    assert c.shapes[0][1] == ("x", pytest.approx(0.15))
+    assert c.shapes[1][0] == ("x", pytest.approx(0.15))
+
+
+def test_f_across_a_gap_fades_out_and_in_as_one_undo(view):  # noqa: F811
+    app, win = view
+    win._range = (1, 3.8, 4.8)                  # pull 1 ends 4.0, pull 2 starts 4.5
+    win.apply_fade()
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.2)]
+    assert _fade_of(app, 2, "in") == [pytest.approx(0.3)]
+    app._s4_undo()
+    assert "fades" not in _res(app, 1) and "fades" not in _res(app, 2)
+
+
+def test_f_with_nothing_to_fade_changes_nothing(view):  # noqa: F811
+    app, win = view
+    undo = len(app._s4_undo_stack)
+    win._range = None
+    win.apply_fade()
+    win._range = (1, 1.0, 2.0)                  # inside one region
+    win.apply_fade()
+    assert "fades" not in _res(app, 1) and len(app._s4_undo_stack) == undo
+
+
+def test_a_fade_handle_sits_on_each_top_corner_and_drags(view):  # noqa: F811
+    app, win = view
+    win.restore_view(100.0, 0.0, 0.0) if hasattr(win, "restore_view") else None
+    win.redraw()
+    y0, _y1 = win._track_box()
+    c = win._clip(1)
+    x_in = win._x(c.start)
+    kind, hc, hk = win._hit(x_in + 4, y0 + 6)
+    assert (kind, hc.order, hk) == ("fade", 1, (0, "in"))
+    # Further down the same edge is still the trim.
+    assert win._hit(x_in + 2, y0 + 60)[0] == "in"
+    # Drag the corner handle half a second into the region.
+    win._on_track_press(_Ev(x_in + 4, y0 + 6))
+    win._on_track_drag(_Ev(x_in + 0.5 * win.pps, y0 + 6))
+    assert win._clip(1).shapes[0][0] == ("f", pytest.approx(0.5, abs=0.02))  # live
+    assert "fades" not in _res(app, 1)                                    # not yet
+    win._on_track_release(_Ev(x_in + 0.5 * win.pps, y0 + 6))
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.5, abs=0.02)]
+    # The handle is now at the fade's end; dragging it back to the edge
+    # takes the fade away again (its own: none).
+    hx = win._x(c.start + _fade_of(app, 1, "in")[0])
+    assert win._hit(hx, y0 + 6)[0] == "fade"
+    win._on_track_press(_Ev(hx, y0 + 6))
+    win._on_track_drag(_Ev(x_in - 30, y0 + 6))
+    win._on_track_release(_Ev(x_in - 30, y0 + 6))
+    assert _fade_of(app, 1, "in") == [0.0]
+
+
+def test_dragging_a_crossfade_handle_sets_both_sides(view):  # noqa: F811
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 11.0), (12.0, 14.0)]
+    app.fade_var.set(0.100)
+    win.refresh()
+    win.restore_view(100.0, 0.0, 0.0)
+    win.redraw()
+    y0, _y1 = win._track_box()
+    cut = win._x(1.0)
+    hx = win._x(1.0 + 0.05)                     # half of 100 ms, right side
+    kind, hc, hk = win._hit(hx, y0 + 6)
+    assert (kind, hk) == ("fade", (1, "in"))
+    win._on_track_press(_Ev(hx, y0 + 6))
+    win._on_track_drag(_Ev(cut + 0.2 * win.pps, y0 + 6))
+    win._on_track_release(_Ev(cut + 0.2 * win.pps, y0 + 6))
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.4, abs=0.03)]
+    assert _fade_of(app, 1, "out") == [pytest.approx(0.4, abs=0.03)]
