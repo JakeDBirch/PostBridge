@@ -813,20 +813,22 @@ def test_a_cut_keeps_its_crossfade_with_the_surrounding_audio_shown(view):
 
 # ── Tab to the next region; Ctrl+K for pre-roll ──────────────────────────
 
-def test_tab_goes_to_the_next_region_and_shift_tab_back(view):
+def test_tab_goes_to_the_next_edit_boundary_and_shift_tab_back(view):
     app, win = view
-    _cut_one(app, win)                            # regions at 0, 1 (pull 1), 3.5 (pull 2)
+    _cut_one(app, win)                  # pull 1: 0-1, 1-3; pull 2 from 3.5
+    end2 = win._clip(2).end
     win.set_insert(0.2)
-    win._on_key(_KeyEv(win.cv, "Tab", 0))
-    assert win.insert == pytest.approx(1.0)
-    win._on_key(_KeyEv(win.cv, "Tab", 0))
-    assert win.insert == pytest.approx(win._clip(2).start) and win.sel_order == 2
-    win._on_key(_KeyEv(win.cv, "Tab", 0))         # nothing after: stays
-    assert win.insert == pytest.approx(win._clip(2).start)
-    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
-    assert win.insert == pytest.approx(1.0) and win.sel_order == 1
-    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
-    assert win.insert == pytest.approx(win._clip(1).start)
+    went = []
+    for _n in range(5):
+        win._on_key(_KeyEv(win.cv, "Tab", 0))
+        went.append((round(win.insert, 3), win.sel_order))
+    assert went == [(1.0, 1), (3.0, 1), (3.5, 2), (round(end2, 3), 2),
+                    (round(end2, 3), 2)]          # nothing after: stays
+    back = []
+    for _n in range(4):
+        win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
+        back.append(round(win.insert, 3))
+    assert back == [3.5, 3.0, 1.0, 0.0]
 
 
 def test_tab_stops_at_pull_starts_with_the_surrounding_audio_shown(view):

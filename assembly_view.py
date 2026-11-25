@@ -5952,12 +5952,14 @@ class AssemblyWindow(object):
 
     def next_region(self, direction):
         """Tab / Shift+Tab: the insertion point to the start of the next (or
-        previous) region on the track -- the next stretch of audio, in this
-        pull or the next -- or of a pull, both ways.  The view follows it."""
+        previous) edit boundary on the track: a region's start or end, in
+        this pull or the next, or a pull's start.  The view follows it."""
         if self.view == "source":
             self._neighbour(direction)
             return
         starts = sorted({round(tl, 6) for c in self.clips for tl, _du, _si in c.pieces}
+                        | {round(tl + du, 6) for c in self.clips
+                           for tl, du, _si in c.pieces}
                         | {round(c.start, 6) for c in self.clips})
         if not starts:
             return
@@ -5968,7 +5970,7 @@ class AssemblyWindow(object):
             nxt = next((s for s in reversed(starts) if s < t - 1e-4), None)
         if nxt is None:
             return
-        c = self._clip_at(nxt + 1e-6)
+        c = self._clip_at(nxt + 1e-6) or self._clip_at(nxt - 1e-6)
         if c is not None and c.order != self.sel_order:
             self.select(c.order)
         self.seek(nxt)

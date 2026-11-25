@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: Tab stops at every edit boundary
+- **Tab and Shift+Tab** now stop at the end of each region as well as its start, so they step through every edit boundary on the track, and at each pull's start too.
+
 ### Assembly: edit keys act at the insertion point
 - **A, S, D and G act at the insertion point** (the dotted white line during playback), not the red playhead. While the cut plays, click where the edit goes, then press the key; playback carries on.
 - **Return to start on stop is now Insertion follows playback** (Shift+N), Pro Tools' name, and its light is the other way round.
