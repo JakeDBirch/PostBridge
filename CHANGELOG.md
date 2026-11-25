@@ -9,6 +9,8 @@ Each music marker (in, out or inflection) now shows the time since the music mar
 
 The playhead also shows the time to the nearest music marker, ahead or behind: a dotted line along the lower marker row from the playhead to the marker, with its length beside the playhead on the marker's side. It follows the playhead as it plays or moves, and disappears when the playhead is on the marker.
 
+Each part flag also shows the time from the last music marker before it to the part's start, in the part row just ahead of the flag. A part with no music marker since the part before shows none.
+
 ### Assembly: every edit shows its surrounding audio
 - **Show surrounding audio now opens up every edit inside a pull.** Before, a jump of more than 30 seconds in the recording, or a jump back (a retake or double start), stayed closed. Each now shows a 3-second handle either side: the tape that runs on after the out, then the tape that leads into the in. Trimming into them with a drag, or with **A** and **S**, works as with any surrounding audio. A or S in the run-on handle extends the region before it, and A or S in the lead-in handle extends the region after it.
 

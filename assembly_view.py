@@ -3273,6 +3273,7 @@ class AssemblyWindow(object):
                                anchor="nw", font=self._font, fill=SUB)
             n += 1
         marks = self.part_marks
+        lead = self._music_to_parts()
         for n, (pt, name) in enumerate(marks):
             x = self._x(pt)
             nxt = self._x(marks[n + 1][0]) if n + 1 < len(marks) else w + 400
@@ -3281,7 +3282,18 @@ class AssemblyWindow(object):
             cv.create_line(x, ls + 4, x, y1, fill=_C_PART, dash=(2, 4))
             cv.create_rectangle(x, ls + 5, x + 6, rh - 3, fill=_C_PART,
                                 outline="")
-            if self._fits(name, nxt - x - 16):
+            d = lead.get(n)
+            if d is not None and self._measure(d[1]) + 12 <= x - self._x(d[0]):
+                # From the last music marker to this part, just ahead of
+                # its flag.
+                cv.create_text(x - 4, ls + 4, text=d[1], anchor="ne",
+                               font=self._font, fill=_C_MUSIC,
+                               tags=("partdur",))
+            room = nxt - x - 16
+            d = lead.get(n + 1)
+            if d is not None:            # the next part's time wins over this name
+                room = min(room, nxt - x - 24 - self._measure(d[1]))
+            if self._fits(name, room):
                 cv.create_text(x + 10, ls + 4, text=name, anchor="nw",
                                font=self._font, fill=TEXT)
         self._draw_marks(w, y1)
@@ -3681,6 +3693,20 @@ class AssemblyWindow(object):
     @staticmethod
     def _mark_colour(m):
         return {"sfx": _C_SFX, "note": _C_NOTE}.get(m["kind"], _C_MUSIC)
+
+    def _music_to_parts(self):
+        """{n: (t, "8s")} -- for part n, the time from the last music
+        marker before it (after the part in front) to its start."""
+        music = sorted(m["t"] for m in self.markers
+                       if m["kind"].startswith("music"))
+        out = {}
+        prev = None
+        for n, (pt, _name) in enumerate(self.part_marks):
+            i = bisect.bisect_left(music, pt) - 1
+            if i >= 0 and (prev is None or music[i] > prev) and pt - music[i] > 1e-3:
+                out[n] = (music[i], _fmt_dur(pt - music[i]))
+            prev = pt
+        return out
 
     def _music_durations(self):
         """{id(marker): "12s"} -- for each music marker (in, out or

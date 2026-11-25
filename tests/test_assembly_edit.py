@@ -1222,6 +1222,23 @@ def test_the_playhead_shows_the_time_to_the_nearest_music_marker(view):
     assert win.cv.find_withtag("phgap") == ()      # on the marker
 
 
+def test_a_part_shows_the_time_since_the_last_music_marker(view):
+    app, win = view
+    for t in (0.5, 1.5):
+        win.playhead = t
+        win.drop_marker("music_inflection")
+    win.part_marks = [(0.0, "Cold open"), (4.0, "Part 1"), (6.0, "Part 2")]
+    win.pps, win.view0 = 100.0, 0.0
+    win.redraw()
+    texts = [win.cv.itemcget(i, "text") for i in win.cv.find_withtag("partdur")]
+    # Part 1: 2.5 s after the last marker; Part 2 has none since Part 1.
+    assert texts == ["2s"] or texts == ["3s"]
+    assert win._music_to_parts() == {1: (1.5, texts[0])}
+    win.pps = 5.0                              # too tight to read
+    win.redraw()
+    assert win.cv.find_withtag("partdur") == ()
+
+
 def test_ctrl_click_deletes_a_mark(view):
     app, win = view
     win.set_insert(0.5)
