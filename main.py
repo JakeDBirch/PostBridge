@@ -485,7 +485,9 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # the screen -- unless Step 4 is only rebuilding them.
         if self._assembly is not None and not keep_assembly:
             self._assembly.close()
-        self.unbind_all("<MouseWheel>")
+        # The wheel's handler stays (see _wheel_route): it finds the
+        # scrolling frame under the pointer, and another window's frame
+        # -- the script window's -- outlives this screen.
         # <x>/<X> are Step 4's "toggle IGNORE on the active card"
         # shortcut (bound via bind_all in _step4).  They were never
         # unbound here, so after visiting Step 4 once they stayed live
@@ -1171,64 +1173,85 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         # Store so callers can access for programmatic scroll
         self._last_scroll_canvas = canvas
 
-        _wheel_accum   = [0]
-        _wheel_pending = [False]
+        self._wheel_register(canvas)
+        return sf
 
-        def _flush_wheel():
-            _wheel_pending[0] = False
-            n, _wheel_accum[0] = _wheel_accum[0], 0
+    # ── The mouse wheel ──────────────────────────────────────────────────
+    # One handler for the whole app, on the "all" tag: the wheel scrolls
+    # the scrolling frame the POINTER is over, whichever window that is in.
+    # It used to be one handler per _scroll_frame call, each replacing the
+    # last -- so a second scrolling frame (the script window's list of
+    # findings) took the wheel away from the screen behind it until that
+    # screen was rebuilt -- and it went by keyboard focus, so a screen
+    # under the pointer would not scroll while another window had focus.
+    def _wheel_register(self, canvas):
+        frames = self.__dict__.setdefault("_wheel_frames", {})
+        for name in [n for n, st in frames.items()
+                     if not st["canvas"].winfo_exists()]:
+            del frames[name]
+        frames[str(canvas)] = {"canvas": canvas, "accum": 0, "pending": False}
+        self.bind_all("<MouseWheel>", self._wheel_route)
+
+    def _wheel_frame_at(self, x_root, y_root):
+        """The registered scrolling frame under a point on the screen:
+        the nearest one the widget there sits in, or None."""
+        frames = self.__dict__.get("_wheel_frames") or {}
+        if not frames:
+            return None
+        try:
+            # A raw path, not a widget: Tk has helper windows (a combobox's
+            # popdown list) Python never made and cannot look up.
+            path = str(self.tk.call("winfo", "containing", x_root, y_root))
+        except tk.TclError:
+            return None
+        return self._wheel_frame_of(path)
+
+    def _wheel_frame_of(self, path):
+        """The nearest registered scrolling frame a widget (by its Tk
+        path) sits in, or None."""
+        frames = self.__dict__.get("_wheel_frames") or {}
+        if ".popdown" in path:
+            return None                  # a dropdown list scrolls itself
+        while path and path != ".":
+            st = frames.get(path)
+            if st is not None:
+                return st
+            path = path.rsplit(".", 1)[0]
+        return None
+
+    def _wheel_route(self, e):
+        st = self._wheel_frame_at(e.x_root, e.y_root)
+        if st is None:
+            return
+        # macOS uses delta 1/-1 per notch; Windows uses 120/-120
+        units = int(-1 * e.delta) if sys.platform == "darwin" \
+            else int(-1 * (e.delta / 120))
+        # COALESCE.  Windows delivers a wheel event per notch, and a flick
+        # of the wheel lands 5-10 of them in the queue at once.  Scrolling
+        # on each made Tk shift the canvas and repaint the embedded frame
+        # that many times for one gesture -- on a Step 4 with hundreds of
+        # cards, visibly out of step with the pointer.  One yview_scroll
+        # per idle cycle turns a flick into a single shift and repaint.
+        # (And no update_idletasks() here: it repainted mid-scroll, which
+        # is the "ghosts of previous things" artefact.)
+        st["accum"] += units
+        if st["pending"]:
+            return
+        st["pending"] = True
+
+        def _flush(st=st):
+            st["pending"] = False
+            n, st["accum"] = st["accum"], 0
             if not n:
                 return
             try:
-                canvas.yview_scroll(n, "units")
+                st["canvas"].yview_scroll(n, "units")
             except tk.TclError:
                 pass          # canvas destroyed between the notch and the flush
-
-        def _on_wheel(e):
-            # Don't scroll when focus is in a popup (e.g. combobox dropdown).
-            # Wrapped in try/except: Tk's focus_get() raises KeyError on
-            # internal helper widgets like a ttk.Combobox's "popdown" — the
-            # widget name exists in Tk-land but isn't registered in Python
-            # children mappings.  We treat that as "not in our toplevel".
-            try:
-                w = self.focus_get()
-                if w is not None and w.winfo_toplevel() != self:
-                    return
-            except (KeyError, tk.TclError):
-                pass
-            # macOS uses delta 1/-1 per notch; Windows uses 120/-120
-            units = int(-1 * e.delta) if sys.platform == "darwin" else int(-1 * (e.delta / 120))
-            # COALESCE.  Windows delivers a wheel event per notch, and a
-            # single flick of the wheel lands 5-10 of them in the queue at
-            # once.  Scrolling on each one made Tk shift the canvas and
-            # repaint the embedded frame that many times for one gesture —
-            # on a Step 4 with hundreds of cards each repaint is expensive
-            # enough that the frames land visibly out of step with the
-            # pointer, which reads as smeared or "lossy" tracking.
-            # Accumulating the notches and issuing ONE yview_scroll per idle
-            # cycle turns a flick into a single shift + single repaint, and
-            # scrolls exactly as far.
-            _wheel_accum[0] += units
-            if not _wheel_pending[0]:
-                _wheel_pending[0] = True
-                try:
-                    canvas.after_idle(_flush_wheel)
-                except tk.TclError:
-                    _wheel_pending[0] = False
-            # NO update_idletasks() here.  It used to force a synchronous
-            # layout+paint flush on every wheel notch, which:
-            #   * ran the <Configure> handler above, recomputing
-            #     bbox("all") across every card in the frame (200+ on a
-            #     real episode) — per notch;
-            #   * repainted MID-SCROLL, before the canvas had finished
-            #     moving its embedded window, so a partially-updated
-            #     frame reached the screen.  That is the "ghosts of
-            #     previous things overlaying the new things" artefact.
-            # Letting Tk return to its event loop coalesces the scroll
-            # and paints once, coherently.
-
-        self.bind_all("<MouseWheel>", _on_wheel)
-        return sf
+        try:
+            st["canvas"].after_idle(_flush)
+        except tk.TclError:
+            st["pending"] = False
 
     def _make_prefetch_panel(self, parent, paths_list,
                              title="MEDIA FILES",
