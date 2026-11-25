@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: every edit shows its surrounding audio
+- **Show surrounding audio now opens up every edit inside a pull.** Before, a jump of more than 30 seconds in the recording, or a jump back (a retake or double start), stayed closed. Each now shows a 3-second handle either side: the tape that runs on after the out, then the tape that leads into the in. Trimming into them with a drag, or with **A** and **S**, works as with any surrounding audio. A or S in the run-on handle extends the region before it, and A or S in the lead-in handle extends the region after it.
+
 ### Assembly: grab a fade anywhere on its dotted line
 - **A fade or crossfade can be grabbed anywhere along its dotted end line**, top to bottom, not just at the top. When the line sits right beside the region's edge (a very short fade), only its top grabs it, so the edge below still trims. With no fade yet, the region's top corner starts one as before.
 

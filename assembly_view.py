@@ -435,8 +435,10 @@ class _Clip(object):
 def _open_up(placed, part_starts, sr, handle_s=HANDLE_S, max_cut_s=EXCISED_MAX_S):
     """layout_timeline's placement with the excised audio shown: every cut
     inside a pull opened up to show the tape it takes out (up to max_cut_s
-    of it; a longer jump, or one back in the recording, stays closed), and
-    a handle of the recording either side of each pull.  The finished cut
+    of it), and a handle of the recording either side of each pull.  A
+    longer jump, or one back in the recording (a retake, a double start),
+    shows a handle of its own either side instead: what runs on after the
+    out, and what leads into the in.  The finished cut
     keeps its order and its silences; only room is made.
 
     Returns (placed, part_starts, shifts).  Each entry gets "ghosts":
@@ -471,6 +473,17 @@ def _open_up(placed, part_starts, sr, handle_s=HANDLE_S, max_cut_s=EXCISED_MAX_S
                     ghosts.append((pst + pdu + shift, ex, psi + pdu, "cut", k))
                     shifts.append(((pst + pdu) / float(sr), ex / float(sr), False))
                     shift += ex
+                elif ex != 0:
+                    # Not one stretch of tape: the out's run-on, then the
+                    # in's lead-in, each a handle long.
+                    hi = min(H, int(si))
+                    ghosts.append((pst + pdu + shift, H, psi + pdu, "handle", k))
+                    if hi > 0:
+                        ghosts.append((pst + pdu + shift + H, hi, si - hi,
+                                       "handle", k))
+                    shifts.append(((pst + pdu) / float(sr), (H + hi) / float(sr),
+                                   False))
+                    shift += H + hi
             new.append((st + shift, du, si))
         end = e["end"] + shift
         lst, ldu, lsi = pieces[-1]
@@ -5409,6 +5422,17 @@ class AssemblyWindow(object):
                 return
             s = g[2] + (t - g[0])
             k = g[4] if side == "in" else g[4] - 1
+            if not 0 <= k < len(c.pieces):
+                return
+            # A handle belongs to the region its tape runs on from (an out)
+            # or leads into (an in); a cut's tape to both.
+            _tl, du, si = c.pieces[k]
+            if g[3] != "cut" and abs((g[2] + g[1] if side == "in" else g[2])
+                                     - (si if side == "in" else si + du)) > 1e-3:
+                self.status.config(fg=SUB, text="Set {}: that tape leads to the "
+                                   "region on the other side -- use {}.".format(
+                                       side.upper(), "S" if side == "in" else "A"))
+                return
             if not 0 <= k < len(c.pieces):
                 return
         segs = ([list(x) for x in c.segments] if len(c.segments) == len(c.pieces)

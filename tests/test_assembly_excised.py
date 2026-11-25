@@ -54,11 +54,50 @@ def test_finished_cut_time_and_the_opened_up_track_map_both_ways():
     assert _to_cut(4.5, shifts) == 1.0           # in the cut: where it resumes
 
 
-def test_a_long_jump_stays_closed():
+def test_a_long_jump_shows_a_handle_either_side_of_it():
     p = _one_pull()
-    p[0]["pieces"][1] = (1, 2, 200)              # 189 s on: not opened up
+    p[0]["pieces"][1] = (1, 2, 200)              # 189 s on: too long to show
+    placed, _q, shifts = _open_up(p, {}, 1, handle_s=3)
+    e = placed[0]
+    assert e["ghosts"] == [(0, 3, 7, "handle", 0),
+                           (4, 3, 11, "handle", 1),   # the out's run-on
+                           (7, 3, 197, "handle", 1),  # the in's lead-in
+                           (12, 3, 202, "handle", 2)]
+    assert e["pieces"] == [(3, 1, 10), (10, 2, 200)]
+    assert _to_cut(_to_open(1.0, shifts), shifts) == pytest.approx(1.0)
+
+
+def test_a_jump_back_in_the_recording_shows_its_handles_too():
+    p = _one_pull()
+    p[0]["pieces"][1] = (1, 2, 8)                # a retake: back to 8 s
     placed, _q, _s = _open_up(p, {}, 1, handle_s=3)
-    assert [g[3] for g in placed[0]["ghosts"]] == ["handle", "handle"]
+    e = placed[0]
+    assert e["ghosts"][1:3] == [(4, 3, 11, "handle", 1), (7, 3, 5, "handle", 1)]
+    assert e["pieces"][1] == (10, 2, 8)
+
+
+def test_a_and_s_in_a_handle_go_to_its_own_region(view):
+    """In a long jump's handles: the run-on belongs to the out before it,
+    the lead-in to the in after it."""
+    app, win = view
+    _res(app, 1)["segments"] = [(10.0, 11.0), (60.0, 62.0)]
+    win.refresh()
+    win.toggle_excised()
+    c = win._clip(1)
+    run_on, lead_in = [g for g in c.ghosts if g[3] == "handle" and g[4] == 1]
+    win.set_insert(run_on[0] + 0.5)              # 11.5 s of the recording
+    win._on_key(_KeyEv(win.cv, "s", 0))
+    assert [tuple(sg) for sg in _res(app, 1)["segments"]][0] ==         (10.0, pytest.approx(11.5))
+    c = win._clip(1)
+    run_on, lead_in = [g for g in c.ghosts if g[3] == "handle" and g[4] == 1]
+    win.set_insert(lead_in[0] + lead_in[1] - 0.5)   # 59.5 s
+    win._on_key(_KeyEv(win.cv, "a", 0))
+    assert [tuple(sg) for sg in _res(app, 1)["segments"]][1] ==         (pytest.approx(59.5), 62.0)
+    c = win._clip(1)
+    run_on, lead_in = [g for g in c.ghosts if g[3] == "handle" and g[4] == 1]
+    win.set_insert(lead_in[0] + 0.5)
+    win._on_key(_KeyEv(win.cv, "s", 0))          # the wrong side: nothing
+    assert [tuple(sg) for sg in _res(app, 1)["segments"]][0] ==         (10.0, pytest.approx(11.5))
 
 
 def test_kept_spans_are_what_the_ghosts_leave():
