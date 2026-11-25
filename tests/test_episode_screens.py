@@ -270,6 +270,15 @@ def test_episode_saves_like_every_other_screen(app, monkeypatch, project):
         asked[:], closed[:], answer[0] = [], [], None
         app._on_app_close()
         assert asked and not closed
+        # Ctrl+Q is the same close, asked the same question.
+        asked[:] = []
+        assert "_quit_key" in app.bind_all("<Control-q>")
+        assert "_quit_key" in app.bind_all("<Control-Q>")   # Caps Lock
+        assert app._quit_key() == "break"
+        assert asked and not closed
+        answer[0] = False                        # Don't Save
+        app._quit_key()
+        assert closed
     finally:
         del app.destroy
     assert not app._errors, "\n".join(app._errors)

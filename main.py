@@ -258,6 +258,10 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
                       self._quick_save(self._footer_save_btn))
         self.bind_all("<Control-o>",       lambda e: self._open_session())
         self.bind_all("<Control-O>",       lambda e: self._open_session())
+        # Quit, from any window: the same path as the title bar's X, so
+        # the unsaved-work and running-transcription prompts still ask.
+        self.bind_all("<Control-q>",       self._quit_key)
+        self.bind_all("<Control-Q>",       self._quit_key)
         # Step 4 <-> Assembly, like Pro Tools' Edit / Mix toggle (the
         # Assembly window handles its own Ctrl+= to come back here).
         self.bind_all("<Control-equal>",   lambda e: self._step4_to_assembly())
@@ -4055,6 +4059,11 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
         if sig is None:
             return False
         return sig != getattr(self, "_saved_signature", None)
+
+    def _quit_key(self, _e=None):
+        """Ctrl+Q, app-wide: quit exactly as the main window's X does."""
+        self._on_app_close()
+        return "break"
 
     def _on_app_close(self):
         """WM_DELETE_WINDOW handler — prompt to save unsaved work."""
