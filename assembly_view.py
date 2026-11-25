@@ -148,7 +148,10 @@ TX_PARA_CHARS = 600   # a pull with no script starts a new paragraph after this 
 TX_PARA_PAUSE_S = 1.0 # at the next sentence end, or a pause this long without one
 MAX_WORD_S  = 3.0     # how far ahead of a piece a word it keeps could start
 NUDGES      = (0.01, 0.1, 0.5, 1.0)   # seconds
-LAYOUT_V    = 2       # panels' contents changed: a saved layout is fitted afresh
+LAYOUT_V    = 3       # the controls became a palette: no panel dividers kept
+# The palette's sections open to start with (the rest folded to their titles);
+# after that, each stays as it was left (prefs "assembly_palette").
+_PALETTE_OPEN = ("EDIT",)
 EXCISED_MAX_S = 30.0
 CUT_EDGE_PX = 14
 HEAL_CONTINUOUS_S = 0.02   # a pull boundary this close in the recording is one stretch
@@ -171,6 +174,7 @@ _TOKEN_COLOURS = ("#20a080", "#4fc3f7", "#8bc34a", "#e57373", "#ba68c8",
                   "#4db6ac", "#dce775", "#90a4ae", "#a1887f", "#7986cb")
 _C_FLAG     = WARN        # a pull Step 4 still flags for review
 _C_PLAYHEAD = ERR
+_C_PREROLL  = "#8a3232"   # where play will start, the pre-roll ahead: a faint red
 _C_PART     = ACCENT
 _C_CLIP_BG  = SURF
 _C_MUSIC    = match_review.MARK_MUSIC   # the waveform editor draws marks
@@ -1113,11 +1117,30 @@ class AssemblyWindow(object):
             self.text.bind(seq, lambda e: "break")
         self._top.add(script, minsize=200, stretch="always")
 
-        # Control panels, one above the other
-        self._side = tk.PanedWindow(self._top, orient="vertical", bg=BORDER,
-                                    sashwidth=5, bd=0, sashrelief="flat")
+        # The controls: the transport, always there, over a palette of
+        # sections that fold to their titles, scrolling when they run long.
+        self._side = tk.Frame(self._top, bg=BORDER)
         self._top.add(self._side, minsize=180, stretch="never")
+        self._fixed = tk.Frame(self._side, bg=BORDER)
+        self._fixed.pack(side="top", fill="x")
+        pal = tk.Frame(self._side, bg=BORDER)
+        pal.pack(side="top", fill="both", expand=True)
+        self._pal_cv = tk.Canvas(pal, bg=BORDER, highlightthickness=0, bd=0)
+        self._pal_sb = tk.Scrollbar(pal, orient="vertical",
+                                    command=self._pal_cv.yview)
+        self._pal_cv.configure(yscrollcommand=self._pal_sb.set)
+        self._pal_sb.pack(side="right", fill="y")
+        self._pal_cv.pack(side="left", fill="both", expand=True)
+        self._palette = tk.Frame(self._pal_cv, bg=BORDER)
+        self._pal_win = self._pal_cv.create_window(0, 0, window=self._palette,
+                                                   anchor="nw")
+        self._pal_cv.bind("<Configure>", lambda e: self._pal_cv.itemconfigure(
+            self._pal_win, width=e.width))
+        self._palette.bind("<Configure>", lambda e: self._pal_cv.configure(
+            scrollregion=(0, 0, e.width, e.height)))
+        self._sections = {}              # title -> (frame, header, flow)
         self._build_panels()
+        self._bind_palette_wheel(self._pal_cv)
 
         # Track pane: the cut view's track, or the source view, over the
         # status line (_show_view packs one or the other).
@@ -1171,16 +1194,68 @@ class AssemblyWindow(object):
             self.win.bind(seq, lambda e: (self.toggle_script_follow(),
                                           "break")[1])
 
-    def _panel(self, title):
-        """One control panel: a title and its buttons, wrapping to the
-        panel's width."""
-        f = tk.Frame(self._side, bg=SURF)
-        tk.Label(f, text=title, font=(FB[0], 9, "bold"), bg=SURF, fg=SUB,
-                 anchor="w").pack(fill="x", padx=8, pady=(6, 2))
+    def _panel(self, title, fixed=False):
+        """One section of controls: a title and its buttons, wrapping to the
+        width.  In the palette its title folds it away and opens it again
+        (kept in prefs); `fixed`, the transport, is always open."""
+        f = tk.Frame(self._fixed if fixed else self._palette, bg=SURF)
+        f.pack(side="top", fill="x", pady=(0, 1))
+        head = tk.Label(f, text=title, font=(FB[0], 9, "bold"), bg=SURF,
+                        fg=SUB, anchor="w")
+        head.pack(fill="x", padx=8, pady=(6, 2))
         flow = _Flow(f, pad=16, bg=SURF)
-        flow.pack(fill="x", padx=8, pady=(0, 6))
-        self._side.add(f, minsize=self._ls + 12, stretch="always")
+        if fixed:
+            flow.pack(fill="x", padx=8, pady=(0, 6))
+            return flow
+        self._sections[title] = (f, head, flow)
+        head.config(cursor="hand2")
+        head.bind("<Button-1>", lambda _e, t=title: self.toggle_section(t))
+        self._show_section(title, self._section_open(title))
         return flow
+
+    def _section_open(self, title):
+        kept = (self._layout_prefs() or {}).get("assembly_palette")
+        if isinstance(kept, dict) and title in kept:
+            return bool(kept[title])
+        return title in _PALETTE_OPEN
+
+    def _show_section(self, title, on):
+        f, head, flow = self._sections[title]
+        head.config(text=("\u25BE  " if on else "\u25B8  ") + title,
+                    pady=0)
+        if on and not flow.winfo_manager():
+            flow.pack(fill="x", padx=8, pady=(0, 6))
+        elif not on and flow.winfo_manager():
+            flow.pack_forget()
+
+    def toggle_section(self, title):
+        """Open a section of the palette, or fold it to its title."""
+        if title not in self._sections:
+            return
+        on = not self._sections[title][2].winfo_manager()
+        self._show_section(title, on)
+        prefs = self._layout_prefs()
+        if prefs is not None:
+            kept = prefs.get("assembly_palette")
+            kept = dict(kept) if isinstance(kept, dict) else {}
+            kept[title] = on
+            prefs["assembly_palette"] = kept
+            save = getattr(self.app, "_save_prefs", None)
+            if callable(save):
+                save()
+
+    def _bind_palette_wheel(self, w):
+        """The wheel anywhere over the palette scrolls it."""
+        w.bind("<MouseWheel>", self._on_palette_wheel, add="+")
+        for c in w.winfo_children():
+            self._bind_palette_wheel(c)
+
+    def _on_palette_wheel(self, e):
+        top, bottom = self._pal_cv.yview()
+        if top <= 0.0 and bottom >= 1.0:
+            return "break"
+        self._pal_cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
 
     def _build_panels(self):
         """The window's key: every action as a button labelled with its
@@ -1192,11 +1267,7 @@ class AssemblyWindow(object):
             flow.add(b.frame)
             return b
 
-        p = self._panel("SESSION")
-        key(p, "◂  Step 4", "Ctrl+=", self.to_step4)
-        self.save_key = key(p, "Save", "Ctrl+S", self.save)
-
-        p = self._panel("PLAY  ·  MONITOR")
+        p = self._panel("TRANSPORT", fixed=True)
         self.tc_lbl = tk.Label(p, text=_fmt_tc(0), font=_TC_FONT, bg=SURF,
                                fg=TEXT, width=10, anchor="w")
         p.add(self.tc_lbl)
@@ -1212,6 +1283,12 @@ class AssemblyWindow(object):
         self.preroll_key = key(p, "", "Ctrl+K", self.toggle_preroll, toggle=True)
         key(p, "−", "", lambda: self.step_preroll(-1))
         key(p, "+", "", lambda: self.step_preroll(1))
+
+        p = self._panel("SESSION")
+        key(p, "◂  Step 4", "Ctrl+=", self.to_step4)
+        self.save_key = key(p, "Save", "Ctrl+S", self.save)
+
+        p = self._panel("MONITOR")
         self.norm_key = key(p, "Normalize", "", self.toggle_normalize,
                             toggle=True)
         self.return_key = key(p, "Return to start on stop", "Shift+N",
@@ -1314,7 +1391,7 @@ class AssemblyWindow(object):
         # On the panel's title row: it still shows in a panel squeezed thin,
         # and the panel doesn't change height when a pass starts.
         title = p.master.winfo_children()[0]
-        x = tkfont.Font(font=title.cget("font")).measure("TRANSCRIPT") + 20
+        x = tkfont.Font(font=title.cget("font")).measure(title.cget("text")) + 20
         self.refine_bar = _FlatProgressBar(p.master, height=6, bg=SURF)
         self.refine_bar.place(in_=title, x=x, rely=0.5, anchor="w",
                               relwidth=1.0, width=-(x + 8), height=6)
@@ -1371,6 +1448,7 @@ class AssemblyWindow(object):
                      fg=TEXT).pack(side="left", padx=(0, 8))
             self.legend.add(f)
             self._legend_items.append(f)
+        self._bind_palette_wheel(self.legend)
 
     def _layout_prefs(self):
         prefs = getattr(self.app, "_prefs", None)
@@ -1392,28 +1470,8 @@ class AssemblyWindow(object):
             w = max(1, self._top.winfo_width())
             self._outer.sash_place(0, 0, int(h * lay.get("track", 0.42)))
             self._top.sash_place(0, int(w * lay.get("script", 0.6)), 0)
-            self.win.update_idletasks()
-            sh = max(1, self._side.winfo_height())
-            panels = lay.get("panels") or []
-            if len(panels) != len(self._side.panes()) - 1 \
-                    or lay.get("v") != LAYOUT_V:
-                self._fit_panels()
-                return
-            for i, f in enumerate(panels):
-                self._side.sash_place(i, 0, int(sh * f))
         except (tk.TclError, TypeError, ValueError, AttributeError):
             pass
-
-    def _fit_panels(self):
-        """Each control panel as tall as its buttons need at this width (a
-        pane keeps the height it had when added, before they wrapped)."""
-        self.win.update_idletasks()
-        y = 0
-        for i, name in enumerate(self._side.panes()[:-1]):
-            y += self._side.nametowidget(str(name)).winfo_reqheight()
-            self._side.sash_place(i, 0, y)
-            self.win.update_idletasks()
-            y = self._side.sash_coord(i)[1] + int(self._side.cget("sashwidth"))
 
     def _save_layout(self):
         prefs = self._layout_prefs()
@@ -1422,14 +1480,10 @@ class AssemblyWindow(object):
         try:
             h = max(1, self._outer.winfo_height())
             w = max(1, self._top.winfo_width())
-            sh = max(1, self._side.winfo_height())
-            n = len(self._side.panes())
             prefs["assembly_layout"] = {
                 "v":      LAYOUT_V,
                 "track":  self._outer.sash_coord(0)[1] / float(h),
-                "script": self._top.sash_coord(0)[0] / float(w),
-                "panels": [self._side.sash_coord(i)[1] / float(sh)
-                           for i in range(n - 1)]}
+                "script": self._top.sash_coord(0)[0] / float(w)}
         except tk.TclError:
             return
         save = getattr(self.app, "_save_prefs", None)
@@ -3211,6 +3265,8 @@ class AssemblyWindow(object):
         if self._playing:
             xi = self._x(self.insert)
             cv.create_line(xi, 0, xi, y1, fill=TEXT, dash=(3, 3), tags=("ins",))
+        cv.create_line(0, 0, 0, y1, fill=_C_PREROLL, dash=(2, 4), tags=("pre",))
+        self._place_preroll()
         x = self._x(self.playhead)
         cv.create_line(x, 0, x, y1, fill=_C_PLAYHEAD, width=2, tags=("ph",))
         self.tc_lbl.config(text=self._tc_text())
@@ -3810,10 +3866,29 @@ class AssemblyWindow(object):
         return _fmt_tc(self._to_cut_t(self.playhead),
                        3 if self.pps >= ENV_HZ else 1)
 
+    def _place_preroll(self):
+        """The dotted line where play will start, stopped with pre-roll on:
+        the pre-roll ahead of the insertion point, as play() counts it
+        (_preroll_start -- in the finished cut, with the surrounding audio
+        shown and skipped).  None while playing, or with no pre-roll."""
+        y1 = self._track_box()[1]
+        at = None
+        if not self._playing and _MONITOR["preroll_on"]:
+            at = self._preroll_start(self.insert)
+            if at >= self.insert - 1e-6:
+                at = None
+        if at is None:
+            self.cv.itemconfigure("pre", state="hidden")
+            return
+        x = self._x(at)
+        self.cv.coords("pre", x, 0, x, y1)
+        self.cv.itemconfigure("pre", state="normal")
+
     def _move_playhead(self):
         x = self._x(self.playhead)
         y1 = self._track_box()[1]
         self.cv.coords("ph", x, 0, x, y1)
+        self._place_preroll()
         if self.total_s > 0:
             k = max(1, self.ov.winfo_width()) / self.total_s
             self.ov.coords("ph", self.playhead * k, 0, self.playhead * k,
@@ -5821,6 +5896,7 @@ class AssemblyWindow(object):
     def toggle_preroll(self):
         _MONITOR["preroll_on"] = not _MONITOR["preroll_on"]
         self._show_monitor()
+        self._place_preroll()
 
     def step_preroll(self, d):
         cur = _MONITOR["preroll_s"]
@@ -5828,6 +5904,7 @@ class AssemblyWindow(object):
         _MONITOR["preroll_s"] = _PREROLLS[max(0, min(len(_PREROLLS) - 1, i + d))]
         _MONITOR["preroll_on"] = True
         self._show_monitor()
+        self._place_preroll()
 
     def toggle_return(self):
         _MONITOR["return_on"] = not _MONITOR["return_on"]

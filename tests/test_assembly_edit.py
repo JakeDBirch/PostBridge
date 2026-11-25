@@ -371,29 +371,37 @@ def test_step4_and_save_from_the_assembly(view):
 
 def test_panels_wrap_and_the_layout_is_kept(view):
     app, win = view
-    side = win._side
-    flow = win.legend.master.winfo_children()[1]
+    win.toggle_section("MOUSE  ·  SPEAKERS")
+    flow = win.legend
     win._top.sash_place(0, win._top.winfo_width() - 600, 0)
     app.update()
     tall_wide = flow.winfo_reqheight()
     win._top.sash_place(0, win._top.winfo_width() - 200, 0)
     app.update()
     assert flow.winfo_reqheight() > tall_wide       # narrower: it wraps
-    # Every panel opens as tall as its buttons need, where there is room.
-    win._top.sash_place(0, win._top.winfo_width() - 900, 0)
-    app.update()
-    win._fit_panels()
-    app.update()
-    panes = [side.nametowidget(str(n)) for n in side.panes()]
-    if sum(f.winfo_reqheight() + 5 for f in panes) <= side.winfo_height():
-        for f in panes[:-1]:
-            assert f.winfo_height() >= f.winfo_reqheight() - 1
     frac = win._top.sash_coord(0)[0] / float(win._top.winfo_width())
-    n_panes = len(side.panes())
     win.close()
     lay = app._prefs["assembly_layout"]
     assert lay["script"] == pytest.approx(frac, abs=0.01)
-    assert len(lay["panels"]) == n_panes - 1
+    assert app._prefs["assembly_palette"]["MOUSE  ·  SPEAKERS"] is True
+
+
+def test_the_transport_stays_and_the_palette_folds(view):
+    app, win = view
+    assert win.play_key.frame.winfo_ismapped()      # the transport: always there
+    f, head, flow = win._sections["EDIT"]
+    assert flow.winfo_manager()                     # open to start with
+    _f, _h, mon = win._sections["MONITOR"]
+    assert not mon.winfo_manager()                  # folded to its title
+    head.event_generate("<Button-1>")
+    app.update()
+    assert not flow.winfo_manager() and head.cget("text").startswith("▸")
+    assert app._prefs["assembly_palette"]["EDIT"] is False
+    import assembly_view
+    snap = assembly_view._MONITOR["snap"]
+    _key(app, win.cv, "g")                          # folded, its keys still work
+    assert assembly_view._MONITOR["snap"] is not snap
+    _key(app, win.cv, "g")
 
 
 def _labels(w):

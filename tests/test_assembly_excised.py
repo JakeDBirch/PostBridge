@@ -895,3 +895,22 @@ def test_ctrl_k_switches_pre_roll_and_p_no_longer_does(view, monkeypatch):
     assert assembly_view._MONITOR["preroll_on"] is True
     win._on_key(_KeyEv(win.cv, "k", 0x0004))
     assert assembly_view._MONITOR["preroll_on"] is False
+
+
+def test_a_dotted_line_marks_the_pre_roll_ahead_of_the_stopped_playhead(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "preroll_on", True)
+    monkeypatch.setitem(assembly_view._MONITOR, "preroll_s", 1.0)
+    win.set_insert(2.5)
+    win.redraw()
+    pre = win.cv.find_withtag("pre")
+    assert pre and win.cv.itemcget(pre[0], "state") == "normal"
+    assert win.cv.coords(pre[0])[0] == pytest.approx(win._x(win._preroll_start(2.5)))
+    assert win._preroll_start(2.5) == pytest.approx(1.5)
+    win.toggle_preroll()                          # off: gone
+    assert win.cv.itemcget(pre[0], "state") == "hidden"
+    win.toggle_preroll()
+    win.step_preroll(1)                           # longer: it moves with it
+    assert win.cv.coords(pre[0])[0] == pytest.approx(
+        win._x(win._preroll_start(2.5)))
+    assert win._preroll_start(2.5) < 1.5

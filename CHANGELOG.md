@@ -4,6 +4,11 @@
 
 ## November 25, 2026
 
+### Assembly: a pre-roll line, and the controls as a palette
+- **With pre-roll on**, a faint dotted red line marks where play will start. It sits ahead of the stopped playhead by the actual pre-roll. With the surrounding audio shown and Skip edits on, the pre-roll is counted back in the finished cut, so the line can land further back on the track. The line moves when the pre-roll length changes and disappears when pre-roll is off or during playback.
+- **Transport** (timecode, Return to zero, Play, Stop, speed and pre-roll) is always shown at the top.
+- **Everything else is a palette of sections that fold to their titles**: Session, Monitor, Edit, Transcript, Spot, View, Mouse · Speakers. Click a title to open or fold its section. Each section stays as you left it next time, and the palette scrolls when open sections run long. Edit starts open; the others start folded. Keys work whether a section is open or not.
+
 ### Assembly: I and O work on the track
 - **I** and **O** used to work only in Find in recording; on the track they just showed a message. Now **I** starts the region under the insertion point right there, and **O** stops it there. With the surrounding audio shown, put the insertion point in the dimmed audio: **I** brings the next region's start back to that spot, and **O** extends the previous region's end out to it. Each is one undo step. I and O go by the playhead line: during playback they stop it and set the edge right there; after a stop, they use wherever the playhead stopped, not where play began.
 
