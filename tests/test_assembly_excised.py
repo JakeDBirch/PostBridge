@@ -825,6 +825,26 @@ def test_tab_goes_to_the_next_region_and_shift_tab_back(view):
     assert win.insert == pytest.approx(win._clip(2).start)
     win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
     assert win.insert == pytest.approx(1.0) and win.sel_order == 1
+    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
+    assert win.insert == pytest.approx(win._clip(1).start)
+
+
+def test_tab_stops_at_pull_starts_with_the_surrounding_audio_shown(view):
+    """Opened up, a pull starts in its dimmed lead-in, ahead of its first
+    region: Tab and Shift+Tab stop there too."""
+    app, win = view
+    _cut_one(app, win)
+    win.toggle_excised()
+    c2 = win._clip(2)
+    first = c2.pieces[0][0]
+    win.set_insert(first + 0.1)
+    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
+    assert win.insert == pytest.approx(first)
+    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
+    if c2.start < first - 1e-3:
+        assert win.insert == pytest.approx(c2.start) and win.sel_order == 2
+    else:
+        assert win.sel_order == 1
 
 
 def test_ctrl_k_switches_pre_roll_and_p_no_longer_does(view, monkeypatch):
