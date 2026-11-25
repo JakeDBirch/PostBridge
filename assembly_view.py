@@ -1209,7 +1209,7 @@ class AssemblyWindow(object):
                                  bg=SURF, fg=TEXT, width=5)
         p.add(self.rate_lbl)
         key(p, "Faster", "]", lambda: self.step_rate(1))
-        self.preroll_key = key(p, "", "P", self.toggle_preroll, toggle=True)
+        self.preroll_key = key(p, "", "Ctrl+K", self.toggle_preroll, toggle=True)
         key(p, "−", "", lambda: self.step_preroll(-1))
         key(p, "+", "", lambda: self.step_preroll(1))
         self.norm_key = key(p, "Normalize", "", self.toggle_normalize,
@@ -5601,6 +5601,28 @@ class AssemblyWindow(object):
         self.pps = max(self._min_pps(), max(1, self.cv.winfo_width()) / 60.0)
         self.redraw()
 
+    def next_region(self, direction):
+        """Tab / Shift+Tab: the insertion point to the start of the next (or
+        previous) region on the track -- the next stretch of audio, in this
+        pull or the next.  The view follows it."""
+        if self.view == "source":
+            self._neighbour(direction)
+            return
+        starts = sorted({round(tl, 6) for c in self.clips for tl, _du, _si in c.pieces})
+        if not starts:
+            return
+        t = self.insert
+        if direction > 0:
+            nxt = next((s for s in starts if s > t + 1e-4), None)
+        else:
+            nxt = next((s for s in reversed(starts) if s < t - 1e-4), None)
+        if nxt is None:
+            return
+        c = self._clip_at(nxt + 1e-6)
+        if c is not None and c.order != self.sel_order:
+            self.select(c.order)
+        self.seek(nxt)
+
     def _neighbour(self, direction):
         """Start of the next / previous pull from the playhead -- in the
         source view, from the pull on show."""
@@ -5842,8 +5864,10 @@ class AssemblyWindow(object):
             self.step_rate(-1)
         elif k == "bracketright":
             self.step_rate(1)
-        elif not ctrl and k.lower() == "p":
+        elif ctrl and k.lower() == "k":
             self.toggle_preroll()
+        elif k in ("Tab", "ISO_Left_Tab") and not ctrl:
+            self.next_region(-1 if shift or k == "ISO_Left_Tab" else 1)
         elif k == "Right":
             self._neighbour(1)
         elif k == "Left":

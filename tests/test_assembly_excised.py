@@ -809,3 +809,28 @@ def test_a_cut_keeps_its_crossfade_with_the_surrounding_audio_shown(view):
     x = [p for p in win.cut_audio._index[1] if p[2] == 1]
     assert len(x) == 2 and x[0][5] > 0 and x[1][4] > 0  # fade out / in ramps
     assert x[1][0] < x[0][0] + x[0][1]                  # the two overlap
+
+
+# ── Tab to the next region; Ctrl+K for pre-roll ──────────────────────────
+
+def test_tab_goes_to_the_next_region_and_shift_tab_back(view):
+    app, win = view
+    _cut_one(app, win)                            # regions at 0, 1 (pull 1), 3.5 (pull 2)
+    win.set_insert(0.2)
+    win._on_key(_KeyEv(win.cv, "Tab", 0))
+    assert win.insert == pytest.approx(1.0)
+    win._on_key(_KeyEv(win.cv, "Tab", 0))
+    assert win.insert == pytest.approx(win._clip(2).start) and win.sel_order == 2
+    win._on_key(_KeyEv(win.cv, "Tab", 0))         # nothing after: stays
+    assert win.insert == pytest.approx(win._clip(2).start)
+    win._on_key(_KeyEv(win.cv, "Tab", SHIFT))
+    assert win.insert == pytest.approx(1.0) and win.sel_order == 1
+
+
+def test_ctrl_k_switches_pre_roll_and_p_no_longer_does(view, monkeypatch):
+    app, win = view
+    monkeypatch.setitem(assembly_view._MONITOR, "preroll_on", True)
+    win._on_key(_KeyEv(win.cv, "p", 0))
+    assert assembly_view._MONITOR["preroll_on"] is True
+    win._on_key(_KeyEv(win.cv, "k", 0x0004))
+    assert assembly_view._MONITOR["preroll_on"] is False

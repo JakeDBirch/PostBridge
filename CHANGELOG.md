@@ -4,6 +4,10 @@
 
 ## November 25, 2026
 
+### Assembly: Tab to the next region; pre-roll is Ctrl+K
+- **Tab** puts the insertion point at the start of the next region on the track: the next stretch of audio, in the same pull or the next. **Shift+Tab** goes back to the one before. The view follows, and the pull it lands in is selected. The arrow keys still go a whole pull at a time.
+- **Pre-roll is now Ctrl+K** (it was P). P on its own does nothing.
+
 ### Ctrl+Q quits
 - **Ctrl+Q quits PostBridge from any screen or window,** the Assembly included. It's the same as closing the main window: you're still asked about unsaved work or a transcription that's running.
 
