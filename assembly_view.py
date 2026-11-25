@@ -3482,10 +3482,16 @@ class AssemblyWindow(object):
                           tags=("fade", "fade_heard"))
 
     def _fade_handle_at(self, x, y):
-        """(clip, k, side) of the fade handle under the pointer, or None."""
-        y0, _y1 = self._track_box()
-        if not (y0 <= y <= y0 + FADE_ZONE_PX + 4):
+        """(clip, k, side) of the fade handle under the pointer, or None.
+        A fade takes hold anywhere along its dotted end line, top to bottom
+        -- unless that line is so near the region's edge that the edge's
+        own trim needs the room, when only its top does.  No fade yet: the
+        region's top corner."""
+        y0, y1 = self._track_box()
+        if not (y0 <= y <= y1):
             return None
+        in_top = y <= y0 + FADE_ZONE_PX + 4
+        reach = max(6, self._ls // 2)
         t = self._t(x)
         i = bisect.bisect_right(self._starts, t) - 1
         best = None
@@ -3499,6 +3505,11 @@ class AssemblyWindow(object):
                 if secs <= 0:                # on the corner: reaches inward
                     hx += FADE_HANDLE_PX / 2.0 if side == "in" else -FADE_HANDLE_PX / 2.0
                 d = abs(x - hx)
+                if not in_top:
+                    # Down the line: a fade there, clear of the edge's trim.
+                    xe_ = self._x(tl if side == "in" else tl + du)
+                    if secs <= 0 or abs(hx - xe_) <= reach + FADE_HANDLE_PX                             or d > FADE_HANDLE_PX / 2.0 + 1:
+                        continue
                 if d <= FADE_HANDLE_PX and (best is None or d < best[0]):
                     best = (d, (c, k, side))
         return best[1] if best else None

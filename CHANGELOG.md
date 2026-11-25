@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: grab a fade anywhere on its dotted line
+- **A fade or crossfade can be grabbed anywhere along its dotted end line**, top to bottom, not just at the top. When the line sits right beside the region's edge (a very short fade), only its top grabs it, so the edge below still trims. With no fade yet, the region's top corner starts one as before.
+
 ### Assembly: Tab stops at every edit boundary
 - **Tab and Shift+Tab** now stop at the end of each region as well as its start, so they step through every edit boundary on the track, and at each pull's start too.
 

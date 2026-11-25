@@ -287,6 +287,16 @@ def test_a_fade_handle_sits_on_each_top_corner_and_drags(view):  # noqa: F811
     # takes the fade away again (its own: none).
     hx = win._x(c.start + _fade_of(app, 1, "in")[0])
     assert win._hit(hx, y0 + 6)[0] == "fade"
+    # ...and anywhere down its dotted line, not just the top.
+    _y0, y1 = win._track_box()
+    for y in (y0 + 60, (y0 + y1) / 2.0, y1 - 3):
+        assert win._hit(hx, y)[0] == "fade"
+        assert win._hit(hx + 12, y)[0] != "fade"    # off the line: the region
+    win._on_track_press(_Ev(hx, y1 - 3))         # grabbed low, it drags the same
+    win._on_track_drag(_Ev(hx + 0.25 * win.pps, y1 - 3))
+    win._on_track_release(_Ev(hx + 0.25 * win.pps, y1 - 3))
+    assert _fade_of(app, 1, "in") == [pytest.approx(0.75, abs=0.02)]
+    hx = win._x(c.start + _fade_of(app, 1, "in")[0])
     win._on_track_press(_Ev(hx, y0 + 6))
     win._on_track_drag(_Ev(x_in - 30, y0 + 6))
     win._on_track_release(_Ev(x_in - 30, y0 + 6))
