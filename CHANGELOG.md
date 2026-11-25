@@ -17,7 +17,7 @@
   - **D** fades in from the region's start to it.
   - **F** fades the highlight, as before.
   - **G** fades out from it to the region's end.
-- I and O still trim, the same as A and S.
+- **I and O are gone**: A and S do what they did, in Find in recording too. They no longer trim.
 - **Snap** moves from G to **Shift+G**.
 - **Shift+drag the bottom half of a region** to slip its boundaries. Both edges move together over the recording while the audio stays where it is on the track. The silence in front grows by what the silence behind gives up, so nothing after the region moves. The drag stops when the silence on either side runs out, or at a neighbouring region of the same recording.
 

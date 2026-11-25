@@ -71,7 +71,7 @@ def test_an_edit_in_the_source_view_is_one_step_four_step(view):
     depth = len(app._s4_undo_stack)
     win.show_source(1)
     win.src._playhead_s = 11.0
-    _key(app, win.src._cv, "i")                # SET IN at the playhead
+    _key(app, win.src._cv, "a")                # SET IN at the playhead
     assert _segs(app, 1) == [(11.0, 14.0)]
     assert len(app._s4_undo_stack) == depth + 1
     assert app._rv[0]["accepted_flag"][0]      # saved as the track's edits are

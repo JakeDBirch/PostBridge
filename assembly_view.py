@@ -5375,7 +5375,7 @@ class AssemblyWindow(object):
                            "handle to change it".format(side, secs * 1000))
 
     def set_point(self, side):
-        """A / S (and I / O): an IN or OUT at the playhead.  On the track, the
+        """A / S: an IN or OUT at the playhead.  On the track, the
         region under it starts (I) or stops (O) there -- in the surrounding
         audio shown, the region after it (I) or before it (O) reaches out
         to it.  In Find in recording, the pull's, at its playhead."""
@@ -6281,9 +6281,9 @@ class AssemblyWindow(object):
             self.cut_out()
         elif k.lower() == "h":
             self.heal()                      # Pro Tools: Heal Separation
-        elif not ctrl and k in ("a", "s", "i", "o"):
+        elif not ctrl and k in ("a", "s"):
             # Pro Tools: A trims the start to the playhead, S the end.
-            self.set_point("in" if k in ("a", "i") else "out")
+            self.set_point("in" if k == "a" else "out")
         elif not ctrl and k in ("d", "g"):
             # Pro Tools: D fades in to the playhead, G out from it.
             self.fade_to_playhead("in" if k == "d" else "out")
@@ -6329,8 +6329,8 @@ class AssemblyWindow(object):
             src.drop_mark("music_inflection")
         elif not ctrl and k.lower() == "x":
             src.drop_mark("sfx")
-        elif not ctrl and k in ("a", "s", "i", "o"):
-            self.set_point("in" if k in ("a", "i") else "out")
+        elif not ctrl and k in ("a", "s"):
+            self.set_point("in" if k == "a" else "out")
         elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
             src.split_at_playhead()
         elif k.lower() == "c" and not ctrl:
