@@ -1189,13 +1189,14 @@ def test_music_markers_show_the_time_between_them(view):
     win.pps, win.view0 = 200.0, 0.0
     win.redraw()
     texts = [win.cv.itemcget(i, "text") for i in win.cv.find_withtag("mdur")]
-    assert texts == ["1.75s"]
+    assert texts == ["2s"]
     win.pps = 2.0                              # too tight to read
     win.redraw()
     assert win.cv.find_withtag("mdur") == ()
-    assert assembly_view._fmt_dur(12.4) == "12.40s"
-    assert assembly_view._fmt_dur(72.4) == "1:12.40"
-    assert assembly_view._fmt_dur(59.999) == "1:00.00"
+    assert assembly_view._fmt_dur(12.4) == "12s"
+    assert assembly_view._fmt_dur(72.6) == "1:13"
+    assert assembly_view._fmt_dur(59.6) == "1:00"
+    assert assembly_view._fmt_dur(0.3) == "<1s"
 
 
 def test_the_playhead_shows_the_time_to_the_nearest_music_marker(view):
@@ -1212,10 +1213,10 @@ def test_the_playhead_shows_the_time_to_the_nearest_music_marker(view):
     def gap():
         i = win.cv.find_withtag("phgap_text")
         return win.cv.itemcget(i[0], "text"), win.cv.itemcget(i[0], "anchor")
-    assert gap() == ("0.50s", "ne")                # behind: left of the playhead
+    assert gap() == ("<1s", "ne")                # behind: left of the playhead
     win.playhead = 2.0
     win._move_playhead()                           # follows the playhead
-    assert gap() == ("1.00s", "nw")                # ahead: right of it
+    assert gap() == ("1s", "nw")                # ahead: right of it
     win.playhead = 3.0
     win._move_playhead()
     assert win.cv.find_withtag("phgap") == ()      # on the marker

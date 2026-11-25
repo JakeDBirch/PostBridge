@@ -345,12 +345,12 @@ def _dim(col, k=0.35):
 
 
 def _fmt_dur(s):
-    """A length: 12.40s under a minute, 1:12.40 from there."""
-    s = max(0.0, s)
-    if s < 59.995:
-        return "{:.2f}s".format(s)
-    m, r = divmod(round(s, 2), 60)
-    return "{:d}:{:05.2f}".format(int(m), r)
+    """A length in whole seconds: 12s under a minute, 1:12 from there;
+    under half a second, <1s."""
+    n = int(round(max(0.0, s)))
+    if n == 0:
+        return "<1s"
+    return "{}s".format(n) if n < 60 else "{}:{:02d}".format(*divmod(n, 60))
 
 
 def _fmt_tc(t, places=1):
@@ -3683,7 +3683,7 @@ class AssemblyWindow(object):
         return {"sfx": _C_SFX, "note": _C_NOTE}.get(m["kind"], _C_MUSIC)
 
     def _music_durations(self):
-        """{id(marker): "12.40s"} -- for each music marker (in, out or
+        """{id(marker): "12s"} -- for each music marker (in, out or
         inflection), the time since the music marker before it."""
         music = sorted((m for m in self.markers
                         if m["kind"].startswith("music")), key=lambda m: m["t"])

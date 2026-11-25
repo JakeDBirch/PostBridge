@@ -5,7 +5,7 @@
 ## November 25, 2026
 
 ### Assembly: the time between music markers
-Each music marker (in, out or inflection) now shows the time since the music marker before it, written in the marker row just ahead of it: 12.40s, or 1:12.40 past a minute. An SFX marker in between doesn't interrupt the count. Where there isn't room for both, the duration wins over the earlier marker's name; zoom in to see both. (The durations between speech ticks added earlier today are taken back out.)
+Each music marker (in, out or inflection) now shows the time since the music marker before it, written in the marker row just ahead of it, in whole seconds: 12s, or 1:12 past a minute (<1s under half a second). An SFX marker in between doesn't interrupt the count. Where there isn't room for both, the duration wins over the earlier marker's name; zoom in to see both. (The durations between speech ticks added earlier today are taken back out.)
 
 The playhead also shows the time to the nearest music marker, ahead or behind: a dotted line along the lower marker row from the playhead to the marker, with its length beside the playhead on the marker's side. It follows the playhead as it plays or moves, and disappears when the playhead is on the marker.
 
