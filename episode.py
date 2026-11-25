@@ -567,6 +567,176 @@ def source_spans(ep, name):
     return out
 
 
+# ── The pool: every file and the token it is assigned to ─────────────────
+# What the episode page shows and edits, the way Script -> Session's Step 2
+# does: a row per file, a token on each.  Underneath, files that were
+# recorded together (a guest's mic, the host's, their cameras) are still
+# kept as one group -- ep["sources"] -- because a camera has to stay with
+# its recording before anyone has named a token, and AAF -> XML pairs them
+# by that.  A group's token is what its files show; the page never names
+# the group.
+
+def label_of(src):
+    """What a group's files are assigned to: its token, "VO: <part>" for
+    narration, or None."""
+    if src.get("token"):
+        return src["token"]
+    if src.get("vo_part"):
+        return "VO: " + src["vo_part"]
+    return None
+
+
+def set_label(src, label):
+    if label and label.startswith("VO: "):
+        src["token"], src["vo_part"] = None, label[4:]
+    else:
+        src["token"] = label or None
+        src.pop("vo_part", None)
+    src["user_made"] = True
+
+
+def clean_token(text):
+    """A typed token as tokens are written: capitals, digits, underscores."""
+    return re.sub(r"[^A-Z0-9_]+", "_", (text or "").strip().upper()).strip("_")
+
+
+def groups_with(ep, label):
+    """Names of the groups assigned to *label*, in name order."""
+    return [n for n in sorted(ep.get("sources", {}))
+            if label_of(ep["sources"][n]) == label]
+
+
+def pool_rows(ep):
+    """One row per file and token: [{"rel", "kind", "label", "group",
+    "linked"}].  A file two tokens share has a row under each.  "group" is
+    the name of the group the row's file sits in (None for a file in none
+    yet); "linked" is how many files that group holds.  In group order,
+    recordings before cameras."""
+    rows, held = [], set()
+    for name in sorted(ep.get("sources", {})):
+        src = ep["sources"][name]
+        n = len(src.get("audio", [])) + len(src.get("video", []))
+        for kind in ("audio", "video"):
+            for r in src.get(kind, []):
+                held.add(r)
+                rows.append({"rel": r, "kind": kind, "label": label_of(src),
+                             "group": name, "linked": n})
+    for r in sorted(ep.get("media", {})):
+        rec = ep["media"][r]
+        if rec.get("status") == "source" and r not in held:
+            rows.append({"rel": r, "kind": rec["kind"], "label": None,
+                         "group": None, "linked": 1})
+    return rows
+
+
+def _new_group(ep, name, label, kind, relpath):
+    base, i = name, 2
+    while name in ep["sources"]:
+        name = "{} ({})".format(base, i); i += 1
+    src = {"token": None, "audio": [], "video": [], "session": None}
+    set_label(src, label)
+    src[kind].append(relpath)
+    ep["sources"][name] = src
+    return name
+
+
+def _best_group(ep, names, relpath):
+    """The one of *names* a file most plainly belongs with: the nearest in
+    running time among those whose name it shares, else the nearest."""
+    if len(names) == 1:
+        return names[0]
+    dur = lambda r: (ep["media"].get(r) or {}).get("duration_s") or 0.0
+    d = dur(relpath)
+
+    def _score(n):
+        src = ep["sources"][n]
+        files = src.get("audio", []) + src.get("video", [])
+        gap = min((abs(dur(f) - d) for f in files), default=1e9) if d else 1e9
+        share = max((_name_match(_stem(f), _stem(relpath))[0] for f in files), default=0.0)
+        return (-round(share, 2), gap, n)
+    return min(names, key=_score)
+
+
+def _drop(ep, group, kind, relpath):
+    src = ep["sources"].get(group)
+    if src is None or relpath not in src.get(kind, []):
+        return
+    src[kind].remove(relpath)
+    src["user_made"] = True
+    if not src.get("audio") and not src.get("video"):
+        ep["sources"].pop(group, None)
+
+
+def assign_file(ep, relpath, kind, label, group=None):
+    """Assign the row for *relpath* in *group* to *label* (None: to nobody).
+    Returns the name of the group the file is in afterwards.
+
+    As in Step 2, files that go together follow each other until someone
+    says otherwise: when the file's group has no token yet, the whole group
+    takes the token.  Once a group has one, changing a file moves that file
+    alone.  A narration recording is always a take of its own, so two reads
+    of one part keep their own cameras.
+    """
+    srcs = ep["sources"]
+    cur = srcs.get(group) if group else None
+    if cur is not None and label_of(cur) == label:
+        return group
+    targets = [n for n in groups_with(ep, label) if n != group] if label else []
+    own_take = bool(label) and label.startswith("VO: ") and kind == "audio"
+
+    if cur is not None and label_of(cur) is None:
+        # Nobody had named these files yet: they take the token together.
+        if not label:
+            return group
+        if not targets or cur.get("audio") and label.startswith("VO: "):
+            set_label(cur, label)
+            return group
+        into = _best_group(ep, targets, relpath)
+        merge_sources(ep, into, group)
+        return into
+
+    if cur is not None:
+        if len(cur.get("audio", [])) + len(cur.get("video", [])) == 1:
+            # Alone in its group: the group goes with it.
+            if not label or own_take or not targets:
+                set_label(cur, label)
+                return group
+        _drop(ep, group, kind, relpath)
+    if not label:
+        return _new_group(ep, _stem(relpath), None, kind, relpath)
+    if targets and not own_take:
+        into = _best_group(ep, targets, relpath)
+        src = srcs[into]
+        if relpath not in src.setdefault(kind, []):
+            src[kind].append(relpath)
+            src[kind].sort()
+        src["user_made"] = True
+        return into
+    return _new_group(ep, _stem(relpath) if own_take else label, label, kind, relpath)
+
+
+def add_label(ep, relpath, kind, label):
+    """Put *relpath* under *label* as well as where it is (a recording two
+    tokens share).  Returns the group it joined."""
+    targets = groups_with(ep, label)
+    if not targets:
+        name = _new_group(ep, label, label, kind, relpath)
+        for other_name, other in ep["sources"].items():
+            if other_name != name and relpath in other.get(kind, []):
+                other["user_made"] = True
+        return name
+    into = _best_group(ep, targets, relpath)
+    share_file(ep, into, kind, relpath)
+    ep["sources"][into]["user_made"] = True
+    return into
+
+
+def rename_label(ep, old, new):
+    """Every group assigned to token *old* is assigned to *new*."""
+    for n in groups_with(ep, old):
+        set_label(ep["sources"][n], new)
+
+
 def assign_script_tokens(ep, tokens):
     """Give each source that has no token the script token its name or its
     recordings' names carry.  Returns the names of the sources given one.

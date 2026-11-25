@@ -324,7 +324,7 @@ def test_a_shared_recording_opens_step_2_under_both_tokens(app, monkeypatch, pro
     assert not app._errors, "\n".join(app._errors)
 
 
-# ── The review: tokens from the script, sources that fold away ────────────
+# ── The review: tokens from the script, tokens that fold away ────────────
 
 def test_sources_take_the_script_tokens_their_names_carry(tmp_path):
     ep = EP.new_episode(str(tmp_path))
@@ -350,7 +350,7 @@ def test_sources_take_the_script_tokens_their_names_carry(tmp_path):
     assert EP.assign_script_tokens(ep, tokens + ["NEWCOMER"]) == ["Dave Kaufmann"]
 
 
-def test_the_review_offers_the_script_tokens_and_folds_sources(app, monkeypatch, project):
+def test_the_review_offers_the_script_tokens_and_folds_them_away(app, monkeypatch, project):
     import tkinter as tk
     _open_fresh(app, monkeypatch, project)
     ep = app._ep
@@ -374,11 +374,11 @@ def test_the_review_offers_the_script_tokens_and_folds_sources(app, monkeypatch,
     shown = _texts(app.body)
     assert "COLLAPSE ALL" in " ".join(shown) and "tokens from Ep 7 tokens.txt" in shown
     # Folding one away keeps it folded through a redraw.
-    assert app._ep_open["Butler Interview"] is True
-    app._ep_open["Butler Interview"] = False
+    assert app._ep_open["BUTLER"] is True
+    app._ep_open["BUTLER"] = False
     app._ep_view()
     _pump(app, 10)
-    assert app._ep_open["Butler Interview"] is False
+    assert app._ep_open["BUTLER"] is False
     assert not app._errors, "\n".join(app._errors)
 
 

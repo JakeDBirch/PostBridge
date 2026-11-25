@@ -11,11 +11,11 @@ import os
 import re
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 from config import *
 from config import _SANS
-from gui_components import _FlatDropdown
+from gui_components import _FlatDropdown, _token_color
 import episode as EP
 import gdocs
 import script_normalize
@@ -337,18 +337,17 @@ class EpisodeWorkflowMixin:
         tk.Label(self.body, text=ep["root"], font=FB, bg=BG, fg=SUB).pack(anchor="w")
         sm = EP.summary(ep)
         tk.Label(self.body,
-                 text="{} source{}  ·  {} recording{}  ·  {} camera file{}  "
+                 text="{} recording{}  ·  {} camera file{}  "
                       "·  {} file{} put aside".format(
-                          sm["sources"], "" if sm["sources"] == 1 else "s",
                           sm["audio"], "" if sm["audio"] == 1 else "s",
                           sm["video"], "" if sm["video"] == 1 else "s",
                           sm["aside"], "" if sm["aside"] == 1 else "s"),
                  font=FB, bg=BG, fg=SUB).pack(anchor="w", pady=(2, 8))
 
         sf = self._scroll_frame(self.body)
+        self._ep_canvas = self._last_scroll_canvas     # for _ep_redraw
         self._ep_render_stages(sf)
-        self._ep_render_sources(sf)
-        self._ep_render_unassigned(sf)
+        self._ep_render_pool(sf)
         self._ep_render_aside(sf)
 
     # -- cards ------------------------------------------------------------
@@ -368,7 +367,7 @@ class EpisodeWorkflowMixin:
     def _ep_render_stages(self, parent):
         ep = self._ep
         body = self._ep_card(parent, "STAGES",
-                             "each one opens already linked to the sources below")
+                             "each one opens with the pool below already assigned")
         links = ep.get("links", {})
         n_sessions = len(EP.pq_session_list(ep))
         rows = [
@@ -423,178 +422,6 @@ class EpisodeWorkflowMixin:
                                  fg=state[1]).pack(side="left", padx=(12, 0))
                     self._btn(r, "VIEW SCRIPT", self._ep_view_script, small=True
                               ).pack(side="left", padx=(12, 0))
-
-    def _ep_render_sources(self, parent):
-        ep = self._ep
-        body = self._ep_card(parent, "SOURCES",
-                             "a speaker or a session: its recordings, its cameras, its token")
-        if not ep["sources"]:
-            tk.Label(body, text="No sources yet. Use a recording below as a source.",
-                     font=FB, bg=SURF, fg=SUB).pack(anchor="w")
-        free_video = self._ep_free_media("video")
-        free_audio = self._ep_free_media("audio")
-        shared = EP.shared_files(ep)
-        # With a script linked, a source's token is one of the script's:
-        # the clear ones are filled in, the rest are a dropdown.
-        tokens, part_names = self._ep_script_names()
-        auto = self.__dict__.setdefault("_ep_auto_tokens", set())
-        if tokens:
-            auto.update(EP.assign_script_tokens(ep, tokens))
-        # Which sources are open.  One with many files starts closed.
-        opened = self.__dict__.setdefault("_ep_open", {})
-        if len(ep["sources"]) > 1:
-            bar = tk.Frame(body, bg=SURF)
-            bar.pack(fill="x")
-            def _all(state):
-                for n in ep["sources"]:
-                    opened[n] = state
-                self._ep_view()
-            self._btn(bar, "COLLAPSE ALL", lambda: _all(False), small=True).pack(side="right")
-            self._btn(bar, "EXPAND ALL", lambda: _all(True), small=True
-                      ).pack(side="right", padx=(0, 6))
-            if tokens:
-                tk.Label(bar, text="tokens from {}".format(os.path.basename(
-                             ep.get("links", {}).get("script") or "")),
-                         font=FB, bg=SURF, fg=SUB).pack(side="left")
-        for name in sorted(ep["sources"]):
-            src = ep["sources"][name]
-            n_rec, n_cam = len(src.get("audio", [])), len(src.get("video", []))
-            is_open = opened.setdefault(name, n_rec + n_cam <= 4)
-            row = tk.Frame(body, bg=SURF2, highlightbackground=BORDER, highlightthickness=1)
-            row.pack(fill="x", pady=3)
-            top = tk.Frame(row, bg=SURF2)
-            top.pack(fill="x", padx=10, pady=(6, 6))
-            arrow = tk.Label(top, text="\u25bc" if is_open else "\u25b6", font=FB,
-                             bg=SURF2, fg=ACCENT, cursor="hand2")
-            arrow.pack(side="left", padx=(0, 6))
-            title = tk.Label(top, text=name, font=FBT, bg=SURF2, fg=TEXT, cursor="hand2")
-            title.pack(side="left")
-            count = tk.Label(top, text="   {} recording{} \u00b7 {} camera{}".format(
-                                 n_rec, "" if n_rec == 1 else "s",
-                                 n_cam, "" if n_cam == 1 else "s"),
-                             font=FB, bg=SURF2, fg=SUB, cursor="hand2")
-            count.pack(side="left")
-            det = tk.Frame(row, bg=SURF2)
-            if is_open:
-                det.pack(fill="x")
-            def _toggle(_e=None, n=name, d=det, a=arrow):
-                opened[n] = not opened.get(n)
-                if opened[n]:
-                    d.pack(fill="x")
-                else:
-                    d.pack_forget()
-                a.config(text="\u25bc" if opened[n] else "\u25b6")
-            for w in (arrow, title, count):
-                w.bind("<Button-1>", _toggle)
-            tk.Label(top, text="   token", font=FB, bg=SURF2, fg=SUB).pack(side="left")
-            if tokens:
-                none = "\u2014 no token \u2014"
-                cur = ("VO: " + src["vo_part"]) if src.get("vo_part") and not src.get("token") \
-                    else (src.get("token") or none)
-                opts = [none] + list(tokens)
-                if src.get("token") and src["token"] not in tokens:
-                    opts.append(src["token"])          # typed before the script was linked
-                opts += ["VO: " + p for p in part_names]
-                if cur not in opts:
-                    opts.append(cur)
-                tv = tk.StringVar(value=cur)
-                _FlatDropdown(top, tv, opts, font=FB, width=20).pack(side="left", padx=(6, 0))
-                hint = tk.Label(top, text="  from the script" if name in auto else "",
-                                font=FB, bg=SURF2, fg=SUB)
-                hint.pack(side="left")
-                def _pick(*_a, n=name, v=tv, h=hint, none=none):
-                    s = ep["sources"][n]
-                    val = v.get()
-                    if val.startswith("VO: "):
-                        s["token"], s["vo_part"] = None, val[4:]
-                    else:
-                        s["token"] = None if val == none else val
-                        s.pop("vo_part", None)
-                    auto.discard(n)
-                    h.config(text="")
-                tv.trace_add("write", _pick)
-            else:
-                tv = tk.StringVar(value=src.get("token") or "")
-                te = tk.Entry(top, textvariable=tv, font=FB, bg=SURF, fg=TEXT,
-                              insertbackground=TEXT, relief="flat", width=14)
-                te.pack(side="left", padx=(6, 0))
-                def _tok(*_a, n=name, v=tv):
-                    t = "".join(ch for ch in v.get().upper() if ch.isalnum() or ch == "_")
-                    ep["sources"][n]["token"] = t or None
-                tv.trace_add("write", _tok)
-                if src.get("vo_part"):
-                    tk.Label(top, text="   narrator \u00b7 VO: {}".format(src["vo_part"]),
-                             font=FB, bg=SURF2, fg=SUB).pack(side="left")
-            if src.get("session"):
-                tk.Label(top, text="   transcribed", font=FB, bg=SURF2, fg=SUCCESS
-                         ).pack(side="left")
-            self._btn(top, "REMOVE SOURCE", lambda n=name: self._ep_remove_source(n),
-                      small=True).pack(side="right")
-            others = [o for o in sorted(ep["sources"]) if o != name]
-            if others:
-                cv = tk.StringVar(value="— combine with —")
-                _FlatDropdown(top, cv, ["— combine with —"] + others, font=FB, width=22
-                              ).pack(side="right", padx=(0, 8))
-                cv.trace_add("write", lambda *_a, n=name, v=cv: (
-                    self._ep_combine(n, v.get()) if v.get() in ep["sources"] else None))
-            spans = EP.source_spans(ep, name)
-            # Recordings
-            for a in src.get("audio", []):
-                self._ep_media_line(det, a, "REC", lambda p=a, n=name: self._ep_detach(n, "audio", p),
-                                    span=spans.get(a), also=[o for o in shared.get(a, []) if o != name])
-            # Cameras
-            for v in src.get("video", []):
-                self._ep_media_line(det, v, "CAM", lambda p=v, n=name: self._ep_detach(n, "video", p),
-                                    span=spans.get(v), also=[o for o in shared.get(v, []) if o != name])
-            # One side of the session in a single file while this source is
-            # one part of the other side: that file is shared, not moved.
-            theirs = [(k, r) for o in others for k in ("audio", "video")
-                      for r in ep["sources"][o].get(k, []) if r not in src.get(k, [])]
-            if theirs:
-                shr = tk.Frame(det, bg=SURF2)
-                shr.pack(fill="x", padx=10, pady=(2, 0))
-                tk.Label(shr, text="+ share from another source", font=FB, bg=SURF2, fg=SUB
-                         ).pack(side="left")
-                hv = tk.StringVar(value="\u2014 choose \u2014")
-                labels = {}
-                for k, r in theirs:
-                    labels.setdefault("{}  {}".format("REC" if k == "audio" else "CAM",
-                                                      os.path.basename(r)), (k, r))
-                _FlatDropdown(shr, hv, ["\u2014 choose \u2014"] + sorted(labels),
-                              font=FB, width=44).pack(side="left", padx=(8, 0))
-                def _share(*_a, n=name, v=hv, lab=labels):
-                    if v.get() in lab:
-                        self._ep_share(n, *lab[v.get()])
-                hv.trace_add("write", _share)
-            if free_audio:
-                addr = tk.Frame(det, bg=SURF2)
-                addr.pack(fill="x", padx=10, pady=(2, 0))
-                tk.Label(addr, text="+ recording", font=FB, bg=SURF2, fg=SUB).pack(side="left")
-                rv = tk.StringVar(value="— choose —")
-                _FlatDropdown(addr, rv, ["— choose —"] + [os.path.basename(a) for a in free_audio],
-                              font=FB, width=34).pack(side="left", padx=(8, 0))
-                def _attach_rec(*_a, n=name, v=rv, fa=free_audio):
-                    for p in fa:
-                        if os.path.basename(p) == v.get():
-                            self._ep_attach(n, "audio", p)
-                            return
-                rv.trace_add("write", _attach_rec)
-            if free_video:
-                add = tk.Frame(det, bg=SURF2)
-                add.pack(fill="x", padx=10, pady=(2, 6))
-                tk.Label(add, text="+ camera", font=FB, bg=SURF2, fg=SUB).pack(side="left")
-                av = tk.StringVar(value="— choose —")
-                _FlatDropdown(add, av, ["— choose —"] + [os.path.basename(v) for v in free_video],
-                              font=FB, width=34).pack(side="left", padx=(8, 0))
-                def _attach(*_a, n=name, v=av, fv=free_video):
-                    pick = v.get()
-                    for p in fv:
-                        if os.path.basename(p) == pick:
-                            self._ep_attach(n, "video", p)
-                            return
-                av.trace_add("write", _attach)
-            else:
-                tk.Frame(det, bg=SURF2, height=4).pack()
 
     def _ep_script_names(self):
         """(tokens, part names) of the linked script, in script order;
@@ -666,29 +493,6 @@ class EpisodeWorkflowMixin:
         ep.setdefault("links", {})["script"] = EP.rel(ep, path)
         self._ep_view()
 
-    def _ep_media_line(self, parent, relpath, tag, detach_cmd, span=None, also=()):
-        """*span* and *also*: for a file shared with other sources, where
-        this source's own recording begins in it, and who else holds it."""
-        ep = self._ep
-        rec = ep["media"].get(relpath, {})
-        r = tk.Frame(parent, bg=SURF2)
-        r.pack(fill="x", padx=10, pady=1)
-        tk.Label(r, text=tag, font=("Courier New", 9, "bold"), bg="#2a3d2a" if tag == "CAM" else "#2a2a3d",
-                 fg=SUCCESS if tag == "CAM" else "#8888ff", padx=5, pady=2).pack(side="left")
-        d = rec.get("duration_s")
-        txt = "{}   {}".format(os.path.basename(relpath), self._ep_fmt_dur(d))
-        tk.Label(r, text=txt, font=FB, bg=SURF2, fg=TEXT, anchor="w").pack(side="left", padx=(8, 0))
-        if also:
-            import engines
-            tk.Label(r, text="shared with {} \u00b7 from {}".format(
-                         ", ".join(also), engines.format_start((span or (0.0,))[0])),
-                     font=FB, bg=SURF2, fg=ACCENT).pack(side="left", padx=(10, 0))
-        tk.Label(r, text=os.path.dirname(relpath), font=(_SANS, 10), bg=SURF2, fg=SUB
-                 ).pack(side="left", padx=(10, 0))
-        x = tk.Label(r, text=" ✕ ", font=FB, bg=SURF2, fg=SUB, cursor="hand2")
-        x.pack(side="right")
-        x.bind("<Button-1>", lambda e: detach_cmd())
-
     @staticmethod
     def _ep_fmt_dur(d):
         if not d:
@@ -696,73 +500,237 @@ class EpisodeWorkflowMixin:
         d = int(round(d))
         return "{}:{:02d}:{:02d}".format(d // 3600, (d % 3600) // 60, d % 60)
 
-    def _ep_render_unassigned(self, parent):
-        ep = self._ep
-        audio = self._ep_free_media("audio")
-        video = self._ep_free_media("video")
-        if not audio and not video:
-            return
-        body = self._ep_card(parent, "NOT YET IN A SOURCE",
-                             "recordings and cameras the scan kept but could not place")
-        choices = self._ep_attach_choices()
-        for a in audio:
-            r = tk.Frame(body, bg=SURF)
-            r.pack(fill="x", pady=1)
-            self._btn(r, "USE AS SOURCE", lambda p=a: self._ep_make_source(p),
-                      small=True).pack(side="left")
-            tk.Label(r, text="{}   {}   {}".format(os.path.basename(a), self._ep_fmt_dur(
-                ep["media"][a].get("duration_s")), os.path.dirname(a)),
-                     font=FB, bg=SURF, fg=TEXT).pack(side="left", padx=(10, 0))
-            self._btn(r, "PUT ASIDE", lambda p=a: self._ep_exclude(p), small=True
-                      ).pack(side="right")
-            self._ep_attach_picker(r, "audio", a, choices)
-        for v in video:
-            r = tk.Frame(body, bg=SURF)
-            r.pack(fill="x", pady=1)
-            tk.Label(r, text="CAM", font=("Courier New", 9, "bold"), bg="#2a3d2a",
-                     fg=SUCCESS, padx=5, pady=2).pack(side="left")
-            tk.Label(r, text="{}   {}   {}".format(os.path.basename(v), self._ep_fmt_dur(
-                ep["media"][v].get("duration_s")), os.path.dirname(v)),
-                     font=FB, bg=SURF, fg=TEXT).pack(side="left", padx=(8, 0))
-            self._btn(r, "PUT ASIDE", lambda p=v: self._ep_exclude(p), small=True
-                      ).pack(side="right")
-            self._ep_attach_picker(r, "video", v, choices)
+    # -- the media pool -----------------------------------------------------
+    # Every recording and camera, each with the token it is assigned to --
+    # the same thing Step 2 of Script -> Session shows, and what it opens
+    # with.  Files are listed under their token; a file is moved by picking
+    # another.  (episode.py's "pool" section says what is kept underneath.)
 
-    def _ep_attach_choices(self):
-        """What a loose file can be attached to, as it is offered: {label:
-        source name}.  A source goes by its token -- that is what the script
-        and every later step call it -- or by its VO part; one with neither
-        yet goes by its name.  Tokens first, then VO parts, then the rest."""
-        ep = self._ep
-        rows = []
-        for name in sorted(ep["sources"]):
-            src = ep["sources"][name]
-            if src.get("token"):
-                rows.append((0, src["token"], name))
-            elif src.get("vo_part"):
-                rows.append((1, "VO: " + src["vo_part"], name))
-            else:
-                rows.append((2, "{}  (no token)".format(name), name))
-        seen = {}
-        for _rank, label, _name in rows:
-            seen[label] = seen.get(label, 0) + 1
-        out = {}
-        for _rank, label, name in sorted(rows, key=lambda t: (t[0], t[1].lower(), t[2])):
-            # Two sources under one token: say which is which.
-            out[label if seen[label] == 1 else "{}  ·  {}".format(label, name)] = name
-        return out
+    _EP_NONE = "— unassigned —"
+    _EP_NEW  = "new token…"
+    _EP_ADD  = "+ token"
 
-    def _ep_attach_picker(self, row, kind, relpath, choices):
-        """The "attach to" dropdown on a loose file's row."""
-        if not choices:
+    def _ep_render_pool(self, parent):
+        ep = self._ep
+        # With a script linked, the clear matches are filled in.
+        tokens, part_names = self._ep_script_names()
+        auto = self.__dict__.setdefault("_ep_auto_tokens", set())
+        if tokens:
+            auto.update(EP.assign_script_tokens(ep, tokens))
+        rows = EP.pool_rows(ep)
+        body = self._ep_card(parent, "MEDIA POOL",
+                             "every recording and camera, and the token it is assigned to")
+        if not rows:
+            tk.Label(body, text="Nothing in the pool yet.  Files put aside below can "
+                                "be added to it.", font=FB, bg=SURF, fg=SUB).pack(anchor="w")
             return
-        none = "— attach to —"
-        sv = tk.StringVar(value=none)
-        _FlatDropdown(row, sv, [none] + list(choices), font=FB, width=26
-                      ).pack(side="right", padx=(0, 8))
-        sv.trace_add("write", lambda *_a: (
-            self._ep_attach(choices[sv.get()], kind, relpath)
-            if sv.get() in choices else None))
+
+        # Headings: the script's tokens in script order, any others, the
+        # narrated parts, then what nobody is assigned yet.
+        in_use = {r["label"] for r in rows if r["label"]}
+        vo_all = ["VO: " + p for p in part_names]
+        other_tok = sorted(l for l in in_use if not l.startswith("VO: ") and l not in tokens)
+        other_vo = sorted(l for l in in_use if l.startswith("VO: ") and l not in vo_all)
+        headings = [t for t in tokens if t in in_use] + other_tok \
+            + [v for v in vo_all if v in in_use] + other_vo
+        if any(r["label"] is None for r in rows):
+            headings.append(None)
+        options = [self._EP_NONE] + list(tokens) + other_tok + vo_all + other_vo \
+            + [self._EP_NEW]
+
+        opened = self.__dict__.setdefault("_ep_open", {})
+        bar = tk.Frame(body, bg=SURF)
+        bar.pack(fill="x", pady=(0, 2))
+        script = os.path.basename(ep.get("links", {}).get("script") or "")
+        tk.Label(bar, font=FB, bg=SURF, fg=SUB,
+                 text="tokens from {}".format(script) if tokens else
+                 "No script linked yet: type tokens with “{}”, or link the "
+                 "script above to choose from its own.".format(self._EP_NEW)
+                 ).pack(side="left")
+
+        def _all(state):
+            for h in headings:
+                opened[h] = state
+            self._ep_redraw()
+        self._btn(bar, "COLLAPSE ALL", lambda: _all(False), small=True).pack(side="right")
+        self._btn(bar, "EXPAND ALL", lambda: _all(True), small=True
+                  ).pack(side="right", padx=(0, 6))
+
+        shared = EP.shared_files(ep)
+        spans = {}
+        # Files nobody has named yet that go together: numbered, so it shows
+        # which follow each other when one is assigned.
+        sets = {}
+        for r in rows:
+            if r["label"] is None and r["group"] and r["linked"] > 1:
+                sets.setdefault(r["group"], len(sets) + 1)
+
+        for label in headings:
+            mine = sorted((r for r in rows if r["label"] == label),
+                          key=lambda r: (r["group"] or "~", r["kind"] != "audio",
+                                         os.path.basename(r["rel"]).lower()))
+            colour = _token_color(label)
+            n_rec = sum(1 for r in mine if r["kind"] == "audio")
+            n_cam = len(mine) - n_rec
+            is_open = opened.setdefault(label, len(mine) <= 8)
+            card = tk.Frame(body, bg=SURF2, highlightbackground=BORDER, highlightthickness=1)
+            card.pack(fill="x", pady=3)
+            tk.Frame(card, bg=colour, width=5).pack(side="left", fill="y")
+            inner = tk.Frame(card, bg=SURF2)
+            inner.pack(side="left", fill="x", expand=True)
+            top = tk.Frame(inner, bg=SURF2)
+            top.pack(fill="x", padx=10, pady=(6, 6))
+            arrow = tk.Label(top, text="▼" if is_open else "▶", font=FB,
+                             bg=SURF2, fg=ACCENT, cursor="hand2")
+            arrow.pack(side="left", padx=(0, 6))
+            title = tk.Label(top, text=label or self._EP_NONE, font=FBT, bg=SURF2,
+                             fg=TEXT if label else SUB, cursor="hand2")
+            title.pack(side="left")
+            count = tk.Label(top, text="   {} recording{} · {} camera{}".format(
+                                 n_rec, "" if n_rec == 1 else "s",
+                                 n_cam, "" if n_cam == 1 else "s"),
+                             font=FB, bg=SURF2, fg=SUB, cursor="hand2")
+            count.pack(side="left")
+            groups = {r["group"] for r in mine if r["group"]}
+            if label and groups & auto:
+                tk.Label(top, text="   from the script", font=FB, bg=SURF2, fg=SUB
+                         ).pack(side="left")
+            if any(ep["sources"][g].get("session") for g in groups):
+                tk.Label(top, text="   transcribed", font=FB, bg=SURF2, fg=SUCCESS
+                         ).pack(side="left")
+            if label and not label.startswith("VO: "):
+                self._btn(top, "RENAME", lambda l=label: self._ep_pool_rename(l),
+                          small=True).pack(side="right")
+            det = tk.Frame(inner, bg=SURF2)
+            if is_open:
+                det.pack(fill="x", pady=(0, 4))
+
+            def _toggle(_e=None, h=label, d=det, a=arrow):
+                opened[h] = not opened.get(h)
+                if opened[h]:
+                    d.pack(fill="x", pady=(0, 4))
+                else:
+                    d.pack_forget()
+                a.config(text="▼" if opened[h] else "▶")
+            for w in (arrow, title, count):
+                w.bind("<Button-1>", _toggle)
+
+            for r in mine:
+                if r["group"] and r["group"] not in spans:
+                    spans[r["group"]] = EP.source_spans(ep, r["group"])
+                self._ep_pool_row(det, r, options, shared,
+                                  spans.get(r["group"], {}), sets.get(r["group"]))
+
+    def _ep_pool_row(self, parent, row, options, shared, spans, linked_set):
+        ep = self._ep
+        rel, kind, label = row["rel"], row["kind"], row["label"]
+        rec = ep["media"].get(rel, {})
+        r = tk.Frame(parent, bg=SURF2)
+        r.pack(fill="x", padx=10, pady=1)
+        cam = kind == "video"
+        tk.Label(r, text="CAM" if cam else "REC", font=("Courier New", 9, "bold"),
+                 bg="#2a3d2a" if cam else "#2a2a3d",
+                 fg=SUCCESS if cam else "#8888ff", padx=5, pady=2).pack(side="left")
+        tk.Label(r, text="{}   {}".format(os.path.basename(rel),
+                                          self._ep_fmt_dur(rec.get("duration_s"))),
+                 font=FB, bg=SURF2, fg=TEXT, anchor="w").pack(side="left", padx=(8, 0))
+        also = [EP.label_of(ep["sources"][n]) or n
+                for n in shared.get(rel, []) if n != row["group"]]
+        if also:
+            import engines
+            tk.Label(r, text="also {} · from {}".format(
+                         ", ".join(also), engines.format_start((spans.get(rel) or (0.0,))[0])),
+                     font=FB, bg=SURF2, fg=ACCENT).pack(side="left", padx=(10, 0))
+        if linked_set:
+            # Assigning one of a numbered set assigns the rest with it.
+            tk.Label(r, text="↔ {}".format(linked_set), font=FB, bg=SURF2, fg=ACCENT
+                     ).pack(side="left", padx=(10, 0))
+        tk.Label(r, text=os.path.dirname(rel), font=(_SANS, 10), bg=SURF2, fg=SUB
+                 ).pack(side="left", padx=(10, 0))
+
+        if also:
+            self._btn(r, "REMOVE", lambda: self._ep_pool_remove(row), small=True, width=10
+                      ).pack(side="right")
+        else:
+            self._btn(r, "PUT ASIDE", lambda: self._ep_exclude(rel), small=True, width=10
+                      ).pack(side="right")
+        if label:
+            # The same file under another token as well: one side of a
+            # session in one file while the other side came in parts.
+            held = {EP.label_of(ep["sources"][n]) for n in shared.get(rel, [])} | {label}
+            more = [o for o in options[1:-1] if o not in held] + [self._EP_NEW]
+            av = tk.StringVar(value=self._EP_ADD)
+            _FlatDropdown(r, av, [self._EP_ADD] + more, font=FB, width=9
+                          ).pack(side="right", padx=(0, 8))
+            av.trace_add("write", lambda *_a: self._ep_pool_set(row, av.get(), add=True))
+        tv = tk.StringVar(value=label or self._EP_NONE)
+        opts = options if label in options or not label else options[:-1] + [label, options[-1]]
+        _FlatDropdown(r, tv, opts, font=FB, width=22).pack(side="right", padx=(0, 8))
+        tv.trace_add("write", lambda *_a: self._ep_pool_set(row, tv.get()))
+
+    def _ep_ask_token(self, title="New token"):
+        """A typed token, cleaned to capitals, digits and underscores; ""
+        when nothing usable was typed."""
+        return EP.clean_token(simpledialog.askstring(
+            title, "Token name (capitals, digits and underscores):", parent=self))
+
+    def _ep_pool_set(self, row, value, add=False):
+        """A row's dropdown was used: assign its file to *value*, or with
+        *add* put it under *value* as well."""
+        ep = self._ep
+        if value == self._EP_ADD:
+            return
+        if value == self._EP_NEW:
+            label = self._ep_ask_token()
+            if not label:
+                self._ep_redraw()               # put the dropdown back
+                return
+        else:
+            label = None if value == self._EP_NONE else value
+        if add:
+            if label:
+                EP.add_label(ep, row["rel"], row["kind"], label)
+        elif label != row["label"]:
+            if row["group"] is None and not label:
+                return
+            EP.assign_file(ep, row["rel"], row["kind"], label, row["group"])
+            self.__dict__.setdefault("_ep_auto_tokens", set()).discard(row["group"])
+        self._ep_redraw()
+
+    def _ep_pool_rename(self, label):
+        new = self._ep_ask_token("Rename {}".format(label))
+        if new and new != label:
+            EP.rename_label(self._ep, label, new)
+            opened = self.__dict__.setdefault("_ep_open", {})
+            if label in opened:
+                opened[new] = opened.pop(label)
+            self._ep_redraw()
+
+    def _ep_pool_remove(self, row):
+        """Take a shared file out from under this token; it stays under its
+        others."""
+        EP._drop(self._ep, row["group"], row["kind"], row["rel"])
+        self._ep_redraw()
+
+    def _ep_redraw(self):
+        """Draw the page again where it was scrolled to."""
+        def _at():
+            cv = getattr(self, "_ep_canvas", None)
+            try:
+                return cv, (cv.yview()[0] if cv is not None and cv.winfo_exists() else 0.0)
+            except tk.TclError:
+                return None, 0.0
+        _cv, y = _at()
+        self._ep_view()
+        cv = getattr(self, "_ep_canvas", None)
+        if cv is not None and y > 0:
+            def _back():
+                try:
+                    cv.update_idletasks()
+                    cv.yview_moveto(y)
+                except tk.TclError:
+                    pass
+            self.after(30, _back)
 
     def _ep_render_aside(self, parent):
         ep = self._ep
@@ -818,7 +786,7 @@ class EpisodeWorkflowMixin:
         if status == "excluded":
             self._btn(r, "RESTORE", lambda p=relpath: self._ep_restore(p), small=True).pack(side="right")
         elif rec["kind"] == "audio" and (d or 0) >= EP.MIN_SOURCE_SECS and status in ("pt_copy", "noise"):
-            self._btn(r, "USE AS SOURCE", lambda p=relpath: self._ep_make_source(p), small=True
+            self._btn(r, "ADD TO POOL", lambda p=relpath: self._ep_make_source(p), small=True
                       ).pack(side="right")
         elif rec["kind"] == "video" and status in ("noise", "short", "pt_copy"):
             self._btn(r, "KEEP", lambda p=relpath: self._ep_restore(p), small=True).pack(side="right")
@@ -890,11 +858,15 @@ class EpisodeWorkflowMixin:
             for kind in ("audio", "video"):
                 if relpath in src.get(kind, []):
                     src[kind].remove(relpath)
+        # A group left with nothing in it is nothing.
+        for name in [n for n, s in ep["sources"].items()
+                     if not s.get("audio") and not s.get("video")]:
+            ep["sources"].pop(name)
         ep["media"][relpath]["status"] = "excluded"
         ep["media"][relpath]["reason"] = "put aside"
         if relpath not in ep["excluded"]:
             ep["excluded"].append(relpath)
-        self._ep_view()
+        self._ep_redraw()
 
     def _ep_restore(self, relpath):
         ep = self._ep
