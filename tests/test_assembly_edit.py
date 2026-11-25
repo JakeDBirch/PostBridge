@@ -1040,31 +1040,10 @@ def test_snap_points_come_from_the_loaded_audio_and_are_ticked(view):
     win.pps = 100.0
     win._sil[1] = edges
     win.redraw()
-    with_ticks = len(win.cv.find_all()) - len(win.cv.find_withtag("span"))
+    with_ticks = len(win.cv.find_all())
     win._sil[1] = []
     win.redraw()
     assert with_ticks - len(win.cv.find_all()) == 4     # two ticks, top and bottom
-
-
-def test_the_stretches_between_ticks_are_timed(view):
-    """Each stretch between ticks -- and from the region's edges to the
-    first and last -- reads its length; a pause reads brighter."""
-    import assembly_view
-    app, win = view
-    c = win._clip(1)
-    tl, du, si = c.pieces[0]
-    win.pps, win.view0 = 100.0, 0.0
-    win._sil[1] = [si + 1.0, si + 1.5]         # a half-second pause, 1 s in
-    win.redraw()
-    spans = {win.cv.itemcget(i, "text"): win.cv.itemcget(i, "fill")
-             for i in win.cv.find_withtag("span")}
-    assert spans["1.00s"] == assembly_view._C_SNAP_TICK      # speech
-    assert spans["0.50s"] == assembly_view.SUB               # the pause
-    assert "{:.2f}s".format(du - 1.5) in spans
-    win.pps = 30.0                             # too tight for a half second
-    win.redraw()
-    texts = {win.cv.itemcget(i, "text") for i in win.cv.find_withtag("span")}
-    assert "0.50s" not in texts
 
 
 def test_the_shared_snap_keeps_the_editors_rules():
@@ -1194,6 +1173,29 @@ def test_marks_saved_with_in_and_out_still_show_and_can_go(view):
 def _flag_at(win, m):
     top, bot = win._marker_row(win._lane(m))
     return _Ev(win._x(m["t"]) + 3, (top + bot) / 2.0)
+
+
+def test_music_markers_show_the_time_between_them(view):
+    """Each music marker reads the time since the music marker before it,
+    just ahead of it -- an SFX between them doesn't break the count."""
+    import assembly_view
+    app, win = view
+    for t, kind in ((0.5, "music_inflection"), (1.0, "sfx"),
+                    (2.25, "music_in")):
+        win.playhead = t
+        win.drop_marker(kind)
+        if win._rename is not None:
+            win._end_rename(True)
+    win.pps, win.view0 = 200.0, 0.0
+    win.redraw()
+    texts = [win.cv.itemcget(i, "text") for i in win.cv.find_withtag("mdur")]
+    assert texts == ["1.75s"]
+    win.pps = 2.0                              # too tight to read
+    win.redraw()
+    assert win.cv.find_withtag("mdur") == ()
+    assert assembly_view._fmt_dur(12.4) == "12.40s"
+    assert assembly_view._fmt_dur(72.4) == "1:12.40"
+    assert assembly_view._fmt_dur(59.999) == "1:00.00"
 
 
 def test_ctrl_click_deletes_a_mark(view):

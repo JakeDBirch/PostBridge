@@ -344,6 +344,15 @@ def _dim(col, k=0.35):
         *(int(round(b + (a - b) * k)) for a, b in zip(c, g)))
 
 
+def _fmt_dur(s):
+    """A length: 12.40s under a minute, 1:12.40 from there."""
+    s = max(0.0, s)
+    if s < 59.995:
+        return "{:.2f}s".format(s)
+    m, r = divmod(round(s, 2), 60)
+    return "{:d}:{:05.2f}".format(int(m), r)
+
+
 def _fmt_tc(t, places=1):
     """Timeline position as M:SS.s (H:MM:SS.s past the hour), to `places`
     decimals of a second."""
@@ -3672,6 +3681,14 @@ class AssemblyWindow(object):
     def _mark_colour(m):
         return {"sfx": _C_SFX, "note": _C_NOTE}.get(m["kind"], _C_MUSIC)
 
+    def _music_durations(self):
+        """{id(marker): "12.40s"} -- for each music marker (in, out or
+        inflection), the time since the music marker before it."""
+        music = sorted((m for m in self.markers
+                        if m["kind"].startswith("music")), key=lambda m: m["t"])
+        return {id(b): _fmt_dur(b["t"] - a["t"])
+                for a, b in zip(music, music[1:])}
+
     def _draw_marks(self, w, y1):
         cv = self.cv
         top, bot = self._marker_row()
@@ -3693,6 +3710,7 @@ class AssemblyWindow(object):
             if xb > 0 and xa < w:
                 cv.create_rectangle(xa, bot, xb, bot + 2, fill=_C_MUSIC,
                                     outline="")
+        since = self._music_durations()
         for lane in (0, 1):
             top, bot = self._marker_row(lane)
             marks = [m for m in self.markers if self._lane(m) == lane]
@@ -3716,7 +3734,16 @@ class AssemblyWindow(object):
                                         **edge)
                 nxt = self._x(marks[n + 1]["t"]) if n + 1 < len(marks) \
                     else w + 400
-                if self._fits(m["label"], nxt - x - 16):
+                room = nxt - x - 16
+                d = since.get(id(marks[n + 1])) if n + 1 < len(marks) else None
+                if d is not None and self._measure(d) + 14 <= nxt - x:
+                    # The time since the music marker before, just ahead of
+                    # the next one -- it wins over this one's label.
+                    cv.create_text(nxt - 4, top, text=d, anchor="ne",
+                                   font=self._font, fill=_C_MUSIC,
+                                   tags=("mdur",))
+                    room -= self._measure(d) + 8
+                if self._fits(m["label"], room):
                     cv.create_text(x + 10, top, text=m["label"], anchor="nw",
                                    font=self._font, fill=TEXT if on else SUB)
         if self._rename is not None:
@@ -3885,27 +3912,6 @@ class AssemblyWindow(object):
                 if 0 <= x < w:
                     self.cv.create_line(x, top, x, top + h, fill=_C_SNAP_TICK)
                     self.cv.create_line(x, bot - h, x, bot, fill=_C_SNAP_TICK)
-            self._draw_tick_spans(sil, lo, hi, tl, du, si, top + h / 2.0, w)
-
-    def _draw_tick_spans(self, sil, lo, hi, tl, du, si, y, w):
-        """How long each stretch between ticks runs -- and from the region's
-        edges to the first and last -- written between them where it fits.
-        The ticks alternate: a silence starts at an even one and ends at the
-        next, so a pause reads brighter than the speech between pauses."""
-        edges = [si] + sil[lo:hi] + [si + du]
-        for n in range(len(edges) - 1):
-            a, b = edges[n], edges[n + 1]
-            xa, xb = self._x(tl + a - si), self._x(tl + b - si)
-            if xb < 0 or xa > w or b - a <= 1e-3:
-                continue
-            txt = "{:.2f}s".format(b - a)
-            if self._measure(txt) + 8 > xb - xa:
-                continue
-            # The tick before this stretch: lo - 1 + n in the whole list.
-            pause = (lo - 1 + n) % 2 == 0
-            self.cv.create_text((xa + xb) / 2.0, y, text=txt, font=self._font,
-                                fill=SUB if pause else _C_SNAP_TICK,
-                                tags=("span",))
 
     def _tick_at(self, x, y):
         """The speech start or stop a click at (x, y) is on -- in the tick
