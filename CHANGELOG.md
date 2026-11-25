@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: Script only (Alt+S)
+- **Alt+S** (or **Script only** under View) switches the script pane to the script as written: no struck, tinted or faded words, and nothing that was said but isn't in the script. Pulls not in the cut read as plain script too. Script words that were said keep their timing, so word lighting and clicking still work. Press Alt+S again to go back to the script set against what was said. The setting is kept for next time.
+
 ### Assembly: a key under the script
 - **Script key**: a strip under the script shows a sample of each colour and style and what it means. It covers the part title, the speaker, script words as said, struck words (in the script but not said, or a whole line not in the cut), tinted words (said but not in the script), faded words (heard by the quick first pass and not yet checked), the pull at the playhead, the selected pull, the word being heard, and your highlight. Click its title to fold it away; it stays folded or open as you left it.
 

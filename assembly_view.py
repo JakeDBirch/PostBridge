@@ -197,7 +197,8 @@ SNAP_TICKS_PPS = 10       # no ticks zoomed out past this: they cluster too clos
 # Monitoring choices, kept for the run like the playback speed.
 _MONITOR = {"follow": False, "preroll_on": True, "preroll_s": 2.0,
             "return_on": True, "script": True, "nudge_s": 0.1,
-            "skip_cuts": True, "normalize": True, "snap": True}
+            "skip_cuts": True, "normalize": True, "snap": True,
+            "script_only": False}
 _PREROLLS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0)
 
 
@@ -301,7 +302,8 @@ def _norm_gain(pcm):
 
 _MONITOR_TYPES = {"follow": bool, "preroll_on": bool, "preroll_s": float,
                   "return_on": bool, "script": bool, "nudge_s": float,
-                  "skip_cuts": bool, "normalize": bool, "snap": bool}
+                  "skip_cuts": bool, "normalize": bool, "snap": bool,
+                  "script_only": bool}
 VIEWS_KEPT = 40       # episodes whose Assembly place the prefs remember
 
 
@@ -695,11 +697,11 @@ class _LineMaker(object):
                                 unit[2], unit[3], True, unit[7]))
         self.text(text, style)
 
-    def struck(self, text):
+    def struck(self, text, style="txstruck"):
         """Script wording that wasn't said: in the line, not in the cut."""
         self.tokens.append(_Tok(self.pos, self.pos + len(text), None, None, None,
                                 None, False, None))
-        self.text(text, "txstruck")
+        self.text(text, style)
 
     def line(self):
         return _Line("".join(x[0] for x in self.chunks), self.tokens,
@@ -763,18 +765,23 @@ def _script_ops(script, said):
     return out
 
 
-def _text_line(script, units, ops, fade=False):
+def _text_line(script, units, ops, fade=False, script_only=False):
     """The pull as it reads in the text: the script's words where they were
     said, timed from the transcript, so it reads as written.  Script wording
     that wasn't said is struck through; words said that aren't in the script
     are tinted.  In what only the draft has heard (fade), a difference is
-    likely the draft's own mishearing, so what it heard just reads faded."""
+    likely the draft's own mishearing, so what it heard just reads faded.
+
+    script_only: the script as written and nothing else -- what was said
+    differently isn't shown, and the script's words keep their timing
+    wherever they were said."""
     words = _script_words(script)
     m = _LineMaker()
     cursor = 0
 
     def faded(u):
-        return "txdraft" if fade and u[6] == engines.DRAFT_MODEL else None
+        return "txdraft" if fade and not script_only \
+            and u[6] == engines.DRAFT_MODEL else None
 
     def said(u, style):
         if m.pos and not m.last.isspace() and not u[5]:
@@ -792,6 +799,13 @@ def _text_line(script, units, ops, fade=False):
                 m.said(script[a:b],
                        (first[0], last[1], first[2], last[3], "", False, None, first[7]),
                        faded(first))
+                cursor = b
+            continue
+        if script_only:
+            for i in range(i1, i2):
+                a, b = words[i][:2]
+                m.gap(script[cursor:a])
+                m.struck(script[a:b], None)
                 cursor = b
             continue
         near = units[max(0, j1 - 1):j2 + 1]
@@ -1194,6 +1208,10 @@ class AssemblyWindow(object):
         for seq in ("<Alt-f>", "<Alt-F>"):
             self.win.bind(seq, lambda e: (self.toggle_script_follow(),
                                           "break")[1])
+        # The script as written, or set against what was said.
+        for seq in ("<Alt-s>", "<Alt-S>"):
+            self.win.bind(seq, lambda e: (self.toggle_script_only(),
+                                          "break")[1])
 
     # What the script's colours and styles mean: (sample, its look, meaning).
     _SCRIPT_KEY = (
@@ -1472,6 +1490,8 @@ class AssemblyWindow(object):
         key(p, "Note", "N", lambda: self.drop_marker("note"))
 
         p = self._panel("VIEW")
+        self.script_only_key = key(p, "Script only", "Alt+S",
+                                   self.toggle_script_only, toggle=True)
         key(p, "Zoom out", "R  −", lambda: self.zoom(1 / 1.5))
         key(p, "Zoom in", "T  +", lambda: self.zoom(1.5))
         key(p, "Zoom out full", "Alt+A", self.fit)
@@ -2232,17 +2252,19 @@ class AssemblyWindow(object):
     # ── Script pane ──────────────────────────────────────────────────────
     def _build_line(self, r, c, fade):
         script = (r.get("quote_text") or "").strip()
+        only = _MONITOR["script_only"] and bool(script)
         if c is None:                    # in the script, not in the cut
             if r.get("status") in ("not_run", "provisional"):
                 return _Line(script, [])  # the first pass hasn't got to it
             tok = _Tok(0, len(script), None, None, None, None, False, None)
-            return _Line(script, [tok] if script else [], [(script, "txstruck")])
+            return _Line(script, [tok] if script else [],
+                         [(script, None if only else "txstruck")])
         words = self._raw_words(c, load=False)
         # Most pulls are as they were: words coming in or an edit changes a few.
         # A file's words are a new list whenever they change.
         kept = self._line_memo.get(c.order)
         if kept is not None and kept[0] is words and kept[1] == script \
-                and kept[2] == c.pieces and kept[3] == fade:
+                and kept[2] == c.pieces and kept[3] == (fade, only):
             return kept[4]
         units = _kept_units(c, words) if words else []
         if not units:
@@ -2256,8 +2278,8 @@ class AssemblyWindow(object):
             memo = self._align_memo.get(c.order)
             if memo is None or memo[0] != script or memo[1] != said:
                 memo = self._align_memo[c.order] = (script, said, _script_ops(script, said))
-            line = _text_line(script, units, memo[2], fade)
-        self._line_memo[c.order] = (words, script, c.pieces, fade, line)
+            line = _text_line(script, units, memo[2], fade, script_only=only)
+        self._line_memo[c.order] = (words, script, c.pieces, (fade, only), line)
         return line
 
     def _line(self, order):
@@ -6087,6 +6109,19 @@ class AssemblyWindow(object):
         _MONITOR["follow"] = not _MONITOR["follow"]
         self._show_monitor()
 
+    def toggle_script_only(self):
+        """Alt+S: the script as written, and nothing else -- or the script
+        set against what was said (struck, tinted, faded)."""
+        _MONITOR["script_only"] = not _MONITOR["script_only"]
+        self._show_monitor()
+        self._tx_shape = None            # every line, drawn afresh
+        self._render_script()
+        self._paint_tx_sel()
+        self._light_script_word()
+        self.status.config(fg=SUB, text=(
+            "Script only: the script as written" if _MONITOR["script_only"]
+            else "Script and transcript: what was said, set against the script"))
+
     def toggle_script_follow(self):
         _MONITOR["script"] = not _MONITOR["script"]
         self._show_monitor()
@@ -6122,6 +6157,7 @@ class AssemblyWindow(object):
         self.skip_key.set_on(_MONITOR["skip_cuts"])
         self.norm_key.set_on(_MONITOR["normalize"])
         self.snap_key.set_on(_MONITOR["snap"])
+        self.script_only_key.set_on(_MONITOR["script_only"])
         self.view_key.set_on(self.excised)
         for v, b in self.nudge_keys.items():
             b.set_on(v == _MONITOR["nudge_s"])

@@ -978,3 +978,31 @@ def test_the_transcript_panel_says_whether_the_script_is_all_in_the_cut(view):
     assert win.cov_key.lbl.cget("text") == "Script: 2 lines missing" and win.cov_key.on
     win.show_coverage(None)                  # not a narrator's read: nothing to say
     assert win.cov_key is None
+
+
+def test_script_only_is_the_script_as_written():
+    from assembly_view import _norm_word, _script_ops, _text_line
+    script = "We are going to walk the ridge."
+    said = ["We're", "gonna", "walk", "um", "the", "ridge."]
+    units = [(i * 0.4, i * 0.4 + 0.3, i * 0.4, i * 0.4 + 0.3, w, False, None, 0)
+             for i, w in enumerate(said)]
+    ops = _script_ops(script, [_norm_word(u[4]) for u in units])
+    line = _text_line(script, units, ops, fade=True, script_only=True)
+    assert line.body == script
+    assert all(style is None for _t, style in line.chunks)
+    # The words that were said keep their timing.
+    assert [line.body[t.cs:t.ce] for t in line.kept] == ["walk", "the", "ridge."]
+
+
+def test_alt_s_shows_the_script_only_and_back(view):
+    import assembly_view
+    app, win = view
+    before = _all_text(win)
+    win.toggle_script_only()
+    assert assembly_view._MONITOR["script_only"] and win.script_only_key.on
+    styled = [t for t in ("txstruck", "txsaid", "txdraft")
+              if win.text.tag_ranges(t)]
+    assert not styled
+    win.toggle_script_only()
+    assert not assembly_view._MONITOR["script_only"]
+    assert _all_text(win) == before
