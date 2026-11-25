@@ -4,6 +4,17 @@
 
 ## November 25, 2026
 
+### Assembly: Pro Tools edit keys; Shift-drag slips a region
+- **Pro Tools' default edit keys**, all at the playhead:
+  - **A** trims the region's start to it.
+  - **S** trims the region's end to it.
+  - **D** fades in from the region's start to it.
+  - **F** fades the highlight, as before.
+  - **G** fades out from it to the region's end.
+- I and O still trim, the same as A and S.
+- **Snap** moves from G to **Shift+G**.
+- **Shift+drag the bottom half of a region** to slip its boundaries. Both edges move together over the recording while the audio stays where it is on the track. The silence in front grows by what the silence behind gives up, so nothing after the region moves. The drag stops when the silence on either side runs out, or at a neighbouring region of the same recording.
+
 ### Assembly: a pre-roll line, and the controls as a palette
 - **With pre-roll on**, a faint dotted red line marks where play will start. It sits ahead of the stopped playhead by the actual pre-roll. With the surrounding audio shown and Skip edits on, the pre-roll is counted back in the finished cut, so the line can land further back on the track. The line moves when the pre-roll length changes and disappears when pre-roll is off or during playback.
 - **Transport** (timecode, Return to zero, Play, Stop, speed and pre-roll) is always shown at the top.

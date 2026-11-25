@@ -353,7 +353,7 @@ def test_a_join_back_in_the_recording_is_not_healed(view):
 
 # ── Snapping on and off (G) ──────────────────────────────────────────────
 
-def test_g_turns_snapping_off_and_on(view, monkeypatch):
+def test_shift_g_turns_snapping_off_and_on(view, monkeypatch):
     app, win = view
     monkeypatch.setitem(assembly_view._MONITOR, "snap", True)
     win._sil[1] = [11.02]                         # a speech edge near 11.0
@@ -361,11 +361,11 @@ def test_g_turns_snapping_off_and_on(view, monkeypatch):
     d = {"mode": "out", "order": 1, "k": 0, "segs0": list(c.segments),
          "gaps0": list(c.seg_gaps)}
     assert win._snap_edge(dict(d), 11.0) == pytest.approx(11.02)
-    _key(app, win.cv, "g")
+    _key(app, win.cv, "G", SHIFT)
     assert not assembly_view._MONITOR["snap"] and not win.snap_key.on
     assert win._snap_edge(dict(d), 11.0) == 11.0
     assert win._snap_timeline(1.0) == 1.0
-    _key(app, win.cv, "g")
+    _key(app, win.cv, "G", SHIFT)
     assert assembly_view._MONITOR["snap"] and win.snap_key.on
 
 
@@ -914,3 +914,61 @@ def test_a_dotted_line_marks_the_pre_roll_ahead_of_the_stopped_playhead(view, mo
     assert win.cv.coords(pre[0])[0] == pytest.approx(
         win._x(win._preroll_start(2.5)))
     assert win._preroll_start(2.5) < 1.5
+
+
+def test_a_and_s_trim_to_the_playhead(view):
+    app, win = view
+    _cut_one(app, win)                            # 0-1 s = 10-11, 1-3 s = 12-14
+    win.set_insert(2.5)
+    win._on_key(_KeyEv(win.cv, "s", 0))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] ==         [(10.0, 11.0), (12.0, pytest.approx(13.5))]
+    win.set_insert(0.5)
+    win._on_key(_KeyEv(win.cv, "a", 0))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] ==         [(pytest.approx(10.5), 11.0), (12.0, pytest.approx(13.5))]
+
+
+def test_d_fades_in_to_the_playhead_and_g_out_from_it(view, monkeypatch):
+    app, win = view
+    _cut_one(app, win)
+    got = []
+    monkeypatch.setattr(app, "_assembly_set_edge_fades_many",
+                        lambda groups: got.extend(groups), raising=False)
+    snap = assembly_view._MONITOR["snap"]
+    win.set_insert(1.4)                           # 0.4 s into region 2 (12-14)
+    win._on_key(_KeyEv(win.cv, "d", 0))
+    assert got[-1] == ([(1, "in", 12.0)], pytest.approx(0.4))
+    win.set_insert(2.25)                          # 0.75 s before its end
+    win._on_key(_KeyEv(win.cv, "g", 0))
+    assert got[-1] == ([(1, "out", 14.0)], pytest.approx(0.75))
+    assert assembly_view._MONITOR["snap"] is snap   # G is a fade now, not snap
+
+
+def test_shift_dragging_a_region_slips_its_boundaries_over_the_audio(view):
+    """Both edges move together and the audio holds its place: the silence
+    in front grows by what the silence behind gives up."""
+    app, win = view
+    _cut_one(app, win)                            # 0-1 | 1-3 butt | gap .5 | pull 2
+    win.redraw()
+    app.update()
+    y0, y1 = win._track_box()
+    low = y0 + 0.8 * (y1 - y0)                    # the grabber
+    x = win._x(2.0)
+    win._on_track_press(_Ev(x, low, SHIFT))
+    assert win._drag["mode"] == "slip"
+    win._on_track_drag(_Ev(x + 0.3 * win.pps, low, SHIFT))
+    win._on_track_release(_Ev(x + 0.3 * win.pps, low, SHIFT))
+    r = _res(app, 1)
+    segs = [tuple(round(v, 3) for v in sg) for sg in r["segments"]]
+    assert segs == [(10.0, 11.0), (12.3, 14.3)]
+    assert r["seg_gaps"][0] == pytest.approx(0.3)
+    assert r["gap_after_s"] == pytest.approx(0.2)
+    c = win._clip(1)
+    assert c.src_at(1.5) == pytest.approx(12.5)    # the same audio, same place
+    assert win._clip(2).start == pytest.approx(3.5)   # nothing after moved
+    # ...and no further than the silence behind it.
+    x = win._x(2.0)
+    win._on_track_press(_Ev(x, low, SHIFT))
+    win._on_track_drag(_Ev(x + 2.0 * win.pps, low, SHIFT))
+    win._on_track_release(_Ev(x + 2.0 * win.pps, low, SHIFT))
+    assert [tuple(round(v, 3) for v in sg) for sg in _res(app, 1)["segments"]][1]         == (12.5, 14.5)
+    assert win._clip(2).start == pytest.approx(3.5)

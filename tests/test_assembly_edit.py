@@ -399,9 +399,9 @@ def test_the_transport_stays_and_the_palette_folds(view):
     assert app._prefs["assembly_palette"]["EDIT"] is False
     import assembly_view
     snap = assembly_view._MONITOR["snap"]
-    _key(app, win.cv, "g")                          # folded, its keys still work
+    _key(app, win.cv, "G", 0x0001)                  # folded, its keys still work
     assert assembly_view._MONITOR["snap"] is not snap
-    _key(app, win.cv, "g")
+    _key(app, win.cv, "G", 0x0001)
 
 
 def _labels(w):

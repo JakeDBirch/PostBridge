@@ -1309,9 +1309,12 @@ class AssemblyWindow(object):
         key(p, "Split", "B", self.split)
         key(p, "Cut ½ s out", "C", self.cut_out)
         key(p, "Heal cut", "H", self.heal)
-        self.snap_key = key(p, "Snap", "G", self.toggle_snap, toggle=True)
-        key(p, "Set IN", "I", lambda: self.set_point("in"))
-        key(p, "Set OUT", "O", lambda: self.set_point("out"))
+        self.snap_key = key(p, "Snap", "Shift+G", self.toggle_snap, toggle=True)
+        key(p, "Start to playhead", "A", lambda: self.set_point("in"))
+        key(p, "End to playhead", "S", lambda: self.set_point("out"))
+        key(p, "Fade in to playhead", "D", lambda: self.fade_to_playhead("in"))
+        key(p, "Fade out from playhead", "G",
+            lambda: self.fade_to_playhead("out"))
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
         key(p, "Nudge later by default gap", "/", self.nudge_gap)
@@ -1422,8 +1425,10 @@ class AssemblyWindow(object):
             "it back.  Gap: drag to "
             "retime.  Flag: drag, double-click to name, Ctrl+click or "
             "right-click to delete.  "
-            "Edges and highlights snap to speech starts and stops (G turns "
-            "it off); hold Ctrl to place one freely.  Click a tick along "
+            "Shift+drag the bottom half of a region: slip its boundaries "
+            "over the audio, which stays where it is.  "
+            "Edges and highlights snap to speech starts and stops (Shift+G "
+            "turns it off); hold Ctrl to place one freely.  Click a tick along "
             "the top or bottom of the waveform to put the insertion point "
             "on it.  Ctrl+wheel: zoom.  In the text: drag to "
             "highlight, double-click "
@@ -4233,6 +4238,16 @@ class AssemblyWindow(object):
             self.redraw()
             self._status_range()
             return
+        if kind == "grab" and e.state & 0x0001 and not e.state & ALT_MASK:
+            # Shift+grab: slip the region's boundaries over its audio --
+            # both edges move together, the audio stays where it is.
+            self._select_region(c.order, k)
+            self._drag = self._slip_drag(c, k, e.x)
+            self.redraw()
+            if self._drag is None:
+                self.status.config(fg=SUB, text="Nothing in front of the first "
+                                   "region to slip into.")
+            return
         if kind == "grab":
             # Grabber: the region is selected; dragging moves it (and
             # everything after) by changing the silence in front of it.
@@ -4314,6 +4329,13 @@ class AssemblyWindow(object):
                 "Crossfade" if d["cross"] else "Fade " + d["side"],
                 d["value"] * 1000))
             return
+        if mode == "slip":
+            d["value"] = self._slipped(d, dt)
+            self._layout(self._slip_overrides(d))
+            self._sync_region_range()
+            self.redraw()
+            self._status_slip(d)
+            return
         if mode == "gap":
             sp = d["space"]
             if sp is None:
@@ -4374,6 +4396,83 @@ class AssemblyWindow(object):
         if sp is not None and sp["value"] > 1e-4:
             return None                  # silence beside it: trim into that
         return ((c, k), across) if kind == "out" else (across, (c, k))
+
+    def _slip_drag(self, c, k, x):
+        """A Shift-drag on a region's grabber: both its edges, and the
+        silence either side, so the audio holds its place on the track.
+        None for the first region of the cut -- nothing in front of it."""
+        before = self._space(c.order, k)
+        if before is None:
+            return None
+        if k + 1 < len(c.pieces):
+            after = self._space(c.order, k + 1)
+        else:
+            n = self._next_clip(c)
+            after = self._space(n.order, 0) if n is not None and n.pieces else None
+        segs = (list(c.segments) if len(c.segments) == len(c.pieces)
+                else [(si, si + du) for _tl, du, si in c.pieces])
+        return {"mode": "slip", "order": c.order, "k": k, "x0": x,
+                "moved": False, "segs0": [tuple(sg) for sg in segs],
+                "gaps0": list(c.seg_gaps), "before": before, "after": after,
+                "end": self._file_end.get(c.play_path, float("inf"))}
+
+    def _slipped(self, d, dt):
+        """dt held to what there is: the silence in front (moving earlier)
+        and behind (later), and the recording between the pull's own
+        neighbouring regions.  Returns (dt, segments)."""
+        segs, k = d["segs0"], d["k"]
+        a, b = segs[k]
+        lo = -d["before"]["value"]
+        hi = d["after"]["value"] if d["after"] is not None else float("inf")
+        lo = max(lo, (segs[k - 1][1] if k > 0 else 0.0) - a)
+        hi = min(hi, (segs[k + 1][0] if k + 1 < len(segs) else d["end"]) - b)
+        dt = max(lo, min(hi, dt)) if lo <= hi else 0.0
+        out = list(segs)
+        out[k] = (a + dt, b + dt)
+        return dt, out
+
+    def _slip_spaces(self, d):
+        """The silence either side after the slip: {owner: gap_after_s}
+        for the gaps after pulls, and the pull's own join silences."""
+        dt, _segs = d["value"]
+        gaps = list(d["gaps0"])
+        after_pulls = {}
+        for sp, v in ((d["before"], d["before"]["value"] + dt),
+                      (d["after"], (d["after"] or {}).get("value", 0.0) - dt)):
+            if sp is None:
+                continue
+            v = max(0.0, v)
+            if sp["k"] == 0:
+                after_pulls[sp["owner"]] = v
+            elif sp["k"] - 1 < len(gaps):
+                gaps[sp["k"] - 1] = v
+        return gaps, after_pulls
+
+    def _slip_overrides(self, d):
+        _dt, segs = d["value"]
+        gaps, after_pulls = self._slip_spaces(d)
+        over = {d["order"]: {"segments": segs, "seg_gaps": gaps}}
+        for o, v in after_pulls.items():
+            over.setdefault(o, {}).update({"gap_after_s": v, "gap_after": True})
+        return over
+
+    def _commit_slip(self, d):
+        dt, segs = d["value"]
+        if abs(dt) < 1e-6:
+            return
+        gaps, after_pulls = self._slip_spaces(d)
+        segs, gaps = _tidy(segs, gaps)
+        self.app._assembly_edit_many({d["order"]: (segs, gaps)},
+                                     gaps_after=after_pulls)
+
+    def _status_slip(self, d):
+        dt, segs = d["value"]
+        c = self._clip(d["order"])
+        a, b = segs[d["k"]]
+        self.status.config(fg=TEXT, text="Slip   {} region {}   {} → {}   "
+                           "({:+.3f}s)   ·   the audio stays where it is".format(
+                               c.label if c else "", d["k"] + 1,
+                               secs_tc(a), secs_tc(b), dt))
 
     def _roll_drag(self, seam, x):
         (cl, kl), (cr, kr) = seam
@@ -4588,6 +4687,15 @@ class AssemblyWindow(object):
             return
         if d.get("grabbed") is None:
             self._range = None           # a moved region stays selected
+        if d["mode"] == "slip":
+            self._commit_slip(d)
+            self.refresh()
+            self._select_region(d["order"], d["k"])
+            c = self._clip(d["order"])
+            if c is not None and d["k"] < len(c.pieces):
+                self.set_insert(c.pieces[d["k"]][0])
+            self.redraw()
+            return
         if d["mode"] == "gap":
             self._commit_space(d["space"], d["value"])
         elif d["mode"] == "roll":
@@ -5143,22 +5251,52 @@ class AssemblyWindow(object):
         elif row is not None:
             self.app._s4_editing_row = None
 
+    def _edit_point(self):
+        """The playhead an edit key goes by: where it is, playing (playback
+        stops there), or where it stopped -- the line on the track, not
+        where play began."""
+        if self._playing and self.player is not None:
+            t = self._from_player(self.player.position())
+            self.stop()
+        else:
+            t = self.playhead
+        return max(0.0, min(t, self.total_s))
+
+    def fade_to_playhead(self, side):
+        """D / G: a fade in from the start of the region under the playhead
+        to it, or a fade out from it to the region's end.  One undo step."""
+        t = self._edit_point()
+        c = self._clip_at(t)
+        k = c.piece_at(t) if c is not None else None
+        if k is None:
+            self.status.config(fg=SUB, text="Fade {}: put the playhead in a "
+                               "region first.".format(side))
+            return
+        tl, du, si = c.pieces[k]
+        sa, sb = (c.segments[k] if len(c.segments) == len(c.pieces)
+                  else (si, si + du))
+        secs = (t - tl) if side == "in" else (tl + du - t)
+        if secs <= 1e-3:
+            self.status.config(fg=SUB, text="Fade {}: the playhead is on the "
+                               "region's {}.".format(
+                                   side, "start" if side == "in" else "end"))
+            return
+        secs = round(min(secs, FADE_MAX), 4)
+        self.app._assembly_set_edge_fades_many(
+            [([(c.order, side, sa if side == "in" else sb)], secs)])
+        self.refresh()
+        self.status.config(fg=TEXT, text="Fade {} {:.0f} ms   ·   drag a "
+                           "handle to change it".format(side, secs * 1000))
+
     def set_point(self, side):
-        """I / O: an IN or OUT at the playhead.  On the track, the
+        """A / S (and I / O): an IN or OUT at the playhead.  On the track, the
         region under it starts (I) or stops (O) there -- in the surrounding
         audio shown, the region after it (I) or before it (O) reaches out
         to it.  In Find in recording, the pull's, at its playhead."""
         if self.view == "source" and self.src is not None:
             self.src._set_point_from_cursor(side)
             return
-        # The playhead: where it is, playing (playback stops there), or
-        # where it stopped -- the line on the track, not where play began.
-        if self._playing and self.player is not None:
-            t = self._from_player(self.player.position())
-            self.stop()
-        else:
-            t = self.playhead
-        t = max(0.0, min(t, self.total_s))
+        t = self._edit_point()
         c = self._clip_at(t)
         if c is None:
             c = next((x for x in self.clips if x.ghost_at(t) is not None), None)
@@ -5982,8 +6120,8 @@ class AssemblyWindow(object):
             self.delete_range(lift=True)
         elif k == "S" and not ctrl:
             self.toggle_skip_cuts()
-        elif not ctrl and k.lower() == "g":
-            self.toggle_snap()
+        elif k == "G" and not ctrl:
+            self.toggle_snap()               # Shift+G; plain G fades out
         elif k in ("Return", "KP_Enter"):
             self.toggle_view()
         elif ctrl and k.lower() == "f":
@@ -6043,8 +6181,12 @@ class AssemblyWindow(object):
             self.cut_out()
         elif k.lower() == "h":
             self.heal()                      # Pro Tools: Heal Separation
-        elif not ctrl and k.lower() in ("i", "o"):
-            self.set_point("in" if k.lower() == "i" else "out")
+        elif not ctrl and k in ("a", "s", "i", "o"):
+            # Pro Tools: A trims the start to the playhead, S the end.
+            self.set_point("in" if k in ("a", "i") else "out")
+        elif not ctrl and k in ("d", "g"):
+            # Pro Tools: D fades in to the playhead, G out from it.
+            self.fade_to_playhead("in" if k == "d" else "out")
         elif k in ("comma", "period"):
             self.nudge(-1 if k == "comma" else 1)
         elif k == "slash":
@@ -6087,8 +6229,8 @@ class AssemblyWindow(object):
             src.drop_mark("music_inflection")
         elif not ctrl and k.lower() == "x":
             src.drop_mark("sfx")
-        elif not ctrl and k.lower() in ("i", "o"):
-            self.set_point("in" if k.lower() == "i" else "out")
+        elif not ctrl and k in ("a", "s", "i", "o"):
+            self.set_point("in" if k in ("a", "i") else "out")
         elif k.lower() == "b" and not ctrl or k.lower() == "e" and ctrl:
             src.split_at_playhead()
         elif k.lower() == "c" and not ctrl:
