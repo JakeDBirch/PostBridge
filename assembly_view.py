@@ -3885,6 +3885,27 @@ class AssemblyWindow(object):
                 if 0 <= x < w:
                     self.cv.create_line(x, top, x, top + h, fill=_C_SNAP_TICK)
                     self.cv.create_line(x, bot - h, x, bot, fill=_C_SNAP_TICK)
+            self._draw_tick_spans(sil, lo, hi, tl, du, si, top + h / 2.0, w)
+
+    def _draw_tick_spans(self, sil, lo, hi, tl, du, si, y, w):
+        """How long each stretch between ticks runs -- and from the region's
+        edges to the first and last -- written between them where it fits.
+        The ticks alternate: a silence starts at an even one and ends at the
+        next, so a pause reads brighter than the speech between pauses."""
+        edges = [si] + sil[lo:hi] + [si + du]
+        for n in range(len(edges) - 1):
+            a, b = edges[n], edges[n + 1]
+            xa, xb = self._x(tl + a - si), self._x(tl + b - si)
+            if xb < 0 or xa > w or b - a <= 1e-3:
+                continue
+            txt = "{:.2f}s".format(b - a)
+            if self._measure(txt) + 8 > xb - xa:
+                continue
+            # The tick before this stretch: lo - 1 + n in the whole list.
+            pause = (lo - 1 + n) % 2 == 0
+            self.cv.create_text((xa + xb) / 2.0, y, text=txt, font=self._font,
+                                fill=SUB if pause else _C_SNAP_TICK,
+                                tags=("span",))
 
     def _tick_at(self, x, y):
         """The speech start or stop a click at (x, y) is on -- in the tick

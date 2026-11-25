@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: the time between speech starts and stops
+Zoomed in far enough to see the ticks along the top and bottom of a region, each stretch between two ticks (and from the region's edges to the first and last) now shows how long it runs, written in the top tick row. Pauses read brighter than the speech between them. A stretch too narrow for its number shows none; zoom in to see it.
+
 ### Assembly: every edit shows its surrounding audio
 - **Show surrounding audio now opens up every edit inside a pull.** Before, a jump of more than 30 seconds in the recording, or a jump back (a retake or double start), stayed closed. Each now shows a 3-second handle either side: the tape that runs on after the out, then the tape that leads into the in. Trimming into them with a drag, or with **A** and **S**, works as with any surrounding audio. A or S in the run-on handle extends the region before it, and A or S in the lead-in handle extends the region after it.
 

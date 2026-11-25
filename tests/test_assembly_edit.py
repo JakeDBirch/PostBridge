@@ -1040,10 +1040,31 @@ def test_snap_points_come_from_the_loaded_audio_and_are_ticked(view):
     win.pps = 100.0
     win._sil[1] = edges
     win.redraw()
-    with_ticks = len(win.cv.find_all())
+    with_ticks = len(win.cv.find_all()) - len(win.cv.find_withtag("span"))
     win._sil[1] = []
     win.redraw()
     assert with_ticks - len(win.cv.find_all()) == 4     # two ticks, top and bottom
+
+
+def test_the_stretches_between_ticks_are_timed(view):
+    """Each stretch between ticks -- and from the region's edges to the
+    first and last -- reads its length; a pause reads brighter."""
+    import assembly_view
+    app, win = view
+    c = win._clip(1)
+    tl, du, si = c.pieces[0]
+    win.pps, win.view0 = 100.0, 0.0
+    win._sil[1] = [si + 1.0, si + 1.5]         # a half-second pause, 1 s in
+    win.redraw()
+    spans = {win.cv.itemcget(i, "text"): win.cv.itemcget(i, "fill")
+             for i in win.cv.find_withtag("span")}
+    assert spans["1.00s"] == assembly_view._C_SNAP_TICK      # speech
+    assert spans["0.50s"] == assembly_view.SUB               # the pause
+    assert "{:.2f}s".format(du - 1.5) in spans
+    win.pps = 30.0                             # too tight for a half second
+    win.redraw()
+    texts = {win.cv.itemcget(i, "text") for i in win.cv.find_withtag("span")}
+    assert "0.50s" not in texts
 
 
 def test_the_shared_snap_keeps_the_editors_rules():
