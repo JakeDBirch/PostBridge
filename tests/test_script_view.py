@@ -193,3 +193,30 @@ def test_the_script_is_fetched_where_it_is_read_and_the_review_follows(
     assert "\u27f3 FETCH LATEST" in _labels(app._ep_findings_win)
     app._ep_findings_win.destroy()
     assert not app._errors, "\n".join(app._errors)
+
+
+@pytest.mark.skipif(not _HAVE_FFMPEG, reason="the app fixture's project needs ffmpeg")
+def test_a_loose_file_is_attached_by_token(app, monkeypatch, project):
+    """"Attach to" listed the sources by name; the script, Step 2 and Pro
+    Tools all know them by token."""
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    ep["sources"]["Ep 7 pt 1"]["vo_part"] = "Open"
+    cam = ep["sources"]["Ep 7 pt 2"]["video"][0]
+    rec = ep["sources"]["Ep 7 pt 2"]["audio"][0]
+    ep["sources"]["Ep 7 pt 2"]["video"].remove(cam)
+    choices = app._ep_attach_choices()
+    assert list(choices.items()) == [("BUTLER", "Butler Interview"),
+                                     ("VO: Open", "Ep 7 pt 1"),
+                                     ("Ep 7 pt 2  (no token)", "Ep 7 pt 2")]
+    app._ep_view()
+    _pump(app, 5)
+    assert "NOT YET IN A SOURCE" in _labels(app.body)
+    app._ep_attach(choices["BUTLER"], "video", cam)
+    assert cam in ep["sources"]["Butler Interview"]["video"]
+    # Two sources under one token are told apart by name.
+    ep["sources"]["Ep 7 pt 2"]["token"] = "BUTLER"
+    assert set(app._ep_attach_choices()) == {
+        "BUTLER  \u00b7  Butler Interview", "BUTLER  \u00b7  Ep 7 pt 2", "VO: Open"}
+    assert rec in ep["sources"]["Ep 7 pt 2"]["audio"]
+    assert not app._errors, "\n".join(app._errors)

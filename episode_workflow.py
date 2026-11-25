@@ -704,6 +704,7 @@ class EpisodeWorkflowMixin:
             return
         body = self._ep_card(parent, "NOT YET IN A SOURCE",
                              "recordings and cameras the scan kept but could not place")
+        choices = self._ep_attach_choices()
         for a in audio:
             r = tk.Frame(body, bg=SURF)
             r.pack(fill="x", pady=1)
@@ -714,7 +715,7 @@ class EpisodeWorkflowMixin:
                      font=FB, bg=SURF, fg=TEXT).pack(side="left", padx=(10, 0))
             self._btn(r, "PUT ASIDE", lambda p=a: self._ep_exclude(p), small=True
                       ).pack(side="right")
-        names = sorted(ep["sources"])
+            self._ep_attach_picker(r, "audio", a, choices)
         for v in video:
             r = tk.Frame(body, bg=SURF)
             r.pack(fill="x", pady=1)
@@ -725,12 +726,43 @@ class EpisodeWorkflowMixin:
                      font=FB, bg=SURF, fg=TEXT).pack(side="left", padx=(8, 0))
             self._btn(r, "PUT ASIDE", lambda p=v: self._ep_exclude(p), small=True
                       ).pack(side="right")
-            if names:
-                sv = tk.StringVar(value="— attach to —")
-                _FlatDropdown(r, sv, ["— attach to —"] + names, font=FB, width=24
-                              ).pack(side="right", padx=(0, 8))
-                sv.trace_add("write", lambda *_a, p=v, s=sv: (
-                    self._ep_attach(s.get(), "video", p) if s.get() in ep["sources"] else None))
+            self._ep_attach_picker(r, "video", v, choices)
+
+    def _ep_attach_choices(self):
+        """What a loose file can be attached to, as it is offered: {label:
+        source name}.  A source goes by its token -- that is what the script
+        and every later step call it -- or by its VO part; one with neither
+        yet goes by its name.  Tokens first, then VO parts, then the rest."""
+        ep = self._ep
+        rows = []
+        for name in sorted(ep["sources"]):
+            src = ep["sources"][name]
+            if src.get("token"):
+                rows.append((0, src["token"], name))
+            elif src.get("vo_part"):
+                rows.append((1, "VO: " + src["vo_part"], name))
+            else:
+                rows.append((2, "{}  (no token)".format(name), name))
+        seen = {}
+        for _rank, label, _name in rows:
+            seen[label] = seen.get(label, 0) + 1
+        out = {}
+        for _rank, label, name in sorted(rows, key=lambda t: (t[0], t[1].lower(), t[2])):
+            # Two sources under one token: say which is which.
+            out[label if seen[label] == 1 else "{}  ·  {}".format(label, name)] = name
+        return out
+
+    def _ep_attach_picker(self, row, kind, relpath, choices):
+        """The "attach to" dropdown on a loose file's row."""
+        if not choices:
+            return
+        none = "— attach to —"
+        sv = tk.StringVar(value=none)
+        _FlatDropdown(row, sv, [none] + list(choices), font=FB, width=26
+                      ).pack(side="right", padx=(0, 8))
+        sv.trace_add("write", lambda *_a: (
+            self._ep_attach(choices[sv.get()], kind, relpath)
+            if sv.get() in choices else None))
 
     def _ep_render_aside(self, parent):
         ep = self._ep
