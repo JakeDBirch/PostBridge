@@ -1449,3 +1449,18 @@ def test_shift_beside_a_split_rolls_it_too(wide):
     d = _drag_to(win, win._x(tl) + 5, win._x(tl) + 55, SHIFT_CTRL)
     assert d["mode"] == "roll"
     assert _segs(app, 1) == [(10.0, 12.5), (12.5, 14.0)]
+
+
+def test_a_key_under_the_script_says_what_its_colours_mean(view):
+    app, win = view
+    box, head, flow = win._script_key
+    said = [w.cget("text") for w in _labels(box)]
+    for want in ("in the script, not said (a whole line: not in the cut)",
+                 "said, but not in the script", "the pull at the playhead",
+                 "the word being heard", "your highlight"):
+        assert want in said
+    assert flow.winfo_manager()                     # open to start with
+    head.event_generate("<Button-1>")
+    app.update()
+    assert not flow.winfo_manager()
+    assert app._prefs["assembly_palette"]["SCRIPT KEY"] is False

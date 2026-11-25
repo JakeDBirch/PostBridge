@@ -4,6 +4,9 @@
 
 ## November 25, 2026
 
+### Assembly: a key under the script
+- **Script key**: a strip under the script shows a sample of each colour and style and what it means. It covers the part title, the speaker, script words as said, struck words (in the script but not said, or a whole line not in the cut), tinted words (said but not in the script), faded words (heard by the quick first pass and not yet checked), the pull at the playhead, the selected pull, the word being heard, and your highlight. Click its title to fold it away; it stays folded or open as you left it.
+
 ### Assembly: Pro Tools edit keys; Shift-drag slips a region
 - **Pro Tools' default edit keys**, all at the playhead:
   - **A** trims the region's start to it.

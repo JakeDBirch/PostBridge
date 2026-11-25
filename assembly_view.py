@@ -1088,6 +1088,7 @@ class AssemblyWindow(object):
                             insertwidth=0, yscrollcommand=sb.set, width=40)
         self.text.pack(side="left", fill="both", expand=True)
         sb.config(command=self.text.yview)
+        self._build_script_key(script, before=sb)
         # Scrolling the script yourself holds its follow off a while.
         for w in (self.text, sb):
             w.bind("<MouseWheel>", self._script_touched, add="+")
@@ -1193,6 +1194,69 @@ class AssemblyWindow(object):
         for seq in ("<Alt-f>", "<Alt-F>"):
             self.win.bind(seq, lambda e: (self.toggle_script_follow(),
                                           "break")[1])
+
+    # What the script's colours and styles mean: (sample, its look, meaning).
+    _SCRIPT_KEY = (
+        ("Part title",  dict(font="part", fg=_C_PART), "a part's title"),
+        ("SCOTT",       dict(font="mono", fg=SUB), "who speaks from here"),
+        ("words",       dict(fg=TEXT), "the script, as it was said"),
+        ("struck",      dict(font="struck", fg=_C_STRUCK),
+         "in the script, not said (a whole line: not in the cut)"),
+        ("tinted",      dict(fg=_C_SAID), "said, but not in the script"),
+        ("faded",       dict(fg=SUB),
+         "heard by the quick first pass, not yet checked"),
+        ("  line  ",    dict(bg=SURF3), "the pull at the playhead"),
+        ("  line  ",    dict(bg=SURF2), "the pull selected"),
+        ("word",        dict(bg=ACCENT), "the word being heard"),
+        ("words",       dict(bg=_C_TXSEL), "your highlight"),
+    )
+
+    def _build_script_key(self, parent, before=None):
+        """The script's key, under it: a sample of each colour and style and
+        what it means.  Its title folds it away (kept in prefs)."""
+        box = tk.Frame(parent, bg=SURF)
+        box.pack(side="bottom", fill="x", before=before)
+        head = tk.Label(box, font=(FB[0], 9, "bold"), bg=SURF, fg=SUB,
+                        anchor="w", cursor="hand2")
+        head.pack(fill="x", padx=8, pady=(4, 2))
+        flow = _Flow(box, pad=16, bg=SURF)
+        fonts = {"part": FBT, "mono": _MONO,
+                 "struck": tkfont.Font(family=FB[0], size=11, overstrike=1)}
+        self._key_font = fonts["struck"]             # kept alive
+        for sample, look, meaning in self._SCRIPT_KEY:
+            f = tk.Frame(flow, bg=SURF)
+            look = dict(look)
+            font = fonts.get(look.pop("font", None), (FB[0], 11))
+            tk.Label(f, text=sample, font=font, bg=look.pop("bg", SURF),
+                     fg=look.pop("fg", TEXT), padx=2).pack(side="left")
+            tk.Label(f, text=meaning, font=(FB[0], 9), bg=SURF,
+                     fg=SUB).pack(side="left", padx=(4, 10))
+            flow.add(f)
+        self._script_key = (box, head, flow)
+
+        def show(on):
+            head.config(text=("\u25BE  " if on else "\u25B8  ") + "SCRIPT KEY")
+            if on and not flow.winfo_manager():
+                flow.pack(fill="x", padx=8, pady=(0, 6))
+            elif not on and flow.winfo_manager():
+                flow.pack_forget()
+
+        def toggle(_e=None):
+            on = not flow.winfo_manager()
+            show(on)
+            prefs = self._layout_prefs()
+            if prefs is not None:
+                kept = prefs.get("assembly_palette")
+                kept = dict(kept) if isinstance(kept, dict) else {}
+                kept["SCRIPT KEY"] = on
+                prefs["assembly_palette"] = kept
+                save = getattr(self.app, "_save_prefs", None)
+                if callable(save):
+                    save()
+        self.toggle_script_key = toggle
+        head.bind("<Button-1>", toggle)
+        kept = (self._layout_prefs() or {}).get("assembly_palette")
+        show(kept.get("SCRIPT KEY", True) if isinstance(kept, dict) else True)
 
     def _panel(self, title, fixed=False):
         """One section of controls: a title and its buttons, wrapping to the
