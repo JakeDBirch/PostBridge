@@ -99,6 +99,10 @@ def new_episode(root, title=None):
         "sources":  {},
         # rel paths the user put aside by hand (survives a rescan)
         "excluded": [],
+        # rel paths the user brought back from what a scan put aside: a copy
+        # of a recording, a short clip, something in a library folder.
+        # In the pool whatever a scan thinks of them (survives a rescan).
+        "included": [],
         "links":    {"script": None, "aaf": None, "mix": None},
         # Each workflow's saved work (see STAGE_*).
         "stages":   {},
@@ -361,6 +365,7 @@ def load(path):
     ep["file_path"] = os.path.abspath(path)
     ep.setdefault("media", {}); ep.setdefault("sources", {})
     ep.setdefault("excluded", []); ep.setdefault("links", {})
+    ep.setdefault("included", [])
     ep["stages"] = _map_paths(ep.get("stages") or {}, _unrooted(ep))
     # True until saved: the file on disk is still the old shape.
     ep["_absorbed"] = _absorb_stage_files(ep)
@@ -731,6 +736,33 @@ def add_label(ep, relpath, kind, label):
     return into
 
 
+def unlink_file(ep, relpath, kind, group):
+    """Take *relpath* out of the files it was grouped with, into a group of
+    its own with no token: for when a scan put together what does not
+    belong together.  Returns the new group's name (or *group* when the
+    file was already alone)."""
+    src = ep["sources"].get(group)
+    if src is None or relpath not in src.get(kind, []):
+        return group
+    if len(src.get("audio", [])) + len(src.get("video", [])) == 1:
+        return group
+    _drop(ep, group, kind, relpath)
+    name = _new_group(ep, _stem(relpath), None, kind, relpath)
+    ep["sources"][name]["user_made"] = True
+    return name
+
+
+def include_file(ep, relpath):
+    """Bring a file a scan put aside into the pool, unassigned, and keep it
+    there through every rescan."""
+    rec = ep["media"][relpath]
+    rec["status"] = "source"; rec["reason"] = ""; rec["dup_of"] = None
+    if relpath in ep.setdefault("excluded", []):
+        ep["excluded"].remove(relpath)
+    if relpath not in ep.setdefault("included", []):
+        ep["included"].append(relpath)
+
+
 def rename_label(ep, old, new):
     """Every group assigned to token *old* is assigned to *new*."""
     for n in groups_with(ep, old):
@@ -814,7 +846,7 @@ def classify_path(relpath):
     return None, ""
 
 
-def scan(root, progress=None, excluded=None, workers=4):
+def scan(root, progress=None, excluded=None, workers=4, included=None):
     """Find the media under *root* and sort it.
 
     Returns {"files": {rel: record}, "sources": {name: {...}},
@@ -828,6 +860,8 @@ def scan(root, progress=None, excluded=None, workers=4):
     """
     root = os.path.abspath(root)
     excluded = set(excluded or [])
+    # What the user brought back: never put aside again, for any reason.
+    included = set(included or []) - excluded
     files = {}
     sessions = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -860,6 +894,8 @@ def scan(root, progress=None, excluded=None, workers=4):
             status, reason = classify_path(r)
             if r in excluded:
                 status, reason = "excluded", "put aside"
+            elif r in included:
+                status, reason = None, ""
             files[r] = {"kind": kind, "size": size, "duration_s": None,
                         "status": status, "reason": reason, "dup_of": None}
 
@@ -888,7 +924,7 @@ def scan(root, progress=None, excluded=None, workers=4):
     for r in probe:
         rec = files[r]
         if rec["status"] is None and rec["duration_s"] is not None \
-                and rec["duration_s"] < MIN_SOURCE_SECS:
+                and rec["duration_s"] < MIN_SOURCE_SECS and r not in included:
             rec["status"] = "short"
             rec["reason"] = "{:.0f} s".format(rec["duration_s"])
 
@@ -917,7 +953,7 @@ def scan(root, progress=None, excluded=None, workers=4):
         members.sort(key=_rank)
         canon = members[0]
         for m in members[1:]:
-            if m == canon:
+            if m == canon or m in included:
                 continue
             files[m]["dup_of"] = canon
             files[m]["status"] = "duplicate"

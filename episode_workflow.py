@@ -285,7 +285,8 @@ class EpisodeWorkflowMixin:
         def _run():
             try:
                 res = EP.scan(ep["root"], progress=_progress,
-                              excluded=ep.get("excluded"))
+                              excluded=ep.get("excluded"),
+                              included=ep.get("included"))
             except Exception as e:
                 msg = str(e)    # `e` is unbound by the time the lambda runs
                 self._ui(lambda: messagebox.showerror("Scan failed", msg))
@@ -645,6 +646,10 @@ class EpisodeWorkflowMixin:
             # Assigning one of a numbered set assigns the rest with it.
             tk.Label(r, text="↔ {}".format(linked_set), font=FB, bg=SURF2, fg=ACCENT
                      ).pack(side="left", padx=(10, 0))
+            # ...unless it is taken out of the set: the scan's guess at what
+            # goes together is only a guess.
+            self._btn(r, "UNLINK", lambda: self._ep_pool_unlink(row), small=True
+                      ).pack(side="left", padx=(6, 0))
         tk.Label(r, text=os.path.dirname(rel), font=(_SANS, 10), bg=SURF2, fg=SUB
                  ).pack(side="left", padx=(10, 0))
 
@@ -705,6 +710,11 @@ class EpisodeWorkflowMixin:
             if label in opened:
                 opened[new] = opened.pop(label)
             self._ep_redraw()
+
+    def _ep_pool_unlink(self, row):
+        """Take a file out of the set it travels with."""
+        EP.unlink_file(self._ep, row["rel"], row["kind"], row["group"])
+        self._ep_redraw()
 
     def _ep_pool_remove(self, row):
         """Take a shared file out from under this token; it stays under its
@@ -783,13 +793,11 @@ class EpisodeWorkflowMixin:
                  anchor="w").pack(side="left")
         tk.Label(r, text=os.path.dirname(relpath), font=(_SANS, 10), bg=SURF, fg=SUB
                  ).pack(side="left", padx=(10, 0))
-        if status == "excluded":
-            self._btn(r, "RESTORE", lambda p=relpath: self._ep_restore(p), small=True).pack(side="right")
-        elif rec["kind"] == "audio" and (d or 0) >= EP.MIN_SOURCE_SECS and status in ("pt_copy", "noise"):
-            self._btn(r, "ADD TO POOL", lambda p=relpath: self._ep_make_source(p), small=True
-                      ).pack(side="right")
-        elif rec["kind"] == "video" and status in ("noise", "short", "pt_copy"):
-            self._btn(r, "KEEP", lambda p=relpath: self._ep_restore(p), small=True).pack(side="right")
+        # Whatever the reason it was put aside, it is the user's to bring
+        # back: a copy of a recording may be the one wanted, a short clip
+        # may be a real pickup.
+        self._btn(r, "ADD TO POOL", lambda p=relpath: self._ep_include(p), small=True
+                  ).pack(side="right")
 
     # -- edits ------------------------------------------------------------
 
@@ -801,19 +809,26 @@ class EpisodeWorkflowMixin:
         return sorted(r for r, rec in ep["media"].items()
                       if rec["kind"] == kind and rec["status"] == "source" and r not in used)
 
-    def _ep_make_source(self, relpath):
+    def _ep_include(self, relpath):
+        """A put-aside file joins the pool, unassigned, and stays through a
+        rescan.  One a scan never measured (a library folder is not probed)
+        is measured now, off the UI thread."""
         ep = self._ep
+        EP.include_file(ep, relpath)
         rec = ep["media"][relpath]
-        rec["status"] = "source"; rec["reason"] = ""; rec["dup_of"] = None
-        if relpath in ep["excluded"]:
-            ep["excluded"].remove(relpath)
-        name = EP._stem(relpath)
-        base, i = name, 2
-        while name in ep["sources"]:
-            name = "{} ({})".format(base, i); i += 1
-        ep["sources"][name] = {"token": None, "audio": [relpath], "video": [],
-                               "session": None, "user_made": True}
-        self._ep_view()
+        if not rec.get("duration_s"):
+            def _measure():
+                d = EP._duration(EP.absp(ep, relpath))
+                def _set():
+                    rec["duration_s"] = round(d, 3)
+                    if self._ep is ep:
+                        self._ep_review_refresh()
+                if d:
+                    self._ui(_set)
+            threading.Thread(target=_measure, daemon=True).start()
+        self._ep_redraw()
+
+    _ep_make_source = _ep_include        # what it used to be called
 
     def _ep_combine(self, name, other):
         """Two sources are one session (each mic was given its own): *other*
@@ -866,15 +881,12 @@ class EpisodeWorkflowMixin:
         ep["media"][relpath]["reason"] = "put aside"
         if relpath not in ep["excluded"]:
             ep["excluded"].append(relpath)
+        if relpath in ep.get("included", []):
+            ep["included"].remove(relpath)
         self._ep_redraw()
 
     def _ep_restore(self, relpath):
-        ep = self._ep
-        if relpath in ep["excluded"]:
-            ep["excluded"].remove(relpath)
-        rec = ep["media"][relpath]
-        rec["status"] = "source"; rec["reason"] = ""
-        self._ep_view()
+        self._ep_include(relpath)
 
     # ── Google Docs ───────────────────────────────────────────────────────
 

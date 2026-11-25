@@ -183,3 +183,55 @@ def test_the_page_is_a_pool_and_a_dropdown_assigns(app, monkeypatch, project):
     _pump(app, 5)
     assert "Ep 7 pt 2.wav" not in [os.path.basename(r["rel"]) for r in EP.pool_rows(ep)]
     assert not app._errors, "\n".join(app._errors)
+
+
+# ── Nothing a scan decides is locked ──────────────────────────────────────
+
+def test_a_file_put_aside_for_any_reason_can_join_the_pool_and_stays(
+        app, monkeypatch, project):
+    """A copy of a recording already listed had no way back: only some kinds
+    of put-aside file had a button, and a rescan would have set it aside
+    again anyway."""
+    from test_episode_screens import _wait
+    _open_fresh(app, monkeypatch, project)
+    ep = app._ep
+    aside = {rec["status"]: r for r, rec in ep["media"].items()
+             if rec["status"] not in ("source", "mix")}
+    assert "duplicate" in aside and "short" in aside, aside
+    assert _labels(app.body).count("ADD TO POOL") == 0        # folded away
+    for status in ("duplicate", "short"):
+        app._ep_include(aside[status])
+    _pump(app, 5)
+    pool = [r["rel"] for r in EP.pool_rows(ep)]
+    assert aside["duplicate"] in pool and aside["short"] in pool
+    assert ep["media"][aside["duplicate"]]["dup_of"] is None
+    assert sorted(ep["included"]) == sorted([aside["duplicate"], aside["short"]])
+
+    # A rescan would call them a copy and a short clip again; they stay.
+    app._ep_scan()
+    assert _wait(app, lambda: app._ep.get("media") and all(
+        app._ep["media"][aside[s]]["status"] == "source" for s in ("duplicate", "short")))
+    _pump(app, 5)
+    assert aside["duplicate"] in [r["rel"] for r in EP.pool_rows(app._ep)]
+    # The recording it is a copy of is still there too.
+    assert sum(1 for r in EP.pool_rows(app._ep)
+               if os.path.basename(r["rel"]) == os.path.basename(aside["duplicate"])) >= 1
+
+    # Put aside again by hand, it is out, and no longer held in.
+    app._ep_exclude(aside["short"])
+    assert aside["short"] not in app._ep["included"]
+    assert app._ep["media"][aside["short"]]["status"] == "excluded"
+    assert not app._errors, "\n".join(app._errors)
+
+
+def test_a_file_can_be_unlinked_from_the_ones_it_travels_with(tmp_path):
+    ep = _episode(tmp_path)
+    name = EP.unlink_file(ep, "a/jordan.wav", "audio", "guest")
+    assert name != "guest" and ep["sources"][name]["audio"] == ["a/jordan.wav"]
+    assert ep["sources"]["guest"]["audio"] == ["a/guest.wav"]
+    # Now naming one no longer names the other.
+    EP.assign_file(ep, "a/guest.wav", "audio", "GUEST", "guest")
+    shown = dict(_shown(ep))
+    assert shown["a/guest.wav"] == "GUEST" and shown["a/jordan.wav"] is None
+    # A file alone has nothing to be unlinked from.
+    assert EP.unlink_file(ep, "a/vo2.wav", "audio", "vo2") == "vo2"
