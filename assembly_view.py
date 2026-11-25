@@ -5069,14 +5069,21 @@ class AssemblyWindow(object):
             self.app._s4_editing_row = None
 
     def set_point(self, side):
-        """I / O: an IN or OUT at the insertion point.  On the track, the
+        """I / O: an IN or OUT at the playhead.  On the track, the
         region under it starts (I) or stops (O) there -- in the surrounding
         audio shown, the region after it (I) or before it (O) reaches out
         to it.  In Find in recording, the pull's, at its playhead."""
         if self.view == "source" and self.src is not None:
             self.src._set_point_from_cursor(side)
             return
-        t = self.insert
+        # The playhead: where it is, playing (playback stops there), or
+        # where it stopped -- the line on the track, not where play began.
+        if self._playing and self.player is not None:
+            t = self._from_player(self.player.position())
+            self.stop()
+        else:
+            t = self.playhead
+        t = max(0.0, min(t, self.total_s))
         c = self._clip_at(t)
         if c is None:
             c = next((x for x in self.clips if x.ghost_at(t) is not None), None)

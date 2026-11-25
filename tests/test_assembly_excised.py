@@ -876,6 +876,18 @@ def test_i_and_o_in_the_surrounding_audio_reach_the_region_out_to_it(view):
         [(10.0, pytest.approx(11.5)), (12.0, 14.0)]
 
 
+def test_i_and_o_go_by_the_playhead_where_playback_stopped(view):
+    """Stopped away from where play began, the edge goes to the playhead
+    line, not back at the insertion point."""
+    app, win = view
+    _cut_one(app, win)
+    win.set_insert(0.2)
+    win.playhead = 2.5                            # stopped here, 13.5 s
+    win._on_key(_KeyEv(win.cv, "o", 0))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == \
+        [(10.0, 11.0), (12.0, pytest.approx(13.5))]
+
+
 def test_ctrl_k_switches_pre_roll_and_p_no_longer_does(view, monkeypatch):
     app, win = view
     monkeypatch.setitem(assembly_view._MONITOR, "preroll_on", True)
