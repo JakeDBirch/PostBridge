@@ -5,7 +5,7 @@
 ## November 25, 2026
 
 ### Assembly: I and O work on the track
-- **I** and **O** used to work only in Find in recording; on the track they just showed a message. Now **I** starts the region under the insertion point right there, and **O** stops it there. With the surrounding audio shown, put the insertion point in the dimmed audio: **I** brings the next region's start back to that spot, and **O** extends the previous region's end out to it. Each is one undo step.
+- **I** and **O** used to work only in Find in recording; on the track they just showed a message. Now **I** starts the region under the insertion point right there, and **O** stops it there. With the surrounding audio shown, put the insertion point in the dimmed audio: **I** brings the next region's start back to that spot, and **O** extends the previous region's end out to it. Each is one undo step. I and O go by the playhead line: during playback they stop it and set the edge right there; after a stop, they use wherever the playhead stopped, not where play began.
 
 ### Assembly: Tab to the next region; pre-roll is Ctrl+K
 - **Tab** puts the insertion point at the start of the next region on the track: the next stretch of audio, in the same pull or the next. **Shift+Tab** goes back to the one before. Both also stop at the start of each pull, so Shift+Tab from a pull's first region lands on that pull's start. The view follows, and the pull it lands in is selected. The arrow keys still go a whole pull at a time.
