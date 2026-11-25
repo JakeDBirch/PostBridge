@@ -147,6 +147,10 @@ def test_a_trim_reaches_into_the_dimmed_audio(view):
 class _Player(object):
     def __init__(self):
         self.segments = "unset"
+        self.source = None
+
+    def load_source(self, source, t0=0.0):
+        self.source = source
 
     def set_segments(self, s):
         self.segments = s
@@ -165,18 +169,22 @@ class _Player(object):
 
 
 def test_playback_skips_the_surrounding_audio_unless_shift_s_says_hear_it(view, monkeypatch):
+    """Shown and skipped, the surrounding audio isn't on what plays at all:
+    the player is on the finished cut itself (cut_audio), on the cut's own
+    time, so a cut plays as its crossfade.  Heard, the track as laid out."""
     app, win = view
     monkeypatch.setitem(assembly_view._MONITOR, "skip_cuts", True)
     win.player = p = _Player()
     _cut_one(app, win)
-    assert p.segments is None                     # nothing on show to skip
     win.toggle_excised()
-    spans = p.segments
-    assert spans[0] == (-assembly_view.LEAD_S, 0.0)
-    assert (3.0, 4.0) in [(round(a, 3), round(b, 3)) for a, b in spans]
-    assert not any(a < 4.5 < b for a, b in spans)  # the cut audio is jumped
+    assert p.source is win.cut_audio and p.segments is None
+    # The finished cut: pull 1's two pieces butt at 1.0 s, no cut audio in it.
+    starts = [(round(st / win.cut_audio.sr - assembly_view.LEAD_S, 3), o, round(si, 3))
+              for st, _du, o, si, *_r in win.cut_audio._index[1]]
+    assert all(not (o == 1 and 11.0 < si < 12.0) for _t, o, si in starts)
+    assert win._to_player(win._to_open_t(1.5)) == pytest.approx(1.5)
     _key(app, win.cv, "S", SHIFT)
-    assert p.segments is None and not assembly_view._MONITOR["skip_cuts"]
+    assert p.source is win.audio and not assembly_view._MONITOR["skip_cuts"]
     # ...and the audio composed now has the cut audio in it.
     assert any(o == 1 and abs(si - 11.0) < 1e-6
                for _st, _du, o, si, *_rest in win.audio._index[1])
@@ -484,8 +492,10 @@ def test_enter_while_playing_carries_on_from_the_same_moment(view):
     try:
         win.toggle_excised()
         assert win._playing                       # not stopped
-        assert p.seeks == [pytest.approx(5.5)]
-        assert win._clip(1).src_at(p.at) == pytest.approx(12.5)
+        # On the finished cut's own time: the same moment, 1.5 s in.
+        assert p.at == pytest.approx(1.5)
+        assert win.playhead == pytest.approx(5.5)
+        assert win._clip(1).src_at(win.playhead) == pytest.approx(12.5)
         win.toggle_excised()
         assert win._playing and p.at == pytest.approx(1.5)
     finally:
@@ -779,3 +789,23 @@ def test_caps_lock_doesnt_turn_a_key_into_its_shifted_one(view, monkeypatch):
     # Shift with Caps Lock arrives as "s": still Shift+S.
     win._on_key(_KeyEv(win.cv, "s", CAPS | SHIFT))
     assert assembly_view._MONITOR["skip_cuts"] is False
+
+
+def test_a_cut_keeps_its_crossfade_with_the_surrounding_audio_shown(view):
+    app, win = view
+    app.fade_var.set(0.200)                       # the crossfade default
+    _cut_one(app, win)                            # 10-11 | cut | 12-14
+    shut = win._clip(1).shapes
+    assert shut[0][1][0] == "x" and shut[1][0][0] == "x"
+    win.toggle_excised()
+    opened = win._clip(1).shapes
+    assert opened == shut                         # the same crossfade, not two fades
+    # Drawn on each side of the dimmed cut audio: the outgoing slope runs on
+    # past its region into the cut audio, the incoming one starts in it.
+    marks = {(k, side): m for k, side, *m in win._fade_marks(win._clip(1))}
+    edge_out, ht_out, secs_out, cross_out, _own = marks[(0, "out")]
+    assert cross_out and secs_out == pytest.approx(0.2)
+    # What plays: the finished cut, with the crossfade in it.
+    x = [p for p in win.cut_audio._index[1] if p[2] == 1]
+    assert len(x) == 2 and x[0][5] > 0 and x[1][4] > 0  # fade out / in ramps
+    assert x[1][0] < x[0][0] + x[0][1]                  # the two overlap

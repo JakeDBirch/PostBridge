@@ -2,6 +2,17 @@
 
 ---
 
+## November 25, 2026
+
+### Ctrl+Q quits
+- **Ctrl+Q quits PostBridge from any screen or window,** the Assembly included. It's the same as closing the main window: you're still asked about unsaved work or a transcription that's running.
+
+### Assembly: a cut is the same crossfade with the surrounding audio shown
+- **With Show surrounding audio on, a cut inside a pull used to turn into something else.** The dimmed audio sits between its two regions, so the cut was drawn and played as a fade out, a jump and a fade in. The X from the cut view turned into two separate slopes, and you heard a dip at every cut. Switching views changed what the fades looked and sounded like.
+- **Now the fades come from the finished cut in both views.** A crossfade stays a crossfade: its outgoing slope runs past its region into the dimmed audio, and its incoming slope starts inside it, exactly as far as each side's tape plays.
+- **With Skip edits on, what plays is the finished cut itself,** crossfades and all, and the playhead follows it across the track. With Skip edits off you still hear the whole track as laid out, dimmed audio included.
+- With the surrounding audio shown, the waveform drawn under a fade in or out is the finished cut's, as everywhere else. A crossfade there is shown by its two slopes.
+
 ## November 23, 2026
 
 ### Keys ignore Caps Lock

@@ -810,6 +810,17 @@ def _text_line(script, units, ops, fade=False):
     return m.line()
 
 
+class _CutClip(object):
+    """A pull as the finished cut places it, for _AssemblyAudio: no
+    surrounding audio, nothing to draw."""
+
+    def __init__(self, order, play_path, pieces, fades):
+        self.order, self.play_path = order, play_path
+        self.pieces = pieces
+        self.fades = fades if len(fades) == len(pieces) else [(0.0, 0.0)] * len(pieces)
+        self.ghosts = []
+
+
 class _AssemblyAudio(object):
     """The cut as a playback.LivePlayer source: composes any window of the
     timeline from the per-pull buffers on demand.  Index 0 is LEAD_S
@@ -1025,6 +1036,10 @@ class AssemblyWindow(object):
         _load_monitor(self._layout_prefs())
 
         self.audio  = _AssemblyAudio(PLAY_SR)
+        # The finished cut, on its own time: what plays with the surrounding
+        # audio shown and Skip edits on, crossfades and all (_set_play_spans).
+        self.cut_audio = _AssemblyAudio(PLAY_SR)
+        self._cut_src = False            # the player is on cut_audio
         self.player = None
         if playback.available():
             self.player = playback.LivePlayer(samplerate=PLAY_SR)
@@ -1461,6 +1476,7 @@ class AssemblyWindow(object):
         self._sync_source()
         clips = self.clips
         self.audio.keep_only({c.order for c in clips})
+        self.cut_audio.keep_only({c.order for c in clips})
         self._env = {o: v for o, v in self._env.items() if o in self._by_order}
         self._gain = {o: v for o, v in self._gain.items() if o in self._by_order}
         self._sil = {o: v for o, v in self._sil.items() if o in self._by_order}
@@ -1497,6 +1513,7 @@ class AssemblyWindow(object):
             fade_secs=self._default_fades())
         # Spotting marks ride on the finished cut's placement.
         marks = engines.place_markers(placed, LAYOUT_SR)
+        cut_placed = placed              # the finished cut, before opening up
         self._shifts = []
         if self.excised:
             placed, part_starts, self._shifts = _open_up(
@@ -1508,7 +1525,10 @@ class AssemblyWindow(object):
         # What each edge gets on the one track, joined as the AAF joins
         # them: per piece ((kind, seconds), (kind, seconds)) -- "x" half a
         # crossfade's length, "f" a fade in or out.
-        flat = [(p, f) for e in placed
+        # From the finished cut, in both views: a cut is the same crossfade
+        # with the surrounding audio shown, its two sides reaching into the
+        # dimmed audio by the tape each borrows.
+        flat = [(p, f) for e in cut_placed
                 for p, f in zip(e["pieces"], e.get("fades") or
                                 [(0, 0)] * len(e["pieces"]))]
         flat_order = sorted(range(len(flat)), key=lambda n: flat[n][0][0])
@@ -1583,6 +1603,7 @@ class AssemblyWindow(object):
             for pi, sa in part_starts.items())
         if clips:
             self.total_s = max(c.vis_hi for c in clips)
+        self._cut_clips(cut_placed, clips)
         self._set_play_spans()
         self.markers = [dict(m, t=_to_open(m["pos"] / float(LAYOUT_SR),
                                            self._shifts))
@@ -2044,6 +2065,7 @@ class AssemblyWindow(object):
             self._show_loading()
             return
         self.audio.put(c.order, path, t0, pcm)
+        self.cut_audio.put(c.order, path, t0, pcm)
         self._gain[c.order] = _norm_gain(pcm)
         self._apply_gains()
         self._env[c.order] = (t0, env)
@@ -3239,7 +3261,7 @@ class AssemblyWindow(object):
             if max(xe_, xh) < -20 or min(xe_, xh) > w + 20:
                 continue
             tl, du, _si = c.pieces[k]
-            if secs > 0 and not (cross and side == "in"):
+            if secs > 0 and not (cross and (side == "in" or self.excised)):
                 # The waveform as it plays here: faded, a crossfade's two
                 # sides mixed.  (A crossfade once, from its outgoing side.)
                 if cross:
@@ -3282,13 +3304,17 @@ class AssemblyWindow(object):
         ls = self._ls
         top, bot = y0 + ls + 8, y1 - ls - 8
         mid, half = (top + bot) / 2.0, (bot - top) / 2.0
-        sr = self.audio.sr
+        src = self.cut_audio if self.excised else self.audio
+        sr = src.sr
         lead = int(round(LEAD_S * sr))
-        i0 = int(round(self._t(xa) * sr)) + lead
-        i1 = int(round(self._t(xb) * sr)) + lead
+        ta, tb = self._t(xa), self._t(xb)
+        if self.excised:
+            ta, tb = self._to_cut_t(ta), self._to_cut_t(tb)
+        i0 = int(round(ta * sr)) + lead
+        i1 = int(round(tb * sr)) + lead
         if i1 - i0 < 2:
             return
-        pcm = self.audio.read(i0, i1 - i0)
+        pcm = src.read(i0, i1 - i0)
         # The lane's scale: Normalize's gain is in what is read already.
         g = self._gain.get(c.order) if _MONITOR["normalize"] else None
         k = (1.0 / NORM_LEVEL) if g is not None else \
@@ -3874,7 +3900,7 @@ class AssemblyWindow(object):
         playback too if it is running (the ruler, the script, Home)."""
         self.playhead = self.insert = max(0.0, min(t, self.total_s))
         if self.player is not None and self._playing:
-            self.player.seek(self.playhead)
+            self.player.seek(self._to_player(self.playhead))
         span = self._span()
         if center or not (self.view0 <= self.playhead <= self.view0 + span):
             self.view0 = self.playhead - span * (0.3 if center else 0.1)
@@ -5090,7 +5116,9 @@ class AssemblyWindow(object):
             if _MONITOR["snap"] else "off: edges go where you drag them"))
 
     def _apply_gains(self):
-        self.audio.set_gains(self._gain if _MONITOR["normalize"] else {})
+        gains = self._gain if _MONITOR["normalize"] else {}
+        self.audio.set_gains(gains)
+        self.cut_audio.set_gains(gains)
 
     def toggle_normalize(self):
         """Normalize: every pull plays (and draws) at the one level, a quiet
@@ -5112,24 +5140,58 @@ class AssemblyWindow(object):
     def toggle_skip_cuts(self):
         """Shift+S, Skip edits: play only the finished cut, skipping the excised audio on
         show -- or hear it as well.  The same in the source view."""
+        playing = self._playing and self.player is not None
+        at = self._from_player(self.player.position()) if playing else None
         _MONITOR["skip_cuts"] = not _MONITOR["skip_cuts"]
         if self.src is not None:
             self.src.skip_cuts = _MONITOR["skip_cuts"]
         self._set_play_spans()
+        if at is not None:
+            self.player.seek(self._to_player(at))
         self._show_monitor()
 
+    def _cut_clips(self, cut_placed, clips):
+        """cut_audio's pieces: the finished cut's own placement (with the
+        surrounding audio shown, the track's is opened up)."""
+        if not self.excised:
+            self.cut_audio.set_clips(clips, self.total_s)
+            return
+        paths = {c.order: c.play_path for c in clips}
+        stubs, end = [], 0.0
+        for e in cut_placed:
+            order = e["res"].get("order")
+            st = _CutClip(order, paths.get(order),
+                          [(a / float(LAYOUT_SR), b / float(LAYOUT_SR), c / float(LAYOUT_SR))
+                           for a, b, c in e["pieces"]],
+                          [(fi / float(LAYOUT_SR), fo / float(LAYOUT_SR))
+                           for fi, fo in e.get("fades") or ()])
+            stubs.append(st)
+            end = max(end, e["end"] / float(LAYOUT_SR))
+        self.cut_audio.set_clips(stubs, end)
+
     def _set_play_spans(self):
-        """What the track's player composes and where it may play: the
-        finished cut, jumping the excised audio on show -- or, with Skip
-        cuts off, that audio heard too."""
+        """What the track's player plays.  With the surrounding audio shown
+        and Skip edits on: the finished cut itself (cut_audio, on the cut's
+        own time), so a cut plays as the crossfade it is, not a fade out
+        and a jump.  Otherwise the track as it is laid out -- with the
+        surrounding audio shown and heard, that audio too."""
         hear = self.excised and not _MONITOR["skip_cuts"]
         self.audio.set_clips(self.clips, self.total_s, ghosts=hear)
         if self.player is None:
             return
-        ghosts = [g for c in self.clips for g in c.ghosts]
-        self.player.set_segments(
-            _kept_spans(ghosts, -LEAD_S, self.total_s + 1.0)
-            if ghosts and not hear else None)
+        use_cut = self.excised and not hear
+        if use_cut != self._cut_src:
+            self.player.load_source(self.cut_audio if use_cut else self.audio,
+                                    t0=-LEAD_S)
+            self._cut_src = use_cut
+        self.player.set_segments(None)
+
+    def _to_player(self, t):
+        """Track time t as the player's: the cut's own time on cut_audio."""
+        return self._to_cut_t(t) if self._cut_src else t
+
+    def _from_player(self, p):
+        return self._to_open_t(p) if self._cut_src else p
 
     def toggle_excised(self):
         """Enter: show the surrounding audio -- every cut opened up
@@ -5142,7 +5204,7 @@ class AssemblyWindow(object):
         # its place on the new layout.  Only a moment of surrounding audio
         # being heard has none once it is hidden: the cut picks up there.
         playing = self._playing and self.player is not None
-        now = self.player.position() if playing else self.playhead
+        now = self._from_player(self.player.position()) if playing else self.playhead
         ph, ins = self._to_cut_t(now), self._to_cut_t(self.insert)
         origin = self._to_cut_t(self._play_origin)
         x = self._x(now)
@@ -5150,7 +5212,7 @@ class AssemblyWindow(object):
         self._layout()
         new = self._to_open_t(ph)
         if playing:
-            self.player.seek(new)        # before the rest of the refresh
+            self.player.seek(self._to_player(new))   # before the rest of the refresh
         self.refresh()
         self.playhead = new
         self.insert = self._to_open_t(ins)
@@ -5596,7 +5658,7 @@ class AssemblyWindow(object):
         self._play_origin = origin
         start = self._preroll_start(origin)
         self.player.set_rate(self._rate)
-        if not self.player.play(start_s=max(0.0, start)):
+        if not self.player.play(start_s=max(0.0, self._to_player(start))):
             self.status.config(text="Couldn't open the audio device.", fg=ERR)
             return
         self._playing = True
@@ -5614,7 +5676,7 @@ class AssemblyWindow(object):
             self.player.stop()
             if was:
                 # Where the sound stopped, not where the last tick saw it.
-                self.playhead = max(0.0, min(self.player.position(),
+                self.playhead = max(0.0, min(self._from_player(self.player.position()),
                                              self.total_s))
         if self._tick_after is not None:
             try:
@@ -5647,7 +5709,8 @@ class AssemblyWindow(object):
         if self._closed or self.player is None:
             return
         playing = self.player.is_playing()
-        self.playhead = max(0.0, min(self.player.position(), self.total_s))
+        self.playhead = max(0.0, min(self._from_player(self.player.position()),
+                                     self.total_s))
         span = self._span()
         # Follow: page the view along -- never while an edit is in hand.
         if _MONITOR["follow"] and self._drag is None and self._rename is None \
@@ -5729,6 +5792,10 @@ class AssemblyWindow(object):
 
     # ── Keys ─────────────────────────────────────────────────────────────
     def _on_key(self, e):
+        if e.state & 0x0004 and e.keysym in ("q", "Q"):
+            # Quit the app, even from a text field.  This handler ends
+            # every key here, so the app-wide Ctrl+Q never sees it.
+            return self.app._quit_key()
         if isinstance(e.widget, (tk.Entry, tk.Spinbox)) or \
                 not isinstance(e.widget, tk.Misc):
             # Typing a mark's name -- or the key that just closed the
