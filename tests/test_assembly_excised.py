@@ -847,6 +847,35 @@ def test_tab_stops_at_pull_starts_with_the_surrounding_audio_shown(view):
         assert win.sel_order == 1
 
 
+def test_i_and_o_set_the_region_edges_at_the_insertion_point(view):
+    app, win = view
+    _cut_one(app, win)                            # 0-1 s = 10-11, 1-3 s = 12-14
+    win.set_insert(2.5)                           # 13.5 s of the recording
+    win._on_key(_KeyEv(win.cv, "o", 0))
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == \
+        [(10.0, 11.0), (12.0, pytest.approx(13.5))]
+    win.set_insert(0.5)
+    win._on_key(_KeyEv(win.cv, "I", 0))           # Caps Lock: the same
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == \
+        [(pytest.approx(10.5), 11.0), (12.0, pytest.approx(13.5))]
+
+
+def test_i_and_o_in_the_surrounding_audio_reach_the_region_out_to_it(view):
+    app, win = view
+    _cut_one(app, win)
+    win.toggle_excised()                          # the cut, 11-12, shown at 4-5 s
+    win.set_insert(4.5)                           # 11.5 s of the recording
+    win._on_key(_KeyEv(win.cv, "i", 0))           # the region after comes back to it
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == \
+        [(10.0, 11.0), (pytest.approx(11.5), 14.0)]
+    _res(app, 1)["segments"] = [(10.0, 11.0), (12.0, 14.0)]
+    win.refresh()
+    win.set_insert(4.5)
+    win._on_key(_KeyEv(win.cv, "o", 0))           # the region before runs on to it
+    assert [tuple(s) for s in _res(app, 1)["segments"]] == \
+        [(10.0, pytest.approx(11.5)), (12.0, 14.0)]
+
+
 def test_ctrl_k_switches_pre_roll_and_p_no_longer_does(view, monkeypatch):
     app, win = view
     monkeypatch.setitem(assembly_view._MONITOR, "preroll_on", True)

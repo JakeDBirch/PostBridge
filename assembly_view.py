@@ -5069,12 +5069,59 @@ class AssemblyWindow(object):
             self.app._s4_editing_row = None
 
     def set_point(self, side):
-        """I / O: the pull's IN or OUT to the playhead, in the source view."""
+        """I / O: an IN or OUT at the insertion point.  On the track, the
+        region under it starts (I) or stops (O) there -- in the surrounding
+        audio shown, the region after it (I) or before it (O) reaches out
+        to it.  In Find in recording, the pull's, at its playhead."""
         if self.view == "source" and self.src is not None:
             self.src._set_point_from_cursor(side)
+            return
+        t = self.insert
+        c = self._clip_at(t)
+        if c is None:
+            c = next((x for x in self.clips if x.ghost_at(t) is not None), None)
+        if c is None or not c.pieces:
+            self.status.config(fg=SUB, text="Set {}: put the insertion point "
+                               "in a region first.".format(side.upper()))
+            return
+        k = c.piece_at(t)
+        if k is not None:
+            tl, _du, si = c.pieces[k]
+            s = si + (t - tl)
         else:
-            self.status.config(fg=SUB, text="Set IN / OUT work in the source "
-                               "view (Ctrl+F), on the recording itself.")
+            g = c.ghost_at(t)
+            if g is None:
+                self.status.config(fg=SUB, text="Set {}: the insertion point "
+                                   "is in a gap, not on audio.".format(side.upper()))
+                return
+            s = g[2] + (t - g[0])
+            k = g[4] if side == "in" else g[4] - 1
+            if not 0 <= k < len(c.pieces):
+                return
+        segs = ([list(x) for x in c.segments] if len(c.segments) == len(c.pieces)
+                else [[si, si + du] for _tl, du, si in c.pieces])
+        a, b = segs[k]
+        if side == "in":
+            lo = segs[k - 1][1] if k > 0 else 0.0
+            segs[k][0] = max(min(s, b - MIN_SEG_S), lo)
+        else:
+            hi = segs[k + 1][0] if k + 1 < len(segs) else \
+                self._file_end.get(c.play_path, float("inf"))
+            segs[k][1] = min(max(s, a + MIN_SEG_S), hi)
+        if [tuple(x) for x in segs] == [tuple(x) for x in c.segments]:
+            return
+        segs, gaps = _tidy([tuple(x) for x in segs], list(c.seg_gaps))
+        if not segs:
+            return
+        order = c.order
+        if order != self.sel_order:
+            self.select(order)
+        self._range = None
+        self.app._assembly_set_segments(order, segs, gaps)
+        self.refresh()
+        self._park_at_edit({"mode": side, "order": order, "k": k})
+        self.status.config(fg=TEXT, text="{} of {} region {} set at {}".format(
+            side.upper(), c.label, k + 1, secs_tc(s)))
 
     def _leave_source(self):
         src = self.src
