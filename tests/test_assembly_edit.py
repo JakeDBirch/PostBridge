@@ -1144,12 +1144,15 @@ def test_x_stays_in_this_window(view):
     app.unbind_all("<x>")
 
 
-def test_shift_n_is_return_to_start_now(view):
+def test_shift_n_is_insertion_follows_playback(view):
+    """Pro Tools' name: lit, a stop leaves the insertion point where play
+    stopped -- the other side of returning to where play began."""
     import assembly_view
     app, win = view
     was = assembly_view._MONITOR["return_on"]
     _key(app, win.cv, "N", state=0x0001)
     assert assembly_view._MONITOR["return_on"] is (not was)
+    assert win.return_key.on is was
     assert not win.markers
     win.toggle_return()
     assert assembly_view._MONITOR["return_on"] is was

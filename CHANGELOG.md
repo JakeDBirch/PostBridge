@@ -4,6 +4,12 @@
 
 ## November 25, 2026
 
+### Assembly: edit keys act at the insertion point
+- **A, S, D and G act at the insertion point** (the dotted white line during playback), not the red playhead. While the cut plays, click where the edit goes, then press the key; playback carries on.
+- **Return to start on stop is now Insertion follows playback** (Shift+N), Pro Tools' name, and its light is the other way round.
+  - **Lit:** a stop leaves the insertion point where playback stopped.
+  - **Off:** the playhead goes back to the insertion point.
+
 ### Assembly: Script only (Alt+S)
 - **Alt+S** (or **Script only** under View) switches the script pane to the script as written: no struck, tinted or faded words, and nothing that was said but isn't in the script. Pulls not in the cut read as plain script too. Script words that were said keep their timing, so word lighting and clicking still work. Press Alt+S again to go back to the script set against what was said. The setting is kept for next time.
 

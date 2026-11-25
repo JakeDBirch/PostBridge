@@ -1373,7 +1373,7 @@ class AssemblyWindow(object):
         p = self._panel("MONITOR")
         self.norm_key = key(p, "Normalize", "", self.toggle_normalize,
                             toggle=True)
-        self.return_key = key(p, "Return to start on stop", "Shift+N",
+        self.return_key = key(p, "Insertion follows playback", "Shift+N",
                               self.toggle_return, toggle=True)
         self.follow_key = key(p, "Follow playhead", "Shift+F",
                               self.toggle_follow, toggle=True)
@@ -1392,10 +1392,10 @@ class AssemblyWindow(object):
         key(p, "Cut ½ s out", "C", self.cut_out)
         key(p, "Heal cut", "H", self.heal)
         self.snap_key = key(p, "Snap", "Shift+G", self.toggle_snap, toggle=True)
-        key(p, "Start to playhead", "A", lambda: self.set_point("in"))
-        key(p, "End to playhead", "S", lambda: self.set_point("out"))
-        key(p, "Fade in to playhead", "D", lambda: self.fade_to_playhead("in"))
-        key(p, "Fade out from playhead", "G",
+        key(p, "Start to insertion point", "A", lambda: self.set_point("in"))
+        key(p, "End to insertion point", "S", lambda: self.set_point("out"))
+        key(p, "Fade in to insertion point", "D", lambda: self.fade_to_playhead("in"))
+        key(p, "Fade out from insertion point", "G",
             lambda: self.fade_to_playhead("out"))
         key(p, "Nudge earlier", ",", lambda: self.nudge(-1))
         key(p, "Nudge later", ".", lambda: self.nudge(1))
@@ -5338,24 +5338,20 @@ class AssemblyWindow(object):
             self.app._s4_editing_row = None
 
     def _edit_point(self):
-        """The playhead an edit key goes by: where it is, playing (playback
-        stops there), or where it stopped -- the line on the track, not
-        where play began."""
-        if self._playing and self.player is not None:
-            t = self._from_player(self.player.position())
-            self.stop()
-        else:
-            t = self.playhead
-        return max(0.0, min(t, self.total_s))
+        """Where an edit key (A S D G) acts: the insertion point -- where a
+        click puts it, the dotted white line while the cut plays.  Playback
+        goes on: click where the edit goes as you listen, then the key."""
+        return max(0.0, min(self.insert, self.total_s))
 
     def fade_to_playhead(self, side):
-        """D / G: a fade in from the start of the region under the playhead
-        to it, or a fade out from it to the region's end.  One undo step."""
+        """D / G: a fade in from the start of the region under the insertion
+        point to it, or a fade out from it to the region's end.  One undo
+        step."""
         t = self._edit_point()
         c = self._clip_at(t)
         k = c.piece_at(t) if c is not None else None
         if k is None:
-            self.status.config(fg=SUB, text="Fade {}: put the playhead in a "
+            self.status.config(fg=SUB, text="Fade {}: put the insertion point in a "
                                "region first.".format(side))
             return
         tl, du, si = c.pieces[k]
@@ -5363,7 +5359,7 @@ class AssemblyWindow(object):
                   else (si, si + du))
         secs = (t - tl) if side == "in" else (tl + du - t)
         if secs <= 1e-3:
-            self.status.config(fg=SUB, text="Fade {}: the playhead is on the "
+            self.status.config(fg=SUB, text="Fade {}: the insertion point is on the "
                                "region's {}.".format(
                                    side, "start" if side == "in" else "end"))
             return
@@ -5375,7 +5371,7 @@ class AssemblyWindow(object):
                            "handle to change it".format(side, secs * 1000))
 
     def set_point(self, side):
-        """A / S: an IN or OUT at the playhead.  On the track, the
+        """A / S: an IN or OUT at the insertion point.  On the track, the
         region under it starts (I) or stops (O) there -- in the surrounding
         audio shown, the region after it (I) or before it (O) reaches out
         to it.  In Find in recording, the pull's, at its playhead."""
@@ -6151,7 +6147,10 @@ class AssemblyWindow(object):
         _keep_monitor(self._layout_prefs(), self._rate)
         self.preroll_key.set_text("Pre-roll  {:g} s".format(_MONITOR["preroll_s"]))
         self.preroll_key.set_on(_MONITOR["preroll_on"])
-        self.return_key.set_on(_MONITOR["return_on"])
+        # Pro Tools' Insertion Follows Playback: on, a stop leaves the
+        # insertion point where playback stopped; off, it stays where play
+        # began and the playhead goes back to it (return_on).
+        self.return_key.set_on(not _MONITOR["return_on"])
         self.follow_key.set_on(_MONITOR["follow"])
         self.script_key.set_on(_MONITOR["script"])
         self.skip_key.set_on(_MONITOR["skip_cuts"])
