@@ -1107,8 +1107,14 @@ class App(EpisodeWorkflowMixin, AafWorkflowMixin, PqWorkflowMixin, RefineMixin,
             def _restore():
                 try: w.config(bg=ACCENT)   # cursor likely still over the button
                 except Exception: pass
-            w.after(130, _restore)
-            w.after(0, f)
+            # Both timers belong to the app, not the button.  f usually
+            # rebuilds the screen, destroying the button mid-call; a timer
+            # the button owned would then finish by deleting its command
+            # by name -- a name Tk may have just handed to a widget on the
+            # new screen, whose next teardown fails ("can't delete Tcl
+            # command").
+            self.after(130, _restore)
+            self.after(0, f)
         w.bind("<Button-1>", _press)
         return w
 
