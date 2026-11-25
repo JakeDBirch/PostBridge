@@ -1198,6 +1198,29 @@ def test_music_markers_show_the_time_between_them(view):
     assert assembly_view._fmt_dur(59.999) == "1:00.00"
 
 
+def test_the_playhead_shows_the_time_to_the_nearest_music_marker(view):
+    app, win = view
+    win._move_playhead()
+    assert win.cv.find_withtag("phgap") == ()      # no markers, nothing
+    for t in (0.5, 3.0):
+        win.playhead = t
+        win.drop_marker("music_inflection")
+    win.pps, win.view0 = 100.0, 0.0
+    win.playhead = 1.0
+    win.redraw()
+
+    def gap():
+        i = win.cv.find_withtag("phgap_text")
+        return win.cv.itemcget(i[0], "text"), win.cv.itemcget(i[0], "anchor")
+    assert gap() == ("0.50s", "ne")                # behind: left of the playhead
+    win.playhead = 2.0
+    win._move_playhead()                           # follows the playhead
+    assert gap() == ("1.00s", "nw")                # ahead: right of it
+    win.playhead = 3.0
+    win._move_playhead()
+    assert win.cv.find_withtag("phgap") == ()      # on the marker
+
+
 def test_ctrl_click_deletes_a_mark(view):
     app, win = view
     win.set_insert(0.5)

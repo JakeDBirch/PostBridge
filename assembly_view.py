@@ -3382,6 +3382,7 @@ class AssemblyWindow(object):
         self._place_preroll()
         x = self._x(self.playhead)
         cv.create_line(x, 0, x, y1, fill=_C_PLAYHEAD, width=2, tags=("ph",))
+        self._place_marker_gap()
         self.tc_lbl.config(text=self._tc_text())
         self._light_word()
         self._light_script_word()
@@ -3688,6 +3689,30 @@ class AssemblyWindow(object):
                         if m["kind"].startswith("music")), key=lambda m: m["t"])
         return {id(b): _fmt_dur(b["t"] - a["t"])
                 for a, b in zip(music, music[1:])}
+
+    def _nearest_music_marker(self, t):
+        """The music marker (in, out or inflection) closest to t, or None."""
+        music = [m for m in self.markers if m["kind"].startswith("music")]
+        return min(music, key=lambda m: abs(m["t"] - t)) if music else None
+
+    def _place_marker_gap(self):
+        """From the playhead to the nearest music marker: a line along the
+        lower marker row and how long it is, beside the playhead on the
+        marker's side.  Moves with the playhead."""
+        cv = self.cv
+        cv.delete("phgap")
+        m = self._nearest_music_marker(self.playhead)
+        if m is None or abs(m["t"] - self.playhead) < 1e-3:
+            return
+        top, bot = self._marker_row(1)
+        xp, xm = self._x(self.playhead), self._x(m["t"])
+        cv.create_line(xp, bot - 1, xm + 3, bot - 1, fill=_C_MUSIC,
+                       dash=(2, 2), tags=("phgap",))
+        after = m["t"] > self.playhead
+        cv.create_text(xp + 5 if after else xp - 5, top,
+                       text=_fmt_dur(abs(m["t"] - self.playhead)),
+                       anchor="nw" if after else "ne", font=self._font,
+                       fill=_C_MUSIC, tags=("phgap", "phgap_text"))
 
     def _draw_marks(self, w, y1):
         cv = self.cv
@@ -4031,6 +4056,7 @@ class AssemblyWindow(object):
         y1 = self._track_box()[1]
         self.cv.coords("ph", x, 0, x, y1)
         self._place_preroll()
+        self._place_marker_gap()
         if self.total_s > 0:
             k = max(1, self.ov.winfo_width()) / self.total_s
             self.ov.coords("ph", self.playhead * k, 0, self.playhead * k,

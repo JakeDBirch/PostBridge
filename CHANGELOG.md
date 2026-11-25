@@ -7,6 +7,8 @@
 ### Assembly: the time between music markers
 Each music marker (in, out or inflection) now shows the time since the music marker before it, written in the marker row just ahead of it: 12.40s, or 1:12.40 past a minute. An SFX marker in between doesn't interrupt the count. Where there isn't room for both, the duration wins over the earlier marker's name; zoom in to see both. (The durations between speech ticks added earlier today are taken back out.)
 
+The playhead also shows the time to the nearest music marker, ahead or behind: a dotted line along the lower marker row from the playhead to the marker, with its length beside the playhead on the marker's side. It follows the playhead as it plays or moves, and disappears when the playhead is on the marker.
+
 ### Assembly: every edit shows its surrounding audio
 - **Show surrounding audio now opens up every edit inside a pull.** Before, a jump of more than 30 seconds in the recording, or a jump back (a retake or double start), stayed closed. Each now shows a 3-second handle either side: the tape that runs on after the out, then the tape that leads into the in. Trimming into them with a drag, or with **A** and **S**, works as with any surrounding audio. A or S in the run-on handle extends the region before it, and A or S in the lead-in handle extends the region after it.
 
